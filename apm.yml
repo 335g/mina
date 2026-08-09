@@ -1,0 +1,12 @@
+name: mina
+version: 1.0.0
+description: APM project for mina
+author: Yoshiki Kudo
+targets:
+  - agent-skills
+dependencies:
+  apm:
+    - mattpocock/skills
+  mcp: []
+includes: auto
+scripts: {}
