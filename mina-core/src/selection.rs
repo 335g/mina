@@ -48,6 +48,10 @@ impl Range {
     }
 
     /// The number of chars covered.
+    //
+    // `is_empty` is intentionally absent: a range covers no text exactly
+    // when it is a cursor, which has its own accessor.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.end() - self.start()
     }
@@ -78,11 +82,11 @@ impl Selection {
     /// In debug builds, panics if `ranges` is empty, `primary_index` is out
     /// of bounds, or ranges overlap or are out of order.
     pub fn new(ranges: Vec<Range>, primary_index: usize) -> Self {
-        debug_assert!(!ranges.is_empty(), "selection must contain at least one range");
         debug_assert!(
-            primary_index < ranges.len(),
-            "primary index out of bounds"
+            !ranges.is_empty(),
+            "selection must contain at least one range"
         );
+        debug_assert!(primary_index < ranges.len(), "primary index out of bounds");
         debug_assert!(
             ranges.windows(2).all(|w| w[0].end() <= w[1].start()),
             "ranges must be sorted by start and non-overlapping"
@@ -99,6 +103,10 @@ impl Selection {
     }
 
     /// The number of ranges.
+    //
+    // `is_empty` is intentionally absent: a selection always contains at
+    // least one range by invariant, so it can never be empty.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
