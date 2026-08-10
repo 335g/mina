@@ -24,9 +24,16 @@ pub enum Operation {
 /// 位置の写像（[`Transaction::map_pos`] / [`Transaction::map_selection`]）を
 /// 持つ。コアは関数型なので、適用は新しい [`Document`] を返し、元の文書は
 /// 変更しない（`docs/adr/0002-functional-core-selection.md` 参照）。
+///
+/// **逆変換は作成時に事前計算して保持する**。コンストラクタは元の文書を
+/// 受け取るため、削除された文字列を逆変換に埋め込める。これにより undo は
+/// 「変更後の文書」だけを手にしていても逆転を適用できる（Helix も同様に
+/// 逆変換を保持する）。`invert(&old_doc)` のように後から元の文書を要求する
+/// 方式は、undo 時には変更前の文書が手元にないため使えない。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     operations: Vec<Operation>,
+    inverse: Vec<Operation>,
 }
 
 impl Transaction {
@@ -40,36 +47,57 @@ impl Transaction {
     /// 後ろに写像される（逆順だと削除点に詰められ、挿入テキストの前に来る）。
     pub fn insert(doc: &Document, selection: &Selection, text: &str) -> Self {
         let mut operations = Vec::new();
+        let mut inverse = Vec::new();
         let mut pos = 0;
         for range in selection.ranges() {
             let start = range.start();
             let end = range.end();
             operations.push(Operation::Retain(start - pos));
+            inverse.push(Operation::Retain(start - pos));
             operations.push(Operation::Insert(text.to_string()));
+            inverse.push(Operation::Delete(text.chars().count()));
             if end > start {
                 operations.push(Operation::Delete(end - start));
+                // 削除された文字列は逆変換に埋め込む（undo 時に元の文書を
+                // 必要としないため）
+                let deleted = doc.text().slice(start..end).to_string();
+                inverse.push(Operation::Insert(deleted));
             }
             pos = end;
         }
-        operations.push(Operation::Retain(doc.len_chars() - pos));
-        Self { operations }
+        let trailing = doc.len_chars() - pos;
+        operations.push(Operation::Retain(trailing));
+        inverse.push(Operation::Retain(trailing));
+        Self {
+            operations,
+            inverse,
+        }
     }
 
     /// `selection` が覆う範囲を削除するトランザクションを作る。
     pub fn delete(doc: &Document, selection: &Selection) -> Self {
         let mut operations = Vec::new();
+        let mut inverse = Vec::new();
         let mut pos = 0;
         for range in selection.ranges() {
             let start = range.start();
             let end = range.end();
             operations.push(Operation::Retain(start - pos));
+            inverse.push(Operation::Retain(start - pos));
             if end > start {
                 operations.push(Operation::Delete(end - start));
+                let deleted = doc.text().slice(start..end).to_string();
+                inverse.push(Operation::Insert(deleted));
             }
             pos = end;
         }
-        operations.push(Operation::Retain(doc.len_chars() - pos));
-        Self { operations }
+        let trailing = doc.len_chars() - pos;
+        operations.push(Operation::Retain(trailing));
+        inverse.push(Operation::Retain(trailing));
+        Self {
+            operations,
+            inverse,
+        }
     }
 
     /// このトランザクションを `doc` に適用した新しい文書を返す。
@@ -96,28 +124,13 @@ impl Transaction {
         Document::from(builder.finish())
     }
 
-    /// このトランザクションの逆転。`invert(old_doc)` を適用結果に適用すると
-    /// `old_doc` に戻る。`old_doc` はこのトランザクションが適用される前の
-    /// 文書であること（削除された文字列はここから復元する）。
-    pub fn invert(&self, old_doc: &Document) -> Transaction {
-        let mut inverse = Vec::new();
-        let mut old = 0;
-        for op in &self.operations {
-            match op {
-                Operation::Retain(n) => {
-                    inverse.push(Operation::Retain(*n));
-                    old += n;
-                }
-                Operation::Delete(n) => {
-                    let deleted = old_doc.text().slice(old..old + n).to_string();
-                    inverse.push(Operation::Insert(deleted));
-                    old += n;
-                }
-                Operation::Insert(s) => inverse.push(Operation::Delete(s.chars().count())),
-            }
-        }
+    /// このトランザクションの逆転（作成時に事前計算したもの）。
+    ///
+    /// 逆転を適用結果に適用すると元の文書に戻る。undo に使う。
+    pub fn invert(&self) -> Transaction {
         Transaction {
-            operations: inverse,
+            operations: self.inverse.clone(),
+            inverse: self.operations.clone(),
         }
     }
 
@@ -203,7 +216,7 @@ mod tests {
         let new_doc = tx.apply(&doc);
         assert_eq!(new_doc.text().to_string(), "hXello");
 
-        let restored = tx.invert(&doc).apply(&new_doc);
+        let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "hello");
     }
 
@@ -216,7 +229,7 @@ mod tests {
         let new_doc = tx.apply(&doc);
         assert_eq!(new_doc.text().to_string(), "hello Rust");
 
-        let restored = tx.invert(&doc).apply(&new_doc);
+        let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "hello world");
     }
 
@@ -229,7 +242,7 @@ mod tests {
         let new_doc = tx.apply(&doc);
         assert_eq!(new_doc.text().to_string(), "hello ");
 
-        let restored = tx.invert(&doc).apply(&new_doc);
+        let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "hello world");
     }
 
@@ -243,7 +256,7 @@ mod tests {
         // カーソル1は h と e の間、カーソル3（元文書の位置）は l と l の間。
         assert_eq!(new_doc.text().to_string(), "h!el!lo");
 
-        let restored = tx.invert(&doc).apply(&new_doc);
+        let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "hello");
     }
 
@@ -265,7 +278,7 @@ mod tests {
         let new_doc = tx.apply(&doc);
         assert_eq!(new_doc.text().to_string(), "a");
 
-        let restored = tx.invert(&doc).apply(&new_doc);
+        let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "");
     }
 
