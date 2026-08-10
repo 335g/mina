@@ -34,6 +34,10 @@ impl Transaction {
     ///
     /// カーソル（空の Range）は「その位置への挿入」として扱われる。複数
     /// カーソルの場合はすべての位置に同じ `text` が挿入・置換される。
+    ///
+    /// 操作列では `Insert` を `Delete` の**前**に置く。これにより、置換範囲の
+    /// 開始位置にいたカーソルが `map_pos(is_insert = true)` で挿入テキストの
+    /// 後ろに写像される（逆順だと削除点に詰められ、挿入テキストの前に来る）。
     pub fn insert(doc: &Document, selection: &Selection, text: &str) -> Self {
         let mut operations = Vec::new();
         let mut pos = 0;
@@ -41,10 +45,10 @@ impl Transaction {
             let start = range.start();
             let end = range.end();
             operations.push(Operation::Retain(start - pos));
+            operations.push(Operation::Insert(text.to_string()));
             if end > start {
                 operations.push(Operation::Delete(end - start));
             }
-            operations.push(Operation::Insert(text.to_string()));
             pos = end;
         }
         operations.push(Operation::Retain(doc.len_chars() - pos));
