@@ -7,6 +7,7 @@
 pub mod document;
 pub mod edit;
 pub mod movement;
+pub mod search;
 pub mod selection;
 pub mod transaction;
 
@@ -14,5 +15,6 @@ pub use document::Document;
 pub use edit::{delete_backward, delete_range, insert_text};
 pub use movement::{Direction, Movement, extend_selection, move_selection};
 pub use ropey::Rope;
+pub use search::{CaseSensitivity, find_matches, find_next};
 pub use selection::{Range, Selection};
 pub use transaction::{Operation, Transaction};
