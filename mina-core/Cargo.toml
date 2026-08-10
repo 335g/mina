@@ -1,0 +1,10 @@
+[package]
+name = "mina-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "UI-agnostic text-editing core for mina"
+
+[dependencies]
+ropey.workspace = true
+smallvec.workspace = true
