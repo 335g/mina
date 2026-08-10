@@ -21,13 +21,6 @@ impl Document {
         Self::default()
     }
 
-    /// Creates a document containing `text`.
-    pub fn from_str(text: &str) -> Self {
-        Self {
-            text: Rope::from_str(text),
-        }
-    }
-
     /// The underlying text.
     pub fn text(&self) -> &Rope {
         &self.text
@@ -44,6 +37,14 @@ impl Document {
     }
 }
 
+impl From<&str> for Document {
+    fn from(text: &str) -> Self {
+        Self {
+            text: Rope::from_str(text),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,13 +58,13 @@ mod tests {
 
     #[test]
     fn len_chars_counts_unicode_scalars() {
-        let doc = Document::from_str("aβ😀");
+        let doc = Document::from("aβ😀");
         assert_eq!(doc.len_chars(), 3);
     }
 
     #[test]
     fn from_str_keeps_text() {
-        let doc = Document::from_str("hello");
+        let doc = Document::from("hello");
         assert_eq!(doc.text().to_string(), "hello");
     }
 }
