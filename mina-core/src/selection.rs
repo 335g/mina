@@ -1,12 +1,11 @@
-//! Selections: the set of active cursor ranges.
+//! 選択: アクティブなカーソル範囲の集合。
 
 use smallvec::SmallVec;
 
-/// One element of a [`Selection`]: a span of text with an anchor (fixed end)
-/// and a head (moving end).
+/// [`Selection`] の1要素: anchor（固定端）と head（移動端）を持つテキストの区間。
 ///
-/// Positions are char indices into the document's text. A range with
-/// `anchor == head` is a cursor: a point, not a span.
+/// 位置は文書テキストへの char インデックス。`anchor == head` の Range は
+/// カーソル、つまり区間ではなく点を表す。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Range {
     anchor: usize,
@@ -14,12 +13,12 @@ pub struct Range {
 }
 
 impl Range {
-    /// Creates a range spanning `anchor`..`head` (either direction).
+    /// `anchor`..`head` を張る Range を作成する（向きはどちらでもよい）。
     pub fn new(anchor: usize, head: usize) -> Self {
         Self { anchor, head }
     }
 
-    /// Creates a cursor at `pos`.
+    /// `pos` にカーソルを作成する。
     pub fn point(pos: usize) -> Self {
         Self {
             anchor: pos,
@@ -27,46 +26,46 @@ impl Range {
         }
     }
 
-    /// The fixed end of the range.
+    /// Range の固定端。
     pub fn anchor(&self) -> usize {
         self.anchor
     }
 
-    /// The moving end of the range; extended during selection operations.
+    /// Range の移動端。選択操作（extend など）ではこちらが伸びる。
     pub fn head(&self) -> usize {
         self.head
     }
 
-    /// The lowest position covered by the range.
+    /// Range が覆う最小の位置。
     pub fn start(&self) -> usize {
         self.anchor.min(self.head)
     }
 
-    /// The highest position covered by the range, exclusive.
+    /// Range が覆う最大の位置（排他的）。
     pub fn end(&self) -> usize {
         self.anchor.max(self.head)
     }
 
-    /// The number of chars covered.
+    /// 覆われる char 数。
     //
-    // `is_empty` is intentionally absent: a range covers no text exactly
-    // when it is a cursor, which has its own accessor.
+    // `is_empty` は意図的に置かない: テキストを覆わない Range はすなわち
+    // カーソルであり、専用のアクセサ（is_cursor）がある。
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.end() - self.start()
     }
 
-    /// Whether this is a cursor (no text covered).
+    /// カーソル（テキストを覆わない点）かどうか。
     pub fn is_cursor(&self) -> bool {
         self.anchor == self.head
     }
 }
 
-/// The set of active cursor ranges.
+/// アクティブなカーソル範囲の集合。
 ///
-/// A single cursor is a `Selection` with one range. Invariants: at least one
-/// range, `primary_index` in bounds, and ranges sorted by start without
-/// overlap (checked by `debug_assert` in [`Selection::new`]).
+/// 単一カーソルは Range を1つ持つ `Selection` である。不変条件: Range が
+/// 1つ以上あること、`primary_index` が範囲内であること、Range が開始位置の
+/// 昇順でソートされ重複しないこと（[`Selection::new`] の `debug_assert` で検査）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     ranges: SmallVec<[Range; 1]>,
@@ -74,22 +73,18 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// Creates a selection from `ranges`; `primary_index` names the primary
-    /// range.
+    /// `ranges` から選択を作成する。`primary_index` が primary Range を指す。
     ///
     /// # Panics
     ///
-    /// In debug builds, panics if `ranges` is empty, `primary_index` is out
-    /// of bounds, or ranges overlap or are out of order.
+    /// debug ビルドで、`ranges` が空・`primary_index` が範囲外・Range の
+    /// 重複または順序違反がある場合に panic する。
     pub fn new(ranges: Vec<Range>, primary_index: usize) -> Self {
-        debug_assert!(
-            !ranges.is_empty(),
-            "selection must contain at least one range"
-        );
-        debug_assert!(primary_index < ranges.len(), "primary index out of bounds");
+        debug_assert!(!ranges.is_empty(), "選択には少なくとも1つの Range が必要");
+        debug_assert!(primary_index < ranges.len(), "primary インデックスが範囲外");
         debug_assert!(
             ranges.windows(2).all(|w| w[0].end() <= w[1].start()),
-            "ranges must be sorted by start and non-overlapping"
+            "Range は開始位置の昇順かつ非重複である必要がある"
         );
         Self {
             ranges: ranges.into(),
@@ -97,43 +92,43 @@ impl Selection {
         }
     }
 
-    /// Creates a single-cursor selection at `pos`.
+    /// `pos` に単一カーソルの選択を作成する。
     pub fn point(pos: usize) -> Self {
         Self::new(vec![Range::point(pos)], 0)
     }
 
-    /// The number of ranges.
+    /// Range の個数。
     //
-    // `is_empty` is intentionally absent: a selection always contains at
-    // least one range by invariant, so it can never be empty.
+    // `is_empty` は意図的に置かない: 不変条件により選択は常に1つ以上の
+    // Range を持ち、空になり得ない。
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
 
-    /// Whether this is a single cursor covering no text.
+    /// テキストを覆わない単一カーソルかどうか。
     pub fn is_single_cursor(&self) -> bool {
         self.len() == 1 && self.ranges[0].is_cursor()
     }
 
-    /// The primary range — the one operations such as extend act on.
+    /// primary Range — extend などの操作が作用する対象。
     pub fn primary(&self) -> Range {
         self.ranges[self.primary_index]
     }
 
-    /// The index of the primary range.
+    /// primary Range のインデックス。
     pub fn primary_index(&self) -> usize {
         self.primary_index
     }
 
-    /// All ranges, in order.
+    /// すべての Range（順序どおり）。
     pub fn ranges(&self) -> &[Range] {
         &self.ranges
     }
 }
 
 impl Default for Selection {
-    /// A single cursor at position 0.
+    /// 位置0の単一カーソル。
     fn default() -> Self {
         Self::point(0)
     }

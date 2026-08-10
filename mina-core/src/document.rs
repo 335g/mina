@@ -1,37 +1,37 @@
-//! The [`Document`]: the unit of editable text.
+//! [`Document`]: 編集対象のテキストの単位。
 
 use ropey::Rope;
 
-/// The unit of editable text.
+/// 編集対象のテキストの単位。
 ///
-/// A thin newtype over [`Rope`]. It owns the text content and is the target
-/// of edits; the active cursor state ([`Selection`](crate::Selection)) lives
-/// outside it, so one document can later be shown in several views.
+/// [`Rope`] に対する薄い NewType。テキストの内容を所有し、編集の対象となる。
+/// アクティブなカーソル状態（[`Selection`](crate::Selection)）はこの外に置く —
+/// 1つの文書を後で複数の View で表示できるようにするためである。
 ///
-/// Properties beyond the text (syntax, diagnostics, edit history) will be
-/// added here only when a step actually needs them.
+/// テキスト以外のプロパティ（構文・診断・編集履歴）は、実際に必要なステップが
+/// 来た時点でここに追加する。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Document {
     text: Rope,
 }
 
 impl Document {
-    /// Creates an empty document.
+    /// 空の文書を作成する。
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The underlying text.
+    /// テキストの内容。
     pub fn text(&self) -> &Rope {
         &self.text
     }
 
-    /// The length of the document in Unicode scalar values (chars).
+    /// 文書の長さ（Unicode スカラー値 = char の数）。
     pub fn len_chars(&self) -> usize {
         self.text.len_chars()
     }
 
-    /// Whether the document contains no text.
+    /// 文書がテキストを一切含まないかどうか。
     pub fn is_empty(&self) -> bool {
         self.text.len_chars() == 0
     }

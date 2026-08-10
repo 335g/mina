@@ -1,9 +1,9 @@
-//! Text-editing core for mina: a UI-agnostic model of documents and
-//! selections, with transactional edits and movement coming in later steps.
+//! mina のテキスト編集コア: 端末非依存の文書・選択のモデル。
+//! トランザクション編集と移動プリミティブは後続ステップで追加する。
 //!
-//! The core is functional: operations transform state instead of mutating it
-//! (see `docs/adr/0002-functional-core-selection.md`). Nothing here knows
-//! about terminals, keymaps, or syntax highlighting.
+//! コアは関数型である: 操作は状態を破壊的に変更するのではなく、新しい状態を
+//! 返す（`docs/adr/0002-functional-core-selection.md` 参照）。
+//! この層はターミナル・キーマップ・構文ハイライトについて何も知らない。
 
 pub mod document;
 pub mod selection;
