@@ -8,3 +8,4 @@ description = "UI-agnostic text-editing core for mina"
 [dependencies]
 ropey.workspace = true
 smallvec.workspace = true
+unicode-segmentation.workspace = true

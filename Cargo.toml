@@ -10,3 +10,4 @@ rust-version = "1.96"
 [workspace.dependencies]
 ropey = "1"
 smallvec = "1"
+unicode-segmentation = "1"
