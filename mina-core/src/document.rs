@@ -45,6 +45,12 @@ impl From<&str> for Document {
     }
 }
 
+impl From<Rope> for Document {
+    fn from(text: Rope) -> Self {
+        Self { text }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
