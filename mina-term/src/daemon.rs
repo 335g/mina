@@ -16,6 +16,7 @@ use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 
 use crate::lsp;
 use crate::lsp::LspSession;
@@ -39,6 +40,19 @@ const MAX_CMD_LINE: usize = 1024 * 1024;
 /// で `first_line + height` の overflow panic を起こさないよう clamp する
 /// （scroll_to_cursor の加算は debug ビルドで panic する）。
 const MAX_VIEWPORT_HEIGHT: usize = 10_000;
+
+/// 応答スナップショット書き込みのタイムアウト（MEDIUM-2）。
+///
+/// クライアントが応答を読まない（SIGSTOP された TUI・停止した agent 等）と
+/// socket バッファが詰まり、write_all が永久ブロックして接続スロット
+/// （[`MAX_CONNECTIONS`]）を消費し続ける。超過した接続は切断する。
+///
+/// ponytail: 固定値。16MiB の制御文字だらけのファイルで応答が ~96MiB に
+/// なっても健全なリンクなら数秒で書ける。遅い読み手が問題になったら再考する。
+#[cfg(not(test))]
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// daemon が保持する編集状態。
 pub struct Daemon {
@@ -273,8 +287,12 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
         };
         let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
         out.push('\n');
-        if write_half.write_all(out.as_bytes()).await.is_err() {
-            break; // クライアントが応答を読めない（切断された）
+        // MEDIUM-2: 応答を読まないクライアントが socket バッファを詰まらせて
+        // 接続スロットを永久に占有しないよう、書き込みにタイムアウトを付ける。
+        // タイムアウト・切断のいずれも接続を閉じて後始末に進む。
+        let wrote = timeout(RESPONSE_WRITE_TIMEOUT, write_half.write_all(out.as_bytes())).await;
+        if !matches!(wrote, Ok(Ok(()))) {
+            break; // 切断 or 書き込みタイムアウト
         }
     }
     // 切断の後始末: 所有者（グループを開いたクライアント）ならグループを閉じ
@@ -917,6 +935,41 @@ mod tests {
         assert_eq!(s.text, "");
     }
 
+    /// テスト用 daemon を一時 socket で起動し、接続できるまで待つ。
+    async fn start_server(sock: &std::path::Path) {
+        let sock_serve = sock.to_path_buf();
+        tokio::spawn(async move {
+            let _ = serve(&sock_serve).await;
+        });
+        for _ in 0..100 {
+            if UnixStream::connect(sock).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("daemon が起動しなかった");
+    }
+
+    /// NDJSON 1 コマンドを送り、応答スナップショット 1 行を受け取る。
+    async fn request(stream: &mut UnixStream, cmd: &Command) -> StateSnapshot {
+        stream
+            .write_all(serde_json::to_string(cmd).unwrap().as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await.expect("応答を読む");
+            assert!(n > 0, "応答が来ない（接続が閉じた）");
+            buf.extend_from_slice(&chunk[..n]);
+            if chunk[..n].contains(&b'\n') {
+                break;
+            }
+        }
+        serde_json::from_slice(&buf).unwrap()
+    }
+
     #[tokio::test]
     async fn real_socket_agent_disconnect_keeps_tui_undo_group() {
         // HIGH-1 e2e: 実 socket で TUI（永続）+ agent（ワンショット）の 2 接続。
@@ -924,37 +977,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-h1-sock-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
-        let sock_serve = sock.clone();
-        tokio::spawn(async move {
-            let _ = serve(&sock_serve).await;
-        });
-        // socket が現れるまで待つ
-        for _ in 0..100 {
-            if UnixStream::connect(&sock).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        // NDJSON 1 コマンド送って応答スナップショット 1 行を受け取る
-        async fn request(stream: &mut UnixStream, cmd: &Command) -> StateSnapshot {
-            stream
-                .write_all(serde_json::to_string(cmd).unwrap().as_bytes())
-                .await
-                .unwrap();
-            stream.write_all(b"\n").await.unwrap();
-            let mut buf = Vec::new();
-            loop {
-                let mut byte = [0u8; 1];
-                let n = stream.read(&mut byte).await.unwrap();
-                assert!(n > 0, "応答が来ない（接続が閉じた）");
-                if byte[0] == b'\n' {
-                    break;
-                }
-                buf.push(byte[0]);
-            }
-            serde_json::from_slice(&buf).unwrap()
-        }
+        start_server(&sock).await;
 
         // TUI: Insert モードで "a" を入力（グループを開く）
         let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
@@ -981,6 +1004,50 @@ mod tests {
             "undo 1回でセッション全体が戻る（agent の切断がグループを壊していない）"
         );
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn stalled_response_writer_is_dropped_and_daemon_recovers() {
+        // MEDIUM-2: 応答を読まないクライアントは書き込みタイムアウトで切断され、
+        // 接続スロット（MAX_CONNECTIONS=4）を永久に占有しない。占有は「新しい
+        // クライアントが応答を受け取れること」で観測する（修正前はスロットが
+        // 戻らず永久に待つ）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m2-sock-{}.sock", std::process::id()));
+        let big = dir.join(format!("mina-m2-big-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&big);
+        // socket バッファ（macOS 8KB / Linux ~208KB）を超える応答（8MB）を作る
+        std::fs::write(&big, "a".repeat(8 * 1024 * 1024)).unwrap();
+        let big_str = big.to_string_lossy().into_owned();
+        start_server(&sock).await;
+
+        // 巨大文書を読み込んでおく（GetState の応答を大きくするため）
+        let mut loader = UnixStream::connect(&sock).await.expect("接続できる");
+        let _ = request(&mut loader, &Command::Open { path: big_str }).await;
+        drop(loader);
+
+        // DoS シナリオ: GetState を送って一切読まないクライアントを放置する
+        // （書き込みがバッファで詰まり、テストでは 500ms のタイムアウトで切断）
+        let mut wedged = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut line = serde_json::to_string(&Command::GetState).unwrap();
+        line.push('\n');
+        wedged.write_all(line.as_bytes()).await.unwrap();
+        // wedged はこの後一切読まない（ソケットは開いたまま）
+
+        // 新しいクライアント: タイムアウトでスロットが解放されるまで待って応答を
+        // 受け取れる。修正前は wedged のスロットが戻らず 5 秒待っても応答が来ない。
+        let mut fresh = UnixStream::connect(&sock).await.expect("接続できる");
+        let snap = timeout(
+            std::time::Duration::from_secs(5),
+            request(&mut fresh, &Command::GetState),
+        )
+        .await
+        .expect("スロットが解放され応答が返る");
+        assert_eq!(snap.text.len(), 8 * 1024 * 1024);
+        drop(wedged);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&big);
     }
 
     #[test]
