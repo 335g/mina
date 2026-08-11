@@ -39,6 +39,17 @@ impl Daemon {
             diagnostics: Vec::new(),
         }
     }
+
+    /// クライアント切断時の後始末: Insert モードで開いたままの undo グループを
+    /// 閉じ、モードを Normal に戻す（ADR-0007）。閉じ忘れると、常駐 daemon の
+    /// 履歴がセッションを跨いで編集を同一 undo グループに統合してしまう
+    /// （H1: Insert のまま終了した次セッションの入力が undo 1回で消える）。
+    fn on_client_disconnect(&mut self) {
+        if self.editor.mode() == mina_view::Mode::Insert {
+            self.editor.end_group();
+            self.editor.set_mode(mina_view::Mode::Normal);
+        }
+    }
 }
 
 /// 常駐デーモンとして起動する（`mina daemon serve`）。
@@ -73,9 +84,9 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line).await {
-            Ok(0) => return, // クライアントの切断
+            Ok(0) => break, // クライアントの切断
             Ok(_) => {}
-            Err(_) => return,
+            Err(_) => break,
         }
         let command: Command = match serde_json::from_str(line.trim()) {
             Ok(c) => c,
@@ -150,9 +161,12 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
         let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
         out.push('\n');
         if write_half.write_all(out.as_bytes()).await.is_err() {
-            return;
+            break; // クライアントが応答を読めない（切断された）
         }
     }
+    // 切断の後始末: Insert モードで開いたままの undo グループを閉じ、モードを
+    // Normal に戻す（ADR-0007）。
+    daemon.lock().await.on_client_disconnect();
 }
 
 /// 編集系コマンドか（LSP 全文同期の対象）。
@@ -280,12 +294,15 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
         Command::SetMode { mode } => {
             let new_mode = convert_mode(mode);
             let current = daemon.editor.mode();
-            // Insert モードの入力を1つの undo グループにまとめる
-            // （グループは daemon 側で開閉する — 状態は daemon が持つため）。
+            // Insert モードの入力を1つの undo グループにまとめる（グループは
+            // daemon 側で開閉する — 状態は daemon が持つため）。境界は「Insert
+            // セッション」: Insert への進入で開き、Insert からの離脱（→Normal・
+            // →Select のいずれでも）で閉じる。切断時は接続ハンドラ側で閉じる
+            // （ADR-0007）。
             // ponytail: ネストしたグループは考慮しない（v1 にその経路はない）。
             if new_mode == mina_view::Mode::Insert && current != mina_view::Mode::Insert {
                 daemon.editor.begin_group();
-            } else if new_mode == mina_view::Mode::Normal && current == mina_view::Mode::Insert {
+            } else if new_mode != mina_view::Mode::Insert && current == mina_view::Mode::Insert {
                 daemon.editor.end_group();
             }
             daemon.editor.set_mode(new_mode);
@@ -451,6 +468,56 @@ mod tests {
         assert_eq!(s.text, "abc");
         let s = apply(&mut d, Command::Undo);
         assert_eq!(s.text, "");
+    }
+
+    #[test]
+    fn leaving_insert_for_select_closes_undo_group() {
+        // H1 変種: Insert→Select でもグループを閉じる（ADR-0007）。
+        // 2回の Insert セッションが別々の undo 単位になる。
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "a".into() });
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "b".into() });
+        let s = apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        assert_eq!(s.text, "ab");
+
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "a", "undo 1回目は2回目の Insert セッションだけを戻す");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "", "undo 2回目で1回目のセッションも戻る");
+    }
+
+    #[test]
+    fn disconnect_in_insert_mode_closes_group_and_resets_mode() {
+        // H1: Insert のまま接続が切れても、次のクライアントの編集は別グループになる
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "a".into() });
+        d.on_client_disconnect(); // 接続切断（修正前はグループが開いたまま漏れた）
+        assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "切断で Normal に戻る");
+
+        // 次のクライアント: 再び Insert で入力しても別グループになる
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "b".into() });
+        let s = apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        assert_eq!(s.text, "ab");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "a", "undo は切断後のセッションだけを戻す");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "", "切断前のセッションも別グループとして戻せる");
+    }
+
+    #[test]
+    fn disconnect_in_normal_mode_is_noop() {
+        let mut d = daemon();
+        open(&mut d, "hello");
+        d.on_client_disconnect();
+        assert_eq!(d.editor.mode(), mina_view::Mode::Normal);
+        assert_eq!(d.editor.current_document().text().to_string(), "hello");
     }
 
     #[test]
