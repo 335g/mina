@@ -260,13 +260,28 @@ pub async fn ensure(
     let arc = Arc::new(Mutex::new(session));
     // 保存（短いロック・await なし）。
     let mut d = daemon.lock().await;
-    if let Some(existing) = &d.lsp {
-        // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
-        // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
-        return Ok(existing.clone());
+    match &d.lsp {
+        // 同時 ensure レース: 既存が生きていればそちらを優先する
+        Some(existing) => {
+            let alive = match existing.try_lock() {
+                Ok(s) => !s.client.is_dead(),
+                Err(_) => true, // 同期中: 生きているとみなす
+            };
+            if alive {
+                // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
+                // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
+                return Ok(existing.clone());
+            }
+            // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
+            // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
+            d.lsp = Some(arc.clone());
+            Ok(arc)
+        }
+        None => {
+            d.lsp = Some(arc.clone());
+            Ok(arc)
+        }
     }
-    d.lsp = Some(arc.clone());
-    Ok(arc)
 }
 
 /// 文書を開いたことを LSP に通知する（daemon ロック外・lsp mutex のみ）。
@@ -337,5 +352,46 @@ mod tests {
         assert_eq!(lsp_pos_to_char(text, 0, 4, PositionEncoding::Utf16), 3);
         // 2行目先頭は char 5（\n の直後）
         assert_eq!(lsp_pos_to_char(text, 1, 0, PositionEncoding::Utf16), 5);
+    }
+
+    #[tokio::test]
+    async fn ensure_replaces_dead_session() {
+        // M3/ADR-0009: サーバが死んだら次の .rs Open で再 spawn される。
+        // 死亡セッションを返し続けず、新しいセッションに置き換わることを検証する。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let daemon = Arc::new(Mutex::new(Daemon::new()));
+        let session = LspSession::new(bin, Path::new("/tmp"))
+            .await
+            .expect("initialize");
+        let dead = Arc::new(Mutex::new(session));
+        daemon.lock().await.lsp = Some(dead.clone());
+
+        // サーバを殺して is_dead になるまで待つ（reader タスクが EOF を拾う）
+        dead.lock().await.client.kill().await;
+        let mut is_dead = false;
+        for _ in 0..100 {
+            if dead.lock().await.client.is_dead() {
+                is_dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(is_dead, "サーバを殺すと is_dead になる");
+
+        let replaced = ensure(&daemon, Path::new("/tmp/x.rs"))
+            .await
+            .expect("再 spawn できる");
+        assert!(
+            !Arc::ptr_eq(&dead, &replaced),
+            "新しいセッションで置き換わる"
+        );
+        assert!(
+            !replaced.lock().await.client.is_dead(),
+            "返るセッションは生きている"
+        );
     }
 }
