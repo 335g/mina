@@ -25,6 +25,34 @@ const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 const CURSOR_HIDE: &str = "\x1b[?25l";
 const CURSOR_SHOW: &str = "\x1b[?25h";
 
+/// TUI 終了時のターミナル復旧ガード（M4）。
+///
+/// raw モード・代替画面・カーソル非表示を、正常終了・エラー経路（`?`）を問わず
+/// 必ず元に戻す。daemon 切断等でエラー return してもシェルを壊さない。
+struct TerminalGuard(PlatformTerminal);
+
+impl std::ops::Deref for TerminalGuard {
+    type Target = PlatformTerminal;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TerminalGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.0.write_all(CURSOR_SHOW.as_bytes());
+        let _ = self.0.write_all(ALT_SCREEN_OFF.as_bytes());
+        let _ = self.0.flush();
+        let _ = self.0.enter_cooked_mode();
+    }
+}
+
 /// TUI を起動する。`file` があればそれを開く。
 pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let socket = crate::daemon::socket_path();
@@ -38,11 +66,14 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         Some(path) => Command::Open { path: path.to_string() },
         None => Command::GetState,
     };
-    // 初回コマンド（Open または GetState）。応答は SetViewport の応答で置き換わる
-    let _ = request(&mut write_half, &mut reader, first).await?;
+    // M5: 初回応答（Open の失敗 status など）を破棄せず保持する
+    let mut state = request(&mut write_half, &mut reader, first).await?;
+    let first_status = state.status.take();
 
     // 端末セットアップ（raw モード + 代替画面 + カーソル非表示）
-    let mut terminal = PlatformTerminal::new()?;
+    let terminal = PlatformTerminal::new()?;
+    // M4: 以降はエラー経路（`?`）でも必ずターミナルを復旧する
+    let mut terminal = TerminalGuard(terminal);
     terminal.enter_raw_mode()?;
     terminal.write_all(ALT_SCREEN_ON.as_bytes())?;
     terminal.write_all(CURSOR_HIDE.as_bytes())?;
@@ -51,7 +82,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let size = terminal.get_dimensions()?;
     let mut width = size.cols;
     let mut height = size.rows;
-    let state = request(
+    let mut state = request(
         &mut write_half,
         &mut reader,
         Command::SetViewport {
@@ -59,14 +90,16 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         },
     )
     .await?;
-
-    let mut state = state;
+    // M5: SetViewport の応答は status を持たないので、初回応答の status を引き継ぐ
+    if state.status.is_none() {
+        state.status = first_status;
+    }
 
     let keymaps = Keymaps::new();
     let mut pending: Vec<KeyEvent> = Vec::new();
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
 
-    render::draw(&mut terminal, &state, &pending, width, height)?;
+    render::draw(&mut *terminal, &state, &pending, width, height)?;
     terminal.flush()?;
 
     while let Some(event) = events.next().await {
@@ -104,15 +137,11 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
             }
             _ => continue,
         }
-        render::draw(&mut terminal, &state, &pending, width, height)?;
+        render::draw(&mut *terminal, &state, &pending, width, height)?;
         terminal.flush()?;
     }
 
-    // 終了処理
-    terminal.write_all(CURSOR_SHOW.as_bytes())?;
-    terminal.write_all(ALT_SCREEN_OFF.as_bytes())?;
-    terminal.flush()?;
-    terminal.enter_cooked_mode()?;
+    // 終了処理は TerminalGuard の Drop が行う（M4: エラー経路でも必ず復旧する）
     Ok(())
 }
 
