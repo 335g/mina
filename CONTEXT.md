@@ -24,6 +24,10 @@ _Avoid_: edit, change, operation
 The unit of undo/redo: a set of Transactions reverted together by one undo. One Insert session is one UndoGroup — it opens on entering Insert mode and closes on leaving Insert (to Normal or Select) or when the owning Client disconnects.
 _Avoid_: change, edit
 
+**Dirty**:
+A Document that has been edited since it was last saved to its Path. Cleared by a successful Save. Scoped to the Document, not the View — saving one Document must not clear another's flag.
+_Avoid_: unsaved, modified
+
 **Mode**:
 The active editing mode — Normal, Insert, or Select. Determines which Keymap resolves key presses.
 _Avoid_: state
