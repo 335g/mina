@@ -161,13 +161,14 @@ fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], widt
     status.push_str(mode);
     status.push_str("\x1b[0m");
     let path = state.path.as_deref().unwrap_or("[no name]");
+    let dirty = if state.dirty { "*" } else { "" };
     let primary = state
         .selection
         .get(state.primary_index)
         .copied()
         .unwrap_or(Range { anchor: 0, head: 0 });
     let (row, col, _) = cursor_pos(&state.text, primary.head);
-    status.push_str(&format!(" {path}  {row}:{col}"));
+    status.push_str(&format!(" {path}{dirty}  {row}:{col}"));
     if !pending.is_empty() {
         let keys: String = pending
             .iter()
@@ -237,6 +238,7 @@ mod tests {
             first_line: 0,
             diagnostics: Vec::new(),
             path: None,
+            dirty: false,
             status: None,
         }
     }

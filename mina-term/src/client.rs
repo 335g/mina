@@ -83,7 +83,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 if quit {
                     break;
                 }
-                match keymaps.resolve(state.mode, &mut pending, key) {
+                match keymaps.resolve_with_insert_fallback(state.mode, &mut pending, key) {
                     Resolution::Command(command) => {
                         state = request(&mut write_half, &mut reader, command).await?;
                     }
