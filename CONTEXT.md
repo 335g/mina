@@ -35,3 +35,11 @@ _Avoid_: action, operation
 **Keymap**:
 A mapping from key sequences to Commands, scoped per Mode and structured as a prefix trie so sequences like `g g` resolve.
 _Avoid_: keybindings, keymap table
+
+**Daemon**:
+The persistent mina process that owns the editor state — documents, histories, selections, and LSP clients — and serves Clients over a local channel. Clients may come and go; the Daemon and its state remain.
+_Avoid_: server, backend
+
+**Client**:
+A process that connects to the Daemon to send Commands and receive editor state: the terminal UI, a CLI invocation, or an agent.
+_Avoid_: frontend, viewer
