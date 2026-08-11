@@ -6,16 +6,29 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use mina_lsp::{Client, Incoming, PositionEncoding, PublishParams};
 use mina_protocol::{Diagnostic, Severity};
 use serde_json::json;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use crate::daemon::Daemon;
 
 /// 1回の publish で取り込む診断の上限（5c: 診断 flood 対策）。
 const MAX_DIAGNOSTICS: usize = 500;
+
+/// LSP セッションの Mutex 取得のタイムアウト（MEDIUM-4）。
+///
+/// サーバが生きているが応答しない（stdin を読まない）と `notify` が最大 2 秒
+/// ロックを握り続け、待ち側の `open_document` / `sync` が無制限に待つ。ロックを
+/// 取れないときは諦める — didOpen の欠落は次回 .rs Open、didChange の欠落は
+/// 全文同期の次の編集で補われる（スキップしても整合が壊れない）。
+#[cfg(not(test))]
+const LSP_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// LSP セッションの状態（1セッション = 1サーバ。S3 は rust-analyzer のみ）。
 pub struct LspSession {
@@ -285,8 +298,13 @@ pub async fn ensure(
 }
 
 /// 文書を開いたことを LSP に通知する（daemon ロック外・lsp mutex のみ）。
+///
+/// MEDIUM-4: ロック取得にもタイムアウトを付け、他タスクが hung サーバの
+/// notify でロックを握り続けていても Open コマンドをブロックしない。
 pub async fn open_document(session: &Mutex<LspSession>, path: &Path, text: &str) {
-    let mut session = session.lock().await;
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return; // サーバが忙しい: didOpen は次回の .rs Open で送られる
+    };
     session.did_open(path, text).await;
 }
 
@@ -295,8 +313,12 @@ pub async fn open_document(session: &Mutex<LspSession>, path: &Path, text: &str)
 /// M1: daemon ロック外で呼ばれる（lsp mutex のみ）。
 /// M3: サーバが死んでいたら何もしない（無駄な 2s タイムアウト待ちを避ける。
 /// 再 spawn は次回 .rs Open 時に `ensure` が行う）。
+/// MEDIUM-4: ロック取得もタイムアウト付き（他タスクがロックを握っていても
+/// 編集の応答を待たせない — 全文同期なので次の編集の sync が最新テキストを運ぶ）。
 pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
-    let mut session = session.lock().await;
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return;
+    };
     if session.client.is_dead() {
         return;
     }
@@ -323,6 +345,12 @@ pub fn drain_into(daemon: &mut Daemon) {
     let Ok(mut session) = session.try_lock() else {
         return;
     };
+    // MEDIUM-3: サーバが死んだら古い診断を残さない（下線・カウントが文書と
+    // 不整合のまま表示され続ける）。再 spawn は次回 .rs Open 時（ADR-0009）。
+    if session.client.is_dead() {
+        daemon.diagnostics.clear();
+        return;
+    }
     if session.current_uri() != Some(doc_uri.as_str()) {
         return;
     }
@@ -393,5 +421,104 @@ mod tests {
             !replaced.lock().await.client.is_dead(),
             "返るセッションは生きている"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_into_clears_stale_diagnostics_when_server_dies() {
+        // MEDIUM-3: サーバが死んだ後も古い診断（下線・カウント）が残り続けない。
+        // 死んだ時点でクリアし、再 spawn 後の Open で新しく載る。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let mut daemon = Daemon::new();
+        daemon
+            .editor
+            .open_with_path(PathBuf::from("/tmp/x.rs"), "fn main() { TODO }");
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        daemon.lsp = Some(session.clone());
+
+        // didOpen で mock が TODO 位置の診断を publish する（非同期到着のため待つ）
+        session
+            .lock()
+            .await
+            .did_open(Path::new("/tmp/x.rs"), "fn main() { TODO }")
+            .await;
+        let mut got = false;
+        for _ in 0..50 {
+            drain_into(&mut daemon);
+            if !daemon.diagnostics.is_empty() {
+                got = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(got, "診断が取り込まれる");
+
+        // サーバを殺す → drain で古い診断がクリアされる
+        session.lock().await.client.kill().await;
+        let mut is_dead = false;
+        for _ in 0..100 {
+            if session.lock().await.client.is_dead() {
+                is_dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(is_dead, "サーバを殺すと is_dead になる");
+        drain_into(&mut daemon);
+        assert!(
+            daemon.diagnostics.is_empty(),
+            "サーバ死亡後の古い診断は残らない"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_document_gives_up_when_session_lock_is_held() {
+        // MEDIUM-4: セッションロックが他タスクに握られていても open_document は
+        // タイムアウトで諦め、Open コマンドをブロックしない。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        let guard = session.lock().await; // ロックを握りっぱなしにする
+        let start = std::time::Instant::now();
+        open_document(&session, Path::new("/tmp/x.rs"), "fn main() {}").await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "ロック解放を無限に待たない（タイムアウトで諦める）: {:?}",
+            start.elapsed()
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn sync_gives_up_when_session_lock_is_held() {
+        // MEDIUM-4: ロックが握られていても sync はタイムアウトで諦め、編集の
+        // 応答をブロックしない（全文同期なので次回の sync が最新テキストを運ぶ）。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        let guard = session.lock().await;
+        let start = std::time::Instant::now();
+        sync(&session, Path::new("/tmp/x.rs"), "fn main() {}").await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "ロック解放を無限に待たない（タイムアウトで諦める）: {:?}",
+            start.elapsed()
+        );
+        drop(guard);
     }
 }
