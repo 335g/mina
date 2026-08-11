@@ -43,3 +43,11 @@ _Avoid_: server, backend
 **Client**:
 A process that connects to the Daemon to send Commands and receive editor state: the terminal UI, a CLI invocation, or an agent.
 _Avoid_: frontend, viewer
+
+**StateSnapshot**:
+The response to every Command: the Daemon's complete editor state — document text, selection, mode, viewport, and diagnostics — serialized for Clients to render.
+_Avoid_: frame, update
+
+**Diagnostic**:
+A problem reported by the language server for a range of text — error, warning, info, or hint. Carried to Clients in the StateSnapshot.
+_Avoid_: lint, problem
