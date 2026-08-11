@@ -1,0 +1,12 @@
+[package]
+name = "mina-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Wire types for mina daemon/client IPC"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
