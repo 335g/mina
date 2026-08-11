@@ -1,0 +1,3 @@
+# termina as the terminal backend
+
+mina's terminal layer uses termina (0.3.x), the low-level VT crate that Helix itself adopted for Unix rendering and events (PR #13307, merged 2025-08), instead of the more established crossterm or the ratatui widget framework. termina provides what a modal editor needs — kitty keyboard protocol, bracketed paste, synchronized output, resize, and a tokio-ready event stream — while keeping the escape-code-level control that Helix-style custom rendering requires. mina owns the cell buffer and frame diff itself, exactly as Helix does. If termina's pre-1.0 API proves unstable, crossterm is the drop-in fallback (it is what Helix ran before).
