@@ -38,7 +38,8 @@ pub struct Daemon {
     /// クライアントから通知されるターミナル表示高さ（カーソル追従スクロール用）。
     pub(crate) viewport_height: usize,
     /// LSP セッション（初回 .rs オープン時に生成。以後は温かいまま保持）。
-    pub(crate) lsp: Option<LspSession>,
+    /// 独立した Mutex で保護し、LSP の await は daemon ロック外で行う（ADR-0009）。
+    pub(crate) lsp: Option<Arc<Mutex<LspSession>>>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
     pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
 }
@@ -70,20 +71,52 @@ pub async fn run() -> std::io::Result<()> {
     serve(&socket_path()).await
 }
 
-/// `path` で待ち受ける。前回の異常終了で残った stale socket は除去してから bind する。
+/// 同時に処理する接続数の上限（6b: 接続の張り放題による fd/タスク枯渇対策）。
+/// 上限を超えた接続はキューに残る（accept されない）。
+///
+/// ponytail: 実質1クライアント前提。アイドルタイムアウトは入れない — TUI は
+/// 読書中もアイドルになるのが正常で、切断されると有害。
+const MAX_CONNECTIONS: usize = 4;
+
+/// `path` で待ち受ける。
+///
+/// M6: 既存の socket を無条件に remove しない。bind が AddrInUse で失敗したら
+/// connect プローブで判定し、生きている daemon の socket なら終了（スプリット
+/// ブレイン防止）、前回の異常終了の残骸（stale）なら除去して再試行する。
 pub async fn serve(path: &Path) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
     let daemon = Arc::new(Mutex::new(Daemon::new()));
-    accept_loop(listener, daemon).await
+    match UnixListener::bind(path) {
+        Ok(listener) => accept_loop(listener, daemon).await,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(path).await.is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another daemon is running",
+                ));
+            }
+            // stale socket: 除去して再試行
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path)?;
+            accept_loop(listener, daemon).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// 接続を受け付け、接続ごとにコマンド処理タスクを立てる。
 async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std::io::Result<()> {
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, _) = listener.accept().await?;
+        let permit = match connections.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // セマフォが閉じられた（起きない）
+        };
         let daemon = daemon.clone();
-        tokio::spawn(handle_connection(stream, daemon));
+        tokio::spawn(async move {
+            let _permit = permit; // 接続処理中は許可を保持
+            handle_connection(stream, daemon).await;
+        });
     }
 }
 
@@ -110,43 +143,50 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
         if line.len() > MAX_CMD_LINE {
             break; // 過大なコマンド行: クライアントが壊れているか悪意がある
         }
-        let command: Command = match serde_json::from_str(line.trim()) {
-            Ok(c) => c,
-            Err(_) => continue, // 壊れた行は無視
-        };
-        let snapshot = match command {
+        let snapshot = match serde_json::from_str(line.trim()) {
             // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
-            Command::Open { path } => {
+            Ok(Command::Open { path }) => {
                 // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
                 // （ADR-0008）。失敗時は状態を変えず status で報告する。
-                let (contents, open_status) = read_open_target(&path).await;
-                let mut d = daemon.lock().await;
-                let status = match &contents {
-                    Some(contents) => {
-                        d.editor.open_with_path(PathBuf::from(&path), contents);
-                        let height = d.viewport_height;
-                        d.editor.scroll_to_cursor(height);
-                        d.diagnostics.clear();
-                        // LSP 対応ファイルならセッションを確保して didOpen する
-                        let path_buf = PathBuf::from(&path);
-                        if lsp::server_for(&path_buf).is_some() {
-                            match lsp::ensure(&mut d, &path_buf).await {
-                                Ok(()) => {
-                                    lsp::open_document(&mut d, &path_buf, contents).await;
-                                    None
-                                }
-                                Err(msg) => Some(msg),
-                            }
-                        } else {
+                let (contents, mut open_status) = read_open_target(&path).await;
+                let path_buf = PathBuf::from(&path);
+                // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
+                // daemon ロック外で行う。失敗時は status に載せる。
+                let session = if contents.is_some() && lsp::server_for(&path_buf).is_some() {
+                    match lsp::ensure(&daemon, &path_buf).await {
+                        Ok(s) => Some(s),
+                        Err(msg) => {
+                            open_status = Some(msg);
                             None
                         }
                     }
-                    None => open_status,
+                } else {
+                    None
                 };
+                // ロック内: 文書状態の変更のみ（await なし）
+                let mut d = daemon.lock().await;
+                let (text, notify) = match &contents {
+                    Some(contents) => {
+                        d.editor.open_with_path(path_buf.clone(), contents);
+                        let height = d.viewport_height;
+                        d.editor.scroll_to_cursor(height);
+                        d.diagnostics.clear();
+                        (contents.clone(), session.is_some())
+                    }
+                    None => (String::new(), false),
+                };
+                drop(d);
+                // M1: didOpen 通知は daemon ロック外（lsp mutex のみ・タイムアウト付き）
+                if notify {
+                    if let Some(session) = &session {
+                        lsp::open_document(session, &path_buf, &text).await;
+                    }
+                }
+                let mut d = daemon.lock().await;
                 lsp::drain_into(&mut d);
-                snapshot(&d, status)
+                snapshot(&d, open_status)
             }
-            Command::Save => {
+            Ok(Command::Save) => {
                 // 保存対象（テキスト・パス・文書 ID）を取り出してから、ロック外で書き込む
                 let (text, path, doc_id) = {
                     let d = daemon.lock().await;
@@ -173,16 +213,35 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
                     Err(e) => snapshot(&d, Some(format!("save failed: {e}"))),
                 }
             }
-            command => {
+            Ok(command) => {
                 let mut d = daemon.lock().await;
                 let is_edit = is_edit(&command);
                 apply(&mut d, command);
-                if is_edit {
-                    // 編集後は LSP へ全文同期し、診断を取り込む
-                    lsp::sync(&mut d).await;
+                // M1/ADR-0009: 同期対象（セッション・パス・テキスト）をロック内で
+                // 取り出し、didChange はロック外で await する（サーバ遅延で全
+                // クライアントがブロックしない）。
+                let sync_target = if is_edit {
+                    d.lsp.clone().map(|session| {
+                        let path = d.editor.focused_path().map(Path::to_path_buf);
+                        let text = d.editor.current_document().text().to_string();
+                        (session, path, text)
+                    })
+                } else {
+                    None
+                };
+                drop(d);
+                if let Some((session, Some(path), text)) = sync_target {
+                    lsp::sync(&session, &path, &text).await;
                 }
+                let mut d = daemon.lock().await;
                 lsp::drain_into(&mut d);
                 snapshot(&d, None)
+            }
+            Err(_) => {
+                // M7: 壊れたコマンド行にも status 付きスナップショットを返す
+                // （応答なしだと送信元が永久待ちになる）
+                let d = daemon.lock().await;
+                snapshot(&d, Some("invalid command".into()))
             }
         };
         let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
