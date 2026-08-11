@@ -56,6 +56,25 @@ pub struct Keymaps {
     select: Node,
 }
 
+/// Shift 付きのアルファベットキーから SHIFT を落とし、大文字に統一する。
+///
+/// termina は大文字バイトを `Char('G')+SHIFT` として報告する（ターミナルによっては
+/// `Char('g')+SHIFT` のこともある）。バインディングは「大文字 = 修飾子なし」に
+/// 統一するため、どちらも `Char('G')`（修飾子なし）へ正規化する。
+fn normalize(key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char(c)
+            if c.is_ascii_alphabetic() && key.modifiers.contains(Modifiers::SHIFT) =>
+        {
+            KeyEvent::new(
+                KeyCode::Char(c.to_ascii_uppercase()),
+                key.modifiers & !Modifiers::SHIFT,
+            )
+        }
+        _ => key,
+    }
+}
+
 fn key(code: KeyCode, modifiers: Modifiers) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }
@@ -125,6 +144,12 @@ impl Keymaps {
             &[plain(KeyCode::Char('i'))],
             Command::SetMode { mode: Mode::Insert },
         );
+        // 編集
+        normal.insert(&[plain(KeyCode::Char('x'))], Command::DeleteForward);
+        normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
+        normal.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
+        normal.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
+        normal.insert(&[plain(KeyCode::Char('s'))], Command::Save);
 
         // Select: 拡張移動 + 解除
         let mut select = Node::default();
@@ -165,13 +190,26 @@ impl Keymaps {
             &[plain(KeyCode::Escape)],
             Command::SetMode { mode: Mode::Normal },
         );
+        select.insert(&[plain(KeyCode::Char('x'))], Command::DeleteRange);
+        select.insert(&[plain(KeyCode::Backspace)], Command::DeleteRange);
+        select.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
+        select.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
-        // Insert: 入力は S2。今は Esc のみ
+        // Insert: 文字入力はクライアント側のフォールバック。ここでは Esc・Backspace・左右移動のみ
         let mut insert = Node::default();
         insert.insert(
             &[plain(KeyCode::Escape)],
             Command::SetMode { mode: Mode::Normal },
         );
+        insert.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
+        insert.insert(&[plain(KeyCode::Left)], Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Backward,
+        });
+        insert.insert(&[plain(KeyCode::Right)], Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
 
         Self {
             normal,
@@ -190,6 +228,7 @@ impl Keymaps {
 
     /// `pending`（確定前の prefix キー列）を保持しつつ `key` を解決する。
     pub fn resolve(&self, mode: Mode, pending: &mut Vec<KeyEvent>, key: KeyEvent) -> Resolution {
+        let key = normalize(key);
         let root = self.root(mode);
         let mut node = root;
         for k in pending.iter() {
@@ -216,6 +255,28 @@ impl Keymaps {
                 pending.clear();
                 Resolution::NoMatch
             }
+        }
+    }
+
+    /// キーイベントをコマンドに解決する。Insert モードでは未バインドの
+    /// 文字キー（修飾キーなし/Shift のみ）をテキスト挿入にフォールバックする。
+    pub fn resolve_with_insert_fallback(
+        &self,
+        mode: Mode,
+        pending: &mut Vec<KeyEvent>,
+        key: KeyEvent,
+    ) -> Resolution {
+        let key = normalize(key);
+        match self.resolve(mode, pending, key) {
+            Resolution::NoMatch if mode == Mode::Insert => match key.code {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == Modifiers::SHIFT =>
+                {
+                    Resolution::Command(Command::Insert { text: c.to_string() })
+                }
+                _ => Resolution::NoMatch,
+            },
+            resolution => resolution,
         }
     }
 }
@@ -274,6 +335,32 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_keys_normalize_shift() {
+        // termina は大文字バイトを Char('G')+SHIFT で報告する → 正規化して一致
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        // 実際の termina の報告形（大文字 + SHIFT）
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), Modifiers::SHIFT);
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, shift_g),
+            Resolution::Command(Command::Goto {
+                target: GotoTarget::DocumentEnd
+            })
+        ));
+        let shift_u = KeyEvent::new(KeyCode::Char('U'), Modifiers::SHIFT);
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, shift_u),
+            Resolution::Command(Command::Redo)
+        ));
+        // 一部ターミナルの報告形（小文字 + SHIFT）も同じく解決できる
+        let shift_u2 = KeyEvent::new(KeyCode::Char('u'), Modifiers::SHIFT);
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, shift_u2),
+            Resolution::Command(Command::Redo)
+        ));
+    }
+
+    #[test]
     fn ctrl_d_scrolls() {
         let km = Keymaps::new();
         let mut pending = Vec::new();
@@ -313,5 +400,64 @@ mod tests {
             move_of(k('l')),
             Some((Movement::Char, Direction::Forward))
         );
+    }
+
+    #[test]
+    fn edit_bindings() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('x')),
+            Resolution::Command(Command::DeleteForward)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('u')),
+            Resolution::Command(Command::Undo)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('U')),
+            Resolution::Command(Command::Redo)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('s')),
+            Resolution::Command(Command::Save)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, KeyCode::Backspace.into()),
+            Resolution::Command(Command::DeleteBackward)
+        ));
+        // Select モードでは x が範囲削除
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('x')),
+            Resolution::Command(Command::DeleteRange)
+        ));
+    }
+
+    #[test]
+    fn insert_mode_character_fallback() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        // 未バインドの文字キーは挿入になる
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, k('a')),
+            Resolution::Command(Command::Insert { text }) if text == "a"
+        ));
+        // Shift 付き（大文字）も挿入
+        let upper = KeyEvent::new(KeyCode::Char('A'), Modifiers::SHIFT);
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, upper),
+            Resolution::Command(Command::Insert { text }) if text == "A"
+        ));
+        // Ctrl 付きは挿入しない
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), Modifiers::CONTROL);
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, ctrl_a),
+            Resolution::NoMatch
+        ));
+        // Normal モードではフォールバックしない
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Normal, &mut pending, k('a')),
+            Resolution::NoMatch
+        ));
     }
 }
