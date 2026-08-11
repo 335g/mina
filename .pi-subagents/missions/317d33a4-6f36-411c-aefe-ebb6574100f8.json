@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "317d33a4-6f36-411c-aefe-ebb6574100f8",
+  "title": "Fact-check three things for a Helix-style Rust editor (termina 0.3 + possible tokio): (1) Which p...",
+  "objective": "Fact-check three things for a Helix-style Rust editor (termina 0.3 + possible tokio): (1) Which popular LSP language servers support non-stdio transports (unix socket or TCP) in addition to stdio? Check specifically: rust-analyzer, typescript-language-server, clangd, pyright/pylsp, gopls. For each state the transport options (e.g. rust-analyzer --socket/--port?). (2) Does termina (helix-editor/termina, 0.3.x) have any async/tokio integration (event-stream feature, async reader), or is it strictly synchronous poll/read? (3) How does Helix bridge termina's synchronous event reading into its tokio event loop (helix-term/src/application.rs) — briefly, what mechanism (blocking task + channel, spawn_blocking, etc.)? Cite primary sources (GitHub, docs.rs, crates.io). Keep the brief under 400 words, bullet format.",
+  "status": "active",
+  "createdAt": "2026-08-11T13:12:15.547Z",
+  "updatedAt": "2026-08-11T13:12:15.547Z",
+  "runs": [],
+  "decisions": [],
+  "artifacts": [],
+  "receipts": [],
+  "cwd": "/Users/335g/dev/other/mina",
+  "ownerSessionId": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-11T12-42-48-351Z_019ff0d8-ce9f-74dc-a59b-d6dd99cd8204.jsonl"
+}
