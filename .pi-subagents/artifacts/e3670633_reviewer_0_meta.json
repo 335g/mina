@@ -1,0 +1,157 @@
+{
+  "runId": "e3670633",
+  "agent": "reviewer",
+  "task": "Task: ANGLE D — SCOPE OUT / CREEP / TRACING: (1) Verify the issue's explicit v1-out-of-scope list is truly absent from code: mouse handling, multiple simultaneous TUI clients, diff snapshots, LSP config TOML, non-UTF8 file I/O, split views actually wired to commands (mina-view has split tree — is it reachable?), explicit daemon stop command, LSP hover/goto/completion. (2) Verify the 'implementation trade-offs recorded as ponytail: comments' exist for: full snapshot per response, UTF-8-only I/O, 1-client assumption, socket path single-user. (3) Cross-check ADRs (0001-0009) against the code that claims to implement them. (4) Look for scope creep: features beyond the issue with no ADR or issue entry.\n\nRepo: /Users/335g/dev/other/mina. FIRST run `gh issue view 1` to read Issue #1 (mina-term v1 spec) in full, then read the source yourself (files: mina-protocol/src/lib.rs, mina-term/src/{daemon,client,session,keymap,render,lsp,main}.rs, mina-view/src/{editor,history,mode,tree}.rs, mina-core/src/*.rs, docs/adr/*.md). Your job is ADVERSARIAL VERIFICATION: hunt for where the code contradicts, over- or under-delivers on the issue. Be skeptical and specific. For each finding: file:line, what the issue says vs what the code does, severity (critical/major/minor), and a one-line recommended fix. Separate CONFIRMED-GOOD items (spec points you verified hold) from FINDINGS. Do not modify any files. Report as structured markdown.",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 54399,
+    "output": 13996,
+    "cacheRead": 543488,
+    "cacheWrite": 0,
+    "cost": 0.0065282532,
+    "turns": 16
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 54399,
+        "output": 13996,
+        "cacheRead": 543488,
+        "cacheWrite": 0,
+        "cost": 0.0065282532,
+        "turns": 16
+      }
+    }
+  ],
+  "durationMs": 208640,
+  "toolCount": 29,
+  "launchContractDigest": "4ba08b0e6b2626ff069398f2f207194f24d2dc6b287e4d0113283db0b1f9f6b3",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Returned concrete findings with file:line and severity: F1 major daemon.rs:279 (silent non-UTF8 open failure violating Command::Open status contract), F2 minor daemon.rs:279 (missing required ponytail comment for UTF-8-only I/O trade-off), F3 minor main.rs:17-18 ('mina daemon <anything>' starts serving), F4-F6 notes; 24 confirmed-good spec points (G1-G24) with evidence, including verification that all 8 out-of-scope items are absent/unwired and 3 of 4 required ponytail comments exist."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "gh issue view 1",
+          "result": "passed",
+          "summary": "Read Issue #1 full spec (v1 plan, S0-S4, out-of-scope list, trade-off list)"
+        },
+        {
+          "command": "cargo test --workspace --quiet",
+          "result": "passed",
+          "summary": "133 passed (10 suites, 0.84s)"
+        },
+        {
+          "command": "grep -rn 'ponytail:' and out-of-scope keywords (mouse/split/stop/hover/goto/completion/UTF-8) across all crates",
+          "result": "passed",
+          "summary": "Located all ponytail comments; confirmed mouse/stop/hover/goto/completion absent; split APIs unreachable from mina-term; UTF-8-only-I/O ponytail comment missing"
+        }
+      ],
+      "validationOutput": [
+        "Issue #1 fully read; all listed source files (mina-protocol/src/lib.rs, mina-term/src/{daemon,client,session,keymap,render,lsp,main}.rs, mina-view/src/{editor,history,mode,tree}.rs, mina-core/src/*.rs, all 9 ADRs) inspected; Cargo.toml workspace deps cross-checked against ADR-0004",
+        "ADR-0001 (clean-room provenance) not verifiable from code — noted as unverifiable by inspection"
+      ],
+      "residualRisks": [
+        "F1: non-UTF8 file open silently yields an empty document (major, unfixed — review-only scope)",
+        "Auto-spawn race between two simultaneous clients (client.rs:160-163), documented 1-client trade-off",
+        "dirty survives undo-to-saved-state (editor.rs:114 ponytail), documented",
+        "termina 0.3 pre-1.0 API instability, crossterm fallback per ADR-0004"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review-only; no files modified",
+      "reviewFindings": [
+        "major: mina-term/src/daemon.rs:279 - non-UTF8 open failure swallowed by .ok() -> snapshot returns empty text with status=None, violating Command::Open contract; map decode error to status message",
+        "minor: mina-term/src/daemon.rs:279 - issue requires UTF-8-only I/O trade-off recorded as ponytail: comment; missing (3 of 4 present)",
+        "minor: mina-term/src/main.rs:17-18 - 'mina daemon stop'/'mina daemon --help' silently starts a daemon; match args[2] == 'serve' and reject other subcommands",
+        "note: mina-term/src/lsp.rs:262-266 - ensure() race orphans a spawned rust-analyzer process; documented 1-client assumption",
+        "note: H1-H3/M4-M7/SEC-1/SEC-2 fixes documented only in code comments, not ADRs (doc drift, not scope creep)",
+        "no blockers; no scope creep beyond the issue found; all out-of-scope items confirmed absent or deliberately unwired"
+      ],
+      "manualNotes": "Review-only task; no files modified, no tests added (acceptance criterion-1 does not require them). G10 confirms mina-view's split tree is unreachable from mina-term by design (matches issue's out-of-scope note). F1 is the single actionable defect; F2 is a spec-compliance gap (missing required ponytail comment); F3 is a UX footgun in CLI arg parsing."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/e3670633_reviewer_0_transcript.jsonl",
+  "timestamp": 1786470422962
+}

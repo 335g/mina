@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "id": "2b45acf7-3042-4107-99e8-4d7ff5067dc6",
+  "title": "Task: ANGLE B — SECURITY/ROBUSTNESS ADVERSARY: Try to break the daemon. Attack surfaces: unix soc...",
+  "objective": "Task: ANGLE B — SECURITY/ROBUSTNESS ADVERSARY: Try to break the daemon. Attack surfaces: unix socket path (temp_dir/mina.sock — world-writable /tmp? symlink attacks? stale socket removal race?), NDJSON parsing (oversized lines, invalid UTF-8, unbounded read_line), file Open path (TOCTOU between metadata check and read, /dev/zero, FIFO, size race, symlinks, non-UTF8), resource exhaustion (MAX_CONNECTIONS=4 — is accept actually bounded? fd leak? semaphore leak on panic?), daemon double-start race (two clients spawning simultaneously), client half-open connections (writer stuck? reader stuck? no timeouts anywhere?), LSP spawn bombs (rust-analyzer restarts, no timeout on non-initialize calls), state corruption via crafted commands (negative/oversized scroll pages, huge insert text, degenerate selections). For each: exploit sketch + whether code actually defends + severity.\n\nRepo: /Users/335g/dev/other/mina. FIRST run `gh issue view 1` to read Issue #1 (mina-term v1 spec) in full, then read the source yourself (files: mina-protocol/src/lib.rs, mina-term/src/{daemon,client,session,keymap,render,lsp,main}.rs, mina-view/src/{editor,history,mode,tree}.rs, mina-core/src/*.rs, docs/adr/*.md). Your job is ADVERSARIAL VERIFICATION: hunt for where the code contradicts, over- or under-delivers on the issue. Be skeptical and specific. For each finding: file:line, what the issue says vs what the code does, severity (critical/major/minor), and a one-line recommended fix. Separate CONFIRMED-GOOD items (spec points you verified hold) from FINDINGS. Do not modify any files. Report as structured markdown.",
+  "status": "completed",
+  "createdAt": "2026-08-11T17:43:34.261Z",
+  "updatedAt": "2026-08-11T17:51:49.596Z",
+  "runs": [
+    {
+      "runId": "f0c74e0e",
+      "mode": "single",
+      "agent": "reviewer",
+      "status": "completed",
+      "startedAt": "2026-08-11T17:51:49.596Z",
+      "completedAt": "2026-08-11T17:51:49.596Z",
+      "usage": {
+        "tokens": 103770
+      }
+    }
+  ],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "output",
+      "path": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/f0c74e0e_reviewer_0_output.md"
+    },
+    {
+      "kind": "other",
+      "path": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/f0c74e0e_reviewer_0_transcript.jsonl",
+      "description": "Child transcript"
+    }
+  ],
+  "receipts": [],
+  "cwd": "/Users/335g/dev/other/mina",
+  "ownerSessionId": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-11T17-42-05-092Z_019ff1ea-ce24-7fdb-80bc-ce3ee70647e9.jsonl",
+  "summary": "All evidence gathered. Here is the adversarial verification report.\n\n---\n\n# ANGLE B — Security/Robustness Adversary Review\n\n**Target**: Issue #1 (mina-term v1 spec) vs. the implementation at `a5c8e0e`.\n**Method**: Read Issue #1 + all ADRs (0001–0009), read every source file, ran the test suite, and live-probed the daemon over the socket with crafted commands (temp dir only; **no repo files modified**).\n\n---\n\n## CONFIRMED-GOOD (spec points verified to hold)\n\n| # | Claim (issue/ADR) | Evidence |\n|---|---|---|\n| 1 | NDJSON oversized lines bounded | `daemon.rs:135` `.take(MAX_CMD_LINE+1)` + break at `daemon.rs:140`; test `oversized_command_line_closes_connection`; 1 MiB matches ADR-0008 |\n| 2 | Invalid UTF-8 on wire can't OOM/misparse | `BufReader::read_line` returns `InvalidData` → `Err(_) => break` (`daemon.rs:142`) |\n| 3 | `/dev/zero`, FIFO, directory rejected | `read_open_target` metadata check (`daemon.rs:278` `m.is_file() && m.len() <= MAX_FILE_SIZE`); probe: `/dev/zero` → `cannot open /dev/zero`, FIFO → `cannot open`; sparse-file oversize test exists |\n| 4 | MAX_CONNECTIONS actually bounds accept | Semaphore `acquire_owned` before spawn (`daemon.rs:108–119`); when full, loop parks 1 connection and kernel backlog absorbs the rest. fd/task count is bounded. Probe after a task panic: daemon served subsequent requests (tokio Mutex doesn't poison; permit/fd released on unwind) |\n| 5 | Scroll pages negative/oversized safe | `scroll_pages` → `saturating_mul` + `clamp(0, max)` (`editor.rs:343–344`); probe with `isize::MAX` — daemon alive, clamped |\n| 6 | Degenerate selections not wire-reachable | Wire has no range/selection input; selection is daemon-internal and `move_selection`/`extend_selection` clamp at doc boundaries (`movement.rs`) |\n| 7 | Daemon double-start: loser exits | Probe: 5 concurrent `daemon serve` → all 5 losers exit `another daemon is running`; stale socket probe-then-remove (`daemon.rs:86–99`) |\n| 8 | LSP timeouts everywhere on the daemon side | `mi...",
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "11 findings with file:line and severity: F1 TOCTOU/size-race major (daemon.rs:276-283), F2 unbounded document accumulation major (editor.rs:80-100), F3 socket path/permissions major (daemon.rs:502), F4 idle-connection DoS minor (daemon.rs:79,108-119, empirically reproduced), F5 viewport overflow panic minor (editor.rs:332, empirically reproduced), F6 utf8_col_to_char slice panic minor (position.rs:6), F7 client no-timeout/unbounded-read minor (client.rs:149-163), F8 remove_file race minor (daemon.rs:94-99), F9 LSP orphan respawn minor (lsp.rs:236-266), F10 undo-group byte-unbounded minor (history.rs:53-84), F11 daemon inherits stdin minor (client.rs:186). 13 confirmed-good spec points verified with probes and 133 passing tests."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test --workspace",
+          "result": "passed",
+          "summary": "133 passed (10 suites)"
+        },
+        {
+          "command": "cargo build (debug + release)",
+          "result": "passed",
+          "summary": "builds; one dead_code warning"
+        },
+        {
+          "command": "live daemon probes (GetState, Open /dev/zero, Open FIFO, Scroll isize::MAX, SetViewport usize::MAX sequence, 5x concurrent daemon serve, 4 idle connections + 5th request)",
+          "result": "passed",
+          "summary": "confirmed /dev/zero+FIFO rejection, double-start loser exits, overflow panic at editor.rs:332, 5th client timeout under 4 idle connections"
+        }
+      ],
+      "validationOutput": [
+        "ADRs 0005-0009 claims verified against code; 133 tests pass; live probes confirm F4 (idle-connection DoS), F5 (debug overflow panic), and the confirmed-good items (non-file rejection, double-start, huge scroll clamp)."
+      ],
+      "residualRisks": [
+        "F3: cross-user socket on Linux /tmp — documented single-user premise but file read/overwrite consequence unrecorded; socket mode depends on daemon umask",
+        "F10: document/snapshot growth past 16MiB via inserts; O(n) snapshot per command is a documented v1 ponytail",
+        "F1/F4 chain: a hung Open task holds a connection permit forever; 4 such hangs = full connection DoS",
+        "Daemon lifecycle is kill + stale-socket recovery (no stop command, per scope-out)"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review only — no repository files modified (probes used temp dirs; only an unrelated .pi-subagents artifact is dirty in git status)",
+      "reviewFindings": [
+        "major: daemon.rs:276-283 - Open metadata-check/read TOCTOU + size race; open fd once and fstat it",
+        "major: editor.rs:80-100 - documents never evicted; repeated Open grows daemon memory unbounded; cap/evict documents",
+        "major: daemon.rs:502 - predictable temp_dir/mina.sock, no chmod/uid; connectable attacker gets arbitrary file read/overwrite; use mina-<uid>.sock or $XDG_RUNTIME_DIR + mode 0700",
+        "minor: daemon.rs:79,108-119 - 4 idle connections block all requests (reproduced); no idle timeout by design",
+        "minor: editor.rs:332 - SetViewport height usize::MAX panics (debug) / wraps (release); clamp height at wire boundary",
+        "minor: position.rs:6 - line[..byte_col] panics on mid-codepoint LSP position; use floor_char_boundary",
+        "minor: client.rs:149-163 - no client timeouts, unbounded response read, TUI freeze on daemon hang",
+        "minor: daemon.rs:94-99 - remove_file race can unlink a concurrently-bound live socket",
+        "minor: lsp.rs:236-266 - concurrent .rs Open leaks orphaned rust-analyzer (no Client Drop kill); add respawn cooldown",
+        "minor: history.rs:53-84 - single Insert group byte-unbounded; cap group bytes/changes",
+        "minor: client.rs:186 - auto-spawned daemon inherits terminal stdin; null it"
+      ],
+      "manualNotes": "No blockers that invalidate the v1 spec; F1 and F2 contradict ADR-0008/3a claims under race/accumulation and should be fixed before the daemon is considered hostile-input-safe. All probes were run against debug (and where built, release) binaries in temp dirs; nothing in the repo was modified."
+    }
+  }
+}

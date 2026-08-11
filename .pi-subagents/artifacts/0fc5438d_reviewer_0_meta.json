@@ -1,0 +1,164 @@
+{
+  "runId": "0fc5438d",
+  "agent": "reviewer",
+  "task": "Task: ANGLE A — SPEC COMPLETENESS: Map EVERY requirement of Issue #1 to concrete code: crate structure (5 crates), each slice S0-S4 completion criteria, daemon/client split (ADR-0005), NDJSON unix-socket IPC + request/response only + full StateSnapshot per response (ADR-0006), keymap trie resolved client-side only, auto-start daemon (emacsclient-style), LSP built-in table (rust-analyzer only) + spawn on first .rs open (no eager), `mina session get/exec` headless CLI. Flag anything in the issue that is missing, partially implemented, or implemented but not declared. Also flag anything implemented that contradicts an issue statement.\n\nRepo: /Users/335g/dev/other/mina. FIRST run `gh issue view 1` to read Issue #1 (mina-term v1 spec) in full, then read the source yourself (files: mina-protocol/src/lib.rs, mina-term/src/{daemon,client,session,keymap,render,lsp,main}.rs, mina-view/src/{editor,history,mode,tree}.rs, mina-core/src/*.rs, docs/adr/*.md). Your job is ADVERSARIAL VERIFICATION: hunt for where the code contradicts, over- or under-delivers on the issue. Be skeptical and specific. For each finding: file:line, what the issue says vs what the code does, severity (critical/major/minor), and a one-line recommended fix. Separate CONFIRMED-GOOD items (spec points you verified hold) from FINDINGS. Do not modify any files. Report as structured markdown.",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 52127,
+    "output": 23707,
+    "cacheRead": 946688,
+    "cacheWrite": 0,
+    "cost": 0.0082932332,
+    "turns": 22
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 52127,
+        "output": 23707,
+        "cacheRead": 946688,
+        "cacheWrite": 0,
+        "cost": 0.0082932332,
+        "turns": 22
+      }
+    }
+  ],
+  "durationMs": 302082,
+  "toolCount": 46,
+  "launchContractDigest": "7248cd220fd575d82c7a905d39cae9c1db33e8b1aa5cd253a893d52be7534040",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Returned concrete findings with file:line and severity: F1 major (mina-term/src/lsp.rs:236-269, dead LSP session never replaced, contradicts ADR-0009), F2 minor (keymap.rs Enter/Tab not insertable), F3 minor (S3 '行マーカー' implemented as underline only), F4 minor (main.rs CLI leniency), F5-F7 notes (4-connection half-open, clippy warnings vs 'クリーン' claim, dirty-on-undo semantics). All findings verified by reading the source; 133 tests pass and clippy exit 0."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "gh issue view 1",
+          "result": "passed",
+          "summary": "Read full Issue #1 body, 5 slice-completion comments, labels"
+        },
+        {
+          "command": "cargo test --workspace",
+          "result": "passed",
+          "summary": "133 tests passed across 10 suites"
+        },
+        {
+          "command": "cargo clippy --workspace --all-targets",
+          "result": "passed",
+          "summary": "Exit 0; 9 style warnings emitted (F6)"
+        },
+        {
+          "command": "git status --short && git log --oneline -8",
+          "result": "passed",
+          "summary": "Repo state inspected; only .pi-subagents artifacts modified (not source)"
+        }
+      ],
+      "validationOutput": [
+        "Verified all 5 crates, ADR-0004/0005/0006/0007/0008/0009, and termina-0.3.3 KeyCode::Enter to confirm F2",
+        "Confirmed ensure() replacement path (lsp.rs:267) is unreachable after first successful session (grep: d.lsp assigned only at Daemon::new and lsp.rs:268)",
+        "No test covers the dead-LSP respawn path (e2e tests drive mina_lsp::Client directly)"
+      ],
+      "residualRisks": [
+        "F1: dead rust-analyzer never respawns until daemon restart; newly spawned server processes are leaked (untested path)",
+        "F2: TUI users cannot insert newlines/tabs; headless exec can",
+        "F5: concurrent connections accepted (max 4) share global state with no per-client isolation",
+        "F6: clippy warnings remain despite 'clippy クリーン' claims in issue comments"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review-only; no source files modified",
+      "reviewFindings": [
+        "major: mina-term/src/lsp.rs:236-269 - dead LSP session is never replaced (d.lsp always Some after first ensure; lsp.rs:267 unreachable); contradicts ADR-0009 respawn-on-next-Open. Fix: replace existing when dead in the second lock",
+        "minor: mina-term/src/keymap.rs:305-348 - Enter/Tab cannot be inserted in TUI Insert mode (fallback only maps KeyCode::Char; termina reports Enter as KeyCode::Enter). Fix: bind Enter/Tab to Insert",
+        "minor: issue S3 says '行マーカー'; render.rs implements underline + [nE nW] count only, no gutter markers and diagnostic message never displayed",
+        "minor: mina-term/src/main.rs:12-19 - 'mina daemon' without 'serve' starts daemon; unknown args (e.g. --help) treated as file paths; validate arity",
+        "note: daemon.rs:79-82 accepts 4 concurrent connections while declaring effectively-1-client (issue scope-out); disconnect resets shared mode/undo groups",
+        "note: clippy emits 9 style warnings (lsp.rs:143, client.rs:119, render.rs:27, etc.) despite 'clippy クリーン' progress claims",
+        "note: editor.rs:139-145 - undo to saved point leaves dirty=true (documented ponytail; not specified in issue)"
+      ],
+      "manualNotes": "No blockers. 12 of 13 spec clusters verified CONFIRMED-GOOD; F1 is the only major deviation and it is an implementation bug contradicting ADR-0009, not an issue-spec contradiction. Every issue statement is mapped to code; nothing in the issue is entirely missing."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/0fc5438d_reviewer_0_transcript.jsonl",
+  "timestamp": 1786470516327
+}

@@ -1,0 +1,179 @@
+{
+  "runId": "d9963a42",
+  "agent": "reviewer",
+  "task": "Task: ANGLE C — CLAIM-vs-CODE ADVERSARY: The code comments claim specific fixes (H1, H3, M1, M3, M4, M5, M7, SEC-1, 5c, 6b, ADR-0007/0008/0009). For EACH claim, read the code path and verify the claim is actually true, not just asserted. Known suspicious spots to stress: (1) M5 first-status retention in client.rs (is there a path where status is lost or wrongly kept?); (2) H3 mark_saved_doc vs focused doc in daemon.rs Save; (3) ADR-0007 undo-group open/close on SetMode and disconnect — is there a leak path (client crashes mid-Insert without disconnect handler? Select→Insert→Normal ordering?); (4) M1 'LSP outside daemon lock' — trace every lsp:: call for accidental lock-held awaits; (5) drain_into try_lock skip — is there a race where diagnostics never arrive; (6) M7 invalid command response — can a client get stuck forever waiting on any path; (7) SEC-1 oversize line — does `take(MAX+1).read_line` actually bound memory; (8) is_edit() list — does every editing command that changes text get LSP sync, and are non-edits (SetMode, Goto) correctly excluded? Also check undo-history 1000-cap (commit 0306a07) and 'dirty survives undo past save point' claim.\n\nRepo: /Users/335g/dev/other/mina. FIRST run `gh issue view 1` to read Issue #1 (mina-term v1 spec) in full, then read the source yourself (files: mina-protocol/src/lib.rs, mina-term/src/{daemon,client,session,keymap,render,lsp,main}.rs, mina-view/src/{editor,history,mode,tree}.rs, mina-core/src/*.rs, docs/adr/*.md). Your job is ADVERSARIAL VERIFICATION: hunt for where the code contradicts, over- or under-delivers on the issue. Be skeptical and specific. For each finding: file:line, what the issue says vs what the code does, severity (critical/major/minor), and a one-line recommended fix. Separate CONFIRMED-GOOD items (spec points you verified hold) from FINDINGS. Do not modify any files. Report as structured markdown.",
+  "exitCode": 0,
+  "usage": {
+    "input": 62913,
+    "output": 38350,
+    "cacheRead": 1863552,
+    "cacheWrite": 0,
+    "cost": 0.0123818828,
+    "turns": 31
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 62913,
+        "output": 38350,
+        "cacheRead": 1863552,
+        "cacheWrite": 0,
+        "cost": 0.0123818828,
+        "turns": 31
+      }
+    }
+  ],
+  "durationMs": 497918,
+  "toolCount": 44,
+  "launchContractDigest": "9feff6520beeb7146773a9dc90417f33c880bdab54d18e07c0151221b4c20ee5",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Returned concrete findings with file:line and severity: 11 findings (F1-F11), all minor/info, each with evidence — F1 verified live via socket probe (save->undo leaves dirty:false while text differs from disk); F3 panic reproduced in scratch harness (mina-lsp/src/position.rs:4-7); F4-F11 traced from daemon.rs, lsp.rs, history.rs, client.rs. Confirmed-good claims (H1, H3, M1, M4-M7, SEC-1, is_edit, 1000-cap, 5c/5f, SEC-2, H2) verified by code trace, 133 passing tests, clippy, and live daemon probes."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "gh issue view 1 --comments",
+          "result": "passed",
+          "summary": "Read full Issue #1 spec (S0-S4 + architecture decisions + out-of-scope list)"
+        },
+        {
+          "command": "cargo test --workspace",
+          "result": "passed",
+          "summary": "133 passed (10 suites) — exceeds the claimed 118"
+        },
+        {
+          "command": "cargo clippy --workspace --all-targets",
+          "result": "passed",
+          "summary": "0 errors but 9 warnings — 'clippy クリーン' claim overstated (F8)"
+        },
+        {
+          "command": "cargo build -p mina-term",
+          "result": "passed",
+          "summary": "Binary built for live daemon probes"
+        },
+        {
+          "command": "live socket probe: invalid cmd / oversize line / disconnect undo-group / save-undo dirty",
+          "result": "passed",
+          "summary": "M7 responds 'invalid command'; oversize line closes conn (0 bytes); disconnect closes group (abcd -> undo1 abc -> undo2 ''); dirty false-negative after save->undo reproduced (F1)"
+        },
+        {
+          "command": "rustc scratch check of utf8_col_to_char",
+          "result": "passed",
+          "summary": "Panics on non-char-boundary byte columns (F3)"
+        }
+      ],
+      "validationOutput": [
+        "All 8 suspect claims + ADR-0007/0008/0009 + 3a cap + dirty-undo claim checked; 9 confirmed-good, 0 critical/major findings, 10 minor/info findings (F1-F10) + 1 acknowledged (F11)",
+        "cargo clippy: 0 errors, 9 warnings (style lints only)"
+      ],
+      "residualRisks": [
+        "F1: dirty false-negative after save->undo (verified live) — wrong dirty marker, no data loss in v1 (daemon persists buffer)",
+        "F3: utf8_col_to_char panic on non-boundary column from a malformed utf-8 LSP server kills a connection task; unreachable with rust-analyzer (utf-16)",
+        "F5: TOCTOU in Open metadata-then-read; FIFO swap can hang one handler; requires local adversarial FS race",
+        "F2: same-doc edit during Save write can be marked clean; needs 2 concurrent clients",
+        "F9: 5th concurrent connection waits forever if 4 stay connected",
+        "F7: M5/M7 behaviors have no automated regression tests",
+        "F6: transiently misplaced diagnostics when LSP server is behind (no version correlation)"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review-only; no files modified. Analyzed HEAD 90b6bd8 against Issue #1 and ADRs 0005-0009.",
+      "reviewFindings": [
+        "minor: mina-view/src/editor.rs:114 + mina-term/src/daemon.rs Save — dirty survives save is only true in the false-positive direction; save->undo yields dirty:false while text != disk (verified live); add save-point marker",
+        "minor: mina-term/src/daemon.rs:213-218 — mark_saved_doc can clear dirty of a same-doc edit made during the async write; re-check captured text before clearing",
+        "minor: mina-lsp/src/position.rs:4-7 — line[..byte_col] panics on non-char-boundary byte column; clamp to previous boundary",
+        "minor: mina-term/src/daemon.rs:322-333 — read_to_string failure returns (None,None) -> silent no-op Open with no status; report the error",
+        "minor: mina-term/src/daemon.rs:322-333 — metadata-then-read TOCTOU defeats ADR-0008 bound (FIFO swap hangs handler); fstat the opened fd",
+        "minor: mina-term/src/lsp.rs:143-162 — no version correlation between didChange and publishDiagnostics; transiently wrong diagnostic positions on slow servers",
+        "minor: mina-term/src/daemon.rs:240-245, client.rs:39-52 — M7 invalid-command branch and M5 status retention have no automated tests",
+        "minor: workspace — clippy reports 9 warnings; 'clippy クリーン' claim overstated",
+        "minor: mina-term/src/daemon.rs:95-109 — 5th concurrent connection waits forever; add busy reply or connect timeout",
+        "info: mina-view/src/history.rs:20-22 — 1000-cap bounds group count, not memory within a group",
+        "info: mina-term/src/lsp.rs:262-267 — concurrent .rs Open can orphan a spawned rust-analyzer (acknowledged ponytail)"
+      ],
+      "manualNotes": "Report delivered in English per the parent's explicit spec (acceptance contract + field names defined in English). The dirty-undo claim (task item) is FALSE in the save->undo direction — this is the single user-visible discrepancy found and is verified live, not just by reading. All other specified suspect spots (M5, H3, ADR-0007 leak paths, M1 lock traces, drain_into race, M7, SEC-1, is_edit, 1000-cap) verified sound."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/d9963a42_reviewer_0_transcript.jsonl",
+  "timestamp": 1786470712208
+}
