@@ -131,6 +131,14 @@ fn draw_line(
     let mut out_width = 0usize;
     let mut style = (false, false); // (選択中, 診断中)
     for (i, ch) in line.chars().enumerate() {
+        // CRLF の \r: 非表示文字。生出力するとターミナルがカーソルを行頭へ戻し、
+        // 直後の \x1b[K で行全体が消える（H2）。
+        if ch == '\r' {
+            continue;
+        }
+        let is_ctrl = ch.is_control() && ch != '\t';
+        // 制御文字（ESC 等）は端末インジェクション対策で � に置換してから出力する
+        let w = if is_ctrl { 1 } else { ch.width().unwrap_or(0) };
         let char_global = line_char_start + i;
         let in_sel = selection
             .iter()
@@ -148,11 +156,14 @@ fn draw_line(
                 (false, false) => s.push_str("\x1b[0m"),
             }
         }
-        let w = ch.width().unwrap_or(0);
         if out_width + w > width {
             break; // 幅超過で切り詰め（行末の全角文字は途中で切れる — ponytail）
         }
-        s.push(ch);
+        if is_ctrl {
+            s.push('\u{FFFD}');
+        } else {
+            s.push(ch);
+        }
         out_width += w;
     }
     if style != (false, false) {
@@ -245,7 +256,8 @@ fn cursor_pos(text: &str, head: usize) -> (usize, usize, usize) {
             row += 1;
             col = 0;
             colw = 0;
-        } else {
+        } else if ch != '\r' {
+            // \r は非表示（CRLF）なので行・列に数えない（H2）
             col += 1;
             colw += ch.width().unwrap_or(0);
         }
@@ -317,6 +329,34 @@ mod tests {
         let out = render_text(&state, &[], 40, 10);
         assert!(!out.contains("a\n"), "行内に生の改行を出さない: {out:?}");
         assert!(out.contains("\x1b[2;1H"), "2行目へ移動: {out:?}");
+    }
+
+    #[test]
+    fn crlf_line_is_rendered_not_erased() {
+        // H2: CRLF の \r を生出力すると直後の \x1b[K で行全体が消える。
+        // \r は非表示文字としてスキップし、両行とも描画される。
+        let state = state_with("a\r\nb\r\n", vec![Range { anchor: 0, head: 0 }], 0);
+        let out = render_text(&state, &[], 40, 10);
+        assert!(!out.contains('\r'), "生の \\r を出力しない: {out:?}");
+        assert!(out.contains("a"), "1行目が描画される: {out:?}");
+        assert!(out.contains("b"), "2行目が描画される: {out:?}");
+    }
+
+    #[test]
+    fn control_chars_are_replaced_not_emitted() {
+        // 制御文字（ESC 等）は � に置換（端末インジェクション対策）。
+        // 文書内の \x1b[31m がそのまま端末へ流れないことを確認する。
+        let state = state_with("\x1b[31mred", vec![Range { anchor: 0, head: 0 }], 0);
+        let out = render_text(&state, &[], 40, 10);
+        assert!(!out.contains("\x1b[31m"), "ESC シーケンスを生出力しない: {out:?}");
+        assert!(out.contains('\u{FFFD}'), "制御文字は � に置換される: {out:?}");
+    }
+
+    #[test]
+    fn cursor_pos_ignores_carriage_return() {
+        // \r は非表示なのでカーソル列（表示幅・表示列）に数えない
+        assert_eq!(cursor_pos("ab\r", 3), (0, 2, 2));
+        assert_eq!(cursor_pos("a\r\nb", 3), (1, 0, 0));
     }
 
     #[test]
