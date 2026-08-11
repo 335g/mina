@@ -104,6 +104,11 @@ impl Editor {
         self.paths.get(&self.view().doc).map(|p| p.as_path())
     }
 
+    /// フォーカス中の View が表示する文書の ID。
+    pub fn focused_doc_id(&self) -> DocumentId {
+        self.view().doc
+    }
+
     /// フォーカス中の View が表示する文書が保存済み状態から編集されているか。
     ///
     /// ponytail: undo で保存時点まで戻っても dirty は残る（履歴に保存時点の
@@ -112,9 +117,12 @@ impl Editor {
         self.dirty.contains(&self.view().doc)
     }
 
-    /// 保存が完了したことを記録し、dirty をクリアする。
-    pub fn mark_saved(&mut self) {
-        let doc_id = self.view().doc;
+    /// 指定した文書の保存完了を記録し、dirty をクリアする。
+    ///
+    /// 保存対象は「保存開始時にフォーカスしていた文書」であり、保存完了時点の
+    /// フォーカスではない（H3: 書き込み中に別接続が Open するとフォーカスが
+    /// 変わり得る。dirty は View ではなく Document 単位）。
+    pub fn mark_saved_doc(&mut self, doc_id: DocumentId) {
         self.dirty.remove(&doc_id);
     }
 
@@ -384,7 +392,7 @@ mod tests {
     #[test]
     fn open_with_path_tracks_path_and_dirty() {
         let mut editor = Editor::new();
-        editor.open_with_path(PathBuf::from("/tmp/foo.txt"), "hello");
+        let id = editor.open_with_path(PathBuf::from("/tmp/foo.txt"), "hello");
         assert_eq!(
             editor.focused_path(),
             Some(Path::new("/tmp/foo.txt")),
@@ -400,7 +408,35 @@ mod tests {
         assert!(editor.is_dirty());
 
         // 保存でクリアされる
-        editor.mark_saved();
+        editor.mark_saved_doc(id);
+        assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn mark_saved_doc_marks_only_the_named_document() {
+        // H3: mark_saved_doc は指定した文書の dirty だけを消す。フォーカスが
+        // 別の文書に移っていても（Save 中の Open 割り込み）、その文書には触れない。
+        let mut editor = Editor::new();
+        let id_a = editor.open_with_path(PathBuf::from("/tmp/a.txt"), "hello");
+        let selection = Selection::point(0);
+        let tx = Transaction::insert(editor.current_document(), &selection, "X");
+        let selection_after = tx.map_selection(&selection, true);
+        editor.apply(tx, selection_after);
+        assert!(editor.is_dirty(), "A は dirty");
+
+        // 保存の書き込み中に別文書 B を開いて編集した状況
+        let id_b = editor.open_with_path(PathBuf::from("/tmp/b.txt"), "world");
+        let tx_b = Transaction::insert(editor.current_document(), &Selection::point(0), "Y");
+        let selection_after_b = tx_b.map_selection(&Selection::point(0), true);
+        editor.apply(tx_b, selection_after_b);
+        assert!(editor.is_dirty(), "B も dirty（フォーカスは B）");
+
+        // A の保存完了を記録しても、B の dirty は残る
+        editor.mark_saved_doc(id_a);
+        assert!(editor.is_dirty(), "B の dirty は消えない");
+
+        // 指定した文書（B）に対してはフォーカスに関係なくクリアできる
+        editor.mark_saved_doc(id_b);
         assert!(!editor.is_dirty());
     }
 
