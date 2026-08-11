@@ -195,12 +195,15 @@ impl Keymaps {
         select.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         select.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
-        // Insert: 文字入力はクライアント側のフォールバック。ここでは Esc・Backspace・左右移動のみ
+        // Insert: 文字入力はクライアント側のフォールバック。ここでは
+        // Esc・Enter（改行）・Tab・Backspace・左右移動のみ
         let mut insert = Node::default();
         insert.insert(
             &[plain(KeyCode::Escape)],
             Command::SetMode { mode: Mode::Normal },
         );
+        insert.insert(&[plain(KeyCode::Enter)], Command::Insert { text: "\n".into() });
+        insert.insert(&[plain(KeyCode::Tab)], Command::Insert { text: "\t".into() });
         insert.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         insert.insert(&[plain(KeyCode::Left)], Command::Move {
             movement: Movement::Char,
@@ -320,6 +323,25 @@ mod tests {
         km.resolve(Mode::Normal, &mut pending, k('g'));
         assert!(matches!(km.resolve(Mode::Normal, &mut pending, k('x')), Resolution::NoMatch));
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn insert_mode_enter_and_tab_insert_newline_and_tab() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert_eq!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, KeyCode::Enter.into()),
+            Resolution::Command(Command::Insert { text: "\n".into() })
+        );
+        assert_eq!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, KeyCode::Tab.into()),
+            Resolution::Command(Command::Insert { text: "\t".into() })
+        );
+        // Normal では Enter/Tab は未定義のまま
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Normal, &mut pending, KeyCode::Enter.into()),
+            Resolution::NoMatch
+        ));
     }
 
     #[test]
