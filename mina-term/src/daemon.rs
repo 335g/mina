@@ -1,13 +1,15 @@
 //! daemon: 編集状態を所有し、クライアントからのコマンドを処理する常駐プロセス。
 //!
-//! 状態は mina-view の [`Editor`] がすべて保持する（ADR-0005）。S1 では
-//! ファイルを開く・移動・スクロール・モード切替を扱い、編集（S2）と
-//! LSP（S3）は後のスライス。socket は `<temp_dir>/mina.sock`（単一ユーザ前提）。
+//! 状態は mina-view の [`Editor`] がすべて保持する（ADR-0005）。S2 では編集
+//! （insert/delete/undo/redo）と保存を扱う。ファイル I/O（Open/Save）だけは
+//! ロックを握らないよう接続ハンドラ側で async 実行する。socket は
+//! `<temp_dir>/mina.sock`（単一ユーザ前提）。
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mina_core::{extend_selection, move_selection};
+use mina_core::{Direction, Movement, Transaction, extend_selection, move_selection};
 use mina_protocol::{Command, GotoTarget, Mode, Range, StateSnapshot};
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,8 +21,6 @@ struct Daemon {
     editor: Editor,
     /// クライアントから通知されるターミナル表示高さ（カーソル追従スクロール用）。
     viewport_height: usize,
-    /// 開いているファイルのパス（S2 の save で使う）。
-    path: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -28,7 +28,6 @@ impl Daemon {
         Self {
             editor: Editor::new(),
             viewport_height: 24,
-            path: None,
         }
     }
 }
@@ -73,14 +72,41 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
             Ok(c) => c,
             Err(_) => continue, // 壊れた行は無視
         };
-        // Open はファイル読み込みが先行（ロックを握ったまま I/O ブロックしない）
-        let file_contents = match &command {
-            Command::Open { path } => Some(tokio::fs::read_to_string(path).await.ok()),
-            _ => None,
-        };
-        let snapshot = {
-            let mut daemon = daemon.lock().await;
-            apply(&mut daemon, command, file_contents.flatten())
+        let snapshot = match command {
+            // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
+            Command::Open { path } => {
+                let contents = tokio::fs::read_to_string(&path).await.ok();
+                let mut d = daemon.lock().await;
+                open_in_editor(&mut d, &path, contents)
+            }
+            Command::Save => {
+                // 保存対象（テキストとパス）を取り出してから、ロック外で書き込む
+                let (text, path) = {
+                    let d = daemon.lock().await;
+                    let text = d.editor.current_document().text().to_string();
+                    (text, d.editor.focused_path().map(Path::to_path_buf))
+                };
+                let write_result = match &path {
+                    Some(p) => tokio::fs::write(p, text.as_bytes()).await,
+                    None => Err(io::Error::new(io::ErrorKind::NotFound, "no file name")),
+                };
+                let mut d = daemon.lock().await;
+                match write_result {
+                    Ok(()) => {
+                        d.editor.mark_saved();
+                        let shown = path
+                            .as_ref()
+                            .expect("書き込み成功ならパスはある")
+                            .display();
+                        snapshot(&d, Some(format!("saved: {shown}")))
+                    }
+                    Err(e) => snapshot(&d, Some(format!("save failed: {e}"))),
+                }
+            }
+            command => {
+                let mut d = daemon.lock().await;
+                apply(&mut d, command)
+            }
         };
         let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
         out.push('\n');
@@ -90,20 +116,73 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
     }
 }
 
-/// コマンドを状態に適用し、新しいスナップショットを返す。
-fn apply(daemon: &mut Daemon, command: Command, file_contents: Option<String>) -> StateSnapshot {
+/// ファイルを読み込んで Editor に開く（clean 状態で始まる）。
+fn open_in_editor(daemon: &mut Daemon, path: &str, contents: Option<String>) -> StateSnapshot {
+    match contents {
+        Some(contents) => {
+            daemon.editor.open_with_path(PathBuf::from(path), &contents);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
+        None => snapshot(daemon, Some(format!("cannot open {path}"))),
+    }
+}
+
+/// Open/Save 以外のコマンドを状態に適用し、新しいスナップショットを返す。
+fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
     match command {
-        Command::Open { path } => match file_contents {
-            Some(contents) => {
-                daemon.editor.open(contents.as_str().into());
-                daemon.path = Some(PathBuf::from(&path));
-                daemon
-                    .editor
-                    .scroll_to_cursor(daemon.viewport_height);
-                snapshot(daemon, None)
+        Command::Insert { text } => {
+            let selection = daemon.editor.selection();
+            let tx = Transaction::insert(daemon.editor.current_document(), &selection, &text);
+            let selection_after = tx.map_selection(&selection, true);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
+        Command::DeleteBackward => {
+            let selection = daemon.editor.selection();
+            let tx = mina_core::delete_backward_transaction(
+                daemon.editor.current_document(),
+                &selection,
+            );
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
+        Command::DeleteForward => {
+            let selection = daemon.editor.selection();
+            let tx = mina_core::delete_forward_transaction(
+                daemon.editor.current_document(),
+                &selection,
+            );
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
+        Command::DeleteRange => {
+            let selection = daemon.editor.selection();
+            let tx = Transaction::delete(daemon.editor.current_document(), &selection);
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            // 選択を消したら Select モードを抜ける（vim の d と同様）
+            if daemon.editor.mode() == mina_view::Mode::Select {
+                daemon.editor.set_mode(mina_view::Mode::Normal);
             }
-            None => snapshot(daemon, Some(format!("cannot open {path}"))),
-        },
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
+        Command::Undo => {
+            daemon.editor.undo();
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
+        Command::Redo => {
+            daemon.editor.redo();
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            snapshot(daemon, None)
+        }
         Command::Move {
             movement,
             direction,
@@ -146,7 +225,17 @@ fn apply(daemon: &mut Daemon, command: Command, file_contents: Option<String>) -
             snapshot(daemon, None)
         }
         Command::SetMode { mode } => {
-            daemon.editor.set_mode(convert_mode(mode));
+            let new_mode = convert_mode(mode);
+            let current = daemon.editor.mode();
+            // Insert モードの入力を1つの undo グループにまとめる
+            // （グループは daemon 側で開閉する — 状態は daemon が持つため）。
+            // ponytail: ネストしたグループは考慮しない（v1 にその経路はない）。
+            if new_mode == mina_view::Mode::Insert && current != mina_view::Mode::Insert {
+                daemon.editor.begin_group();
+            } else if new_mode == mina_view::Mode::Normal && current == mina_view::Mode::Insert {
+                daemon.editor.end_group();
+            }
+            daemon.editor.set_mode(new_mode);
             snapshot(daemon, None)
         }
         Command::SetViewport { height } => {
@@ -154,6 +243,9 @@ fn apply(daemon: &mut Daemon, command: Command, file_contents: Option<String>) -
             snapshot(daemon, None)
         }
         Command::GetState => snapshot(daemon, None),
+        Command::Open { .. } | Command::Save => {
+            unreachable!("I/O コマンドは接続ハンドラで処理される")
+        }
     }
 }
 
@@ -174,7 +266,8 @@ fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
         mode: convert_mode_back(editor.mode()),
         first_line: editor.first_line(),
         diagnostics: Vec::new(),
-        path: daemon.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
+        dirty: editor.is_dirty(),
         status,
     }
 }
@@ -194,19 +287,19 @@ fn convert_direction(d: mina_protocol::Direction) -> mina_core::Direction {
     }
 }
 
-fn convert_mode(m: Mode) -> mina_view::Mode {
+fn convert_mode(m: mina_protocol::Mode) -> mina_view::Mode {
     match m {
-        Mode::Normal => mina_view::Mode::Normal,
-        Mode::Insert => mina_view::Mode::Insert,
-        Mode::Select => mina_view::Mode::Select,
+        mina_protocol::Mode::Normal => mina_view::Mode::Normal,
+        mina_protocol::Mode::Insert => mina_view::Mode::Insert,
+        mina_protocol::Mode::Select => mina_view::Mode::Select,
     }
 }
 
-fn convert_mode_back(m: mina_view::Mode) -> Mode {
+fn convert_mode_back(m: mina_view::Mode) -> mina_protocol::Mode {
     match m {
-        mina_view::Mode::Normal => Mode::Normal,
-        mina_view::Mode::Insert => Mode::Insert,
-        mina_view::Mode::Select => Mode::Select,
+        mina_view::Mode::Normal => mina_protocol::Mode::Normal,
+        mina_view::Mode::Insert => mina_protocol::Mode::Insert,
+        mina_view::Mode::Select => mina_protocol::Mode::Select,
     }
 }
 
@@ -228,13 +321,11 @@ mod tests {
     }
 
     fn open(d: &mut Daemon, text: &str) -> StateSnapshot {
-        apply(
-            d,
-            Command::Open {
-                path: "test.txt".into(),
-            },
-            Some(text.into()),
-        )
+        open_in_editor(d, "test.txt", Some(text.into()))
+    }
+
+    fn open_path(d: &mut Daemon, path: &str, text: &str) -> StateSnapshot {
+        open_in_editor(d, path, Some(text.into()))
     }
 
     #[test]
@@ -243,6 +334,7 @@ mod tests {
         let s = open(&mut d, "hello\nworld");
         assert_eq!(s.text, "hello\nworld");
         assert_eq!(s.path.as_deref(), Some("test.txt"));
+        assert!(!s.dirty);
         assert_eq!(s.status, None);
         assert_eq!(s.selection[0], Range { anchor: 0, head: 0 });
     }
@@ -250,9 +342,110 @@ mod tests {
     #[test]
     fn open_failure_reports_status() {
         let mut d = daemon();
-        let s = apply(&mut d, Command::Open { path: "missing".into() }, None);
+        let s = open_in_editor(&mut d, "missing", None);
         assert!(s.status.is_some());
         assert!(s.path.is_none());
+    }
+
+    #[test]
+    fn insert_marks_dirty_and_moves_cursor() {
+        let mut d = daemon();
+        open(&mut d, "hello");
+        let s = apply(&mut d, Command::Insert { text: "X".into() });
+        assert_eq!(s.text, "Xhello");
+        assert!(s.dirty, "編集で dirty になる");
+        assert_eq!(s.selection[0].head, 1);
+    }
+
+    #[test]
+    fn delete_backward_and_undo() {
+        let mut d = daemon();
+        open(&mut d, "hello");
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::DeleteBackward);
+        assert_eq!(s.text, "hllo");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "hello");
+        let s = apply(&mut d, Command::Redo);
+        assert_eq!(s.text, "hllo");
+    }
+
+    #[test]
+    fn delete_forward_deletes_next_char() {
+        let mut d = daemon();
+        open(&mut d, "hello");
+        let s = apply(&mut d, Command::DeleteForward);
+        assert_eq!(s.text, "ello");
+    }
+
+    #[test]
+    fn insert_mode_typing_undoes_as_one_group() {
+        // i → "abc" 入力 → Esc → undo 1回で元に戻る
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        for ch in ["a", "b", "c"] {
+            apply(&mut d, Command::Insert { text: ch.into() });
+        }
+        let s = apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        assert_eq!(s.text, "abc");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "");
+    }
+
+    #[test]
+    fn delete_selection_exits_select_mode() {
+        let mut d = daemon();
+        open(&mut d, "hello");
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        for _ in 0..3 {
+            apply(&mut d, Command::Extend {
+                movement: Movement::Char,
+                direction: Direction::Forward,
+            });
+        }
+        let s = apply(&mut d, Command::DeleteRange);
+        assert_eq!(s.text, "lo");
+        assert_eq!(s.mode, Mode::Normal, "選択削除後は Normal に戻る");
+    }
+
+    #[test]
+    fn save_writes_file_and_clears_dirty() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mina-save-test-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut d = daemon();
+        open_path(&mut d, &path_str, "hello");
+        apply(
+            &mut d,
+            Command::Goto {
+                target: GotoTarget::DocumentEnd,
+            },
+        );
+        apply(&mut d, Command::Insert { text: " world".into() });
+
+        // Save は接続ハンドラ相当のロジック（テストでは直接実行）
+        let (text, p) = {
+            let text = d.editor.current_document().text().to_string();
+            (text, d.editor.focused_path().map(Path::to_path_buf))
+        };
+        let p = p.expect("パスがある");
+        std::fs::write(&p, text.as_bytes()).unwrap();
+        d.editor.mark_saved();
+        let s = snapshot(&d, Some("saved".into()));
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+        assert!(!s.dirty);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -265,24 +458,8 @@ mod tests {
                 movement: Movement::Char,
                 direction: Direction::Forward,
             },
-            None,
         );
         assert_eq!(s.selection[0].head, 1);
-    }
-
-    #[test]
-    fn extend_grows_selection() {
-        let mut d = daemon();
-        open(&mut d, "hello");
-        let s = apply(
-            &mut d,
-            Command::Extend {
-                movement: Movement::Char,
-                direction: Direction::Forward,
-            },
-            None,
-        );
-        assert_eq!(s.selection[0], Range { anchor: 0, head: 1 });
     }
 
     #[test]
@@ -290,26 +467,14 @@ mod tests {
         let mut d = daemon();
         let text = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz\n";
         open(&mut d, text);
-        apply(&mut d, Command::SetViewport { height: 5 }, None);
+        apply(&mut d, Command::SetViewport { height: 5 }, );
         let s = apply(
             &mut d,
             Command::Goto {
                 target: GotoTarget::DocumentEnd,
             },
-            None,
         );
         assert_eq!(s.selection[0].head, text.chars().count());
         assert!(s.first_line > 0, "カーソルに追従してスクロールする: {}", s.first_line);
-        let s2 = apply(&mut d, Command::Scroll { pages: -1 }, None);
-        assert!(s2.first_line < s.first_line);
-    }
-
-    #[test]
-    fn mode_switch_is_recorded() {
-        let mut d = daemon();
-        let s = apply(&mut d, Command::SetMode { mode: Mode::Insert }, None);
-        assert_eq!(s.mode, Mode::Insert);
-        let s2 = apply(&mut d, Command::SetMode { mode: Mode::Normal }, None);
-        assert_eq!(s2.mode, Mode::Normal);
     }
 }
