@@ -1,0 +1,3 @@
+# Request/response state-snapshot IPC, no push channel
+
+mina's IPC is request/response only: a Client sends a Command and the Daemon replies with a full StateSnapshot (document text, selection, mode, viewport, diagnostics), framed as NDJSON over a local unix socket. There is no server-initiated push or subscription channel in v1 — the TUI redraws after each command anyway, and LSP-derived state (Diagnostics) is carried in the next snapshot. Rejected for now: push/event channels (additive later if a client must react while idle), diffed/partial snapshots (deferred until large-file profiling demands), binary serialization (NDJSON kept for debuggability — agents can read the wire).
