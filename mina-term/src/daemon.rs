@@ -32,6 +32,13 @@ const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// 接続を閉じる（SEC-1）。
 const MAX_CMD_LINE: usize = 1024 * 1024;
 
+/// SetViewport で受け入れる高さの上限。
+///
+/// 端末の行数はこれを超えないが、壊れた/悪意あるコマンド（usize::MAX 等）
+/// で `first_line + height` の overflow panic を起こさないよう clamp する
+/// （scroll_to_cursor の加算は debug ビルドで panic する）。
+const MAX_VIEWPORT_HEIGHT: usize = 10_000;
+
 /// daemon が保持する編集状態。
 pub struct Daemon {
     pub(crate) editor: Editor,
@@ -45,7 +52,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             editor: Editor::new(),
             viewport_height: 24,
@@ -270,13 +277,47 @@ fn is_edit(command: &Command) -> bool {
 
 /// Open 対象を検証して読み込む。
 ///
-/// 非正規ファイル（ディレクトリ・デバイス・FIFO 等）は `cannot open`、
-/// [`MAX_FILE_SIZE`] を超えるファイルは `file too large` を返す（SEC-1 /
-/// ADR-0008）。成功時は (Some(内容), None)。
+/// 非正規ファイルは `cannot open`、[`MAX_FILE_SIZE`] 超は `file too large`、
+/// 非 UTF-8 等の読み込み失敗は `cannot read` を status で報告する（SEC-1 /
+/// ADR-0008）。
+///
+/// TOCTOU 対策: サイズ検証は open した fd の fstat で行い、その fd から
+/// バイト上限付きで読む（metadata と read が別々の path を辿らない）。
+///
+/// ponytail: UTF-8 のみの I/O（read_to_string）。非 UTF-8 対応は v1 対象外。
+/// 検証→open の間にパスが FIFO に差し替えられた場合は open でブロックし得る
+/// （単一ユーザ前提。O_NONBLOCK 化は必要になってから）。
 async fn read_open_target(path: &str) -> (Option<String>, Option<String>) {
+    // 高速パス: 非正規ファイル（FIFO・ディレクトリ等）は open 前に弾く
     match tokio::fs::metadata(path).await {
+        Ok(m) if m.len() > MAX_FILE_SIZE => {
+            return (None, Some(format!("file too large: {path}")))
+        }
+        Ok(m) if !m.is_file() => return (None, Some(format!("cannot open {path}"))),
+        _ => {}
+    }
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return (None, Some(format!("cannot open {path}"))),
+    };
+    // 同一 fd の fstat で再検証（検証後に巨大化したファイルを丸読みしない）
+    match file.metadata().await {
         Ok(m) if m.is_file() && m.len() <= MAX_FILE_SIZE => {
-            (tokio::fs::read_to_string(path).await.ok(), None)
+            let mut contents = String::new();
+            // バイト上限付きで同一 fd から読む（fstat 後に伸びた分も cap）
+            match file
+                .take(MAX_FILE_SIZE + 1)
+                .read_to_string(&mut contents)
+                .await
+            {
+                Ok(_) if contents.len() as u64 > MAX_FILE_SIZE => {
+                    (None, Some(format!("file too large: {path}")))
+                }
+                Ok(_) => (Some(contents), None),
+                // 非 UTF-8 など decode 失敗も status で報告する（修正前は
+                // 握り潰して「空文書が開けた」ように見えていた）
+                Err(e) => (None, Some(format!("cannot read {path}: {e}"))),
+            }
         }
         Ok(m) if m.len() > MAX_FILE_SIZE => (None, Some(format!("file too large: {path}"))),
         Ok(_) => (None, Some(format!("cannot open {path}"))),
@@ -411,7 +452,8 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
             snapshot(daemon, None)
         }
         Command::SetViewport { height } => {
-            daemon.viewport_height = height;
+            // 壊れた/悪意ある高さでスクロール計算が overflow しないよう clamp
+            daemon.viewport_height = height.min(MAX_VIEWPORT_HEIGHT);
             snapshot(daemon, None)
         }
         Command::GetState => snapshot(daemon, None),
@@ -557,6 +599,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_reports_non_utf8_as_cannot_read() {
+        // 非 UTF-8 ファイルを無言で空文書にせず、status で報告する
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mina-sec-nonutf8-{}.txt", std::process::id()));
+        // 無効な UTF-8 バイト列（UTF-16 BOM に使われる 0xFF 0xFE を含む）
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+
+        let path_str = path.to_string_lossy().into_owned();
+        let (contents, status) = read_open_target(&path_str).await;
+        assert!(contents.is_none());
+        let msg = status.expect("拒否メッセージが出る");
+        assert!(msg.starts_with("cannot read"), "{msg}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn oversized_command_line_closes_connection() {
         // SEC-1: 改行のない過大な行を送ると接続が閉じられ、応答が返らない
         let dir = std::env::temp_dir();
@@ -586,6 +644,29 @@ mod tests {
             "過大行に対して応答しない: {n:?}"
         );
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn set_viewport_huge_height_is_clamped() {
+        // usize::MAX の高さでも overflow panic せず、上限に clamp される
+        let mut d = daemon();
+        open(&mut d, "a\nb\nc\nd\ne");
+        apply(&mut d, Command::SetViewport { height: usize::MAX });
+        assert_eq!(d.viewport_height, MAX_VIEWPORT_HEIGHT);
+        // clamp 後はスクロール計算（first_line + height）が overflow しない
+        let _ = apply(
+            &mut d,
+            Command::Goto {
+                target: GotoTarget::DocumentEnd,
+            },
+        );
+        let _ = apply(
+            &mut d,
+            Command::Move {
+                movement: Movement::Char,
+                direction: Direction::Forward,
+            },
+        );
     }
 
     #[test]
