@@ -1,6 +1,7 @@
 //! エディタ状態: 文書の集合・View の分割ツリー・モード・履歴。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use mina_core::{Document, Selection, Transaction};
 
@@ -36,6 +37,10 @@ pub struct View {
 pub struct Editor {
     documents: BTreeMap<DocumentId, Document>,
     histories: BTreeMap<DocumentId, History>,
+    /// 文書がファイルに紐づいている場合のパス（未保存のスクラッチ文書は含まれない）。
+    paths: BTreeMap<DocumentId, PathBuf>,
+    /// 保存済み状態から編集が進んでいる文書（保存でクリアされる）。
+    dirty: BTreeSet<DocumentId>,
     next_document_id: usize,
     views: Vec<Option<View>>,
     next_view_id: usize,
@@ -50,6 +55,8 @@ impl Editor {
         let mut editor = Self {
             documents: BTreeMap::new(),
             histories: BTreeMap::new(),
+            paths: BTreeMap::new(),
+            dirty: BTreeSet::new(),
             next_document_id: 1,
             views: Vec::new(),
             next_view_id: 1,
@@ -80,6 +87,35 @@ impl Editor {
         view.selection = Selection::point(0);
         view.first_line = 0;
         id
+    }
+
+    /// ファイルから文書を開き、新しい文書 ID を返す。
+    ///
+    /// [`Editor::open`] と同じくフォーカス中の View が新しい文書へ移動する。
+    /// パスを登録し、保存済み（clean）の状態で始まる。
+    pub fn open_with_path(&mut self, path: PathBuf, text: &str) -> DocumentId {
+        let id = self.open(Document::from(text));
+        self.paths.insert(id, path);
+        id
+    }
+
+    /// フォーカス中の View が表示する文書のファイルパス（未保存なら None）。
+    pub fn focused_path(&self) -> Option<&Path> {
+        self.paths.get(&self.view().doc).map(|p| p.as_path())
+    }
+
+    /// フォーカス中の View が表示する文書が保存済み状態から編集されているか。
+    ///
+    /// ponytail: undo で保存時点まで戻っても dirty は残る（履歴に保存時点の
+    /// マーカーを持たない）。正確な追跡が必要になったら履歴にマーカーを入れる。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.contains(&self.view().doc)
+    }
+
+    /// 保存が完了したことを記録し、dirty をクリアする。
+    pub fn mark_saved(&mut self) {
+        let doc_id = self.view().doc;
+        self.dirty.remove(&doc_id);
     }
 
     /// 文書を ID で取得する。
@@ -222,6 +258,7 @@ impl Editor {
             .push(transaction, selection_before, selection_after.clone());
         self.documents.insert(doc_id, new_doc);
         self.view_mut().selection = selection_after;
+        self.dirty.insert(doc_id);
     }
 
     /// フォーカス中の View の文書について undo できる変更があるか。
@@ -342,6 +379,29 @@ mod tests {
         assert_eq!(editor.selection(), Selection::point(0));
         assert!(!editor.can_undo());
         assert!(!editor.can_redo());
+    }
+
+    #[test]
+    fn open_with_path_tracks_path_and_dirty() {
+        let mut editor = Editor::new();
+        editor.open_with_path(PathBuf::from("/tmp/foo.txt"), "hello");
+        assert_eq!(
+            editor.focused_path(),
+            Some(Path::new("/tmp/foo.txt")),
+            "パスが登録される"
+        );
+        assert!(!editor.is_dirty(), "開いた直後は clean");
+
+        // 編集で dirty になる
+        let selection = Selection::point(0);
+        let tx = Transaction::insert(editor.current_document(), &selection, "X");
+        let selection_after = tx.map_selection(&selection, true);
+        editor.apply(tx, selection_after);
+        assert!(editor.is_dirty());
+
+        // 保存でクリアされる
+        editor.mark_saved();
+        assert!(!editor.is_dirty());
     }
 
     #[test]
