@@ -172,6 +172,16 @@ fn draw_line(
     s.push_str("\x1b[K"); // 行末までクリア
 }
 
+/// 制御文字（ESC 等）を � に置換する（端末インジェクション対策 — SEC-2）。
+///
+/// `\t` はそのまま。ステータス行のパス・メッセージ（クライアント/ファイル由来の
+/// データ）に使う。draw_line と同一の方針。
+fn sanitize_status_data(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\t' { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 /// ステータス行: `[モード] パス 行:列 [pending] [status]`
 fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], width: usize) {
     // ステータス文字列は別バッファで組み立ててから切り詰める
@@ -185,7 +195,7 @@ fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], widt
     status.push_str("\x1b[7m");
     status.push_str(mode);
     status.push_str("\x1b[0m");
-    let path = state.path.as_deref().unwrap_or("[no name]");
+    let path = sanitize_status_data(state.path.as_deref().unwrap_or("[no name]"));
     let dirty = if state.dirty { "*" } else { "" };
     let primary = state
         .selection
@@ -205,7 +215,7 @@ fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], widt
         status.push_str(&format!("  <{keys}>"));
     }
     if let Some(msg) = &state.status {
-        status.push_str(&format!("  {msg}"));
+        status.push_str(&format!("  {}", sanitize_status_data(msg)));
     }
     // 診断カウント（ステータス行に載せる）
     let errors = state
@@ -357,6 +367,33 @@ mod tests {
         // \r は非表示なのでカーソル列（表示幅・表示列）に数えない
         assert_eq!(cursor_pos("ab\r", 3), (0, 2, 2));
         assert_eq!(cursor_pos("a\r\nb", 3), (1, 0, 0));
+    }
+
+    #[test]
+    fn status_line_sanitizes_path_and_message() {
+        // SEC-2: パス・status メッセージ（クライアント/ファイル由来のデータ）の
+        // 制御文字は � に置換され、生の ESC が端末に流れない。
+        let state = StateSnapshot {
+            text: "hello".into(),
+            selection: vec![Range { anchor: 0, head: 0 }],
+            primary_index: 0,
+            mode: Mode::Normal,
+            first_line: 0,
+            diagnostics: Vec::new(),
+            // OSC シーケンス（ターミナルタイトル変更）と SGR（色変更）の注入を試みる
+            path: Some("\x1b]0;evil\x07".into()),
+            dirty: false,
+            status: Some("\x1b[31m".into()),
+        };
+        let out = render_text(&state, &[], 40, 10);
+        assert!(!out.contains("\x1b]0;evil"), "OSC を生出力しない: {out:?}");
+        assert!(!out.contains("\x1b[31m"), "status の ESC を生出力しない: {out:?}");
+    }
+
+    #[test]
+    fn sanitize_status_data_replaces_control_chars() {
+        assert_eq!(sanitize_status_data("a\x1bb"), "a\u{FFFD}b");
+        assert_eq!(sanitize_status_data("tab\tok"), "tab\tok", "\t は維持");
     }
 
     #[test]
