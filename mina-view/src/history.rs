@@ -12,6 +12,12 @@ struct Change {
     selection_after: Selection,
 }
 
+/// undo スタックに残すグループ数の上限（3a）。
+///
+/// 超過分は古い順に破棄する（メモリ有界化。巨大挿入ループの悪用対策）。
+/// vim の既定（約1000）に合わせる。
+const MAX_UNDO_GROUPS: usize = 1000;
+
 /// undo / redo の履歴。
 ///
 /// undo の単位は「グループ」。単独の変更は1要素のグループ、
@@ -73,6 +79,10 @@ impl History {
                 // 新しいグループを開始したので、以降の push はここに追記する
                 self.group_open = true;
             }
+        }
+        // 3a: 上限を超えたら古いグループから破棄する（メモリ有界化）
+        while self.undo.len() > MAX_UNDO_GROUPS {
+            self.undo.remove(0);
         }
         self.redo.clear();
     }
@@ -204,6 +214,29 @@ mod tests {
         let (fwd1, fwd1_sel) = history.redo(&fwd2).expect("redo 2");
         assert_eq!(fwd1.text().to_string(), "hXYello");
         assert_eq!(fwd1_sel, after2);
+    }
+
+    #[test]
+    fn undo_history_is_bounded() {
+        // 3a: undo スタックは MAX_UNDO_GROUPS を超えて育たない
+        let doc = Document::from("");
+        let mut history = History::new();
+        let mut cur = doc.clone();
+        let mut sel = Selection::point(0);
+        for _ in 0..(MAX_UNDO_GROUPS + 50) {
+            let (tx, after) = insert_change(&cur, &sel, "x");
+            cur = tx.apply(&cur);
+            history.push(tx, sel.clone(), after.clone());
+            sel = after;
+        }
+        let mut undoable = 0;
+        let mut doc = cur;
+        while history.can_undo() {
+            let (restored, _) = history.undo(&doc).expect("undo");
+            doc = restored;
+            undoable += 1;
+        }
+        assert_eq!(undoable, MAX_UNDO_GROUPS, "上限分だけ undo できる");
     }
 
     #[test]
