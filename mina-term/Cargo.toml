@@ -10,7 +10,12 @@ name = "mina"
 path = "src/main.rs"
 
 [dependencies]
+mina-core = { path = "../mina-core" }
+mina-view = { path = "../mina-view" }
 mina-protocol = { path = "../mina-protocol" }
 serde_json.workspace = true
 tokio.workspace = true
 libc.workspace = true
+termina.workspace = true
+futures-lite.workspace = true
+unicode-width.workspace = true
