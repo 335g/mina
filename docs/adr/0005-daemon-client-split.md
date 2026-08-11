@@ -1,0 +1,3 @@
+# Daemon + client split from day one
+
+mina runs as a local daemon from v1: a persistent daemon process owns the editor state (documents, histories, LSP clients) and serves it over a local IPC channel, while the terminal UI, CLI, and agents connect as Clients that send Commands and receive state. Modeled on Hunk's session daemon (`hunk daemon serve` + `hunk session …`). The alternative — a single in-process editor with the process boundary retrofitted later — was rejected: the daemon is the product's core (agent-driven editing, warm LSP, fast attach), and retrofitting a process boundary after the fact is the expensive path. Commands-as-data and a shared protocol crate make the boundary real from the start.
