@@ -1,0 +1,157 @@
+{
+  "runId": "9933a929",
+  "agent": "reviewer",
+  "task": "Adversarial red-team review of the daemon/client IPC editor at /Users/335g/dev/other/mina against its spec (GitHub Issue #1: daemon owns all editor state, clients send Command and receive a full StateSnapshot; NDJSON over a unix socket in temp_dir/mina.sock; effectively-one-client assumption is a documented trade-off; daemon auto-starts from clients via setsid; LSP = rust-analyzer only, spawned on first .rs open; ADR-0008 caps file size at 16MiB and command lines at 1MiB; ADR-0009 runs LSP outside the daemon lock with 2s write / 10s request timeouts and try_lock diagnostic drains; ADR-0007 closes undo groups on leaving Insert AND on client disconnect).\nHunt for REAL bugs and spec violations, not style nits. Focus on:\n1. IPC trust boundary: is the socket path predictable/unprotected (temp_dir/mina.sock, no uid in path — single-user assumption noted)? Can a malformed NDJSON frame, oversized line, or truncated connection hang or crash the daemon? Is the 1MiB command-line cap actually enforced on the read path?\n2. Race conditions: ensure_daemon double-start (two clients racing to spawn), client disconnect during an in-flight request, daemon shutdown mid-write, connection reset while daemon holds a lock.\n3. Undo group correctness: what happens on disconnect while in Insert mode — is the group closed and mode reset to Normal as ADR-0007 requires? Can edits from two different clients merge into one undo unit?\n4. LSP: does a hung server actually fail to block the daemon lock (try_lock)? What if the LSP channel closes mid-request? Is didChange sent on EVERY edit (full text, O(n))?\n5. Open/TOCTOU: ADR-0008 rejects non-regular files and files > 16MiB; check the metadata check vs read race, and whether the recently-added Open TOCTOU fix is sound.\n6. StateSnapshot correctness: does every response actually carry the full state (document text, selection, mode, viewport, diagnostics)? Any path where a response is partial or stale?\nRead mina-term/src/{daemon.rs,client.rs,lsp.rs,render.rs,session.rs}, mina-lsp/src/lib.rs, mina-protocol/src/lib.rs. Run `cargo test --workspace` and `cargo clippy --workspace` (note any warnings). Output: a prioritized list of findings, each with file:line, severity (CRITICAL/HIGH/MEDIUM/LOW/NIT), and a one-line suggested fix. Distinguish confirmed bugs from theoretical risks.",
+  "exitCode": 0,
+  "usage": {
+    "input": 53203,
+    "output": 28546,
+    "cacheRead": 508928,
+    "cacheWrite": 0,
+    "cost": 0.0084331492,
+    "turns": 17
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 53203,
+        "output": 28546,
+        "cacheRead": 508928,
+        "cacheWrite": 0,
+        "cost": 0.0084331492,
+        "turns": 17
+      }
+    }
+  ],
+  "durationMs": 328637,
+  "toolCount": 26,
+  "launchContractDigest": "8a2bf0692a868e39dd314d9f30ce160297b8126b2398bd032ff4cd6511a3ed7f",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Returned 12 prioritized findings with file:line references and severity (HIGH-1 undo/mode ownership, MEDIUM-2 write-stall DoS, MEDIUM-3 stale diagnostics, MEDIUM-4 hung-LSP stall; LOW/NIT 5-12), plus confirmed-correct items; ran cargo test --workspace (139 passed) and cargo clippy --workspace --all-targets (0 errors, 9 warnings)."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test --workspace",
+          "result": "passed",
+          "summary": "139 passed (10 suites)"
+        },
+        {
+          "command": "cargo clippy --workspace --all-targets",
+          "result": "passed",
+          "summary": "0 errors, 9 warnings (collapsible ifs, unused fn, etc.)"
+        }
+      ],
+      "validationOutput": [
+        "Read daemon.rs, client.rs, lsp.rs, render.rs, session.rs, mina-lsp/src/lib.rs+position.rs, mina-protocol/src/lib.rs, mina-view editor/history/mode, ADR-0005..0009, Issue #1",
+        "Verified 1MiB line cap enforcement, 16MiB file cap + same-fd fstat TOCTOU fix, SetViewport clamp, disconnect undo-group cleanup, LSP timeouts/try_lock, full-snapshot completeness, ensure_daemon convergence"
+      ],
+      "residualRisks": [
+        "HIGH-1: undo group and Insert mode are global, not connection-scoped; agent session-exec disconnect closes the TUI's open group and resets mode; agent edits during TUI Insert merge into the TUI's undo unit",
+        "MEDIUM-2: unbounded response write; 4 non-reading clients exhaust MAX_CONNECTIONS and wedge the daemon for new clients",
+        "MEDIUM-3: stale diagnostics persist after LSP server death until the next .rs Open",
+        "MEDIUM-4: hung-but-alive LSP adds up to 2s per edit (documented in ADR-0009)",
+        "LOW: predictable socket path (temp_dir/mina.sock, umask-dependent) enables local squatting DoS; FIFO-swap can block a blocking-pool thread",
+        "no CRITICAL findings"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review only; no files modified",
+      "reviewFindings": [
+        "high: mina-term/src/daemon.rs:68-73,262 + mina-view/src/history.rs:66-72 - undo group/Insert mode not connection-scoped; agent exec disconnect closes TUI group and resets mode; agent edits merge into TUI undo unit",
+        "medium: mina-term/src/daemon.rs:253-256 - no write timeout; 4 non-reading clients exhaust MAX_CONNECTIONS (daemon.rs:54-61) and wedge all new clients",
+        "medium: mina-term/src/lsp.rs drain_into - stale diagnostics persist after LSP death (no is_dead check; cleared only on next .rs Open)",
+        "medium: mina-lsp/src/lib.rs:160-175 - hung-alive server stalls each edit up to 2s and blocks the LspSession mutex for concurrent Open (per ADR-0009 bounds)",
+        "low: daemon.rs socket_path - temp_dir/mina.sock without uid/0600 allows local squatting DoS (documented trade-off)",
+        "low: daemon.rs read_open_target - FIFO swap before open can block a blocking-pool thread (documented)",
+        "low: daemon.rs:204-210 - trailing newline counts toward 1MiB cap (off-by-one, conservative)",
+        "low: response JSON can expand ~6x for control-char-heavy 16MiB docs (~96MiB transient)",
+        "nit: Insert with empty text pushes a no-op undo change; uri() lacks percent-encoding; no didClose on .rs->non-LSP switch; 9 clippy warnings",
+        "no critical findings; 1MiB cap, 16MiB cap, TOCTOU fix, SetViewport clamp, disconnect cleanup, LSP timeouts, and full-snapshot completeness all confirmed sound"
+      ],
+      "manualNotes": "HIGH-1 is the priority: it silently corrupts undo granularity and mode consistency in the exact documented agent+TUI interleaving use case. Fix direction: track the connection that opened the Insert group and scope disconnect cleanup + group membership to it."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/9933a929_reviewer_0_transcript.jsonl",
+  "timestamp": 1786471922945
+}
