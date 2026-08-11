@@ -4,7 +4,7 @@
 //! （`docs/adr/0002-functional-core-selection.md` 参照）。内部で
 //! [`Transaction`] を作って適用する。
 
-use crate::movement::prev_grapheme_boundary;
+use crate::movement::{next_grapheme_boundary, prev_grapheme_boundary};
 use crate::{Document, Range, Selection, Transaction};
 
 /// `selection` の各 Range を `text` で置き換える。
@@ -28,6 +28,14 @@ pub fn delete_range(doc: &Document, selection: &Selection) -> (Document, Selecti
 /// 後方削除（Backspace 相当）。カーソルなら直前の1書記素を削除し、
 /// 選択があれば選択全体を削除する。
 pub fn delete_backward(doc: &Document, selection: &Selection) -> (Document, Selection) {
+    let tx = delete_backward_transaction(doc, selection);
+    let new_doc = tx.apply(doc);
+    let new_selection = tx.map_selection(selection, false);
+    (new_doc, new_selection)
+}
+
+/// 後方削除のトランザクション。undo 履歴に記録する呼び出し側（Editor 層）向け。
+pub fn delete_backward_transaction(doc: &Document, selection: &Selection) -> Transaction {
     // カーソルのみ1書記素分後方へ広げ、選択はそのまま削除対象にする
     let text = doc.text().to_string();
     let ranges: Vec<Range> = selection
@@ -43,7 +51,35 @@ pub fn delete_backward(doc: &Document, selection: &Selection) -> (Document, Sele
         })
         .collect();
     let expanded = Selection::new(ranges, selection.primary_index());
-    delete_range(doc, &expanded)
+    Transaction::delete(doc, &expanded)
+}
+
+/// 前方削除（Delete キー相当）。カーソルなら次の1書記素を削除し、
+/// 選択があれば選択全体を削除する。
+pub fn delete_forward(doc: &Document, selection: &Selection) -> (Document, Selection) {
+    let tx = delete_forward_transaction(doc, selection);
+    let new_doc = tx.apply(doc);
+    let new_selection = tx.map_selection(selection, false);
+    (new_doc, new_selection)
+}
+
+/// 前方削除のトランザクション。undo 履歴に記録する呼び出し側（Editor 層）向け。
+pub fn delete_forward_transaction(doc: &Document, selection: &Selection) -> Transaction {
+    let text = doc.text().to_string();
+    let ranges: Vec<Range> = selection
+        .ranges()
+        .iter()
+        .map(|r| {
+            if r.is_cursor() {
+                let next = next_grapheme_boundary(&text, r.head());
+                Range::new(r.head(), next) // [head, next) = 次の1書記素
+            } else {
+                *r
+            }
+        })
+        .collect();
+    let expanded = Selection::new(ranges, selection.primary_index());
+    Transaction::delete(doc, &expanded)
 }
 
 #[cfg(test)]
@@ -138,6 +174,41 @@ mod tests {
         let (mid, selection) = delete_backward(&doc, &Selection::point(3));
         assert_eq!(mid.text().to_string(), "helo");
         let (restored, _) = insert_text(&mid, &selection, "l");
+        assert_eq!(restored.text().to_string(), "hello");
+    }
+
+    #[test]
+    fn delete_forward_deletes_next_char() {
+        let doc = Document::from("hello");
+        let (new_doc, selection) = delete_forward(&doc, &Selection::point(1));
+        assert_eq!(new_doc.text().to_string(), "hllo");
+        assert_eq!(selection, Selection::point(1));
+    }
+
+    #[test]
+    fn delete_forward_with_selection_deletes_selection() {
+        let doc = Document::from("hello");
+        let (new_doc, selection) = delete_forward(&doc, &sel(vec![(1, 4)], 0));
+        assert_eq!(new_doc.text().to_string(), "ho");
+        assert_eq!(selection, Selection::point(1));
+    }
+
+    #[test]
+    fn delete_forward_at_end_is_noop() {
+        let doc = Document::from("hello");
+        let (new_doc, selection) = delete_forward(&doc, &Selection::point(5));
+        assert_eq!(new_doc.text().to_string(), "hello");
+        assert_eq!(selection, Selection::point(5));
+    }
+
+    #[test]
+    fn delete_backward_transaction_inverts() {
+        // トランザクション版: invert で undo できる
+        let doc = Document::from("hello");
+        let tx = delete_backward_transaction(&doc, &Selection::point(3));
+        let new_doc = tx.apply(&doc);
+        assert_eq!(new_doc.text().to_string(), "helo");
+        let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "hello");
     }
 }
