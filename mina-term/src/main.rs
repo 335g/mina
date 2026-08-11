@@ -9,16 +9,14 @@ mod daemon;
 mod keymap;
 mod lsp;
 mod render;
+mod session;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("daemon") => daemon::run().await,
-        Some("session") => {
-            eprintln!("mina: session サブコマンドは v1 の S4 で追加予定");
-            Ok(())
-        }
+        Some("session") => session::run(&args[2..]).await,
         // ファイルパス → TUI で開く
         Some(path) => client::run(Some(path)).await,
         None => client::run(None).await,
