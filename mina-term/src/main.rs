@@ -6,6 +6,8 @@
 
 mod client;
 mod daemon;
+mod keymap;
+mod render;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -16,8 +18,8 @@ async fn main() -> std::io::Result<()> {
             eprintln!("mina: session サブコマンドは v1 の S4 で追加予定");
             Ok(())
         }
-        // ファイルパス（S1 で利用）。今は無視して接続する
-        Some(_) => client::run().await,
-        None => client::run().await,
+        // ファイルパス → TUI で開く
+        Some(path) => client::run(Some(path)).await,
+        None => client::run(None).await,
     }
 }
