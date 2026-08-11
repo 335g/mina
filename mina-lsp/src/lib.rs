@@ -15,6 +15,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+/// 1フレーム（LSP メッセージ）の最大バイト数（5f）。
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 pub mod position;
 
 /// クライアントが受信した通知。
@@ -140,22 +143,51 @@ impl Client {
             self.pending.lock().await.remove(&id);
             return Err(e);
         }
-        timeout(Duration::from_secs(10), rx)
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "LSP 応答タイムアウト"))?
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "サーバが終了した"))
+        match timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "サーバが終了した",
+            )),
+            Err(_) => {
+                // L2: タイムアウト時も pending から除去する（oneshot リーク防止）
+                self.pending.lock().await.remove(&id);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "LSP 応答タイムアウト",
+                ))
+            }
+        }
     }
 
     /// 通知を送る（応答を待たない）。
+    ///
+    /// M2: サーバが stdin を読まないとパイプが詰まって永久ブロックするため、
+    /// 書き込み全体に 2 秒のタイムアウトを付ける。
     pub async fn notify(&mut self, method: &str, params: Value) -> std::io::Result<()> {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let data = serde_json::to_vec(&msg).expect("シリアライズ可能");
-        write_frame(&mut self.write, &data).await
+        timeout(Duration::from_secs(2), write_frame(&mut self.write, &data))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "LSP 書き込みタイムアウト",
+                )
+            })?
     }
 
     /// 未処理の通知を1つ取り出す。
     pub fn try_recv(&mut self) -> Result<Incoming, mpsc::error::TryRecvError> {
         self.notifications.try_recv()
+    }
+
+    /// サーバが終了したか。
+    ///
+    /// reader タスクがサーバ stdout の EOF/エラーで終了すると通知チャネルの
+    /// 送信側が drop されるため、`is_closed()` で検知できる（M3）。
+    pub fn is_dead(&self) -> bool {
+        self.notifications.is_closed()
     }
 
     /// サーバプロセスを終了させる。
@@ -193,6 +225,13 @@ async fn read_frame(reader: &mut BufReader<ChildStdout>) -> std::io::Result<Opti
     let len = content_length.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "Content-Length ヘッダがない")
     })?;
+    // 5f: 巨大な Content-Length で巨大アロケーションしないよう上限を設ける
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Content-Length が大きすぎる",
+        ));
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     Ok(Some(buf))
