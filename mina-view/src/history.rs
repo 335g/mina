@@ -20,12 +20,21 @@ struct Change {
 /// 消える、という挙動のため。トランザクションを合成せず、グループ内の変更を
 /// 逆順に逆転して適用する）。
 ///
+/// グループの境界は「Insert セッション」（ADR-0007）: [`History::begin_group`] は
+/// 新しいグループを開始し、[`History::end_group`] で閉じる。閉じたグループには
+/// 以降の push が追記されない。
+///
 /// 関数型のコアに合わせ、undo / redo は新しい文書と選択を返す。
 #[derive(Clone, Debug, Default)]
 pub struct History {
     undo: Vec<Vec<Change>>,
     redo: Vec<Vec<Change>>,
+    /// Insert セッション中か（push がグループにまとめられる）。
     grouping: bool,
+    /// 最後のグループが現在の Insert セッションの追記対象か。
+    /// [`History::begin_group`] で偽（= 新しいグループを開始）、
+    /// 新しいグループへの最初の push で真になる。
+    group_open: bool,
 }
 
 impl History {
@@ -46,25 +55,39 @@ impl History {
             selection_before,
             selection_after,
         };
-        if self.grouping {
+        // 追記できるのは「現在の Insert セッションが開始した開いたグループ」だけ。
+        // 閉じた（end_group 済みの）グループや他セッションのグループには追記しない。
+        if self.grouping && self.group_open {
             match self.undo.last_mut() {
+                // 現在のセッションの開いたグループへ追記する
                 Some(group) => group.push(change),
-                None => self.undo.push(vec![change]),
+                // 防御: 開いたグループが無い（undo で pop された等）場合は新グループ
+                None => {
+                    self.undo.push(vec![change]);
+                    self.group_open = true;
+                }
             }
         } else {
             self.undo.push(vec![change]);
+            if self.grouping {
+                // 新しいグループを開始したので、以降の push はここに追記する
+                self.group_open = true;
+            }
         }
         self.redo.clear();
     }
 
-    /// 以降の [`History::push`] を同じ undo 単位にまとめる。
+    /// 新しい Insert セッションを開始する。以降の push は新しいグループに
+    /// まとまる（直前のグループには追記されない — ADR-0007）。
     pub fn begin_group(&mut self) {
         self.grouping = true;
+        self.group_open = false;
     }
 
-    /// グループ化を終了する。
+    /// Insert セッションを終了する。以降の push はグループにまとまらない。
     pub fn end_group(&mut self) {
         self.grouping = false;
+        self.group_open = false;
     }
 
     /// undo できる変更があるか。
@@ -94,6 +117,9 @@ impl History {
             .selection_before
             .clone();
         self.redo.push(group);
+        // 開いたグループが pop された場合、以降の push が古いグループに
+        // 追記されないよう閉じる（ADR-0007）。
+        self.group_open = false;
         Some((new_doc, selection))
     }
 
@@ -112,6 +138,8 @@ impl History {
             .selection_after
             .clone();
         self.undo.push(group);
+        // 復元されたグループに以降の push が追記されないよう閉じる（ADR-0007）。
+        self.group_open = false;
         Some((new_doc, selection))
     }
 }
@@ -223,6 +251,35 @@ mod tests {
         let (redone, redone_sel) = history.redo(&restored).expect("redo");
         assert_eq!(redone.text().to_string(), "heXYllo");
         assert_eq!(redone_sel, Selection::point(4));
+    }
+
+    #[test]
+    fn new_begin_group_starts_fresh_group() {
+        // ADR-0007: begin_group は直前のグループ（end_group 済み）に追記せず、
+        // 新しいグループを開始する。2回の Insert セッションは別々の undo 単位になる。
+        let doc = Document::from("");
+        let mut history = History::new();
+        let sel = Selection::point(0);
+
+        // セッション1: "a"
+        history.begin_group();
+        let (tx_a, after_a) = insert_change(&doc, &sel, "a");
+        let doc_a = tx_a.apply(&doc);
+        history.push(tx_a, sel.clone(), after_a.clone());
+        history.end_group();
+
+        // セッション2: "b"
+        history.begin_group();
+        let (tx_b, after_b) = insert_change(&doc_a, &after_a, "b");
+        let doc_b = tx_b.apply(&doc_a);
+        history.push(tx_b, after_a.clone(), after_b.clone());
+        history.end_group();
+
+        // undo 1回でセッション2だけが戻り、2回目でセッション1も戻る
+        let (back, _) = history.undo(&doc_b).expect("undo");
+        assert_eq!(back.text().to_string(), "a");
+        let (back2, _) = history.undo(&back).expect("undo 2");
+        assert_eq!(back2.text().to_string(), "");
     }
 
     #[test]
