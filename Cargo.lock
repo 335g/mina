@@ -104,6 +104,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mina-lsp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mina-protocol"
 version = "0.1.0"
 dependencies = [
@@ -118,6 +127,7 @@ dependencies = [
  "futures-lite",
  "libc",
  "mina-core",
+ "mina-lsp",
  "mina-protocol",
  "mina-view",
  "serde_json",
@@ -355,6 +365,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys",

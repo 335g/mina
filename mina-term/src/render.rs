@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use mina_protocol::{Mode, Range, StateSnapshot};
+use mina_protocol::{Diagnostic, Mode, Range, Severity, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthChar;
 
@@ -80,7 +80,14 @@ pub fn render_text(state: &StateSnapshot, pending: &[KeyEvent], width: u16, heig
                 let cs = lines
                     .char_start(line_idx)
                     .expect("byte_range があるなら char_start もある");
-                draw_line(&mut s, &state.text[bs..be], cs, &state.selection, width);
+                draw_line(
+                    &mut s,
+                    &state.text[bs..be],
+                    cs,
+                    &state.selection,
+                    &state.diagnostics,
+                    width,
+                );
             }
             None => s.push_str("\x1b[K"), // 行が無ければクリア
         }
@@ -112,27 +119,34 @@ pub fn draw(
     out.write_all(render_text(state, pending, width, height).as_bytes())
 }
 
-/// 1行分を描画する。選択範囲は反転表示、幅は表示幅（全角2）で切り詰める。
+/// 1行分を描画する。選択範囲は反転、診断範囲は下線。幅は表示幅（全角2）で切り詰める。
 fn draw_line(
     s: &mut String,
     line: &str,
     line_char_start: usize,
     selection: &[Range],
+    diagnostics: &[Diagnostic],
     width: usize,
 ) {
     let mut out_width = 0usize;
-    let mut highlighted = false;
+    let mut style = (false, false); // (選択中, 診断中)
     for (i, ch) in line.chars().enumerate() {
         let char_global = line_char_start + i;
         let in_sel = selection
             .iter()
             .any(|r| char_global >= r.anchor.min(r.head) && char_global < r.anchor.max(r.head));
-        if in_sel && !highlighted {
-            s.push_str("\x1b[7m"); // 反転開始
-            highlighted = true;
-        } else if !in_sel && highlighted {
-            s.push_str("\x1b[0m");
-            highlighted = false;
+        let in_diag = diagnostics
+            .iter()
+            .any(|d| char_global >= d.start && char_global < d.end);
+        let new_style = (in_sel, in_diag);
+        if new_style != style {
+            style = new_style;
+            match style {
+                (true, true) => s.push_str("\x1b[4;7m"), // 下線 + 反転
+                (true, false) => s.push_str("\x1b[7m"),
+                (false, true) => s.push_str("\x1b[4m"), // 下線
+                (false, false) => s.push_str("\x1b[0m"),
+            }
         }
         let w = ch.width().unwrap_or(0);
         if out_width + w > width {
@@ -141,7 +155,7 @@ fn draw_line(
         s.push(ch);
         out_width += w;
     }
-    if highlighted {
+    if style != (false, false) {
         s.push_str("\x1b[0m");
     }
     s.push_str("\x1b[K"); // 行末までクリア
@@ -181,6 +195,20 @@ fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], widt
     }
     if let Some(msg) = &state.status {
         status.push_str(&format!("  {msg}"));
+    }
+    // 診断カウント（ステータス行に載せる）
+    let errors = state
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let warnings = state
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
+    if errors > 0 || warnings > 0 {
+        status.push_str(&format!("  [{errors}E {warnings}W]"));
     }
     truncate_wide(&mut status, width);
     s.push_str(&status);
@@ -289,6 +317,29 @@ mod tests {
         let out = render_text(&state, &[], 40, 10);
         assert!(!out.contains("a\n"), "行内に生の改行を出さない: {out:?}");
         assert!(out.contains("\x1b[2;1H"), "2行目へ移動: {out:?}");
+    }
+
+    #[test]
+    fn diagnostics_get_underlined_and_counted() {
+        let state = StateSnapshot {
+            text: "hello world".into(),
+            selection: vec![Range { anchor: 0, head: 0 }],
+            primary_index: 0,
+            mode: Mode::Normal,
+            first_line: 0,
+            diagnostics: vec![mina_protocol::Diagnostic {
+                start: 6,
+                end: 11,
+                severity: mina_protocol::Severity::Error,
+                message: "oops".into(),
+            }],
+            path: None,
+            dirty: false,
+            status: None,
+        };
+        let out = render_text(&state, &[], 40, 10);
+        assert!(out.contains("\x1b[4mworld\x1b[0m"), "診断範囲に下線: {out:?}");
+        assert!(out.contains("[1E 0W]"), "ステータスにカウント: {out:?}");
     }
 
     fn plain(code: KeyCode) -> KeyEvent {

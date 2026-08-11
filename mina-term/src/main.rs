@@ -7,6 +7,7 @@
 mod client;
 mod daemon;
 mod keymap;
+mod lsp;
 mod render;
 
 #[tokio::main]

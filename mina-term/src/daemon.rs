@@ -9,18 +9,25 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mina_core::{Direction, Movement, Transaction, extend_selection, move_selection};
-use mina_protocol::{Command, GotoTarget, Mode, Range, StateSnapshot};
+use mina_core::{Transaction, extend_selection, move_selection};
+use mina_protocol::{Command, GotoTarget, Range, StateSnapshot};
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use crate::lsp;
+use crate::lsp::LspSession;
+
 /// daemon が保持する編集状態。
-struct Daemon {
-    editor: Editor,
+pub struct Daemon {
+    pub(crate) editor: Editor,
     /// クライアントから通知されるターミナル表示高さ（カーソル追従スクロール用）。
-    viewport_height: usize,
+    pub(crate) viewport_height: usize,
+    /// LSP セッション（初回 .rs オープン時に生成。以後は温かいまま保持）。
+    pub(crate) lsp: Option<LspSession>,
+    /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
+    pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
 }
 
 impl Daemon {
@@ -28,6 +35,8 @@ impl Daemon {
         Self {
             editor: Editor::new(),
             viewport_height: 24,
+            lsp: None,
+            diagnostics: Vec::new(),
         }
     }
 }
@@ -77,7 +86,30 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
             Command::Open { path } => {
                 let contents = tokio::fs::read_to_string(&path).await.ok();
                 let mut d = daemon.lock().await;
-                open_in_editor(&mut d, &path, contents)
+                let status = match &contents {
+                    Some(contents) => {
+                        d.editor.open_with_path(PathBuf::from(&path), contents);
+                        let height = d.viewport_height;
+                        d.editor.scroll_to_cursor(height);
+                        d.diagnostics.clear();
+                        // LSP 対応ファイルならセッションを確保して didOpen する
+                        let path_buf = PathBuf::from(&path);
+                        if lsp::server_for(&path_buf).is_some() {
+                            match lsp::ensure(&mut d, &path_buf).await {
+                                Ok(()) => {
+                                    lsp::open_document(&mut d, &path_buf, contents).await;
+                                    None
+                                }
+                                Err(msg) => Some(msg),
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => Some(format!("cannot open {path}")),
+                };
+                lsp::drain_into(&mut d);
+                snapshot(&d, status)
             }
             Command::Save => {
                 // 保存対象（テキストとパス）を取り出してから、ロック外で書き込む
@@ -105,7 +137,14 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
             }
             command => {
                 let mut d = daemon.lock().await;
-                apply(&mut d, command)
+                let is_edit = is_edit(&command);
+                apply(&mut d, command);
+                if is_edit {
+                    // 編集後は LSP へ全文同期し、診断を取り込む
+                    lsp::sync(&mut d).await;
+                }
+                lsp::drain_into(&mut d);
+                snapshot(&d, None)
             }
         };
         let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
@@ -116,7 +155,21 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
     }
 }
 
-/// ファイルを読み込んで Editor に開く（clean 状態で始まる）。
+/// 編集系コマンドか（LSP 全文同期の対象）。
+fn is_edit(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Insert { .. }
+            | Command::DeleteBackward
+            | Command::DeleteForward
+            | Command::DeleteRange
+            | Command::Undo
+            | Command::Redo
+    )
+}
+
+/// ファイルを読み込んで Editor に開く（clean 状態で始まる）。テスト用。
+#[cfg(test)]
 fn open_in_editor(daemon: &mut Daemon, path: &str, contents: Option<String>) -> StateSnapshot {
     match contents {
         Some(contents) => {
@@ -265,7 +318,7 @@ fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
         primary_index: selection.primary_index(),
         mode: convert_mode_back(editor.mode()),
         first_line: editor.first_line(),
-        diagnostics: Vec::new(),
+        diagnostics: daemon.diagnostics.clone(),
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
         dirty: editor.is_dirty(),
         status,
