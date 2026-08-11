@@ -1,0 +1,151 @@
+{
+  "runId": "8ad5f482",
+  "agent": "researcher",
+  "task": "Fact-check three things for a Helix-style Rust editor (termina 0.3 + possible tokio): (1) Which popular LSP language servers support non-stdio transports (unix socket or TCP) in addition to stdio? Check specifically: rust-analyzer, typescript-language-server, clangd, pyright/pylsp, gopls. For each state the transport options (e.g. rust-analyzer --socket/--port?). (2) Does termina (helix-editor/termina, 0.3.x) have any async/tokio integration (event-stream feature, async reader), or is it strictly synchronous poll/read? (3) How does Helix bridge termina's synchronous event reading into its tokio event loop (helix-term/src/application.rs) — briefly, what mechanism (blocking task + channel, spawn_blocking, etc.)? Cite primary sources (GitHub, docs.rs, crates.io). Keep the brief under 400 words, bullet format.\n\n---\n**Output:**\nWrite your findings to exactly this path: /Users/335g/dev/other/mina/.pi-subagents/artifacts/outputs/8ad5f482/research.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
+  "exitCode": 0,
+  "usage": {
+    "input": 41952,
+    "output": 15033,
+    "cacheRead": 643840,
+    "cacheWrite": 0,
+    "cost": 0.0059426359999999985,
+    "turns": 19
+  },
+  "model": "opencode-go/deepseek-v4-flash:medium",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:medium"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:medium",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 41952,
+        "output": 15033,
+        "cacheRead": 643840,
+        "cacheWrite": 0,
+        "cost": 0.0059426359999999985,
+        "turns": 19
+      }
+    }
+  ],
+  "durationMs": 338231,
+  "toolCount": 35,
+  "launchContractDigest": "303ba22239d258444387302fd96c85bdf2ca5438c052aa920976b7796d9e45cb",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Concrete findings with file paths and severity: (1) rust-analyzer stdio-only — crates/rust-analyzer/src/cli/flags.rs (lsp-server subcommand: only --version/--print-config-schema), open feature request issue #14473; ts-ls stdio-only — src/cli.ts (.requiredOption('--stdio')); clangd stdio/XPC-only — tool/ClangdMain.cpp (newJSONTransport(stdin, llvm::outs()) unless CLANGD_AS_XPC_SERVICE); pyright --socket inverted semantics — microsoft/pyright#3932; pylsp --tcp/--ws — pylsp(1) manpage; gopls -listen/-remote TCP + unix; sockets — gopls/doc/daemon.md. (2) termina 0.3.x: sync EventReader + event-stream feature (Cargo.toml: dep:futures-core) exposing EventStream in src/event/stream.rs (helper thread + PlatformWaker + mpsc task channel; no tokio dep). (3) Helix: helix-term/src/application.rs event_stream() -> termina::EventStream::new(reader, filter); event_loop_until_idle() consumes input_stream.next() inside tokio::select!; no spawn_blocking; workspace pins termina = \"0.3\"."
+        }
+      ],
+      "changedFiles": [
+        ".pi-subagents/artifacts/outputs/8ad5f482/research.md"
+      ],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "web_search (3 passes, 12 queries across LSP transports / termina async / helix bridge)",
+          "result": "passed",
+          "summary": "Located primary sources for all 5 LSP servers, termina features, and helix application.rs"
+        },
+        {
+          "command": "fetch_content (raw GitHub sources: flags.rs, cli.ts, ClangdMain.cpp, daemon.md, termina Cargo.toml/event.rs/stream.rs, helix application.rs/main.rs/Cargo.toml, pyright issue #3932)",
+          "result": "passed",
+          "summary": "Confirmed CLI flags and bridge mechanism directly from source; 2 pyright entry-point paths 404'd but issue #3932 sufficed"
+        },
+        {
+          "command": "read (local clones: helix Cargo.toml, helix-tui/Cargo.toml)",
+          "result": "passed",
+          "summary": "Confirmed helix workspace pins termina = \"0.3\""
+        }
+      ],
+      "validationOutput": [
+        "Brief is 6,096 bytes (~430 words incl. headers/sources, body under 400 words), bullet format, all findings cited to primary sources; 3 known gaps documented in Gaps section"
+      ],
+      "residualRisks": [
+        "ts-ls history of when --socket was removed not verified (current master cli.ts is authoritative: stdio only)",
+        "pyright-langserver current flag list not confirmed from its source (entry file moved/404); relied on issue #3932 + vscode-languageserver semantics",
+        "Some distro forks patch clangd with TCP; official LLVM builds verified stdio/XPC only"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Wrote research brief (LSP transports, termina async, Helix event bridge) to .pi-subagents/artifacts/outputs/8ad5f482/research.md",
+      "reviewFindings": [
+        "no blockers; key correction vs. common assumption: official typescript-language-server is stdio-only (--socket belongs to the prabirshrestha fork), and pyright's --socket is client-listens/server-connects, not a listen socket"
+      ],
+      "manualNotes": "Artifact written in English per research-brief convention; primary sources cited inline. No coordination needed; task complete."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi-subagents/artifacts/8ad5f482_researcher_0_transcript.jsonl",
+  "timestamp": 1786454273792
+}
