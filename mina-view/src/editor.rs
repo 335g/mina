@@ -1,4 +1,4 @@
-//! エディタ状態: 文書の集合・アクティブな View・モード・履歴。
+//! エディタ状態: 文書の集合・View の分割ツリー・モード・履歴。
 
 use std::collections::BTreeMap;
 
@@ -6,16 +6,20 @@ use mina_core::{Document, Selection, Transaction};
 
 use crate::Mode;
 use crate::history::History;
+use crate::tree::{SplitDirection, Tree, ViewId};
 
 /// 文書を一意に識別する ID。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DocumentId(pub usize);
 
-/// 1つの表示領域（将来のスプリット1つ分）を表す。
+/// 1つの表示領域（スプリット1つ分）を表す。
 ///
-/// どの文書を表示しているか、その文書でのアクティブな選択、そして
-/// 表示範囲の先頭行（viewport）を保持する。viewport の高さ（行数）は
-/// ターミナルが描画時に渡すので、ここには「先頭行」だけを持つ。
+/// どの文書を表示しているか、その文書でのアクティブな選択、そして表示範囲の
+/// 先頭行（viewport）を保持する。viewport の高さ（行数）はターミナルが描画時に
+/// 渡すので、ここには「先頭行」だけを持つ。
+///
+/// 1つの文書を複数の View で表示できる。選択は文書ではなく View ごとに持つ
+/// （`docs/adr/0002-functional-core-selection.md` 参照）。
 #[derive(Clone, Debug)]
 pub struct View {
     pub doc: DocumentId,
@@ -25,50 +29,56 @@ pub struct View {
 
 /// エディタのグローバル状態。
 ///
-/// 関数型コアの「現在の状態」を保持する imperative shell。コアの変換は
-/// トランザクションとして [`Editor::apply`] に渡し、文書・選択・履歴を
-/// 更新する。
+/// 関数型コアの「現在の状態」を保持する imperative shell。文書の集合・View の
+/// 分割ツリー・フォーカス・モード・履歴を持つ。コアの変換はトランザクション
+/// として [`Editor::apply`] に渡し、フォーカス中の View の文書と選択を更新する。
 #[derive(Clone, Debug)]
 pub struct Editor {
     documents: BTreeMap<DocumentId, Document>,
     histories: BTreeMap<DocumentId, History>,
     next_document_id: usize,
-    view: View,
+    views: Vec<Option<View>>,
+    next_view_id: usize,
+    tree: Tree,
     mode: Mode,
 }
 
 impl Editor {
-    /// 空のスクラッチ文書を1つ持つエディタを作る。
+    /// 空のスクラッチ文書と1つの View を持つエディタを作る。
     pub fn new() -> Self {
         let scratch = DocumentId(0);
         let mut editor = Self {
             documents: BTreeMap::new(),
             histories: BTreeMap::new(),
             next_document_id: 1,
-            view: View {
-                doc: scratch,
-                selection: Selection::point(0),
-                first_line: 0,
-            },
+            views: Vec::new(),
+            next_view_id: 1,
+            tree: Tree::new(ViewId(0)),
             mode: Mode::Normal,
         };
         editor.documents.insert(scratch, Document::new());
         editor.histories.insert(scratch, History::new());
+        editor.views.push(Some(View {
+            doc: scratch,
+            selection: Selection::point(0),
+            first_line: 0,
+        }));
         editor
     }
 
     /// `doc` を開き、新しい文書 ID を返す。
     ///
-    /// 単一 View のため、View は開いた文書へ移動する（分割表示は Tree の
-    /// 導入時に対応する）。履歴は文書ごとに独立して持つ。
+    /// フォーカス中の View が開いた文書へ移動する。履歴は文書ごとに独立して
+    /// 持つ。
     pub fn open(&mut self, doc: Document) -> DocumentId {
         let id = DocumentId(self.next_document_id);
         self.next_document_id += 1;
         self.documents.insert(id, doc);
         self.histories.insert(id, History::new());
-        self.view.doc = id;
-        self.view.selection = Selection::point(0);
-        self.view.first_line = 0;
+        let view = self.view_mut();
+        view.doc = id;
+        view.selection = Selection::point(0);
+        view.first_line = 0;
         id
     }
 
@@ -81,24 +91,46 @@ impl Editor {
         &self.documents[&id]
     }
 
-    /// アクティブな View が表示している文書。
+    /// フォーカス中の View が表示している文書。
     pub fn current_document(&self) -> &Document {
-        self.document(self.view.doc)
+        let doc_id = self.view().doc;
+        self.document(doc_id)
     }
 
-    /// アクティブな View。
+    /// フォーカス中の View。
     pub fn view(&self) -> &View {
-        &self.view
+        self.views[self.tree.focused().0]
+            .as_ref()
+            .expect("フォーカス中の View が存在しない")
     }
 
-    /// 現在の選択。
+    /// View を ID で取得する。
+    ///
+    /// # Panics
+    ///
+    /// 存在しない ID の場合に panic する。
+    pub fn view_by_id(&self, id: ViewId) -> &View {
+        self.views[id.0].as_ref().expect("View が存在しない")
+    }
+
+    /// フォーカス中の View の ID。
+    pub fn focused_view_id(&self) -> ViewId {
+        self.tree.focused()
+    }
+
+    /// ツリー上の View の数。
+    pub fn view_count(&self) -> usize {
+        self.tree.views_in_order().len()
+    }
+
+    /// 現在の選択（フォーカス中の View）。
     pub fn selection(&self) -> Selection {
-        self.view.selection.clone()
+        self.view().selection.clone()
     }
 
-    /// 現在の選択を置き換える。
+    /// 現在の選択を置き換える（フォーカス中の View）。
     pub fn set_selection(&mut self, selection: Selection) {
-        self.view.selection = selection;
+        self.view_mut().selection = selection;
     }
 
     /// 現在のモード。
@@ -111,7 +143,59 @@ impl Editor {
         self.mode = mode;
     }
 
-    /// トランザクションを現在の文書に適用し、履歴に記録する。
+    /// フォーカス中の View を `direction` に分割する。
+    ///
+    /// 新しい View は現在の View の文書・選択・先頭行を引き継ぎ（選択は
+    /// 独立した値としてコピー）、フォーカスは新 View へ移る。新しい View の
+    /// ID を返す。
+    pub fn split(&mut self, direction: SplitDirection) -> ViewId {
+        let focused = self.tree.focused();
+        let new_view = {
+            let view = self.view();
+            View {
+                doc: view.doc,
+                selection: view.selection.clone(),
+                first_line: view.first_line,
+            }
+        };
+        let id = ViewId(self.next_view_id);
+        self.next_view_id += 1;
+        self.views.push(Some(new_view));
+        self.tree.split(focused, direction, id);
+        id
+    }
+
+    /// フォーカスを次の View へ（表示順に循環）。
+    pub fn focus_next(&mut self) {
+        self.tree.focus_next();
+    }
+
+    /// フォーカスを前の View へ（表示順に循環）。
+    pub fn focus_prev(&mut self) {
+        self.tree.focus_prev();
+    }
+
+    /// フォーカス中の View を閉じる。最後の1つの場合は何もしない。
+    ///
+    /// 閉じた View のあった位置に近い View（表示順で次）へフォーカスを移す。
+    pub fn close_view(&mut self) {
+        let focused = self.tree.focused();
+        let order = self.tree.views_in_order();
+        if order.len() <= 1 {
+            return;
+        }
+        let idx = order
+            .iter()
+            .position(|v| *v == focused)
+            .expect("フォーカス中の View がツリーにある");
+        if self.tree.remove(focused) {
+            self.views[focused.0] = None;
+        }
+        let new_order = self.tree.views_in_order();
+        self.tree.set_focused(new_order[idx % new_order.len()]);
+    }
+
+    /// トランザクションをフォーカス中の View の文書に適用し、履歴に記録する。
     ///
     /// `selection_after` は適用後の選択（挿入なら挿入テキストの後ろ、削除なら
     /// 削除開始点）。redo 時にここへ戻る。例:
@@ -130,43 +214,43 @@ impl Editor {
     /// assert!(editor.current_document().is_empty());
     /// ```
     pub fn apply(&mut self, transaction: Transaction, selection_after: Selection) {
-        let doc_id = self.view.doc;
+        let doc_id = self.view().doc;
         let old_doc = self.documents[&doc_id].clone();
-        let selection_before = self.view.selection.clone();
+        let selection_before = self.view().selection.clone();
         let new_doc = transaction.apply(&old_doc);
         self.history_mut()
             .push(transaction, selection_before, selection_after.clone());
         self.documents.insert(doc_id, new_doc);
-        self.view.selection = selection_after;
+        self.view_mut().selection = selection_after;
     }
 
-    /// 現在の文書について undo できる変更があるか。
+    /// フォーカス中の View の文書について undo できる変更があるか。
     pub fn can_undo(&self) -> bool {
         self.history().can_undo()
     }
 
-    /// 現在の文書について redo できる変更があるか。
+    /// フォーカス中の View の文書について redo できる変更があるか。
     pub fn can_redo(&self) -> bool {
         self.history().can_redo()
     }
 
-    /// 現在の文書の直近の変更グループを元に戻す。
+    /// フォーカス中の View の文書の直近の変更グループを元に戻す。
     pub fn undo(&mut self) {
-        let doc_id = self.view.doc;
+        let doc_id = self.view().doc;
         let old_doc = self.documents[&doc_id].clone();
         if let Some((new_doc, selection)) = self.history_mut().undo(&old_doc) {
             self.documents.insert(doc_id, new_doc);
-            self.view.selection = selection;
+            self.view_mut().selection = selection;
         }
     }
 
     /// 直近に undo された変更グループをやり直す。
     pub fn redo(&mut self) {
-        let doc_id = self.view.doc;
+        let doc_id = self.view().doc;
         let old_doc = self.documents[&doc_id].clone();
         if let Some((new_doc, selection)) = self.history_mut().redo(&old_doc) {
             self.documents.insert(doc_id, new_doc);
-            self.view.selection = selection;
+            self.view_mut().selection = selection;
         }
     }
 
@@ -183,7 +267,7 @@ impl Editor {
 
     /// 表示範囲の先頭行（viewport の上端）。
     pub fn first_line(&self) -> usize {
-        self.view.first_line
+        self.view().first_line
     }
 
     /// カーソルが見えるように viewport をスクロールする。
@@ -196,12 +280,12 @@ impl Editor {
         let cursor_line = self
             .current_document()
             .text()
-            .char_to_line(self.view.selection.primary().head());
-        let first = self.view.first_line;
+            .char_to_line(self.view().selection.primary().head());
+        let first = self.view().first_line;
         if cursor_line < first {
-            self.view.first_line = cursor_line;
+            self.view_mut().first_line = cursor_line;
         } else if height > 0 && cursor_line >= first + height {
-            self.view.first_line = cursor_line - height + 1;
+            self.view_mut().first_line = cursor_line - height + 1;
         }
     }
 
@@ -210,8 +294,8 @@ impl Editor {
     /// 先頭行は文書の範囲内 `[0, 最終行]` にクランプされる。
     pub fn scroll_lines(&mut self, amount: isize) {
         let max = self.current_document().text().len_lines().saturating_sub(1);
-        let first = self.view.first_line as isize + amount;
-        self.view.first_line = first.clamp(0, max as isize) as usize;
+        let first = self.view().first_line as isize + amount;
+        self.view_mut().first_line = first.clamp(0, max as isize) as usize;
     }
 
     /// 表示範囲を `pages` ページ分スクロールする（1ページ = `height` 行）。
@@ -219,13 +303,20 @@ impl Editor {
         self.scroll_lines(pages.saturating_mul(height as isize));
     }
 
+    fn view_mut(&mut self) -> &mut View {
+        self.views[self.tree.focused().0]
+            .as_mut()
+            .expect("フォーカス中の View が存在しない")
+    }
+
     fn history(&self) -> &History {
-        &self.histories[&self.view.doc]
+        &self.histories[&self.view().doc]
     }
 
     fn history_mut(&mut self) -> &mut History {
+        let doc_id = self.view().doc;
         self.histories
-            .get_mut(&self.view.doc)
+            .get_mut(&doc_id)
             .expect("ビューが指す文書の履歴が存在しない")
     }
 }
@@ -246,6 +337,7 @@ mod tests {
         let editor = Editor::new();
         assert_eq!(editor.mode(), Mode::Normal);
         assert_eq!(editor.view().doc, DocumentId(0));
+        assert_eq!(editor.view_count(), 1);
         assert!(editor.current_document().is_empty());
         assert_eq!(editor.selection(), Selection::point(0));
         assert!(!editor.can_undo());
@@ -253,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn open_switches_view_to_new_document() {
+    fn open_switches_focused_view_to_new_document() {
         let mut editor = Editor::new();
         let id = editor.open(Document::from("hello"));
         assert_eq!(editor.view().doc, id);
@@ -285,21 +377,6 @@ mod tests {
         editor.redo();
         assert_eq!(editor.current_document().text().to_string(), "heXYllo");
         assert_eq!(editor.selection(), Selection::point(4));
-    }
-
-    #[test]
-    fn apply_only_touches_the_view_document() {
-        let mut editor = Editor::new();
-        editor.open(Document::from("aaa"));
-        editor.open(Document::from("bbb"));
-        let selection = Selection::point(0);
-        let tx = Transaction::insert(editor.current_document(), &selection, "!");
-        let selection_after = tx.map_selection(&selection, true);
-        editor.apply(tx, selection_after);
-
-        // 現在の文書だけが変わり、以前に開いた文書は無傷
-        assert_eq!(editor.current_document().text().to_string(), "!bbb");
-        assert_eq!(editor.document(DocumentId(1)).text().to_string(), "aaa");
     }
 
     #[test]
@@ -486,5 +563,112 @@ mod tests {
         // 9回下がって最終行。高さ3なので first_line は 7
         assert_eq!(editor.first_line(), 7);
         assert_eq!(editor.selection(), Selection::point(27));
+    }
+
+    // --- 分割表示 ---
+
+    #[test]
+    fn split_creates_second_view_sharing_document() {
+        let mut editor = Editor::new();
+        let doc_id = editor.open(Document::from("hello"));
+        let first = editor.focused_view_id();
+        let second = editor.split(SplitDirection::Vertical);
+
+        assert_eq!(editor.view_count(), 2);
+        assert_eq!(editor.focused_view_id(), second);
+        // 同じ文書・同じ選択を引き継ぐ
+        assert_eq!(editor.view_by_id(first).doc, doc_id);
+        assert_eq!(editor.view_by_id(second).doc, doc_id);
+        assert_eq!(
+            editor.view_by_id(first).selection,
+            editor.view_by_id(second).selection
+        );
+    }
+
+    #[test]
+    fn split_same_direction_stays_flat_and_focus_cycles() {
+        let mut editor = Editor::new();
+        editor.open(Document::from("hello"));
+        let first = editor.focused_view_id();
+        let second = editor.split(SplitDirection::Vertical);
+        let third = editor.split(SplitDirection::Vertical);
+        assert_eq!(editor.view_count(), 3);
+
+        // フォーカスは新 View → 前へ戻る → 循環
+        assert_eq!(editor.focused_view_id(), third);
+        editor.focus_prev();
+        assert_eq!(editor.focused_view_id(), second);
+        editor.focus_prev();
+        assert_eq!(editor.focused_view_id(), first);
+        editor.focus_prev();
+        assert_eq!(editor.focused_view_id(), third); // 先頭から末尾へ循環
+        editor.focus_next();
+        assert_eq!(editor.focused_view_id(), first); // 末尾から先頭へ循環
+    }
+
+    #[test]
+    fn views_keep_independent_selections() {
+        // ADR-0002 の本領: 同じ文書を表示していても選択は View ごとに独立
+        let mut editor = Editor::new();
+        editor.open(Document::from("hello"));
+        let first = editor.focused_view_id();
+        let second = editor.split(SplitDirection::Vertical);
+
+        editor.set_selection(Selection::point(2)); // 2番目の View で移動
+        assert_eq!(editor.view_by_id(second).selection, Selection::point(2));
+
+        editor.focus_prev();
+        assert_eq!(editor.focused_view_id(), first);
+        assert_eq!(editor.selection(), Selection::point(0)); // 1番目は無傷
+    }
+
+    #[test]
+    fn edit_in_one_view_affects_shared_document_only_via_focused_view() {
+        let mut editor = Editor::new();
+        editor.open(Document::from("hello"));
+        let first = editor.focused_view_id();
+        let second = editor.split(SplitDirection::Vertical);
+
+        // 2番目の View で挿入
+        editor.set_selection(Selection::point(2));
+        let selection = editor.selection();
+        let tx = Transaction::insert(editor.current_document(), &selection, "X");
+        let selection_after = tx.map_selection(&selection, true);
+        editor.apply(tx, selection_after);
+        assert_eq!(editor.current_document().text().to_string(), "heXllo");
+        assert_eq!(editor.view_by_id(second).selection, Selection::point(3));
+
+        // 1番目の View の選択は無傷（文書は共有なのでテキストは変わる）
+        editor.focus_prev();
+        assert_eq!(editor.view_by_id(first).selection, Selection::point(0));
+        assert_eq!(editor.current_document().text().to_string(), "heXllo");
+    }
+
+    #[test]
+    fn close_view_collapses_and_moves_focus() {
+        let mut editor = Editor::new();
+        editor.open(Document::from("hello"));
+        let first = editor.focused_view_id();
+        let _second = editor.split(SplitDirection::Vertical);
+        let third = editor.split(SplitDirection::Vertical);
+        assert_eq!(editor.view_count(), 3);
+
+        // 3番目を閉じる → 2つになり、フォーカスは次の位置へ
+        editor.close_view();
+        assert_eq!(editor.view_count(), 2);
+        assert!(editor.focused_view_id() != third);
+        assert_eq!(editor.focused_view_id(), first); // 表示順の次（循環）
+
+        // 2つを閉じて1つに
+        editor.close_view();
+        assert_eq!(editor.view_count(), 1);
+        editor.close_view(); // 最後の1つは閉じない
+        assert_eq!(editor.view_count(), 1);
+
+        // 折りたたまれて View 1つになっても、再分割できる
+        let again = editor.split(SplitDirection::Horizontal);
+        assert_eq!(editor.view_count(), 2);
+        assert_eq!(editor.focused_view_id(), again);
+        assert_ne!(editor.focused_view_id(), first);
     }
 }
