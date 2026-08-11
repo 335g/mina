@@ -20,6 +20,10 @@ _Avoid_: cursor, span
 The unit of change applied to a Document. Designed so it can be inverted to support undo.
 _Avoid_: edit, change, operation
 
+**UndoGroup**:
+The unit of undo/redo: a set of Transactions reverted together by one undo. One Insert session is one UndoGroup — it opens on entering Insert mode and closes on leaving Insert (to Normal or Select) or when the owning Client disconnects.
+_Avoid_: change, edit
+
 **Mode**:
 The active editing mode — Normal, Insert, or Select. Determines which Keymap resolves key presses.
 _Avoid_: state
