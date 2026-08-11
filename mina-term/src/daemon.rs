@@ -123,11 +123,12 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
                 snapshot(&d, status)
             }
             Command::Save => {
-                // 保存対象（テキストとパス）を取り出してから、ロック外で書き込む
-                let (text, path) = {
+                // 保存対象（テキスト・パス・文書 ID）を取り出してから、ロック外で書き込む
+                let (text, path, doc_id) = {
                     let d = daemon.lock().await;
                     let text = d.editor.current_document().text().to_string();
-                    (text, d.editor.focused_path().map(Path::to_path_buf))
+                    let doc_id = d.editor.focused_doc_id();
+                    (text, d.editor.focused_path().map(Path::to_path_buf), doc_id)
                 };
                 let write_result = match &path {
                     Some(p) => tokio::fs::write(p, text.as_bytes()).await,
@@ -136,7 +137,9 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
                 let mut d = daemon.lock().await;
                 match write_result {
                     Ok(()) => {
-                        d.editor.mark_saved();
+                        // 保存した文書そのものの dirty を消す（H3: 書き込み中に他接続が
+                        // Open してフォーカスが変わっても、保存対象の文書を正しく扱う）。
+                        d.editor.mark_saved_doc(doc_id);
                         let shown = path
                             .as_ref()
                             .expect("書き込み成功ならパスはある")
@@ -554,18 +557,53 @@ mod tests {
         apply(&mut d, Command::Insert { text: " world".into() });
 
         // Save は接続ハンドラ相当のロジック（テストでは直接実行）
-        let (text, p) = {
+        let (text, p, doc_id) = {
             let text = d.editor.current_document().text().to_string();
-            (text, d.editor.focused_path().map(Path::to_path_buf))
+            (text, d.editor.focused_path().map(Path::to_path_buf), d.editor.focused_doc_id())
         };
         let p = p.expect("パスがある");
         std::fs::write(&p, text.as_bytes()).unwrap();
-        d.editor.mark_saved();
+        d.editor.mark_saved_doc(doc_id);
         let s = snapshot(&d, Some("saved".into()));
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
         assert!(!s.dirty);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_marks_the_saved_doc_not_the_current_focus() {
+        // H3: Save の書き込み中に他接続が Open するとフォーカスが変わる。
+        // 保存した文書（保存開始時点の ID）の dirty を消し、新フォーカスの
+        // dirty（未保存編集）は残す — 修正前は新フォーカス文書の dirty まで
+        // 消えて「保存済み」誤認（データ損失）につながった。
+        let dir = std::env::temp_dir();
+        let path_a = dir.join(format!("mina-h3-a-{}.txt", std::process::id()));
+        let path_b = dir.join(format!("mina-h3-b-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+        let path_a_str = path_a.to_string_lossy().into_owned();
+        let path_b_str = path_b.to_string_lossy().into_owned();
+
+        let mut d = daemon();
+        // A を開いて編集（dirty）
+        open_path(&mut d, &path_a_str, "hello");
+        apply(&mut d, Command::Insert { text: " X".into() });
+        // Save の保存対象を捕捉（接続ハンドラのロック解放前の処理に相当）
+        let doc_id_a = d.editor.focused_doc_id();
+        let text_a = d.editor.current_document().text().to_string();
+        // 書き込み中に他接続が B を開いて編集（フォーカスが B に移動）
+        open_path(&mut d, &path_b_str, "world");
+        apply(&mut d, Command::Insert { text: " Y".into() });
+        // 書き込み完了 → 保存した文書 A の dirty を消す
+        std::fs::write(&path_a, text_a.as_bytes()).unwrap();
+        d.editor.mark_saved_doc(doc_id_a);
+
+        // スナップショットはフォーカス（B）の状態: B の未保存編集は dirty のまま
+        let s = snapshot(&d, Some("saved".into()));
+        assert!(s.dirty, "B の未保存編集が保存済み扱いにならない: {}", s.dirty);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
     }
 
     #[test]
