@@ -13,12 +13,14 @@ pub struct DocumentId(pub usize);
 
 /// 1つの表示領域（将来のスプリット1つ分）を表す。
 ///
-/// どの文書を表示しているかと、その文書でのアクティブな選択を保持する。
-/// スクロール位置（viewport）はターミナル描画の段階で追加する。
+/// どの文書を表示しているか、その文書でのアクティブな選択、そして
+/// 表示範囲の先頭行（viewport）を保持する。viewport の高さ（行数）は
+/// ターミナルが描画時に渡すので、ここには「先頭行」だけを持つ。
 #[derive(Clone, Debug)]
 pub struct View {
     pub doc: DocumentId,
     pub selection: Selection,
+    pub first_line: usize,
 }
 
 /// エディタのグローバル状態。
@@ -46,6 +48,7 @@ impl Editor {
             view: View {
                 doc: scratch,
                 selection: Selection::point(0),
+                first_line: 0,
             },
             mode: Mode::Normal,
         };
@@ -65,6 +68,7 @@ impl Editor {
         self.histories.insert(id, History::new());
         self.view.doc = id;
         self.view.selection = Selection::point(0);
+        self.view.first_line = 0;
         id
     }
 
@@ -175,6 +179,44 @@ impl Editor {
     /// グループ化を終了する。
     pub fn end_group(&mut self) {
         self.history_mut().end_group();
+    }
+
+    /// 表示範囲の先頭行（viewport の上端）。
+    pub fn first_line(&self) -> usize {
+        self.view.first_line
+    }
+
+    /// カーソルが見えるように viewport をスクロールする。
+    ///
+    /// カーソルが viewport の上に出ていれば上端をカーソル行に合わせ、
+    /// 下に出ていれば下端（`first_line + height - 1`）がカーソル行になるように
+    /// 合わせる。`height` はターミナルの表示行数。カーソル移動・編集の後に
+    /// 呼ぶこと（自動ではスクロールしない）。カーソル位置は primary の head。
+    pub fn scroll_to_cursor(&mut self, height: usize) {
+        let cursor_line = self
+            .current_document()
+            .text()
+            .char_to_line(self.view.selection.primary().head());
+        let first = self.view.first_line;
+        if cursor_line < first {
+            self.view.first_line = cursor_line;
+        } else if height > 0 && cursor_line >= first + height {
+            self.view.first_line = cursor_line - height + 1;
+        }
+    }
+
+    /// 表示範囲を `amount` 行分スクロールする（正で下、負で上）。
+    ///
+    /// 先頭行は文書の範囲内 `[0, 最終行]` にクランプされる。
+    pub fn scroll_lines(&mut self, amount: isize) {
+        let max = self.current_document().text().len_lines().saturating_sub(1);
+        let first = self.view.first_line as isize + amount;
+        self.view.first_line = first.clamp(0, max as isize) as usize;
+    }
+
+    /// 表示範囲を `pages` ページ分スクロールする（1ページ = `height` 行）。
+    pub fn scroll_pages(&mut self, pages: isize, height: usize) {
+        self.scroll_lines(pages.saturating_mul(height as isize));
     }
 
     fn history(&self) -> &History {
@@ -357,5 +399,92 @@ mod tests {
         editor.undo();
         assert_eq!(editor.current_document().text().to_string(), "bbb");
         assert!(!editor.can_undo());
+    }
+
+    /// 10行の文書（行 i は char 位置 3i から始まる）。
+    fn ten_line_document() -> Document {
+        Document::from("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9")
+    }
+
+    #[test]
+    fn scroll_to_cursor_keeps_cursor_visible() {
+        let mut editor = Editor::new();
+        editor.open(ten_line_document());
+
+        // カーソルが viewport 内なら動かない
+        editor.set_selection(Selection::point(6)); // 2行目
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 0);
+
+        // カーソルが viewport の下に出ている → 下端がカーソル行になる
+        editor.set_selection(Selection::point(21)); // 7行目
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 3);
+
+        // カーソルが viewport の上に出ている → 上端がカーソル行になる
+        editor.set_selection(Selection::point(21)); // 7行目
+        editor.scroll_to_cursor(5); // 下端基準で first_line = 3
+        editor.set_selection(Selection::point(3)); // 1行目
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 1);
+
+        // 最終行でスクロールするとカーソルが下端に来る
+        editor.set_selection(Selection::point(27)); // 9行目
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 5);
+    }
+
+    #[test]
+    fn scroll_lines_clamps_to_document() {
+        let mut editor = Editor::new();
+        editor.open(ten_line_document());
+
+        editor.scroll_lines(3);
+        assert_eq!(editor.first_line(), 3);
+        editor.scroll_lines(-5);
+        assert_eq!(editor.first_line(), 0); // 上端でクランプ
+        editor.scroll_lines(100);
+        assert_eq!(editor.first_line(), 9); // 最終行でクランプ
+    }
+
+    #[test]
+    fn scroll_pages_moves_by_height() {
+        let mut editor = Editor::new();
+        editor.open(ten_line_document());
+
+        editor.scroll_pages(1, 5);
+        assert_eq!(editor.first_line(), 5);
+        editor.scroll_pages(1, 5);
+        assert_eq!(editor.first_line(), 9); // クランプ
+        editor.scroll_pages(-2, 5);
+        assert_eq!(editor.first_line(), 0);
+    }
+
+    #[test]
+    fn scroll_on_empty_document_is_noop() {
+        let mut editor = Editor::new();
+        editor.scroll_lines(5);
+        assert_eq!(editor.first_line(), 0);
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 0);
+    }
+
+    #[test]
+    fn cursor_movement_followed_by_scroll_to_cursor() {
+        use mina_core::{Direction, Movement, move_selection};
+
+        // 移動のたびに scroll_to_cursor を呼ぶのがターミナル層の役割
+        let mut editor = Editor::new();
+        editor.open(ten_line_document());
+        for _ in 0..9 {
+            let doc = editor.current_document();
+            let selection = editor.selection();
+            let moved = move_selection(doc, &selection, Movement::Line, Direction::Forward);
+            editor.set_selection(moved);
+            editor.scroll_to_cursor(3);
+        }
+        // 9回下がって最終行。高さ3なので first_line は 7
+        assert_eq!(editor.first_line(), 7);
+        assert_eq!(editor.selection(), Selection::point(27));
     }
 }
