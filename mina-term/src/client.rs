@@ -116,8 +116,8 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// コマンドを送り、応答スナップショットを1つ受け取る。
-async fn request(
+/// コマンドを送り、応答スナップショットを1つ受け取る。TUI と session CLI の両方から使う。
+pub(crate) async fn request(
     write_half: &mut OwnedWriteHalf,
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     command: Command,
@@ -133,14 +133,14 @@ async fn request(
     })
 }
 
-/// daemon が動いていなければ自動起動し、socket が現れるまで待つ。
+/// daemon が動いていなければ自動起動し、socket が現れるまで待つ。TUI と session CLI の両方から使う。
 ///
 /// 競合: 同時に2つのクライアントが spawn した場合、片方の daemon が bind に
 /// 失敗して終了する（v1 の割り切り）。
 ///
 /// ponytail: 起動確認は50×50ms のポーリング。遅い環境で起動が遅れたら
 /// 回数を増やすか、daemon 側の ready 通知を導入する。
-async fn ensure_daemon(path: &Path) -> std::io::Result<()> {
+pub(crate) async fn ensure_daemon(path: &Path) -> std::io::Result<()> {
     if UnixStream::connect(path).await.is_ok() {
         return Ok(());
     }
