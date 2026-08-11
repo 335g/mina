@@ -12,12 +12,25 @@ use std::sync::Arc;
 use mina_core::{Transaction, extend_selection, move_selection};
 use mina_protocol::{Command, GotoTarget, Range, StateSnapshot};
 use mina_view::Editor;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::lsp;
 use crate::lsp::LspSession;
+
+/// Open で受け入れる最大ファイルサイズ（ADR-0008）。
+///
+/// v1 は毎コマンド全文スナップショット + LSP 全文同期のため、これを超える
+/// ファイルは実用外。非正規ファイル（/dev/zero 等の無限ストリーム・FIFO・
+/// ディレクトリ）の無制限読み込みによる OOM もこの検証で防ぐ（SEC-1）。
+const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// NDJSON 1コマンド行の最大バイト数。
+///
+/// 改行のない無限ストリームで daemon が OOM しないよう、超過する行は
+/// 接続を閉じる（SEC-1）。
+const MAX_CMD_LINE: usize = 1024 * 1024;
 
 /// daemon が保持する編集状態。
 pub struct Daemon {
@@ -83,10 +96,19 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
     let mut reader = BufReader::new(read_half);
     loop {
         let mut line = String::new();
-        match reader.read_line(&mut line).await {
+        // SEC-1: 改行のない無限ストリームで行バッファが無制限に育たないよう、
+        // 上限を超える行は接続を閉じる
+        let read = (&mut reader)
+            .take(MAX_CMD_LINE as u64 + 1)
+            .read_line(&mut line)
+            .await;
+        match read {
             Ok(0) => break, // クライアントの切断
             Ok(_) => {}
             Err(_) => break,
+        }
+        if line.len() > MAX_CMD_LINE {
+            break; // 過大なコマンド行: クライアントが壊れているか悪意がある
         }
         let command: Command = match serde_json::from_str(line.trim()) {
             Ok(c) => c,
@@ -95,7 +117,9 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
         let snapshot = match command {
             // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
             Command::Open { path } => {
-                let contents = tokio::fs::read_to_string(&path).await.ok();
+                // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
+                // （ADR-0008）。失敗時は状態を変えず status で報告する。
+                let (contents, open_status) = read_open_target(&path).await;
                 let mut d = daemon.lock().await;
                 let status = match &contents {
                     Some(contents) => {
@@ -117,7 +141,7 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
                             None
                         }
                     }
-                    None => Some(format!("cannot open {path}")),
+                    None => open_status,
                 };
                 lsp::drain_into(&mut d);
                 snapshot(&d, status)
@@ -183,6 +207,22 @@ fn is_edit(command: &Command) -> bool {
             | Command::Undo
             | Command::Redo
     )
+}
+
+/// Open 対象を検証して読み込む。
+///
+/// 非正規ファイル（ディレクトリ・デバイス・FIFO 等）は `cannot open`、
+/// [`MAX_FILE_SIZE`] を超えるファイルは `file too large` を返す（SEC-1 /
+/// ADR-0008）。成功時は (Some(内容), None)。
+async fn read_open_target(path: &str) -> (Option<String>, Option<String>) {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() && m.len() <= MAX_FILE_SIZE => {
+            (tokio::fs::read_to_string(path).await.ok(), None)
+        }
+        Ok(m) if m.len() > MAX_FILE_SIZE => (None, Some(format!("file too large: {path}"))),
+        Ok(_) => (None, Some(format!("cannot open {path}"))),
+        Err(_) => (None, Some(format!("cannot open {path}"))),
+    }
 }
 
 /// ファイルを読み込んで Editor に開く（clean 状態で始まる）。テスト用。
@@ -418,6 +458,75 @@ mod tests {
         let s = open_in_editor(&mut d, "missing", None);
         assert!(s.status.is_some());
         assert!(s.path.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_oversized_file() {
+        // SEC-1 / ADR-0008: MAX_FILE_SIZE 超のファイルは状態を変えずに拒否する
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mina-sec-oversize-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // スパースファイル: 実データなしでサイズだけ上限を超える
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_FILE_SIZE + 1).unwrap();
+        drop(f);
+
+        let path_str = path.to_string_lossy().into_owned();
+        let (contents, status) = read_open_target(&path_str).await;
+        assert!(contents.is_none());
+        let msg = status.expect("拒否メッセージが出る");
+        assert!(
+            msg.starts_with("file too large"),
+            "専用メッセージ: {msg}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_non_regular_file() {
+        // SEC-1: ディレクトリ（非正規ファイル）は拒否し、既存のメッセージで報告
+        let dir = std::env::temp_dir().join(format!("mina-sec-nonfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::create_dir(&dir).unwrap();
+
+        let path_str = dir.to_string_lossy().into_owned();
+        let (contents, status) = read_open_target(&path_str).await;
+        assert!(contents.is_none());
+        let msg = status.expect("拒否メッセージが出る");
+        assert!(msg.starts_with("cannot open"), "{msg}");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn oversized_command_line_closes_connection() {
+        // SEC-1: 改行のない過大な行を送ると接続が閉じられ、応答が返らない
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-sec-sock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let sock_serve = sock.clone();
+        tokio::spawn(async move {
+            let _ = serve(&sock_serve).await;
+        });
+        // socket が現れるまで待つ
+        for _ in 0..100 {
+            if UnixStream::connect(&sock).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        use tokio::io::AsyncReadExt;
+        let mut stream = UnixStream::connect(&sock).await.expect("接続できる");
+        let big = "x".repeat(MAX_CMD_LINE + 1);
+        let _ = stream.write_all(big.as_bytes()).await; // 途中で EPIPE になる場合もある
+        let mut buf = vec![0u8; 16];
+        let n = stream.read(&mut buf).await;
+        // 応答は来ず、接続は閉じられる（EOF かエラー）
+        assert!(
+            matches!(n, Ok(0) | Err(_)),
+            "過大行に対して応答しない: {n:?}"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[test]
