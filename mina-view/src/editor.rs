@@ -28,6 +28,16 @@ pub struct View {
     pub first_line: usize,
 }
 
+/// 保持する文書の上限（M4）。
+///
+/// Open の繰り返しで文書・履歴が無制限に蓄積しないよう、上限超過時は
+/// 「どの View も表示しておらず・dirty でもない」最も古い文書を破棄する。
+/// dirty な文書は破棄しない（未保存の編集を失わない）。
+///
+/// ponytail: 上限は実質1文書閲覧の v1 に対する安全弁。タブ UI 等で複数文書を
+/// 並行保持する必要が出たら LRU/参照カウントに置き換える。
+const MAX_DOCUMENTS: usize = 8;
+
 /// エディタのグローバル状態。
 ///
 /// 関数型コアの「現在の状態」を保持する imperative shell。文書の集合・View の
@@ -76,7 +86,7 @@ impl Editor {
     /// `doc` を開き、新しい文書 ID を返す。
     ///
     /// フォーカス中の View が開いた文書へ移動する。履歴は文書ごとに独立して
-    /// 持つ。
+    /// 持つ。上限を超えた場合は不要な文書を破棄する（[`Self::evict_oldest_if_over_cap`]）。
     pub fn open(&mut self, doc: Document) -> DocumentId {
         let id = DocumentId(self.next_document_id);
         self.next_document_id += 1;
@@ -86,7 +96,27 @@ impl Editor {
         view.doc = id;
         view.selection = Selection::point(0);
         view.first_line = 0;
+        self.evict_oldest_if_over_cap();
         id
+    }
+
+    /// 文書数が上限を超えたら、どの View も表示していない・dirty でもない
+    /// 最も古い文書を上限に収まるまで破棄する（M4: Open の繰り返しによる
+    /// メモリ蓄積の防止）。
+    fn evict_oldest_if_over_cap(&mut self) {
+        while self.documents.len() > MAX_DOCUMENTS {
+            let viewed: BTreeSet<DocumentId> =
+                self.views.iter().flatten().map(|v| v.doc).collect();
+            let oldest = self
+                .documents
+                .keys()
+                .copied()
+                .find(|&id| !viewed.contains(&id) && !self.dirty.contains(&id));
+            let Some(id) = oldest else { break }; // 残りは全て表示中 or dirty
+            self.documents.remove(&id);
+            self.histories.remove(&id);
+            self.paths.remove(&id);
+        }
     }
 
     /// ファイルから文書を開き、新しい文書 ID を返す。
@@ -766,5 +796,41 @@ mod tests {
         assert_eq!(editor.view_count(), 2);
         assert_eq!(editor.focused_view_id(), again);
         assert_ne!(editor.focused_view_id(), first);
+    }
+
+    #[test]
+    fn open_evicts_oldest_docs_but_keeps_focused() {
+        // M4: 上限を超えて Open しても、フォーカス中の文書は残り、
+        // 文書数は上限に収まる
+        let mut editor = Editor::new();
+        for i in 0..(MAX_DOCUMENTS + 4) {
+            editor.open_with_path(PathBuf::from(format!("/tmp/f{i}")), "x");
+        }
+        assert!(
+            editor.documents.len() <= MAX_DOCUMENTS,
+            "上限を超えない: {}",
+            editor.documents.len()
+        );
+        assert!(
+            editor.documents.contains_key(&editor.focused_doc_id()),
+            "フォーカス中の文書は残る"
+        );
+        // 最も古い文書（scratch を除く最初の Open）は破棄されている
+        assert!(!editor.documents.contains_key(&DocumentId(1)));
+    }
+
+    #[test]
+    fn open_does_not_evict_dirty_docs() {
+        // M4: dirty な文書は破棄されない（未保存の編集を失わない）
+        let mut editor = Editor::new();
+        let a = editor.open_with_path(PathBuf::from("/tmp/a.txt"), "x");
+        editor.dirty.insert(a);
+        for i in 0..(MAX_DOCUMENTS + 2) {
+            editor.open_with_path(PathBuf::from(format!("/tmp/f{i}")), "x");
+        }
+        assert!(
+            editor.documents.contains_key(&a),
+            "dirty な文書は破棄されない"
+        );
     }
 }
