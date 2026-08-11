@@ -21,7 +21,7 @@ The unit of change applied to a Document. Designed so it can be inverted to supp
 _Avoid_: edit, change, operation
 
 **UndoGroup**:
-The unit of undo/redo: a set of Transactions reverted together by one undo. One Insert session is one UndoGroup — it opens on entering Insert mode and closes on leaving Insert (to Normal or Select) or when the owning Client disconnects.
+The unit of undo/redo: a set of Transactions reverted together by one undo. One Insert session is one UndoGroup — it opens on entering Insert mode and closes on leaving Insert (to Normal or Select) or when the owning Client disconnects. A group is owned by exactly one Client (the one that opened it); a write from any other Client closes it first, so a single UndoGroup never contains edits from different Clients.
 _Avoid_: change, edit
 
 **Dirty**:
