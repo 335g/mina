@@ -35,6 +35,20 @@ pub enum Command {
     SetMode { mode: Mode },
     /// ターミナルの表示高さを通知する（カーソル追従スクロールに使う）。
     SetViewport { height: usize },
+    /// 選択（またはカーソル位置）にテキストを挿入する。
+    Insert { text: String },
+    /// 後方削除（Backspace 相当）。
+    DeleteBackward,
+    /// 前方削除（Delete キー相当）。
+    DeleteForward,
+    /// 選択範囲を削除する。
+    DeleteRange,
+    /// 直近の変更グループを元に戻す。
+    Undo,
+    /// 直近に undo された変更グループをやり直す。
+    Redo,
+    /// 現在の文書をファイルに書き込む（結果は status に報告）。
+    Save,
 }
 
 /// 移動の種類（wire 型）。
@@ -95,6 +109,8 @@ pub struct StateSnapshot {
     pub diagnostics: Vec<Diagnostic>,
     /// 開いているファイルのパス（未開なら None）。
     pub path: Option<String>,
+    /// 保存済み状態から編集されているか。
+    pub dirty: bool,
     /// 一時的なメッセージ（Open の失敗など）。ステータス行に表示される。
     pub status: Option<String>,
 }
@@ -110,6 +126,7 @@ impl Default for StateSnapshot {
             first_line: 0,
             diagnostics: Vec::new(),
             path: None,
+            dirty: false,
             status: None,
         }
     }
@@ -134,6 +151,7 @@ mod tests {
                 message: "unused".to_string(),
             }],
             path: Some("test.rs".to_string()),
+            dirty: true,
             status: Some("ok".to_string()),
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
