@@ -13,5 +13,8 @@ smallvec = "1"
 unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
 libc = "0.2"
+termina = { version = "0.3", features = ["event-stream"] }
+futures-lite = "2"
+unicode-width = "0.2"
