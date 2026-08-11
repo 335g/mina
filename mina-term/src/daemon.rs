@@ -8,6 +8,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mina_core::{Transaction, extend_selection, move_selection};
 use mina_protocol::{Command, GotoTarget, Range, StateSnapshot};
@@ -49,6 +50,12 @@ pub struct Daemon {
     pub(crate) lsp: Option<Arc<Mutex<LspSession>>>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
     pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
+    /// 開いている undo グループの所有者（= SetMode(Insert) で開いたクライアント）。
+    ///
+    /// HIGH-1: グループは接続スコープで所有される。所有者の切断のみがグループを
+    /// 閉じモードを戻し、非所有者の書き込みは後勝ちで奪取する（preempt）。
+    /// 不変条件: mode == Insert ⟺ insert_owner == Some(_)。
+    pub(crate) insert_owner: Option<u64>,
 }
 
 impl Daemon {
@@ -58,6 +65,7 @@ impl Daemon {
             viewport_height: 24,
             lsp: None,
             diagnostics: Vec::new(),
+            insert_owner: None,
         }
     }
 
@@ -65,10 +73,16 @@ impl Daemon {
     /// 閉じ、モードを Normal に戻す（ADR-0007）。閉じ忘れると、常駐 daemon の
     /// 履歴がセッションを跨いで編集を同一 undo グループに統合してしまう
     /// （H1: Insert のまま終了した次セッションの入力が undo 1回で消える）。
-    fn on_client_disconnect(&mut self) {
-        if self.editor.mode() == mina_view::Mode::Insert {
+    ///
+    /// HIGH-1: 後始末はグループを開いたクライアント（所有者）の切断に限定する。
+    /// 非所有者（ワンショットの agent コマンド等）の切断は編集状態を触らない —
+    /// 修正前は読み取り専用の agent コマンドが終わるたびに人間の Insert
+    /// セッションが閉じられていた。
+    fn on_client_disconnect(&mut self, conn_id: u64) {
+        if self.insert_owner == Some(conn_id) && self.editor.mode() == mina_view::Mode::Insert {
             self.editor.end_group();
             self.editor.set_mode(mina_view::Mode::Normal);
+            self.insert_owner = None;
         }
     }
 }
@@ -81,9 +95,14 @@ pub async fn run() -> std::io::Result<()> {
 /// 同時に処理する接続数の上限（6b: 接続の張り放題による fd/タスク枯渇対策）。
 /// 上限を超えた接続はキューに残る（accept されない）。
 ///
-/// ponytail: 実質1クライアント前提。アイドルタイムアウトは入れない — TUI は
-/// 読書中もアイドルになるのが正常で、切断されると有害。
+/// ponytail: 対話クライアントは実質1。ワンショットのコマンドクライアントは
+/// 接続スコープの所有権（HIGH-1）で保護される。アイドルタイムアウトは入れない
+/// — TUI は読書中もアイドルになるのが正常で、切断されると有害。
 const MAX_CONNECTIONS: usize = 4;
+
+/// 接続に振る一意 ID のカウンタ（undo グループの所有者判定に使う）。
+/// 0 は「接続なし」（テストの既定）なので 1 から振る。
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// `path` で待ち受ける。
 ///
@@ -120,9 +139,10 @@ async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std:
             Err(_) => return Ok(()), // セマフォが閉じられた（起きない）
         };
         let daemon = daemon.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _permit = permit; // 接続処理中は許可を保持
-            handle_connection(stream, daemon).await;
+            handle_connection(stream, daemon, conn_id).await;
         });
     }
 }
@@ -131,7 +151,7 @@ async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std:
 ///
 /// ponytail: 接続ごとに全状態スナップショットを返す（O(n)/コマンド）。
 /// 巨大ファイルで問題になったら差分送信に差し替える。
-async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
+async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_id: u64) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     loop {
@@ -223,7 +243,7 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
             Ok(command) => {
                 let mut d = daemon.lock().await;
                 let is_edit = is_edit(&command);
-                apply(&mut d, command);
+                apply_from(&mut d, command, conn_id);
                 // M1/ADR-0009: 同期対象（セッション・パス・テキスト）をロック内で
                 // 取り出し、didChange はロック外で await する（サーバ遅延で全
                 // クライアントがブロックしない）。
@@ -257,9 +277,9 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
             break; // クライアントが応答を読めない（切断された）
         }
     }
-    // 切断の後始末: Insert モードで開いたままの undo グループを閉じ、モードを
-    // Normal に戻す（ADR-0007）。
-    daemon.lock().await.on_client_disconnect();
+    // 切断の後始末: 所有者（グループを開いたクライアント）ならグループを閉じ
+    // モードを Normal に戻す（ADR-0007 / HIGH-1）。
+    daemon.lock().await.on_client_disconnect(conn_id);
 }
 
 /// 編集系コマンドか（LSP 全文同期の対象）。
@@ -339,9 +359,36 @@ fn open_in_editor(daemon: &mut Daemon, path: &str, contents: Option<String>) -> 
 }
 
 /// Open/Save 以外のコマンドを状態に適用し、新しいスナップショットを返す。
+///
+/// 接続 ID なし（テストの既定 = 接続 0）で適用する。
+#[cfg(test)]
 fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
+    apply_from(daemon, command, 0)
+}
+
+/// 書き込み競合の後勝ち奪取（HIGH-1 確定設計）: 別クライアントが開いた Insert
+/// グループが開いている間に、非所有者の書き込みが来たら、先にそのグループを
+/// 閉じて Normal に戻してから編集を適用する。これにより 1 つの UndoGroup に
+/// 異なるクライアントの編集が混入しない（単一書き手への直列化）。
+///
+/// 主用途（agent が駆動し人間 TUI が介入）では agent の書き込みが後勝ちになる。
+/// 所有者自身の書き込みと、グループが開いていない書き込みには影響しない。
+fn preempt(daemon: &mut Daemon, conn_id: u64) {
+    if let Some(owner) = daemon.insert_owner {
+        if owner != conn_id && daemon.editor.mode() == mina_view::Mode::Insert {
+            daemon.editor.end_group();
+            daemon.editor.set_mode(mina_view::Mode::Normal);
+            daemon.insert_owner = None;
+        }
+    }
+}
+
+/// 接続 ID 付きでコマンドを状態に適用する（接続ハンドラから呼ばれる）。
+/// `conn_id` は undo グループの所有者判定に使う。
+fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnapshot {
     match command {
         Command::Insert { text } => {
+            preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = Transaction::insert(daemon.editor.current_document(), &selection, &text);
             let selection_after = tx.map_selection(&selection, true);
@@ -350,6 +397,7 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
             snapshot(daemon, None)
         }
         Command::DeleteBackward => {
+            preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = mina_core::delete_backward_transaction(
                 daemon.editor.current_document(),
@@ -361,6 +409,7 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
             snapshot(daemon, None)
         }
         Command::DeleteForward => {
+            preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = mina_core::delete_forward_transaction(
                 daemon.editor.current_document(),
@@ -372,6 +421,7 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
             snapshot(daemon, None)
         }
         Command::DeleteRange => {
+            preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = Transaction::delete(daemon.editor.current_document(), &selection);
             let selection_after = tx.map_selection(&selection, false);
@@ -384,11 +434,14 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
             snapshot(daemon, None)
         }
         Command::Undo => {
+            // Undo/Redo も書き込みとして扱う（単一の共有履歴・グローバル undo）
+            preempt(daemon, conn_id);
             daemon.editor.undo();
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             snapshot(daemon, None)
         }
         Command::Redo => {
+            preempt(daemon, conn_id);
             daemon.editor.redo();
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             snapshot(daemon, None)
@@ -442,11 +495,25 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
             // セッション」: Insert への進入で開き、Insert からの離脱（→Normal・
             // →Select のいずれでも）で閉じる。切断時は接続ハンドラ側で閉じる
             // （ADR-0007）。
+            //
+            // HIGH-1: グループは開いたクライアントが所有者。既に別クライアント
+            // のセッションが開いている状態での SetMode(Insert) は後勝ちで奪取
+            // する。モード自体はグローバルなので、離脱は誰が送ってもグループを
+            // 閉じる（agent の SetMode は通常送られない — ponytail 参照）。
             // ponytail: ネストしたグループは考慮しない（v1 にその経路はない）。
-            if new_mode == mina_view::Mode::Insert && current != mina_view::Mode::Insert {
-                daemon.editor.begin_group();
-            } else if new_mode != mina_view::Mode::Insert && current == mina_view::Mode::Insert {
+            if new_mode == mina_view::Mode::Insert {
+                if current != mina_view::Mode::Insert {
+                    daemon.editor.begin_group();
+                    daemon.insert_owner = Some(conn_id);
+                } else if daemon.insert_owner != Some(conn_id) {
+                    // 別クライアントのセッションが開いている: 後勝ちで奪取
+                    daemon.editor.end_group();
+                    daemon.editor.begin_group();
+                    daemon.insert_owner = Some(conn_id);
+                }
+            } else if current == mina_view::Mode::Insert {
                 daemon.editor.end_group();
+                daemon.insert_owner = None;
             }
             daemon.editor.set_mode(new_mode);
             snapshot(daemon, None)
@@ -749,7 +816,7 @@ mod tests {
         open(&mut d, "");
         apply(&mut d, Command::SetMode { mode: Mode::Insert });
         apply(&mut d, Command::Insert { text: "a".into() });
-        d.on_client_disconnect(); // 接続切断（修正前はグループが開いたまま漏れた）
+        d.on_client_disconnect(0); // 所有者の切断（修正前はグループが開いたまま漏れた）
         assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "切断で Normal に戻る");
 
         // 次のクライアント: 再び Insert で入力しても別グループになる
@@ -767,9 +834,153 @@ mod tests {
     fn disconnect_in_normal_mode_is_noop() {
         let mut d = daemon();
         open(&mut d, "hello");
-        d.on_client_disconnect();
+        d.on_client_disconnect(0);
         assert_eq!(d.editor.mode(), mina_view::Mode::Normal);
         assert_eq!(d.editor.current_document().text().to_string(), "hello");
+    }
+
+    #[test]
+    fn non_owner_disconnect_keeps_insert_session() {
+        // HIGH-1 主症状: 読み取り専用 agent（非所有者）の切断が人間の Insert
+        // セッションを壊さない。修正前はグループが閉じ Normal に戻っていた。
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert }); // TUI（接続 0）が所有者
+        apply(&mut d, Command::Insert { text: "a".into() });
+        d.on_client_disconnect(9); // 非所有者（agent ワンショット）の切断
+        assert_eq!(
+            d.editor.mode(),
+            mina_view::Mode::Insert,
+            "非所有者の切断でモードは変わらない"
+        );
+        // セッションは無傷: 続けて入力し、undo 1回で全体が戻る
+        apply(&mut d, Command::Insert { text: "b".into() });
+        apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "", "1 undo でセッション全体が戻る（グループが無傷）");
+    }
+
+    #[test]
+    fn non_owner_edit_takes_over_closing_owners_group() {
+        // HIGH-1 症状2: agent の編集が人間のグループに混入しない。後勝ちで奪取し、
+        // agent の編集は独立グループになる。
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert }); // TUI（接続 0）
+        apply(&mut d, Command::Insert { text: "a".into() }); // グループ [a]
+        let s = apply_from(&mut d, Command::Insert { text: "X".into() }, 9); // agent: 奪取
+        assert_eq!(s.text, "aX");
+        assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "奪取で Normal に戻る");
+        assert_eq!(d.insert_owner, None, "奪取後は所有者がいない");
+        // undo は後勝ち順: agent の編集 [X] → 人間のセッション [a]
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "a", "agent の編集だけが戻る");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "", "次で人間のグループも戻る");
+    }
+
+    #[test]
+    fn owner_edit_after_non_owner_takeover_starts_fresh_group() {
+        // 奪取後、所有者（TUI）が再び入力すると新しいグループになる（旧グループに
+        // 追記されない）。
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "a".into() });
+        apply_from(&mut d, Command::Insert { text: "X".into() }, 9); // 奪取
+        apply(&mut d, Command::Insert { text: "b".into() }); // TUI が続けて入力
+        assert_eq!(d.editor.current_document().text().to_string(), "aXb");
+        // b は独立グループ（a とは分かれている）
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "aX");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "a");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "");
+    }
+
+    #[test]
+    fn non_owner_set_mode_insert_takes_over_open_group() {
+        // 別クライアントの SetMode(Insert) は開いているグループを奪取する
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert }); // TUI（接続 0）
+        apply(&mut d, Command::Insert { text: "a".into() });
+        apply_from(&mut d, Command::SetMode { mode: Mode::Insert }, 9); // agent が奪取
+        apply_from(&mut d, Command::Insert { text: "X".into() }, 9);
+        apply_from(&mut d, Command::SetMode { mode: Mode::Normal }, 9);
+        assert_eq!(d.editor.current_document().text().to_string(), "aX");
+        // undo: agent のセッション [X] → 人間のセッション [a] の順
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "a");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "");
+    }
+
+    #[tokio::test]
+    async fn real_socket_agent_disconnect_keeps_tui_undo_group() {
+        // HIGH-1 e2e: 実 socket で TUI（永続）+ agent（ワンショット）の 2 接続。
+        // agent の読み取り専用コマンドと切断が TUI の Insert グループを壊さない。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-h1-sock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let sock_serve = sock.clone();
+        tokio::spawn(async move {
+            let _ = serve(&sock_serve).await;
+        });
+        // socket が現れるまで待つ
+        for _ in 0..100 {
+            if UnixStream::connect(&sock).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // NDJSON 1 コマンド送って応答スナップショット 1 行を受け取る
+        async fn request(stream: &mut UnixStream, cmd: &Command) -> StateSnapshot {
+            stream
+                .write_all(serde_json::to_string(cmd).unwrap().as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            let mut buf = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                let n = stream.read(&mut byte).await.unwrap();
+                assert!(n > 0, "応答が来ない（接続が閉じた）");
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            serde_json::from_slice(&buf).unwrap()
+        }
+
+        // TUI: Insert モードで "a" を入力（グループを開く）
+        let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
+        let snap = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
+        assert_eq!(snap.mode, Mode::Insert);
+        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        assert_eq!(snap.text, "a");
+
+        // agent ワンショット: 読み取り専用 GetState → 切断
+        let mut agent = UnixStream::connect(&sock).await.unwrap();
+        let snap = request(&mut agent, &Command::GetState).await;
+        assert_eq!(snap.text, "a");
+        assert_eq!(snap.mode, Mode::Insert, "agent にも現状のモードが見える");
+        drop(agent);
+
+        // TUI のセッションは無傷: "b" → Esc → undo 1回で "ab" が全部戻る
+        let snap = request(&mut tui, &Command::Insert { text: "b".into() }).await;
+        assert_eq!(snap.text, "ab");
+        assert_eq!(snap.mode, Mode::Insert, "agent の切断でモードが変わっていない");
+        let _ = request(&mut tui, &Command::SetMode { mode: Mode::Normal }).await;
+        let snap = request(&mut tui, &Command::Undo).await;
+        assert_eq!(
+            snap.text, "",
+            "undo 1回でセッション全体が戻る（agent の切断がグループを壊していない）"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[test]
