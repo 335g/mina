@@ -1,5 +1,5 @@
 [workspace]
-members = ["mina-core", "mina-view"]
+members = ["mina-core", "mina-view", "mina-protocol", "mina-term"]
 resolver = "3"
 
 [workspace.package]
@@ -11,3 +11,7 @@ rust-version = "1.96"
 ropey = "1"
 smallvec = "1"
 unicode-segmentation = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+libc = "0.2"
