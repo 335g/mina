@@ -1,9 +1,9 @@
 //! テスト用のモック LSP サーバ（stdio 同期版）。
 //!
-//! - `initialize` には `positionEncoding: "utf-8"` で応答する
+//! - `initialize` には `positionEncoding` で応答する（`--cjk` なら `"utf-16"`、それ以外は `"utf-8"`）
 //! - `textDocument/didOpen` / `didChange` を受けたら、テキスト内の "TODO" の
-//!   位置に error 診断を publish する（テキストが変われば位置も変わる）
-//! - 起動引数 `--cjk` で UTF-16 エンコーディングを選び、CJK 文字を診断対象にする
+//!   位置に error 診断を publish する（テキストが変われば位置も変わる。
+//!   `--cjk` 時は位置を UTF-16 単位に変換して publish する）
 
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -74,9 +74,17 @@ fn main() {
                         .unwrap_or_default()
                 };
                 // "TODO" の位置に error を publish（テキストが変われば位置が動く）
-                let needle = if utf16 { "TODO" } else { "TODO" };
-                let start = text.find(needle).map(|i| i as u32).unwrap_or(0);
-                let end = start + 4;
+                let needle = "TODO";
+                let start_byte = text.find(needle).unwrap_or(0);
+                // LSP の character は行頭からの UTF-16 単位（--cjk 時は utf-16 を advertise）。
+                // バイトオフセットのまま使うと非 ASCII が前にあればずれるため、
+                // 行頭から UTF-16 単位に変換してから publish する。
+                let start = if utf16 {
+                    text[..start_byte].encode_utf16().count() as u32
+                } else {
+                    start_byte as u32
+                };
+                let end = start + 4; // "TODO" は ASCII なので UTF-16 でも 4 単位
                 let notif = json!({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",

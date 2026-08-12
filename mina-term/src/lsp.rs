@@ -56,7 +56,12 @@ fn uri(path: &Path) -> String {
 impl LspSession {
     /// サーバを spawn し、initialize まで完了させる。
     pub async fn new(command: &str, root: &Path) -> Result<Self, String> {
-        let (mut client, _reader) = Client::spawn(command, &[])
+        Self::new_with_args(command, root, &[]).await
+    }
+
+    /// サーバを spawn し、initialize まで完了させる（テスト用: 起動引数付き）。
+    pub async fn new_with_args(command: &str, root: &Path, args: &[&str]) -> Result<Self, String> {
+        let (mut client, _reader) = Client::spawn(command, args)
             .await
             .map_err(|e| format!("LSP サーバを起動できません: {e}"))?;
         let result = client
@@ -421,6 +426,46 @@ mod tests {
             !replaced.lock().await.client.is_dead(),
             "返るセッションは生きている"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_into_converts_cjk_utf16_positions() {
+        // 欠陥の E2E 検証: --cjk の mock が publish する UTF-16 単位の位置が、
+        // daemon の drain_into（drain_diagnostics → position.rs 変換）を経て
+        // char インデックスとして正しくスナップショットに載る。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let mut daemon = Daemon::new();
+        let path = PathBuf::from("/tmp/x.rs");
+        // "あ😀TODO": UTF-16 では あ=1単位 + 😀=2単位 で TODO は offset 3。
+        // バイトでは offset 7 なので、バイトのままだと誤って 7 文字目扱いになる。
+        daemon.editor.open_with_path(path.clone(), "あ😀TODO");
+        let session = Arc::new(Mutex::new(
+            LspSession::new_with_args(bin, Path::new("/tmp"), &["--cjk"])
+                .await
+                .expect("initialize"),
+        ));
+        daemon.lsp = Some(session.clone());
+
+        session.lock().await.did_open(&path, "あ😀TODO").await;
+        let mut got = false;
+        for _ in 0..50 {
+            drain_into(&mut daemon);
+            if !daemon.diagnostics.is_empty() {
+                got = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(got, "UTF-16 診断が取り込まれる");
+        let d = &daemon.diagnostics[0];
+        // UTF-16 offset 3 → char 2（TODO の 'T'。あ=char0、😀=char1）
+        assert_eq!(d.start, 2, "あ(1単位)+😀(2単位) の後: {d:?}");
+        assert_eq!(d.end, 6, "TODO は4文字: {d:?}");
+        assert_eq!(d.message, "mock: TODO found");
     }
 
     #[tokio::test]

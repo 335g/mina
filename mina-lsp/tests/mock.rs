@@ -113,6 +113,72 @@ async fn did_change_moves_diagnostic_position() {
 }
 
 #[tokio::test]
+async fn cjk_publishes_utf16_character_offsets() {
+    // 欠陥の E2E 検証: --cjk の mock は位置を UTF-16 単位で publish する。
+    // バイトオフセットのまま publish すると "あTODO" で 3 になるが、
+    // 正しくは 1（あ は UTF-8 で3バイト / UTF-16 で1単位）。
+    let (mut client, reader) = spawn_client(&["--cjk"]).await;
+    let result = client
+        .request("initialize", json!({}))
+        .await
+        .expect("initialize");
+    assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
+
+    client.notify("initialized", json!({})).await.unwrap();
+    client
+        .notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///mock_cjk.rs",
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "あTODO",
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    match wait_notification(&mut client).await {
+        Incoming::Notification { method, params } => {
+            assert_eq!(method, "textDocument/publishDiagnostics");
+            assert_eq!(
+                params["diagnostics"][0]["range"]["start"]["character"], 1,
+                "UTF-16 単位の位置（あ=1単位、バイトでは3）: {params}"
+            );
+            assert_eq!(
+                params["diagnostics"][0]["range"]["end"]["character"], 5,
+                "TODO は4単位: {params}"
+            );
+        }
+    }
+
+    // サロゲートペア（😀=2単位）も正しく数えることを確認
+    client
+        .notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": "file:///mock_cjk.rs", "version": 2 },
+                "contentChanges": [{ "text": "あ😀TODO" }],
+            }),
+        )
+        .await
+        .unwrap();
+    match wait_notification(&mut client).await {
+        Incoming::Notification { params, .. } => {
+            assert_eq!(
+                params["diagnostics"][0]["range"]["start"]["character"], 3,
+                "あ=1単位 + 😀=2単位 で UTF-16 は3（バイトでは7）: {params}"
+            );
+        }
+    }
+
+    client.kill().await;
+    reader.abort();
+}
+
+#[tokio::test]
 async fn utf16_encoding_is_negotiated() {
     let (mut client, reader) = spawn_client(&["--cjk"]).await;
     let result = client.request("initialize", json!({})).await.unwrap();

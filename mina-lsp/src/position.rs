@@ -3,7 +3,9 @@
 /// UTF-8（バイト）列 → 行内 char 数。
 pub fn utf8_col_to_char(line: &str, byte_col: u32) -> usize {
     let byte_col = (byte_col as usize).min(line.len());
-    line[..byte_col].chars().count()
+    // 非 char 境界の列は直前の境界に floor して panic を避ける（クライアントは utf-8 を選択し得るため）。
+    let end = line.floor_char_boundary(byte_col);
+    line[..end].chars().count()
 }
 
 /// UTF-16 単位の列 → 行内 char 数（サロゲートペアを2単位として数える）。
@@ -43,6 +45,15 @@ mod tests {
         assert_eq!(utf16_col_to_char("a😀b", 1), 1); // 'a' の直後
         assert_eq!(utf16_col_to_char("a😀b", 3), 2); // 'b' の直前（a=1 + 😀=2）
         assert_eq!(char_to_utf16_col("a😀b", 2), 3);
+    }
+
+    #[test]
+    fn utf8_col_floors_to_char_boundary() {
+        assert_eq!(utf8_col_to_char("あいう", 1), 0); // バイト1は "あ" の途中 → 0
+        assert_eq!(utf8_col_to_char("あいう", 4), 1); // バイト4は "い" の途中 → 1
+        assert_eq!(utf8_col_to_char("a😀b", 2), 1); // バイト2は 😀 の途中 → 'a' まで
+        assert_eq!(utf8_col_to_char("あいう", 99), 3); // 行長超過は clamp
+        assert_eq!(utf8_col_to_char("", 1), 0);
     }
 
     #[test]
