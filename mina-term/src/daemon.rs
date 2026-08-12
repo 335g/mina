@@ -259,55 +259,95 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
         let snapshot = match serde_json::from_str(line.trim()) {
             // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
             Ok(Command::Open { path }) => {
-                // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
-                // （ADR-0008）。失敗時は状態を変えず status で報告する。
-                let (contents, mut open_status) = read_open_target(&path).await;
                 let path_buf = PathBuf::from(&path);
-                // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
-                // daemon ロック外で行う。失敗時は status に載せる。
-                let session = if contents.is_some() && lsp::server_for(&path_buf).is_some() {
-                    match lsp::ensure(&daemon, &path_buf).await {
-                        Ok(s) => Some(s),
-                        Err(msg) => {
-                            open_status = Some(msg);
-                            None
+                // #7: 既に開かれているパスはディスク再読込せず、既存ドキュメントへ
+                // フォーカスし直す。未保存編集・dirty フラグ・undo ヒストリーを
+                // 保持する（再利用 = 「何も変えない」）。
+                let reuse_text: Option<String> = {
+                    let mut d = daemon.lock().await;
+                    let reused = d.editor.focus_open_path(&path_buf);
+                    // フォーカス直後のテキストを掴んでおく（後に ensure で await する
+                    // 間に他接続がフォーカスを動かしても、正しい文書に通知するため）
+                    reused.map(|_| d.editor.current_document().text().to_string())
+                };
+                if let Some(text) = reuse_text {
+                    // LSP: ADR-0009 の「次回 Open でリスポーン」を維持するため、
+                    // サーバが死んでいればここで再生成し、現在のバッファ内容で
+                    // didOpen を再通知する（フルテキスト同期なので再利用への
+                    // 再通知は無害）。
+                    let session = if lsp::server_for(&path_buf).is_some() {
+                        match lsp::ensure(&daemon, &path_buf).await {
+                            Ok(s) => Some(s),
+                            Err(_) => None, // サーバが無くても文書は保持される
                         }
-                    }
-                } else {
-                    None
-                };
-                // ロック内: 文書状態の変更のみ（await なし）
-                let mut d = daemon.lock().await;
-                let (text, notify) = match &contents {
-                    Some(contents) => {
-                        d.editor.open_with_path(path_buf.clone(), contents);
-                        let height = d.viewport_height;
-                        d.editor.scroll_to_cursor(height);
-                        d.diagnostics.clear();
-                        (contents.clone(), session.is_some())
-                    }
-                    None => (String::new(), false),
-                };
-                drop(d);
-                // M1: didOpen 通知は daemon ロック外（lsp mutex のみ・タイムアウト付き）
-                if notify {
+                    } else {
+                        None
+                    };
                     if let Some(session) = &session {
                         lsp::open_document(session, &path_buf, &text).await;
+                        let daemon_task = daemon.clone();
+                        let session_task = session.clone();
+                        let path_task = path_buf.clone();
+                        tokio::spawn(async move {
+                            lsp::settle_open_diagnostics(&daemon_task, session_task, path_task)
+                                .await;
+                        });
                     }
+                    let mut d = daemon.lock().await;
+                    lsp::drain_into(&mut d);
+                    snapshot(&d, None)
+                } else {
+                    // 未開パス: 従来どおりディスクから読む
+                    // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
+                    // （ADR-0008）。失敗時は状態を変えず status で報告する。
+                    let (contents, mut open_status) = read_open_target(&path).await;
+                    // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
+                    // daemon ロック外で行う。失敗時は status に載せる。
+                    let session = if contents.is_some() && lsp::server_for(&path_buf).is_some() {
+                        match lsp::ensure(&daemon, &path_buf).await {
+                            Ok(s) => Some(s),
+                            Err(msg) => {
+                                open_status = Some(msg);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // ロック内: 文書状態の変更のみ（await なし）
+                    let mut d = daemon.lock().await;
+                    let (text, notify) = match &contents {
+                        Some(contents) => {
+                            d.editor.open_with_path(path_buf.clone(), contents);
+                            let height = d.viewport_height;
+                            d.editor.scroll_to_cursor(height);
+                            d.diagnostics.clear();
+                            (contents.clone(), session.is_some())
+                        }
+                        None => (String::new(), false),
+                    };
+                    drop(d);
+                    // M1: didOpen 通知は daemon ロック外（lsp mutex のみ・タイムアウト付き）
+                    if notify {
+                        if let Some(session) = &session {
+                            lsp::open_document(session, &path_buf, &text).await;
+                        }
+                    }
+                    // 初期解析（crate ロード・数秒）が完了するまで pull で診断を追う。
+                    // 解析未完の間の pull は空を返すため、バックグラウンドで poll する。
+                    if let Some(session) = &session {
+                        let daemon_task = daemon.clone();
+                        let session_task = session.clone();
+                        let path_task = path_buf.clone();
+                        tokio::spawn(async move {
+                            lsp::settle_open_diagnostics(&daemon_task, session_task, path_task)
+                                .await;
+                        });
+                    }
+                    let mut d = daemon.lock().await;
+                    lsp::drain_into(&mut d);
+                    snapshot(&d, open_status)
                 }
-                // 初期解析（crate ロード・数秒）が完了するまで pull で診断を追う。
-                // 解析未完の間の pull は空を返すため、バックグラウンドで poll する。
-                if let Some(session) = &session {
-                    let daemon_task = daemon.clone();
-                    let session_task = session.clone();
-                    let path_task = path_buf.clone();
-                    tokio::spawn(async move {
-                        lsp::settle_open_diagnostics(&daemon_task, session_task, path_task).await;
-                    });
-                }
-                let mut d = daemon.lock().await;
-                lsp::drain_into(&mut d);
-                snapshot(&d, open_status)
             }
             Ok(Command::Save) => {
                 // 保存対象（テキスト・パス・文書 ID）を取り出してから、ロック外で書き込む
@@ -1170,6 +1210,26 @@ mod tests {
         serde_json::from_slice(&buf).unwrap()
     }
 
+    /// 述語が満たされるまで GetState を繰り返す（非同期の LSP 診断反映待ち用）。
+    async fn poll_snapshot(
+        stream: &mut UnixStream,
+        predicate: impl Fn(&StateSnapshot) -> bool,
+        timeout: std::time::Duration,
+    ) -> StateSnapshot {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let snap = request(stream, &Command::GetState).await;
+            if predicate(&snap) {
+                return snap;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "タイムアウト: {snap:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     #[tokio::test]
     async fn real_socket_agent_disconnect_keeps_tui_undo_group() {
         // HIGH-1 e2e: 実 socket で TUI（永続）+ agent（ワンショット）の 2 接続。
@@ -1204,6 +1264,123 @@ mod tests {
             "undo 1回でセッション全体が戻る（agent の切断がグループを壊していない）"
         );
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn reopen_already_open_path_preserves_unsaved_edits() {
+        // #7 e2e: 実 socket で agent の Open が、開き済みパスの未保存編集を
+        // 破棄しない（ディスク再読込もしない）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-7-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-7-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        // TUI: ファイルを開いて編集（未保存）
+        let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.text, "base\n");
+        let snap = request(&mut tui, &Command::Insert { text: "X".into() }).await;
+        assert_eq!(snap.text, "Xbase\n");
+        assert!(snap.dirty);
+
+        // ディスクの中身を変えておく: 再 Open がディスクを読んだら X が消える
+        std::fs::write(&file, "changed\n").unwrap();
+
+        // agent: 同じパスを Open し直す → 既存ドキュメントへフォーカス
+        let mut agent = UnixStream::connect(&sock).await.unwrap();
+        let snap = request(&mut agent, &Command::Open { path }).await;
+        assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
+        assert!(snap.dirty, "dirty が保持される");
+
+        // undo も効く（ヒストリーが保持されている）
+        let snap = request(&mut agent, &Command::Undo).await;
+        assert_eq!(snap.text, "base\n", "undo で挿入だけ戻る");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn reopen_rs_path_respawns_lsp_and_reannounces_current_text() {
+        // #7 + ADR-0009: 再利用 Open でも LSP フロー（ensure → didOpen → settle）が
+        // 走る。サーバ死亡後は再 spawn され、現在のバッファ内容で診断が返る。
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        // 環境変数はプロセスグローバル。他のテストは LSP を起動しないので安全。
+        // （edition 2024 のため set_var/remove_var は unsafe）
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-7lsp-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-7lsp-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "fn f() { TODO }\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        // 初回解析: TODO（byte 9）の診断が反映されるまで待つ
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(snap.diagnostics[0].start, 9, "TODO は byte 9 から");
+        assert_eq!(snap.diagnostics[0].message, "mock: TODO found");
+
+        // 先頭に挿入して TODO を byte 13 へ移動（didChange で同期される）
+        let snap = request(&mut tui, &Command::Insert { text: "aaaa".into() }).await;
+        assert_eq!(snap.text, "aaaafn f() { TODO }\n");
+        assert_eq!(snap.diagnostics[0].start, 13, "didChange 後に位置が追従する");
+
+        // サーバを殺す（reader タスクが EOF を拾い is_dead になる）
+        let killed = std::process::Command::new("pkill")
+            .args(["-f", "target/debug/mock-server"])
+            .status()
+            .expect("pkill を実行できる");
+        assert!(killed.success(), "mock サーバを kill できる: {killed}");
+
+        // 死亡検知で古い診断がクリアされるのを待つ（ADR-0009）
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(snap.diagnostics.is_empty(), "死亡後に古い診断は残らない");
+
+        // 同じパスを再 Open: 再利用 + リスポーン + 現在テキストで didOpen 再通知
+        let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.text, "aaaafn f() { TODO }\n", "再利用で状態保持");
+        assert!(snap.dirty, "dirty 保持");
+        // 新しいセッションからの診断が現在テキストの位置（byte 13）で返る
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(
+            snap.diagnostics[0].start, 13,
+            "リスポーン後の診断は現在のバッファ内容に基づく"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
