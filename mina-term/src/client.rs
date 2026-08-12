@@ -1,5 +1,9 @@
 //! クライアント（TUI）: daemon にコマンドを送り、StateSnapshot を受け取って描画する。
 //!
+//! Open のパスはクライアント側で絶対化してから送る — daemon は常駐で cwd が
+//! 起動時のディレクトリのままなので、相対パスの解決を daemon に任せると
+//! 別ディレクトリから起動したクライアントの意図と食い違う（[`absolutize`]）。
+//!
 //! リクエスト/レスポンスのみ（ADR-0006）。編集状態は持たない — キーイベントを
 //! キーマップで Command に解決して送り、返ってきたスナップショットを描画するだけ。
 //! daemon が動いていなければ自動起動する（ADR-0005）。
@@ -19,6 +23,21 @@ use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 
 use crate::keymap::{Keymaps, Resolution};
 use crate::render;
+
+/// Open に送るパスを絶対化する。既に絶対パスならそのまま返す。
+///
+/// daemon の cwd は最初に spawn された場所で固定されるため（ADR-0005）、
+/// 相対パスは送信側で現在のディレクトリ基準に解決してから渡す。
+fn absolutize(path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return path.to_string();
+    }
+    std::env::current_dir()
+        .map(|dir| dir.join(p))
+        .map(|abs| abs.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
 
 const ALT_SCREEN_ON: &str = "\x1b[?1049h";
 const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
@@ -61,9 +80,12 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // 初回コマンド: ファイル指定があれば Open、なければ GetState
+    // 初回コマンド: ファイル指定があれば Open、なければ GetState。
+    // Open のパスは絶対化して送る — daemon は常駐で cwd が起動時のディレクトリの
+    // ままなので、相対パスを daemon 側で解決すると別ディレクトリから起動した
+    // クライアントの意図と食い違う（`cannot open` になる）。
     let first = match file {
-        Some(path) => Command::Open { path: path.to_string() },
+        Some(path) => Command::Open { path: absolutize(path) },
         None => Command::GetState,
     };
     // M5: 初回応答（Open の失敗 status など）を破棄せず保持する
@@ -164,6 +186,10 @@ pub(crate) async fn request(
 
 /// daemon が動いていなければ自動起動し、socket が現れるまで待つ。TUI と session CLI の両方から使う。
 ///
+/// daemon はクライアントの cwd を引き継いで spawn される。相対パスの解決は
+/// この cwd 基準になるため、クライアントはパスを絶対化してから送る
+/// （[`absolutize`]）。
+///
 /// 競合: 同時に2つのクライアントが spawn した場合、片方の daemon が bind に
 /// 失敗して終了する（v1 の割り切り）。
 ///
@@ -194,4 +220,21 @@ pub(crate) async fn ensure_daemon(path: &Path) -> std::io::Result<()> {
         std::io::ErrorKind::NotFound,
         "daemon が起動しなかった",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolutize_keeps_absolute_path() {
+        assert_eq!(absolutize("/abs/path/file.rs"), "/abs/path/file.rs");
+    }
+
+    #[test]
+    fn absolutize_resolves_relative_to_cwd() {
+        let abs = absolutize("rel/file.rs");
+        assert!(std::path::Path::new(&abs).is_absolute());
+        assert!(abs.ends_with("rel/file.rs"));
+    }
 }
