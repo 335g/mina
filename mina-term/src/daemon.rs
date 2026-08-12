@@ -3,7 +3,8 @@
 //! 状態は mina-view の [`Editor`] がすべて保持する（ADR-0005）。S2 では編集
 //! （insert/delete/undo/redo）と保存を扱う。ファイル I/O（Open/Save）だけは
 //! ロックを握らないよう接続ハンドラ側で async 実行する。socket は
-//! `<temp_dir>/mina.sock`（単一ユーザ前提）。
+//! `<temp_dir>/mina.sock`（単一ユーザ前提）。0600 で作成し、接続時に
+//! peer uid を検証して別ユーザの接続を拒否する（MEDIUM-3）。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,22 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// 最初のコマンドを待つタイムアウト（MEDIUM-5）。
+///
+/// 接続後に何も送らない無言接続がスロット（[`MAX_CONNECTIONS`]）を永久に
+/// 占有する DoS を防ぐ。最初のコマンド行がこの時間内に届かなければ切断して
+/// スロットを解放する。最初のコマンドを送った後のアイドル（読書中の TUI 等）
+/// にはタイムアウトを付けない — アイドルは正常で切断は有害（TUI は接続直後に
+/// Open/GetState を送るので影響しない）。
+///
+/// ponytail: 固定値。30 秒あればどんなクライアントも最初のコマンドを送れる。
+/// 放置するだけで全スロットが枯渇する脆弱性は塞げる（継続的に張り直す攻撃者
+/// には効かない）。
+#[cfg(not(test))]
+const FIRST_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const FIRST_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// daemon が保持する編集状態。
 pub struct Daemon {
     pub(crate) editor: Editor,
@@ -119,13 +136,28 @@ pub async fn run() -> std::io::Result<()> {
 /// 上限を超えた接続はキューに残る（accept されない）。
 ///
 /// ponytail: 対話クライアントは実質1。ワンショットのコマンドクライアントは
-/// 接続スコープの所有権（HIGH-1）で保護される。アイドルタイムアウトは入れない
-/// — TUI は読書中もアイドルになるのが正常で、切断されると有害。
+/// 接続スコープの所有権（HIGH-1）で保護される。確立済みの接続にはアイドル
+/// タイムアウトを付けない — TUI は読書中もアイドルになるのが正常で、切断
+/// されると有害。無言接続のスロット枯渇 DoS（MEDIUM-5）は、最初のコマンド
+/// だけに付けたタイムアウト（[`FIRST_COMMAND_TIMEOUT`]）で防ぐ。
 const MAX_CONNECTIONS: usize = 4;
 
 /// 接続に振る一意 ID のカウンタ（undo グループの所有者判定に使う）。
 /// 0 は「接続なし」（テストの既定）なので 1 から振る。
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// `path` に bind し、socket ファイルの mode を 0600 に絞る（MEDIUM-3）。
+///
+/// プロセス umask が 0022 だと socket は 0755 で作られ、共有 /tmp の
+/// マルチユーザ環境で別ユーザが接続・spoofing できる。bind 直後の chmod は
+/// umask に関係なく mode を確定させる。stale socket の除去・再試行（M6）の
+/// 二度目の bind でも同じ経路を通る。
+fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
+    let listener = UnixListener::bind(path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
 
 /// `path` で待ち受ける。
 ///
@@ -134,7 +166,7 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// ブレイン防止）、前回の異常終了の残骸（stale）なら除去して再試行する。
 pub async fn serve(path: &Path) -> std::io::Result<()> {
     let daemon = Arc::new(Mutex::new(Daemon::new()));
-    match UnixListener::bind(path) {
+    match bind_listener(path) {
         Ok(listener) => accept_loop(listener, daemon).await,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
             if UnixStream::connect(path).await.is_ok() {
@@ -145,18 +177,36 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
             }
             // stale socket: 除去して再試行
             let _ = std::fs::remove_file(path);
-            let listener = UnixListener::bind(path)?;
+            let listener = bind_listener(path)?;
             accept_loop(listener, daemon).await
         }
         Err(e) => Err(e),
     }
 }
 
+/// MEDIUM-3: 接続元 uid が daemon 自身の uid と一致するか（spoofing 対策）。
+///
+/// socket を 0600 にしても「同じ uid の別プロセスが先に bind して偽 daemon を
+/// 立てる」余地は残るが、接続受付ごとに peer uid を検証することで別ユーザの
+/// 偽 daemon への接続・状態破壊を拒否する。
+fn is_peer_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
+    peer_uid == daemon_uid
+}
+
 /// 接続を受け付け、接続ごとにコマンド処理タスクを立てる。
 async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std::io::Result<()> {
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    // MEDIUM-3: daemon 自身の uid。共有 /tmp では別ユーザの接続を拒否する。
+    let daemon_uid = unsafe { libc::getuid() };
     loop {
         let (stream, _) = listener.accept().await?;
+        // MEDIUM-3: peer uid が取れない（エラー）場合も含め、daemon の uid と
+        // 一致しない接続は即切断する（fail closed）。
+        let peer_uid = stream.peer_cred().map(|c| c.uid());
+        if peer_uid.map_or(true, |uid| !is_peer_allowed(uid, daemon_uid)) {
+            drop(stream);
+            continue;
+        }
         let permit = match connections.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => return Ok(()), // セマフォが閉じられた（起きない）
@@ -177,14 +227,25 @@ async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std:
 async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_id: u64) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut first_command = true;
     loop {
         let mut line = String::new();
         // SEC-1: 改行のない無限ストリームで行バッファが無制限に育たないよう、
         // 上限を超える行は接続を閉じる
-        let read = (&mut reader)
-            .take(MAX_CMD_LINE as u64 + 1)
-            .read_line(&mut line)
-            .await;
+        let mut bounded = (&mut reader).take(MAX_CMD_LINE as u64 + 1);
+        let read_line = bounded.read_line(&mut line);
+        // MEDIUM-5: 最初のコマンドだけタイムアウトを付ける — 接続後に何も
+        // 送らない無言接続がスロット（MAX_CONNECTIONS）を永久に占有しないよう
+        // 切断する。コマンドを送った後のアイドル（読書中の TUI）は切断しない。
+        let read = if first_command {
+            first_command = false;
+            match timeout(FIRST_COMMAND_TIMEOUT, read_line).await {
+                Ok(r) => r,
+                Err(_) => break, // 無言接続: タイムアウトで切断
+            }
+        } else {
+            read_line.await
+        };
         match read {
             Ok(0) => break, // クライアントの切断
             Ok(_) => {}
@@ -424,6 +485,15 @@ fn preempt(daemon: &mut Daemon, conn_id: u64) {
 fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnapshot {
     match command {
         Command::Insert { text } => {
+            // SEC-1/ADR-0008: Insert による無制限の文書成長を防ぐ。Open と同じ
+            // MAX_FILE_SIZE（バイト数）を超える挿入は状態を変えず status で
+            // 拒否する（read_open_target の「status で報告して状態を触らない」
+            // 流儀に合わせる）。preempt より前に判定するので undo グループの
+            // 開閉（SetMode の group 管理）には一切干渉しない。
+            let doc_bytes = daemon.editor.current_document().text().len_bytes() as u64;
+            if doc_bytes + text.len() as u64 > MAX_FILE_SIZE {
+                return snapshot(daemon, Some("file too large: insert rejected".into()));
+            }
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = Transaction::insert(daemon.editor.current_document(), &selection, &text);
@@ -625,8 +695,9 @@ fn convert_mode_back(m: mina_view::Mode) -> mina_protocol::Mode {
 
 /// socket パス。
 ///
-/// ponytail: uid を入れていない（単一ユーザ前提）。複数ユーザ対応が必要に
-/// なったら `<dir>/mina-<uid>.sock` にする。
+/// ponytail: uid をファイル名に入れていない（単一ユーザ前提）。アクセス制御
+/// は socket の 0600 化 + 接続時の peer uid 検証（MEDIUM-3）で行う。複数ユーザ
+/// を同時に扱う必要が出たら `<dir>/mina-<uid>.sock` にする。
 pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join("mina.sock")
 }
@@ -796,6 +867,73 @@ mod tests {
         assert_eq!(s.text, "Xhello");
         assert!(s.dirty, "編集で dirty になる");
         assert_eq!(s.selection[0].head, 1);
+    }
+
+    #[test]
+    fn insert_over_max_file_size_is_rejected_without_changes() {
+        // SEC-1/ADR-0008: MAX_FILE_SIZE を超える挿入は拒否される。Open と同じ
+        // 上限を Insert にも適用し、文書・選択・dirty を一切変えず status で
+        // 報告する（修正前は繰り返し Insert でメモリが無制限に成長した）。
+        let mut d = daemon();
+        // 上限の 10 バイト手前まで埋めた文書
+        let base = "x".repeat(MAX_FILE_SIZE as usize - 10);
+        open(&mut d, &base);
+        apply(
+            &mut d,
+            Command::Goto {
+                target: GotoTarget::DocumentEnd,
+            },
+        );
+        let sel_before = d.editor.selection();
+        // 上限を超える挿入（+11 バイト）は拒否され、状態が不変
+        let s = apply(&mut d, Command::Insert { text: "y".repeat(11) });
+        let msg = s.status.as_deref().expect("拒否メッセージが出る");
+        assert!(msg.starts_with("file too large"), "専用メッセージ: {msg}");
+        assert_eq!(s.text.len() as u64, MAX_FILE_SIZE - 10, "文書は不変");
+        assert!(!s.dirty, "拒否では dirty にならない");
+        let r = sel_before.ranges()[0];
+        assert_eq!(
+            s.selection[0],
+            Range {
+                anchor: r.anchor(),
+                head: r.head()
+            },
+            "選択は不変"
+        );
+
+        // 上限ちょうどまでなら成功する（+10 バイトでぴったり MAX_FILE_SIZE）
+        let s = apply(&mut d, Command::Insert { text: "z".repeat(10) });
+        assert_eq!(s.text.len() as u64, MAX_FILE_SIZE);
+        assert!(s.dirty, "上限内の挿入は成功して dirty になる");
+    }
+
+    #[test]
+    fn rejected_insert_keeps_undo_group_open() {
+        // SEC-1/ADR-0008: 拒否された Insert は undo グループの状態を変えない。
+        // Insert セッション中の拒否後もグループは開いたまま（undo 1回で
+        // セッション全体が戻る）。
+        let mut d = daemon();
+        open(&mut d, "");
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "a".into() });
+        // 上限を超える Insert を拒否（グループは開いたまま）
+        let s = apply(
+            &mut d,
+            Command::Insert {
+                text: "x".repeat(MAX_FILE_SIZE as usize),
+            },
+        );
+        assert!(
+            s.status.as_deref().unwrap().starts_with("file too large"),
+            "拒否される"
+        );
+        assert_eq!(s.mode, Mode::Insert, "拒否でモードも変わらない");
+        // 拒否後も同じグループに追記でき、undo 1回で全体が戻る
+        apply(&mut d, Command::Insert { text: "b".into() });
+        let s = apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        assert_eq!(s.text, "ab");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "", "undo 1回でセッション全体が戻る（グループが無傷）");
     }
 
     #[test]
@@ -1084,6 +1222,38 @@ mod tests {
         let _ = std::fs::remove_file(&big);
     }
 
+    #[tokio::test]
+    async fn silent_connections_time_out_and_free_slots() {
+        // MEDIUM-5: 接続後に何も送らない無言接続は、最初のコマンドのタイムアウト
+        // （テスト 500ms）で切断されスロット（MAX_CONNECTIONS=4）が解放される。
+        // 修正前は 4 本の無言接続で全スロットが永久に枯渇し、5 台目のクライアント
+        // のリクエストが永久にハングした。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m5-sock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        // 全スロットを無言接続で埋める（何も送らない）
+        let mut silent = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            silent.push(UnixStream::connect(&sock).await.expect("接続できる"));
+        }
+
+        // 5 台目: 最初はスロット待ちだが、無言接続がタイムアウトで切断されると
+        // accept されて応答が返る。修正前は永久に待つ（5 秒でタイムアウト判定）。
+        let mut fresh = UnixStream::connect(&sock).await.expect("接続できる");
+        let snap = timeout(
+            std::time::Duration::from_secs(5),
+            request(&mut fresh, &Command::GetState),
+        )
+        .await
+        .expect("無言接続が切断されスロットが解放されて応答が返る");
+        assert_eq!(snap.text, "");
+
+        drop(silent);
+        let _ = std::fs::remove_file(&sock);
+    }
+
     #[test]
     fn delete_selection_exits_select_mode() {
         let mut d = daemon();
@@ -1222,5 +1392,31 @@ mod tests {
         );
         assert_eq!(s.selection[0].head, text.chars().count());
         assert!(s.first_line > 0, "カーソルに追従してスクロールする: {}", s.first_line);
+    }
+
+    #[tokio::test]
+    async fn socket_file_mode_is_0600() {
+        // MEDIUM-3: serve 後の socket ファイルは 0600。修正前はプロセス umask
+        // （通常 0022）で 0755 になり、共有 /tmp の別ユーザから接続・spoofing
+        // できた。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m3-mode-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket の mode は 0600: {mode:o}");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn peer_uid_mismatch_is_rejected() {
+        // MEDIUM-3: 純関数の uid 判定 — uid が一致する接続のみ許可する
+        // （別ユーザの偽 daemon / 状態破壊を拒否）。
+        let uid = unsafe { libc::getuid() };
+        assert!(is_peer_allowed(uid, uid), "同一 uid は許可");
+        assert!(!is_peer_allowed(uid.wrapping_add(1), uid), "別ユーザは拒否");
+        assert!(!is_peer_allowed(0, uid), "root でも別 uid なら拒否");
     }
 }
