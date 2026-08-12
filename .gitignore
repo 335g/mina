@@ -12,3 +12,5 @@ apm_modules/
 .pi/todos
 
 .DS_Store
+
+tmp
