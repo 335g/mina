@@ -1365,6 +1365,49 @@ mod tests {
     }
 
     #[test]
+    fn undo_after_save_marks_dirty() {
+        // バグ修正: 保存後に undo するとテキストがディスクと乖離するのに dirty が
+        // false のままだった（undo/redo は dirty を触らなかった）。undo/redo は
+        // 文書を変えるので常に dirty を立てる — 履歴に保存時点のマーカーを
+        // 持たない割り切り（is_dirty の ponytail コメント）と整合。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mina-undo-dirty-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut d = daemon();
+        open_path(&mut d, &path_str, "hello");
+        // グループ1: "a" 挿入
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "a".into() });
+        apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        // グループ2: "b" 挿入
+        apply(&mut d, Command::SetMode { mode: Mode::Insert });
+        apply(&mut d, Command::Insert { text: "b".into() });
+        apply(&mut d, Command::SetMode { mode: Mode::Normal });
+
+        // 保存（"abhello" をディスクに書き、dirty をクリア）
+        let (text, doc_id) = {
+            let text = d.editor.current_document().text().to_string();
+            (text, d.editor.focused_doc_id())
+        };
+        std::fs::write(&path, text.as_bytes()).unwrap();
+        assert!(d.editor.mark_saved_doc(doc_id, &text));
+        assert!(!d.editor.is_dirty());
+
+        // undo でグループ2 だけ戻る → text="ahello" ≠ disk="abhello" → dirty
+        apply(&mut d, Command::Undo);
+        assert_eq!(d.editor.current_document().text().to_string(), "ahello");
+        assert!(d.editor.is_dirty(), "undo でテキストがディスクと乖離 → dirty のはず");
+
+        // redo で復元しても dirty は残る（保存時点のマーカーを持たないため）
+        apply(&mut d, Command::Redo);
+        assert_eq!(d.editor.current_document().text().to_string(), "abhello");
+        assert!(d.editor.is_dirty(), "redo 後も保守的に dirty");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn move_advances_cursor() {
         let mut d = daemon();
         open(&mut d, "hello");
