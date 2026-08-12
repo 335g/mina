@@ -242,14 +242,23 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                 let mut d = daemon.lock().await;
                 match write_result {
                     Ok(()) => {
-                        // 保存した文書そのものの dirty を消す（H3: 書き込み中に他接続が
-                        // Open してフォーカスが変わっても、保存対象の文書を正しく扱う）。
-                        d.editor.mark_saved_doc(doc_id);
+                        // 保存した文書そのものの dirty を消す。ただし書き込んだ
+                        // テキストが現在のテキストと一致する場合のみ（H3: 書き込
+                        // み中に他接続が Open してフォーカスが変わっても、保存対象
+                        // の文書を正しく扱う / HIGH-1: 書き込み中に他接続が編集し
+                        // たなら古いテキストを保存したことになるので、dirty を残
+                        // して未保存の編集を失わせない）。
+                        let clean = d.editor.mark_saved_doc(doc_id, &text);
                         let shown = path
                             .as_ref()
                             .expect("書き込み成功ならパスはある")
                             .display();
-                        snapshot(&d, Some(format!("saved: {shown}")))
+                        let status = if clean {
+                            format!("saved: {shown}")
+                        } else {
+                            format!("saved: {shown} (edited during save, still dirty)")
+                        };
+                        snapshot(&d, Some(status))
                     }
                     Err(e) => snapshot(&d, Some(format!("save failed: {e}"))),
                 }
@@ -1090,7 +1099,7 @@ mod tests {
         };
         let p = p.expect("パスがある");
         std::fs::write(&p, text.as_bytes()).unwrap();
-        d.editor.mark_saved_doc(doc_id);
+        assert!(d.editor.mark_saved_doc(doc_id, &text));
         let s = snapshot(&d, Some("saved".into()));
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
@@ -1124,13 +1133,40 @@ mod tests {
         apply(&mut d, Command::Insert { text: " Y".into() });
         // 書き込み完了 → 保存した文書 A の dirty を消す
         std::fs::write(&path_a, text_a.as_bytes()).unwrap();
-        d.editor.mark_saved_doc(doc_id_a);
+        assert!(d.editor.mark_saved_doc(doc_id_a, &text_a));
 
         // スナップショットはフォーカス（B）の状態: B の未保存編集は dirty のまま
         let s = snapshot(&d, Some("saved".into()));
         assert!(s.dirty, "B の未保存編集が保存済み扱いにならない: {}", s.dirty);
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn save_keeps_dirty_if_edited_during_write() {
+        // HIGH-1: Save の書き込み中に他接続が同じ文書を編集すると、保存した
+        // のは書き込み開始時点の古いテキスト。dirty を消してしまうと未保存の
+        // 編集が「保存済み」と誤表示され、quit で失われる（データ損失）。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mina-high1-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let mut d = daemon();
+        open_path(&mut d, &path_str, "hello");
+        // 保存対象を捕捉（接続ハンドラのロック解放前の処理に相当）
+        let doc_id = d.editor.focused_doc_id();
+        let text = d.editor.current_document().text().to_string();
+        // 書き込み中に他接続が編集（dirty になる）
+        apply(&mut d, Command::Insert { text: " X".into() });
+        assert!(d.editor.is_dirty(), "書き込み中の編集で dirty");
+
+        // 書き込み完了 → 古いテキストでは dirty が消えない
+        std::fs::write(&path, text.as_bytes()).unwrap();
+        assert!(!d.editor.mark_saved_doc(doc_id, &text));
+        let s = snapshot(&d, Some("saved".into()));
+        assert!(s.dirty, "書き込み中に編集された文書が保存済み扱いにならない: {}", s.dirty);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
