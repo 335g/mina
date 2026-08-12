@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mina_lsp::{Client, Incoming, PositionEncoding, PublishParams};
+use mina_lsp::{Client, PositionEncoding, PublishDiagnostic};
 use mina_protocol::{Diagnostic, Severity};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
@@ -18,6 +18,13 @@ use crate::daemon::Daemon;
 
 /// 1回の publish で取り込む診断の上限（5c: 診断 flood 対策）。
 const MAX_DIAGNOSTICS: usize = 500;
+
+/// 編集後の pull 診断を打つまでの待ち時間。
+///
+/// rust-analyzer は解析完了まで pull に「解析前の空」を返すため、didChange の
+/// 直後に pull すると誤ってクリーン扱いになる。インクリメンタル解析は概ね
+/// 100ms 前後で完了するため、250ms 待ってから pull する。
+const PULL_SETTLE: Duration = Duration::from_millis(250);
 
 /// LSP セッションの Mutex 取得のタイムアウト（MEDIUM-4）。
 ///
@@ -36,6 +43,8 @@ pub struct LspSession {
     encoding: PositionEncoding,
     version: i64,
     current_uri: Option<String>,
+    /// initialize 応答で advertise された pull 診断の identifier。
+    diagnostic_identifier: Option<String>,
 }
 
 /// 拡張子 → サーバコマンド（組み込みテーブル。設定ファイル化はサーバが増えてから）。
@@ -85,6 +94,11 @@ impl LspSession {
             Some("utf-8") => PositionEncoding::Utf8,
             _ => PositionEncoding::Utf16,
         };
+        // pull 診断の identifier（rust-analyzer は "rust-analyzer" を advertise）。
+        let diagnostic_identifier = result
+            .pointer("/capabilities/diagnosticProvider/identifier")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         client
             .notify("initialized", json!({}))
             .await
@@ -94,6 +108,7 @@ impl LspSession {
             encoding,
             version: 0,
             current_uri: None,
+            diagnostic_identifier,
         })
     }
 
@@ -136,60 +151,73 @@ impl LspSession {
         self.current_uri.as_deref()
     }
 
-    /// 未処理の通知を処理し、現在の文書向けの最新診断を返す。
-    /// 診断が publish されていなければ None。
-    fn drain_diagnostics(&mut self, text: &str, doc_uri: &str) -> Option<Vec<Diagnostic>> {
-        let mut out = None;
-        while let Ok(msg) = self.client.try_recv() {
-            let Incoming::Notification { method, params } = msg;
-            if method != "textDocument/publishDiagnostics" {
-                continue;
-            }
-            let Ok(p) = serde_json::from_value::<PublishParams>(params) else {
-                continue;
-            };
-            if p.uri != doc_uri {
-                continue;
-            }
-            // 5c: 行インデックスを1回だけ構築し、各診断の座標変換を O(行長) に抑える
-            // （毎回 O(文書長) を診断数ぶん繰り返さない）。
-            let index = LineIndex::new(text);
-            out = Some(
-                p.diagnostics
-                    .into_iter()
-                    .take(MAX_DIAGNOSTICS)
-                    .filter_map(|d| {
-                        let start = lsp_pos_to_char_indexed(
-                            &index,
-                            text,
-                            d.range.start.line,
-                            d.range.start.character,
-                            self.encoding,
-                        );
-                        let end = lsp_pos_to_char_indexed(
-                            &index,
-                            text,
-                            d.range.end.line,
-                            d.range.end.character,
-                            self.encoding,
-                        );
-                        Some(Diagnostic {
-                            start,
-                            end,
-                            severity: match d.severity {
-                                Some(1) => Severity::Error,
-                                Some(2) => Severity::Warning,
-                                Some(3) => Severity::Info,
-                                _ => Severity::Hint,
-                            },
-                            message: d.message,
-                        })
-                    })
-                    .collect(),
-            );
+    /// pull 診断（`textDocument/diagnostic`）を取得し、char インデックスに変換して返す。
+    ///
+    /// 解析未完了（空）・エラー応答・URI 不一致の場合は `None`（呼び出し側は
+    /// 現在の診断を維持する）。rust-analyzer はライブ（in-memory）の診断を
+    /// push（publishDiagnostics）ではなく pull で返すため、編集後の診断更新は
+    /// この経路で行う（上流フィードバック: クライアントは両方扱うべき）。
+    pub async fn pull_diagnostics(&mut self, path: &Path, text: &str) -> Option<Vec<Diagnostic>> {
+        let doc_uri = uri(path);
+        if self.current_uri.as_deref() != Some(doc_uri.as_str()) {
+            return None;
         }
-        out
+        let mut params = json!({ "textDocument": { "uri": doc_uri } });
+        if let Some(id) = &self.diagnostic_identifier {
+            params["identifier"] = json!(id);
+        }
+        let result = self
+            .client
+            .request("textDocument/diagnostic", params)
+            .await
+            .ok()?;
+        let items = result.get("items")?.as_array()?;
+        let items: Vec<PublishDiagnostic> = serde_json::from_value(Value::Array(items.clone())).ok()?;
+        Some(convert_diagnostics(text, self.encoding, items))
     }
+}
+
+/// LSP 診断アイテム（LSP 座標・severity）を char インデックスに変換する。
+///
+/// 5c: 行インデックスを1回だけ構築し、各診断の座標変換を O(行長) に抑える
+/// （毎回 O(文書長) を診断数ぶん繰り返さない）。
+fn convert_diagnostics(
+    text: &str,
+    enc: PositionEncoding,
+    items: Vec<PublishDiagnostic>,
+) -> Vec<Diagnostic> {
+    let index = LineIndex::new(text);
+    items
+        .into_iter()
+        .take(MAX_DIAGNOSTICS)
+        .filter_map(|d| {
+            let start = lsp_pos_to_char_indexed(
+                &index,
+                text,
+                d.range.start.line,
+                d.range.start.character,
+                enc,
+            );
+            let end = lsp_pos_to_char_indexed(
+                &index,
+                text,
+                d.range.end.line,
+                d.range.end.character,
+                enc,
+            );
+            Some(Diagnostic {
+                start,
+                end,
+                severity: match d.severity {
+                    Some(1) => Severity::Error,
+                    Some(2) => Severity::Warning,
+                    Some(3) => Severity::Info,
+                    _ => Severity::Hint,
+                },
+                message: d.message,
+            })
+        })
+        .collect()
 }
 
 /// 行先頭の char インデックス（5c: 診断座標変換を O(N×文書長) にしないための索引）。
@@ -240,6 +268,7 @@ fn lsp_pos_to_char_indexed(
 
 /// LSP 座標（行・列）を文書内の char インデックスへ変換する。O(文書長)。
 /// テストと単発変換用。診断の一括変換は [`lsp_pos_to_char_indexed`] を使う。
+#[cfg(test)]
 fn lsp_pos_to_char(text: &str, line: u32, col: u32, enc: PositionEncoding) -> usize {
     lsp_pos_to_char_indexed(&LineIndex::new(text), text, line, col, enc)
 }
@@ -334,10 +363,12 @@ pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
     session.did_change(path, text).await;
 }
 
-/// 未処理の LSP 通知を取り込み、診断を daemon に反映する。
+/// 未処理の LSP 通知を取り込み、daemon の診断を維持する。
 ///
-/// M1: セッションが同期中（ロック中）ならスキップする — 診断は「次の
-/// スナップショットに載る」設計のため、daemon ロック内で LSP を待たない。
+/// 診断の実体は pull（[`pull_after_edit`] / [`settle_open_diagnostics`]）で更新する。
+/// ここでは MEDIUM-3（サーバ死亡時のクリア）だけを行う。push（publishDiagnostics）
+/// は flycheck（cargo check・ディスク基準）由来で、編集内容と食い違う stale な
+/// 診断を publish することがあり、pull の結果を上書きしないよう適用しない。
 pub fn drain_into(daemon: &mut Daemon) {
     let Some(session) = &daemon.lsp else {
         return;
@@ -347,21 +378,89 @@ pub fn drain_into(daemon: &mut Daemon) {
         return;
     };
     let doc_uri = uri(path);
-    let Ok(mut session) = session.try_lock() else {
+    let Ok(session) = session.try_lock() else {
         return;
     };
     // MEDIUM-3: サーバが死んだら古い診断を残さない（下線・カウントが文書と
     // 不整合のまま表示され続ける）。再 spawn は次回 .rs Open 時（ADR-0009）。
     if session.client.is_dead() {
         daemon.diagnostics.clear();
-        return;
+    } else if session.current_uri() != Some(doc_uri.as_str()) {
+        // フォーカスが LSP 対象外の文書に移ったら診断は残さない
+        daemon.diagnostics.clear();
     }
-    if session.current_uri() != Some(doc_uri.as_str()) {
-        return;
+}
+
+/// 編集後の診断を pull で取り込む（daemon ロック外・lsp mutex のみ）。
+///
+/// didChange の直後は解析未完了で pull が空を返すため、[`PULL_SETTLE`] だけ
+/// 待ってから打つ。`None`（サーバ死亡・ロック待ち・エラー応答）なら呼び出し側は
+/// 現状維持する。
+///
+/// ponytail: 固定待ち 250ms。解析が遅い環境では「解析前の空」が返り、次の編集
+/// まで診断が消えることがある。気になるなら push 通知を解析完了シグナルとして
+/// 使ってから pull する方式に差し替える。
+pub async fn pull_after_edit(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+) -> Option<Vec<Diagnostic>> {
+    tokio::time::sleep(PULL_SETTLE).await;
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return None;
+    };
+    if session.client.is_dead() {
+        return None;
     }
-    let text = daemon.editor.current_document().text().to_string();
-    if let Some(diagnostics) = session.drain_diagnostics(&text, &doc_uri) {
-        daemon.diagnostics = diagnostics;
+    session.pull_diagnostics(path, text).await
+}
+
+/// Open 直後の診断追跡タスク: 初期解析が完了するまで pull を繰り返し、
+/// 診断を daemon に反映する。
+///
+/// rust-analyzer の初期解析（crate ロード）は数秒かかり、その間の pull は空を
+/// 返す。500ms 間隔で打ち続け、2 回連続で同じ件数になったら安定とみなして終了
+/// する（上限 120 回 = 60 秒）。フォーカスが別文書に移ったら中断する。
+pub async fn settle_open_diagnostics(
+    daemon: &Mutex<Daemon>,
+    session: Arc<Mutex<LspSession>>,
+    path: PathBuf,
+) {
+    let mut prev: Option<usize> = None;
+    let mut stable = 0;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // 現在のテキストを掴んでから pull（フォーカス移動・編集の最中は中断）
+        let text = {
+            let d = daemon.lock().await;
+            if d.editor.focused_path().map(Path::to_path_buf).as_deref() != Some(path.as_path()) {
+                return;
+            }
+            d.editor.current_document().text().to_string()
+        };
+        let pulled = {
+            let Ok(mut s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+                continue;
+            };
+            if s.client.is_dead() {
+                return;
+            }
+            s.pull_diagnostics(&path, &text).await
+        };
+        let Some(diags) = pulled else {
+            continue;
+        };
+        let n = diags.len();
+        daemon.lock().await.diagnostics = diags;
+        if prev == Some(n) {
+            stable += 1;
+            if stable >= 2 {
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+        prev = Some(n);
     }
 }
 
@@ -429,39 +528,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_into_converts_cjk_utf16_positions() {
-        // 欠陥の E2E 検証: --cjk の mock が publish する UTF-16 単位の位置が、
-        // daemon の drain_into（drain_diagnostics → position.rs 変換）を経て
-        // char インデックスとして正しくスナップショットに載る。
+    async fn pull_converts_cjk_utf16_positions() {
+        // 欠陥の E2E 検証: --cjk の mock が返す pull 診断の UTF-16 単位の位置が、
+        // pull_diagnostics（convert_diagnostics → position.rs 変換）を経て
+        // char インデックスとして正しく返る。
         let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
         if !std::path::Path::new(bin).exists() {
             eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
             return;
         }
-        let mut daemon = Daemon::new();
         let path = PathBuf::from("/tmp/x.rs");
         // "あ😀TODO": UTF-16 では あ=1単位 + 😀=2単位 で TODO は offset 3。
         // バイトでは offset 7 なので、バイトのままだと誤って 7 文字目扱いになる。
-        daemon.editor.open_with_path(path.clone(), "あ😀TODO");
         let session = Arc::new(Mutex::new(
             LspSession::new_with_args(bin, Path::new("/tmp"), &["--cjk"])
                 .await
                 .expect("initialize"),
         ));
-        daemon.lsp = Some(session.clone());
-
         session.lock().await.did_open(&path, "あ😀TODO").await;
-        let mut got = false;
-        for _ in 0..50 {
-            drain_into(&mut daemon);
-            if !daemon.diagnostics.is_empty() {
-                got = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(got, "UTF-16 診断が取り込まれる");
-        let d = &daemon.diagnostics[0];
+        let diags = session
+            .lock()
+            .await
+            .pull_diagnostics(&path, "あ😀TODO")
+            .await
+            .expect("pull 診断が返る");
+        assert_eq!(diags.len(), 1, "TODO 診断が1件: {diags:?}");
+        let d = &diags[0];
         // UTF-16 offset 3 → char 2（TODO の 'T'。あ=char0、😀=char1）
         assert_eq!(d.start, 2, "あ(1単位)+😀(2単位) の後: {d:?}");
         assert_eq!(d.end, 6, "TODO は4文字: {d:?}");
@@ -478,30 +570,29 @@ mod tests {
             return;
         }
         let mut daemon = Daemon::new();
+        let path = PathBuf::from("/tmp/x.rs");
         daemon
             .editor
-            .open_with_path(PathBuf::from("/tmp/x.rs"), "fn main() { TODO }");
+            .open_with_path(path.clone(), "fn main() { TODO }");
         let session = Arc::new(Mutex::new(
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
         daemon.lsp = Some(session.clone());
 
-        // didOpen で mock が TODO 位置の診断を publish する（非同期到着のため待つ）
+        // pull で TODO 診断を取り込んでから殺す（MEDIUM-3 の前提: 診断がある状態）
         session
             .lock()
             .await
-            .did_open(Path::new("/tmp/x.rs"), "fn main() { TODO }")
+            .did_open(&path, "fn main() { TODO }")
             .await;
-        let mut got = false;
-        for _ in 0..50 {
-            drain_into(&mut daemon);
-            if !daemon.diagnostics.is_empty() {
-                got = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(got, "診断が取り込まれる");
+        let diags = session
+            .lock()
+            .await
+            .pull_diagnostics(&path, "fn main() { TODO }")
+            .await
+            .expect("pull 診断が返る");
+        daemon.diagnostics = diags;
+        assert!(!daemon.diagnostics.is_empty(), "診断が入っている");
 
         // サーバを殺す → drain で古い診断がクリアされる
         session.lock().await.client.kill().await;
