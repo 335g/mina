@@ -330,6 +330,10 @@ impl Editor {
         if let Some((new_doc, selection)) = self.history_mut().undo(&old_doc) {
             self.documents.insert(doc_id, new_doc);
             self.view_mut().selection = selection;
+            // undo は文書を変えるので dirty を立てる。履歴に保存時点のマーカー
+            // を持たないため、保存時点まで戻った場合も保守的に dirty を残す
+            // （is_dirty の ponytail コメントと整合）。
+            self.dirty.insert(doc_id);
         }
     }
 
@@ -340,6 +344,8 @@ impl Editor {
         if let Some((new_doc, selection)) = self.history_mut().redo(&old_doc) {
             self.documents.insert(doc_id, new_doc);
             self.view_mut().selection = selection;
+            // redo も undo と同じく文書を変えるので dirty を立てる。
+            self.dirty.insert(doc_id);
         }
     }
 
