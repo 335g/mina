@@ -6,3 +6,7 @@ target
 
 # APM dependencies
 apm_modules/
+/.agents
+
+/.pi-subagents
+.pi/todos
