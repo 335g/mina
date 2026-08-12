@@ -156,13 +156,19 @@ fn step_line(text: &str, char_pos: usize, dir: Direction) -> usize {
     if len == 0 {
         return 0;
     }
-    let line_start = text[..char_to_byte(text, char_pos)]
+    let byte_pos = char_to_byte(text, char_pos);
+    let line_start = text[..byte_pos]
         .rfind('\n')
         .map(|b| byte_to_char(text, b) + 1)
         .unwrap_or(0);
-    let line_end = text[char_to_byte(text, char_pos)..]
+    // 注意: `find('\n')` の戻り値 `b` は `text[byte_pos..]` からの相対バイト。
+    // `byte_to_char(text, b)`（文書先頭からの絶対変換）に渡すと、前の行に
+    // 多バイト文字があるとき char インデックスがずれ、その後のスライスが
+    // char 境界を跨いで panic する（バグ修正前: 日本語行を跨ぐ j 移動で
+    // 「byte index is not a char boundary」）。相対バイト → 相対 char 数に変換する。
+    let line_end = text[byte_pos..]
         .find('\n')
-        .map(|b| char_pos + byte_to_char(text, b))
+        .map(|b| char_pos + text[byte_pos..byte_pos + b].chars().count())
         .unwrap_or(len);
     let col = char_pos - line_start;
     match dir {
@@ -171,9 +177,10 @@ fn step_line(text: &str, char_pos: usize, dir: Direction) -> usize {
                 return char_pos; // 最終行
             }
             let next_start = line_end + 1;
-            let next_end = text[char_to_byte(text, next_start)..]
+            let next_byte = char_to_byte(text, next_start);
+            let next_end = text[next_byte..]
                 .find('\n')
-                .map(|b| next_start + byte_to_char(text, b))
+                .map(|b| next_start + text[next_byte..next_byte + b].chars().count())
                 .unwrap_or(len);
             next_start + col.min(next_end - next_start)
         }
@@ -463,6 +470,44 @@ mod tests {
             ),
             Selection::point(8)
         );
+    }
+
+    #[test]
+    fn move_line_over_multibyte_lines_does_not_panic() {
+        // バグ修正: 全角文字を含む行を跨ぐ Line 移動で、相対バイトオフセットを
+        // 絶対変換してしまい「byte index is not a char boundary」で panic していた。
+        // 日本語行の上から 3 回下へ移動しても panic せず正しい位置へ着く。
+        let doc = Document::from("あ\nい\nう\nえ");
+        // 行0 の 'あ' から: 下 → 行1 の 'い'（char 2）→ 行2 の 'う'（char 4）→ 行3 の 'え'（char 6）
+        let mut sel = Selection::point(0);
+        for expected in [2, 4, 6] {
+            sel = move_selection(
+                &doc,
+                &sel,
+                Movement::Line,
+                Direction::Forward,
+            );
+            assert_eq!(sel.primary().head(), expected, "移動後位置: {sel:?}");
+        }
+        // 上の行にも戻れる
+        let mut sel = Selection::point(6);
+        for expected in [4, 2, 0] {
+            sel = move_selection(
+                &doc,
+                &sel,
+                Movement::Line,
+                Direction::Backward,
+            );
+            assert_eq!(sel.primary().head(), expected, "移動後位置: {sel:?}");
+        }
+        // 日本語 + ASCII 混在（報告ケースに近い形）
+        let doc = Document::from("//! 検索: 文書内のパターン一致\n//! 主役は [`find_matches`]\nabc");
+        let mut sel = Selection::point(0);
+        sel = move_selection(&doc, &sel, Movement::Line, Direction::Forward);
+        sel = move_selection(&doc, &sel, Movement::Line, Direction::Forward);
+        sel = move_selection(&doc, &sel, Movement::Line, Direction::Forward);
+        // 最終行（abc）の先頭に着く（panic しないこと・位置は行先頭）
+        assert_eq!(sel.primary().head(), 0 + doc.text().chars().count() - 3);
     }
 
     #[test]
