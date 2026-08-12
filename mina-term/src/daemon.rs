@@ -293,6 +293,16 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                         lsp::open_document(session, &path_buf, &text).await;
                     }
                 }
+                // 初期解析（crate ロード・数秒）が完了するまで pull で診断を追う。
+                // 解析未完の間の pull は空を返すため、バックグラウンドで poll する。
+                if let Some(session) = &session {
+                    let daemon_task = daemon.clone();
+                    let session_task = session.clone();
+                    let path_task = path_buf.clone();
+                    tokio::spawn(async move {
+                        lsp::settle_open_diagnostics(&daemon_task, session_task, path_task).await;
+                    });
+                }
                 let mut d = daemon.lock().await;
                 lsp::drain_into(&mut d);
                 snapshot(&d, open_status)
@@ -352,10 +362,21 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                 drop(d);
                 if let Some((session, Some(path), text)) = sync_target {
                     lsp::sync(&session, &path, &text).await;
+                    // 編集後のライブ診断は push ではなく pull で取る（flycheck は
+                    // ディスク基準のため編集内容を反映しない。上流フィードバック
+                    // どおり pull を扱う）。解析完了まで短く待ってから打つ。
+                    let pulled = lsp::pull_after_edit(&session, &path, &text).await;
+                    let mut d = daemon.lock().await;
+                    if let Some(diags) = pulled {
+                        d.diagnostics = diags;
+                    }
+                    lsp::drain_into(&mut d);
+                    snapshot(&d, None)
+                } else {
+                    let mut d = daemon.lock().await;
+                    lsp::drain_into(&mut d);
+                    snapshot(&d, None)
                 }
-                let mut d = daemon.lock().await;
-                lsp::drain_into(&mut d);
-                snapshot(&d, None)
             }
             Err(_) => {
                 // M7: 壊れたコマンド行にも status 付きスナップショットを返す
