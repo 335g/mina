@@ -195,6 +195,22 @@ fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], widt
     status.push_str("\x1b[7m");
     status.push_str(mode);
     status.push_str("\x1b[0m");
+    // 診断カウントは mode の直後（パスより前）に置く — 長いパスで truncate され
+    // てもカウントが消えないようにする（修正前は末尾だったため、実用の長い
+    // パスで [nE nW] が画面外に切れていた）。
+    let errors = state
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let warnings = state
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
+    if errors > 0 || warnings > 0 {
+        status.push_str(&format!("  [{errors}E {warnings}W]"));
+    }
     let path = sanitize_status_data(state.path.as_deref().unwrap_or("[no name]"));
     let dirty = if state.dirty { "*" } else { "" };
     let primary = state
@@ -216,20 +232,6 @@ fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], widt
     }
     if let Some(msg) = &state.status {
         status.push_str(&format!("  {}", sanitize_status_data(msg)));
-    }
-    // 診断カウント（ステータス行に載せる）
-    let errors = state
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warnings = state
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
-    if errors > 0 || warnings > 0 {
-        status.push_str(&format!("  [{errors}E {warnings}W]"));
     }
     truncate_wide(&mut status, width);
     s.push_str(&status);
