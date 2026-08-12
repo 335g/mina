@@ -147,13 +147,27 @@ impl Editor {
         self.dirty.contains(&self.view().doc)
     }
 
-    /// 指定した文書の保存完了を記録し、dirty をクリアする。
+    /// 指定した文書への保存完了を記録する。
     ///
     /// 保存対象は「保存開始時にフォーカスしていた文書」であり、保存完了時点の
     /// フォーカスではない（H3: 書き込み中に別接続が Open するとフォーカスが
     /// 変わり得る。dirty は View ではなく Document 単位）。
-    pub fn mark_saved_doc(&mut self, doc_id: DocumentId) {
-        self.dirty.remove(&doc_id);
+    ///
+    /// 書き込み対象のテキストが現在のテキストと一致する場合のみ dirty をクリア
+    /// して `true` を返す。一致しない場合（HIGH-1: 書き込み中に他接続が編集）
+    /// は dirty を残して `false` を返す — 古いテキストを保存しても未保存の
+    /// 編集が残っているので、「保存済み」と誤認させて編集を失わせない。文書が
+    /// 既に破棄されている場合（破棄は clean な文書のみ）はクリア不要なので
+    /// `true`。
+    pub fn mark_saved_doc(&mut self, doc_id: DocumentId, written_text: &str) -> bool {
+        match self.documents.get(&doc_id) {
+            Some(doc) if doc.text().to_string() == written_text => {
+                self.dirty.remove(&doc_id);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        }
     }
 
     /// 文書を ID で取得する。
@@ -437,8 +451,9 @@ mod tests {
         editor.apply(tx, selection_after);
         assert!(editor.is_dirty());
 
-        // 保存でクリアされる
-        editor.mark_saved_doc(id);
+        // 保存でクリアされる（書き込んだテキスト == 現在のテキスト）
+        let text = editor.document(id).text().to_string();
+        assert!(editor.mark_saved_doc(id, &text));
         assert!(!editor.is_dirty());
     }
 
@@ -462,11 +477,39 @@ mod tests {
         assert!(editor.is_dirty(), "B も dirty（フォーカスは B）");
 
         // A の保存完了を記録しても、B の dirty は残る
-        editor.mark_saved_doc(id_a);
+        let text_a = editor.document(id_a).text().to_string();
+        assert!(editor.mark_saved_doc(id_a, &text_a));
         assert!(editor.is_dirty(), "B の dirty は消えない");
 
         // 指定した文書（B）に対してはフォーカスに関係なくクリアできる
-        editor.mark_saved_doc(id_b);
+        let text_b = editor.document(id_b).text().to_string();
+        assert!(editor.mark_saved_doc(id_b, &text_b));
+        assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn mark_saved_doc_keeps_dirty_if_edited_during_save() {
+        // HIGH-1: Save はテキストを捕捉→ロック外で書き込み→完了後に dirty を
+        // 消す。書き込み中に他接続が編集すると、保存したのは古いテキストなの
+        // で dirty を消してはならない（消すと「保存済み」誤認で編集を失う）。
+        let mut editor = Editor::new();
+        let id = editor.open_with_path(PathBuf::from("/tmp/a.txt"), "hello");
+        // 保存対象として捕捉したテキスト（書き込み開始時点）
+        let written = editor.document(id).text().to_string();
+
+        // 書き込み中に他接続が編集（dirty になる）
+        let tx = Transaction::insert(editor.current_document(), &Selection::point(0), "X");
+        let selection_after = tx.map_selection(&Selection::point(0), true);
+        editor.apply(tx, selection_after);
+        assert!(editor.is_dirty(), "書き込み中の編集で dirty");
+
+        // 書き込み完了 → 古いテキストではクリアされない
+        assert!(!editor.mark_saved_doc(id, &written));
+        assert!(editor.is_dirty(), "未保存の編集が保存済み扱いにならない");
+
+        // 書き込みと同時点のテキストで保存した場合はクリアされる
+        let current = editor.document(id).text().to_string();
+        assert!(editor.mark_saved_doc(id, &current));
         assert!(!editor.is_dirty());
     }
 
