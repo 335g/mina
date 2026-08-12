@@ -36,6 +36,10 @@ _Avoid_: state
 One display region (one split) showing a Document with its own Selection and viewport position. Multiple Views can show the same Document.
 _Avoid_: pane, window
 
+**WorkspaceRoot**:
+The smallest analysis unit containing an opened file — the nearest directory with a manifest (`Cargo.toml`) or `.git`, falling back to the file's parent directory. The scope unit of an LSP session.
+_Avoid_: project root, crate root
+
 **Command**:
 A named editor action that the term layer resolves from key presses and applies to the Editor state.
 _Avoid_: action, operation
