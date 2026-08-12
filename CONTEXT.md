@@ -41,8 +41,12 @@ The smallest analysis unit containing an opened file — the nearest directory w
 _Avoid_: project root, crate root
 
 **Command**:
-A named editor action that the term layer resolves from key presses and applies to the Editor state.
+A selection-based editor action, resolved from key presses by the Keymap or sent directly by a Client (`session exec`), that reads and may change the Selection.
 _Avoid_: action, operation
+
+**DocumentEdit**:
+A position-addressed change to a Document — insert, delete, or replace at explicit character ranges — that neither reads nor changes the Selection. Sent by headless Clients (agents); the interactive TUI operates only through Commands.
+_Avoid_: patch, edit request
 
 **Keymap**:
 A mapping from key sequences to Commands, scoped per Mode and structured as a prefix trie so sequences like `g g` resolve.
