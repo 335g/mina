@@ -419,16 +419,17 @@ pub async fn pull_after_edit(
 /// 診断を daemon に反映する。
 ///
 /// rust-analyzer の初期解析（crate ロード）は数秒かかり、その間の pull は空を
-/// 返す。500ms 間隔で打ち続け、2 回連続で同じ件数になったら安定とみなして終了
-/// する（上限 120 回 = 60 秒）。フォーカスが別文書に移ったら中断する。
+/// 返す。非空が 2 回連続で返ったら解析完了とみなして終了する（空の連続は
+/// 「解析未完」と区別できないため安定判定しない。30 秒間空ならクリーン
+/// ファイルとみなして停止）。フォーカスが別文書に移ったら中断する。
+/// 上限 120 回 = 60 秒。
 pub async fn settle_open_diagnostics(
     daemon: &Mutex<Daemon>,
     session: Arc<Mutex<LspSession>>,
     path: PathBuf,
 ) {
     let mut prev: Option<usize> = None;
-    let mut stable = 0;
-    for _ in 0..120 {
+    for i in 0..120 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         // 現在のテキストを掴んでから pull（フォーカス移動・編集の最中は中断）
         let text = {
@@ -448,17 +449,21 @@ pub async fn settle_open_diagnostics(
             s.pull_diagnostics(&path, &text).await
         };
         let Some(diags) = pulled else {
-            continue;
+            continue; // 解析中のキャンセル等: 次回に持ち越し
         };
         let n = diags.len();
         daemon.lock().await.diagnostics = diags;
-        if prev == Some(n) {
-            stable += 1;
-            if stable >= 2 {
+        if n > 0 {
+            // 非空が返った = 解析完了の確証。2回連続同じ件数なら安定とみなす
+            // （誤検出: 解析未完の空（0,0,0...）を安定と誤認しないため、
+            //  空の場合は安定判定しない）。
+            if prev == Some(n) {
                 return;
             }
-        } else {
-            stable = 0;
+        } else if i >= 60 {
+            // 30秒間空のまま: クリーンファイルとみなして停止（解析が遅くても
+            // 次の編集の pull で自己修復する）。
+            return;
         }
         prev = Some(n);
     }
