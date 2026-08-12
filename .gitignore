@@ -10,3 +10,5 @@ apm_modules/
 
 /.pi-subagents
 .pi/todos
+
+.DS_Store
