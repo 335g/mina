@@ -62,6 +62,26 @@ fn uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
+/// 開いたファイルを包含する最小の解析単位（WorkspaceRoot）を求める。
+///
+/// ファイルの親から上方探索し、最寄りの `Cargo.toml` を含むディレクトリを返す
+/// （crates/ 配下の個別プロジェクト等、最小グループに閉じた LSP のため）。
+/// なければ最寄りの `.git`（worktree 等のファイル形式も含む）、それもなければ
+/// ファイルの親ディレクトリにフォールバックする（ADR-0010）。
+pub fn workspace_root(path: &Path) -> PathBuf {
+    let fallback = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut dir = fallback.to_path_buf();
+    loop {
+        if dir.join("Cargo.toml").exists() || dir.join(".git").exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return fallback.to_path_buf(),
+        }
+    }
+}
+
 impl LspSession {
     /// サーバを spawn し、initialize まで完了させる。
     pub async fn new(command: &str, root: &Path) -> Result<Self, String> {
@@ -277,6 +297,8 @@ fn lsp_pos_to_char(text: &str, line: u32, col: u32, enc: PositionEncoding) -> us
 
 /// 必要なら LSP セッションを spawn + initialize する（初回 .rs オープン時）。
 ///
+/// セッションは WorkspaceRoot 毎に持つ（ADR-0010）: 異なるプロジェクトの
+/// ファイルを開いても、それぞれの root で spawn されたサーバに解析させる。
 /// M1: spawn + initialize（最大10秒）は daemon ロック外で行うため、この関数は
 /// `&Mutex<Daemon>` を受け取り、daemon ロックは短時間だけ掴む。
 /// M3: 既存セッションが死んでいたら新しいセッションで置き換える。
@@ -284,10 +306,11 @@ pub async fn ensure(
     daemon: &Mutex<Daemon>,
     path: &Path,
 ) -> Result<Arc<Mutex<LspSession>>, String> {
-    // 既存セッション（生きていれば）を再利用する
+    let root = workspace_root(path);
+    // 既存セッション（root に生きていれば）を再利用する
     {
         let d = daemon.lock().await;
-        if let Some(session) = &d.lsp {
+        if let Some(session) = d.lsp_sessions.get(&root) {
             let reuse = match session.try_lock() {
                 Ok(s) => !s.client.is_dead(),
                 Err(_) => true, // 同期中: 生きているとみなして再利用
@@ -299,36 +322,26 @@ pub async fn ensure(
     }
     // 未作成 or 死亡: ロックを離して spawn + initialize（M1）
     let command = server_for(path).expect("ensure は LSP 対応ファイルでのみ呼ばれる");
-    let root = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
     let session = LspSession::new(command, &root).await?;
     let arc = Arc::new(Mutex::new(session));
     // 保存（短いロック・await なし）。
     let mut d = daemon.lock().await;
-    match &d.lsp {
-        // 同時 ensure レース: 既存が生きていればそちらを優先する
-        Some(existing) => {
-            let alive = match existing.try_lock() {
-                Ok(s) => !s.client.is_dead(),
-                Err(_) => true, // 同期中: 生きているとみなす
-            };
-            if alive {
-                // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
-                // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
-                return Ok(existing.clone());
-            }
-            // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
-            // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
-            d.lsp = Some(arc.clone());
-            Ok(arc)
-        }
-        None => {
-            d.lsp = Some(arc.clone());
-            Ok(arc)
+    // 同時 ensure レース: 既存が生きていればそちらを優先する
+    if let Some(existing) = d.lsp_sessions.get(&root) {
+        let alive = match existing.try_lock() {
+            Ok(s) => !s.client.is_dead(),
+            Err(_) => true, // 同期中: 生きているとみなす
+        };
+        if alive {
+            // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
+            // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
+            return Ok(existing.clone());
         }
     }
+    // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
+    // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
+    d.lsp_sessions.insert(root, arc.clone());
+    Ok(arc)
 }
 
 /// 文書を開いたことを LSP に通知する（daemon ロック外・lsp mutex のみ）。
@@ -370,10 +383,13 @@ pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
 /// は flycheck（cargo check・ディスク基準）由来で、編集内容と食い違う stale な
 /// 診断を publish することがあり、pull の結果を上書きしないよう適用しない。
 pub fn drain_into(daemon: &mut Daemon) {
-    let Some(session) = &daemon.lsp else {
+    let Some(path) = daemon.editor.focused_path() else {
+        daemon.diagnostics.clear();
         return;
     };
-    let Some(path) = daemon.editor.focused_path() else {
+    let Some(session) = daemon.lsp_sessions.get(&workspace_root(path)) else {
+        // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
+        // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
         daemon.diagnostics.clear();
         return;
     };
@@ -474,6 +490,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_root_prefers_nearest_manifest_over_outer_git() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root1-{}", std::process::id()));
+        let proj = dir.join("crates").join("foo");
+        std::fs::create_dir_all(proj.join("src")).expect("tmp dirs");
+        std::fs::write(proj.join("Cargo.toml"), "").expect("manifest");
+        std::fs::create_dir_all(dir.join(".git")).expect("git dir");
+        let file = proj.join("src").join("main.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(workspace_root(&file), proj, "Cargo.toml が .git より優先");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_prefers_nearest_git_over_outer_manifest() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root2-{}", std::process::id()));
+        let proj = dir.join("repo");
+        std::fs::create_dir_all(proj.join("src")).expect("tmp dirs");
+        std::fs::create_dir_all(proj.join(".git")).expect("git dir");
+        std::fs::write(dir.join("Cargo.toml"), "").expect("outer manifest");
+        let file = proj.join("src").join("main.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(workspace_root(&file), proj, "内側の .git が外側の Cargo.toml より優先");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_accepts_git_file_worktree() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        std::fs::write(dir.join(".git"), "gitdir: ../main/.git/worktrees/x").expect("gitfile");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(workspace_root(&file), dir, ".git はファイル形式（worktree）でも目印になる");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_falls_back_to_file_parent() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(workspace_root(&file), dir, "目印がなければファイルの親");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn lsp_pos_to_char_utf8_multi_line() {
         let text = "ab\ncd\nこんにちは";
         // 2行目（cd）の char 1 = 'd'（"ab\n" の3 + 1）
@@ -505,7 +568,11 @@ mod tests {
             .await
             .expect("initialize");
         let dead = Arc::new(Mutex::new(session));
-        daemon.lock().await.lsp = Some(dead.clone());
+        daemon
+            .lock()
+            .await
+            .lsp_sessions
+            .insert(workspace_root(Path::new("/tmp/x.rs")), dead.clone());
 
         // サーバを殺して is_dead になるまで待つ（reader タスクが EOF を拾う）
         dead.lock().await.client.kill().await;
@@ -582,7 +649,9 @@ mod tests {
         let session = Arc::new(Mutex::new(
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
-        daemon.lsp = Some(session.clone());
+        daemon
+            .lsp_sessions
+            .insert(workspace_root(&path), session.clone());
 
         // pull で TODO 診断を取り込んでから殺す（MEDIUM-3 の前提: 診断がある状態）
         session

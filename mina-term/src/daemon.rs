@@ -6,6 +6,7 @@
 //! `<temp_dir>/mina.sock`（単一ユーザ前提）。0600 で作成し、接続時に
 //! peer uid を検証して別ユーザの接続を拒否する（MEDIUM-3）。
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -85,9 +86,10 @@ pub struct Daemon {
     pub(crate) editor: Editor,
     /// クライアントから通知されるターミナル表示高さ（カーソル追従スクロール用）。
     pub(crate) viewport_height: usize,
-    /// LSP セッション（初回 .rs オープン時に生成。以後は温かいまま保持）。
-    /// 独立した Mutex で保護し、LSP の await は daemon ロック外で行う（ADR-0009）。
-    pub(crate) lsp: Option<Arc<Mutex<LspSession>>>,
+    /// WorkspaceRoot 毎の LSP セッション（初回 .rs オープン時に生成。以後は
+    /// 温かいまま保持・reap なし）。各セッションは独立した Mutex で保護し、
+    /// LSP の await は daemon ロック外で行う（ADR-0009/ADR-0010）。
+    pub(crate) lsp_sessions: HashMap<PathBuf, Arc<Mutex<LspSession>>>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
     pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
     /// 開いている undo グループの所有者（= SetMode(Insert) で開いたクライアント）。
@@ -103,7 +105,7 @@ impl Daemon {
         Self {
             editor: Editor::new(),
             viewport_height: 24,
-            lsp: None,
+            lsp_sessions: HashMap::new(),
             diagnostics: Vec::new(),
             insert_owner: None,
         }
@@ -351,16 +353,21 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                 // 取り出し、didChange はロック外で await する（サーバ遅延で全
                 // クライアントがブロックしない）。
                 let sync_target = if is_edit {
-                    d.lsp.clone().map(|session| {
-                        let path = d.editor.focused_path().map(Path::to_path_buf);
-                        let text = d.editor.current_document().text().to_string();
-                        (session, path, text)
+                    d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
+                        // フォーカス文書の WorkspaceRoot に対応するセッションだけを
+                        // 同期対象にする（ADR-0010）。.rs 以外の文書にはセッションが
+                        // なく、同期スキップ + drain_into で診断が消える。
+                        let root = lsp::workspace_root(&path);
+                        d.lsp_sessions.get(&root).cloned().map(|session| {
+                            let text = d.editor.current_document().text().to_string();
+                            (session, path, text)
+                        })
                     })
                 } else {
                     None
                 };
                 drop(d);
-                if let Some((session, Some(path), text)) = sync_target {
+                if let Some((session, path, text)) = sync_target {
                     lsp::sync(&session, &path, &text).await;
                     // 編集後のライブ診断は push ではなく pull で取る（flycheck は
                     // ディスク基準のため編集内容を反映しない。上流フィードバック
