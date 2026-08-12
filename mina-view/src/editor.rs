@@ -129,6 +129,21 @@ impl Editor {
         id
     }
 
+    /// 既に開かれているパスに対応する文書へフォーカスを戻す（#7）。
+    ///
+    /// 該当する文書が無ければ `None` を返し、状態は一切変えない。文書のテキスト・
+    /// dirty フラグ・undo/redo ヒストリーは保持される（ディスクからの再読込はしない）。
+    /// 選択・先頭行は View の現在値をそのまま使う（再利用 = 「何も変えない」）。
+    pub fn focus_open_path(&mut self, path: &Path) -> Option<DocumentId> {
+        let id = self
+            .paths
+            .iter()
+            .find(|(_, p)| p.as_path() == path)
+            .map(|(id, _)| *id)?;
+        self.view_mut().doc = id;
+        Some(id)
+    }
+
     /// フォーカス中の View が表示する文書のファイルパス（未保存なら None）。
     pub fn focused_path(&self) -> Option<&Path> {
         self.paths.get(&self.view().doc).map(|p| p.as_path())
@@ -461,6 +476,36 @@ mod tests {
         let text = editor.document(id).text().to_string();
         assert!(editor.mark_saved_doc(id, &text));
         assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn focus_open_path_reuses_document_keeping_state_and_history() {
+        // #7: 開き済みパスの再 Open は既存ドキュメントを再利用し、
+        // テキスト・dirty・undo ヒストリーを保持して重複生成しない。
+        let mut editor = Editor::new();
+        let a = editor.open_with_path(PathBuf::from("/tmp/a.txt"), "hello");
+        // 編集して dirty + undo 可能にする
+        let selection = editor.selection();
+        let tx = Transaction::insert(editor.current_document(), &selection, "X");
+        let selection_after = tx.map_selection(&selection, true);
+        editor.apply(tx, selection_after);
+        assert!(editor.is_dirty());
+
+        // 別文書を開いてから同じパスへ戻す
+        let b = editor.open_with_path(PathBuf::from("/tmp/b.txt"), "world");
+        assert_ne!(a, b);
+        let id = editor
+            .focus_open_path(Path::new("/tmp/a.txt"))
+            .expect("開き済みパスは再利用される");
+        assert_eq!(id, a, "同じ DocumentId が返る（重複生成しない）");
+        assert_eq!(editor.focused_path(), Some(Path::new("/tmp/a.txt")));
+        assert_eq!(editor.current_document().text(), "Xhello", "テキスト保持");
+        assert!(editor.is_dirty(), "dirty 保持");
+        assert!(editor.can_undo(), "undo ヒストリー保持");
+
+        // 未登録パスは None で状態不変
+        assert!(editor.focus_open_path(Path::new("/tmp/none.txt")).is_none());
+        assert_eq!(editor.focused_path(), Some(Path::new("/tmp/a.txt")));
     }
 
     #[test]
