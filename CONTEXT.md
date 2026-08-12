@@ -25,7 +25,7 @@ The unit of undo/redo: a set of Transactions reverted together by one undo. One 
 _Avoid_: change, edit
 
 **Dirty**:
-A Document that has been edited since it was last saved to its Path. Cleared by a successful Save. Scoped to the Document, not the View — saving one Document must not clear another's flag.
+A Document that has been edited since it was last saved to its Path. Cleared by a successful Save only if the document text is unchanged since the save began — an edit landing while the save is writing leaves the flag set, so unsaved edits are never reported as saved. Scoped to the Document, not the View — saving one Document must not clear another's flag.
 _Avoid_: unsaved, modified
 
 **Mode**:
