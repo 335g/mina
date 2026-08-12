@@ -86,6 +86,7 @@ pub fn render_text(state: &StateSnapshot, pending: &[KeyEvent], width: u16, heig
                     cs,
                     &state.selection,
                     &state.diagnostics,
+                    Some(head),
                     width,
                 );
             }
@@ -119,17 +120,22 @@ pub fn draw(
     out.write_all(render_text(state, pending, width, height).as_bytes())
 }
 
-/// 1行分を描画する。選択範囲は反転、診断範囲は下線。幅は表示幅（全角2）で切り詰める。
+/// 1行分を描画する。選択範囲は反転、診断範囲は下線、カーソルセルは青背景。
+///
+/// ターミナルカーソルは `\x1b[?25l` で隠しているため、カーソル位置はこの
+/// セル描画でのみ可視化される（修正前はどこにも見えず、ステータス行の座標だけが
+/// 手がかりだった）。
 fn draw_line(
     s: &mut String,
     line: &str,
     line_char_start: usize,
     selection: &[Range],
     diagnostics: &[Diagnostic],
+    cursor: Option<usize>,
     width: usize,
 ) {
     let mut out_width = 0usize;
-    let mut style = (false, false); // (選択中, 診断中)
+    let mut style = (false, false, false); // (カーソル, 選択中, 診断中)
     for (i, ch) in line.chars().enumerate() {
         // CRLF の \r: 非表示文字。生出力するとターミナルがカーソルを行頭へ戻し、
         // 直後の \x1b[K で行全体が消える（H2）。
@@ -140,20 +146,23 @@ fn draw_line(
         // 制御文字（ESC 等）は端末インジェクション対策で � に置換してから出力する
         let w = if is_ctrl { 1 } else { ch.width().unwrap_or(0) };
         let char_global = line_char_start + i;
+        let is_cursor = cursor == Some(char_global);
         let in_sel = selection
             .iter()
             .any(|r| char_global >= r.anchor.min(r.head) && char_global < r.anchor.max(r.head));
         let in_diag = diagnostics
             .iter()
             .any(|d| char_global >= d.start && char_global < d.end);
-        let new_style = (in_sel, in_diag);
+        let new_style = (is_cursor, in_sel, in_diag);
         if new_style != style {
             style = new_style;
             match style {
-                (true, true) => s.push_str("\x1b[4;7m"), // 下線 + 反転
-                (true, false) => s.push_str("\x1b[7m"),
-                (false, true) => s.push_str("\x1b[4m"), // 下線
-                (false, false) => s.push_str("\x1b[0m"),
+                (true, _, true) => s.push_str("\x1b[4;44m"), // カーソル + 診断: 青背景 + 下線
+                (true, _, false) => s.push_str("\x1b[44m"),   // カーソル: 青背景
+                (false, true, true) => s.push_str("\x1b[4;7m"), // 下線 + 反転
+                (false, true, false) => s.push_str("\x1b[7m"),
+                (false, false, true) => s.push_str("\x1b[4m"), // 下線
+                (false, false, false) => s.push_str("\x1b[0m"),
             }
         }
         if out_width + w > width {
@@ -166,7 +175,16 @@ fn draw_line(
         }
         out_width += w;
     }
-    if style != (false, false) {
+    // カーソルが行末（最後の文字の直後）にある場合: 青背景の空白で可視化する
+    if let Some(c) = cursor {
+        if c == line_char_start + line.chars().count() && out_width < width {
+            let in_diag = diagnostics.iter().any(|d| d.start <= c && c < d.end);
+            s.push_str(if in_diag { "\x1b[4;44m" } else { "\x1b[44m" });
+            s.push(' ');
+            s.push_str("\x1b[0m");
+        }
+    }
+    if style != (false, false, false) {
         s.push_str("\x1b[0m");
     }
     s.push_str("\x1b[K"); // 行末までクリア
@@ -299,10 +317,11 @@ mod tests {
     fn renders_text_status_and_cursor() {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
         let out = render_text(&state, &[], 40, 10);
-        // 選択ハイライトで "hello" は分割されるので部分で検証
-        assert!(out.contains("he") && out.contains("lo"), "{out:?}");
+        // 選択ハイライトとカーソルセルで "hello" は分割されるので部分で検証
+        assert!(out.contains("he"), "{out:?}");
         assert!(out.contains("NORMAL"), "{out:?}");
-        assert!(out.contains("\x1b[1;4H"), "カーソル: {out:?}");
+        assert!(out.contains("\x1b[44ml"), "カーソルセルが青背景で見える: {out:?}");
+        assert!(out.contains("\x1b[1;4H"), "カーソル位置エスケープ: {out:?}");
         assert!(out.contains("\x1b[?2026l"), "同期出力 OFF で閉じる");
     }
 
@@ -310,7 +329,16 @@ mod tests {
     fn selection_is_highlighted() {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
         let out = render_text(&state, &[], 40, 10);
-        assert!(out.contains("\x1b[7ml\x1b[0m"), "{out:?}");
+        // 選択（char 2）は反転、カーソル（head=3）は青背景で区別される
+        assert!(out.contains("\x1b[7ml\x1b[44ml"), "{out:?}");
+    }
+
+    #[test]
+    fn cursor_at_line_end_is_visible() {
+        // カーソルが行末（最後の文字の直後）にあっても青背景の空白で見える
+        let state = state_with("hi", vec![Range { anchor: 2, head: 2 }], 0);
+        let out = render_text(&state, &[], 40, 10);
+        assert!(out.contains("\x1b[44m "), "行末カーソルの青背景空白: {out:?}");
     }
 
     #[test]
