@@ -41,6 +41,15 @@ const MAX_CMD_LINE: usize = 1024 * 1024;
 /// （scroll_to_cursor の加算は debug ビルドで panic する）。
 const MAX_VIEWPORT_HEIGHT: usize = 10_000;
 
+/// Scroll コマンドで受け入れるページ数の上限。
+///
+/// 壊れた/悪意あるコマンド（isize::MAX 等）で scroll_lines の
+/// `first_line + amount` の加算が overflow panic を起こさないよう
+/// clamp する（debug ビルドで panic する）。上限 × 最大 viewport 高
+/// （[`MAX_VIEWPORT_HEIGHT`]）が isize 範囲を超えない値にすること
+/// （1_000_000 × 10_000 = 10^10 行 ≪ isize::MAX）。
+const MAX_SCROLL_PAGES: isize = 1_000_000;
+
 /// 応答スナップショット書き込みのタイムアウト（MEDIUM-2）。
 ///
 /// クライアントが応答を読まない（SIGSTOP された TUI・停止した agent 等）と
@@ -509,6 +518,9 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
             snapshot(daemon, None)
         }
         Command::Scroll { pages } => {
+            // 壊れた/悪意あるページ数でスクロール計算が overflow しないよう
+            // clamp する（SetViewport と同様、daemon 側で防御する）
+            let pages = pages.clamp(-MAX_SCROLL_PAGES, MAX_SCROLL_PAGES);
             daemon
                 .editor
                 .scroll_pages(pages, daemon.viewport_height);
@@ -761,6 +773,19 @@ mod tests {
                 direction: Direction::Forward,
             },
         );
+    }
+
+    #[test]
+    fn scroll_huge_pages_do_not_panic() {
+        // i64::MAX / i64::MIN のページ数でも overflow panic せず snapshot が返る
+        let mut d = daemon();
+        open(&mut d, "a\nb\nc\nd\ne");
+        for pages in [isize::MAX, isize::MIN, 0] {
+            let s = apply(&mut d, Command::Scroll { pages });
+            assert_eq!(s.text, "a\nb\nc\nd\ne");
+        }
+        // clamp 後はスクロール計算（first_line + amount）が overflow しない
+        let _ = apply(&mut d, Command::Scroll { pages: isize::MAX });
     }
 
     #[test]
