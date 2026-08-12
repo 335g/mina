@@ -321,8 +321,14 @@ pub async fn ensure(
         }
     }
     // 未作成 or 死亡: ロックを離して spawn + initialize（M1）
-    let command = server_for(path).expect("ensure は LSP 対応ファイルでのみ呼ばれる");
-    let session = LspSession::new(command, &root).await?;
+    // ponytail: MINA_LSP_COMMAND はテスト用シーム（daemon 統合テストが mock
+    // サーバを指す）。本番では server_for の組み込みテーブルを使う。
+    let command = std::env::var("MINA_LSP_COMMAND").unwrap_or_else(|_| {
+        server_for(path)
+            .expect("ensure は LSP 対応ファイルでのみ呼ばれる")
+            .to_string()
+    });
+    let session = LspSession::new(&command, &root).await?;
     let arc = Arc::new(Mutex::new(session));
     // 保存（短いロック・await なし）。
     let mut d = daemon.lock().await;
