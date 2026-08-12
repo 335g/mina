@@ -186,3 +186,72 @@ async fn utf16_encoding_is_negotiated() {
     client.kill().await;
     reader.abort();
 }
+
+#[tokio::test]
+async fn pull_diagnostics_returns_items() {
+    // pull 診断（textDocument/diagnostic）: didOpen 後の状態を items で返し、
+    // didChange で位置が追随する。identifier は initialize で advertise される。
+    let (mut client, reader) = spawn_client(&[]).await;
+    let result = client.request("initialize", json!({})).await.unwrap();
+    assert_eq!(
+        result["capabilities"]["diagnosticProvider"]["identifier"], "mock"
+    );
+    client.notify("initialized", json!({})).await.unwrap();
+    client
+        .notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///mock.rs",
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn f() { TODO }",
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    wait_notification(&mut client).await; // push も届く（無視してよい）
+
+    let result = client
+        .request(
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": { "uri": "file:///mock.rs" },
+                "identifier": "mock",
+            }),
+        )
+        .await
+        .expect("pull 診断");
+    assert_eq!(result["kind"], "full");
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["items"][0]["range"]["start"]["character"], 9);
+    assert_eq!(result["items"][0]["message"], "mock: TODO found");
+
+    // didChange 後の pull は位置が追随する
+    client
+        .notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": "file:///mock.rs", "version": 2 },
+                "contentChanges": [{ "text": "xx TODO" }],
+            }),
+        )
+        .await
+        .unwrap();
+    wait_notification(&mut client).await;
+    let result = client
+        .request(
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": { "uri": "file:///mock.rs" },
+                "identifier": "mock",
+            }),
+        )
+        .await
+        .expect("pull 診断");
+    assert_eq!(result["items"][0]["range"]["start"]["character"], 3);
+
+    client.kill().await;
+    reader.abort();
+}

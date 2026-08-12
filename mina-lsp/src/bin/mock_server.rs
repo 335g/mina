@@ -4,6 +4,7 @@
 //! - `textDocument/didOpen` / `didChange` を受けたら、テキスト内の "TODO" の
 //!   位置に error 診断を publish する（テキストが変われば位置も変わる。
 //!   `--cjk` 時は位置を UTF-16 単位に変換して publish する）
+//! - `textDocument/diagnostic`（pull）には同じ TODO 診断を items で返す
 
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -14,6 +15,7 @@ fn main() {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
+    let mut current: Option<(String, String)> = None; // (uri, text)
     loop {
         // Content-Length フレームを読む
         let mut content_length = None;
@@ -46,6 +48,11 @@ fn main() {
                             "capabilities": {
                                 "positionEncoding": enc,
                                 "textDocumentSync": 1, // full sync
+                                "diagnosticProvider": {
+                                    "identifier": "mock",
+                                    "interFileDependencies": false,
+                                    "workspaceDiagnostics": false,
+                                },
                             },
                             "serverInfo": { "name": "mock-server" },
                         },
@@ -54,6 +61,22 @@ fn main() {
                 }
                 "shutdown" => {
                     let resp = json!({ "jsonrpc": "2.0", "id": id, "result": null });
+                    write_frame(&mut stdout, &resp);
+                }
+                "textDocument/diagnostic" => {
+                    // pull 診断: 現在のテキストの TODO 位置を items で返す
+                    let diag = current
+                        .as_ref()
+                        .map(|(_, text)| todo_diagnostic(text, utf16));
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "kind": "full",
+                            "resultId": "mock",
+                            "items": diag.map(|d| vec![d]).unwrap_or_default(),
+                        },
+                    });
                     write_frame(&mut stdout, &resp);
                 }
                 _ => {}
@@ -68,42 +91,45 @@ fn main() {
                     msg["params"]["textDocument"]["text"]
                         .as_str()
                         .unwrap_or_default()
+                        .to_string()
                 } else {
                     msg["params"]["contentChanges"][0]["text"]
                         .as_str()
                         .unwrap_or_default()
+                        .to_string()
                 };
-                // "TODO" の位置に error を publish（テキストが変われば位置が動く）
-                let needle = "TODO";
-                let start_byte = text.find(needle).unwrap_or(0);
-                // LSP の character は行頭からの UTF-16 単位（--cjk 時は utf-16 を advertise）。
-                // バイトオフセットのまま使うと非 ASCII が前にあればずれるため、
-                // 行頭から UTF-16 単位に変換してから publish する。
-                let start = if utf16 {
-                    text[..start_byte].encode_utf16().count() as u32
-                } else {
-                    start_byte as u32
-                };
-                let end = start + 4; // "TODO" は ASCII なので UTF-16 でも 4 単位
+                current = Some((uri.clone(), text.clone()));
                 let notif = json!({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",
-                    "params": {
-                        "uri": uri,
-                        "diagnostics": [{
-                            "range": {
-                                "start": { "line": 0, "character": start },
-                                "end": { "line": 0, "character": end },
-                            },
-                            "severity": 1,
-                            "message": "mock: TODO found",
-                        }],
-                    },
+                    "params": { "uri": uri, "diagnostics": vec![todo_diagnostic(&text, utf16)] },
                 });
                 write_frame(&mut stdout, &notif);
             }
         }
     }
+}
+
+/// テキスト内の "TODO" 位置の error 診断（LSP 座標は UTF-8 バイト or UTF-16 単位）。
+fn todo_diagnostic(text: &str, utf16: bool) -> Value {
+    let needle = "TODO";
+    let start_byte = text.find(needle).unwrap_or(0);
+    // LSP の character は行頭からの UTF-16 単位（--cjk 時は utf-16 を advertise）。
+    let start = if utf16 {
+        text[..start_byte].encode_utf16().count() as u32
+    } else {
+        start_byte as u32
+    };
+    let end = start + 4; // "TODO" は ASCII なので UTF-16 でも 4 単位
+    json!({
+        "range": {
+            "start": { "line": 0, "character": start },
+            "end": { "line": 0, "character": end },
+        },
+        "severity": 1,
+        "source": "mock",
+        "message": "mock: TODO found",
+    })
 }
 
 fn write_frame(out: &mut impl Write, msg: &Value) {
