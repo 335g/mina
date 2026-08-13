@@ -13,7 +13,7 @@
 
 use std::io;
 
-use mina_protocol::{Command, DocumentEdit, StateSnapshot};
+use mina_protocol::{ClientKind, Command, DocumentEdit, StateSnapshot};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
@@ -59,6 +59,8 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
     let stream = UnixStream::connect(&path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
+    client::send_hello(&mut write_half, ClientKind::Headless).await?;
     client::request(&mut write_half, &mut reader, command).await
 }
 
@@ -69,6 +71,8 @@ async fn execute_edit(edit: &DocumentEdit) -> io::Result<StateSnapshot> {
     let stream = UnixStream::connect(&path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
+    client::send_hello(&mut write_half, ClientKind::Headless).await?;
     client::request(&mut write_half, &mut reader, edit).await
 }
 

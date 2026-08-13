@@ -15,7 +15,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use mina_protocol::{Command, Mode, StateSnapshot};
+use mina_protocol::{ClientKind, Command, Hello, Mode, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent, KeyEventKind};
 use termina::{Event, EventStream, PlatformTerminal, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -79,6 +79,9 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let stream = UnixStream::connect(&socket).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+
+    // ADR-0012: 接続直後に Hello（対話型宣言）を送る
+    send_hello(&mut write_half, ClientKind::Interactive).await?;
 
     // 初回コマンド: ファイル指定があれば Open、なければ GetState。
     // Open のパスは絶対化して送る — daemon は常駐で cwd が起動時のディレクトリの
@@ -165,6 +168,18 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
 
     // 終了処理は TerminalGuard の Drop が行う（M4: エラー経路でも必ず復旧する）
     Ok(())
+}
+
+/// 接続直後に Hello（クライアント種別の宣言）を送る（ADR-0012）。
+/// 応答は待たない（最初のコマンドの応答スナップショットに乗る）。
+pub(crate) async fn send_hello(
+    write_half: &mut OwnedWriteHalf,
+    kind: ClientKind,
+) -> std::io::Result<()> {
+    let mut line = serde_json::to_string(&Hello { kind }).expect("Hello はシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await
 }
 
 /// メッセージを送り、応答スナップショットを1つ受け取る。TUI と session CLI の両方から使う。
