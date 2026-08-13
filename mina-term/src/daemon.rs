@@ -404,7 +404,7 @@ async fn handle_connection(
                 if line.len() > MAX_CMD_LINE {
                     break; // 過大なコマンド行: クライアントが壊れているか悪意がある
                 }
-                let snapshot = process_command(&daemon, conn_id, source, &line).await;
+                let snapshot = process_command(&daemon, &push_tx, conn_id, source, &line).await;
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
                 // 応答（GetState・拒否・no-op など）で送ると無駄な push が飛ぶ。
@@ -460,25 +460,29 @@ async fn write_message(
 /// ブロックしないよう接続ハンドラ側で async 実行する）。
 async fn process_command(
     daemon: &Arc<Mutex<Daemon>>,
+    push_tx: &watch::Sender<StateSnapshot>,
     conn_id: u64,
     source: EventSource,
     line: &str,
 ) -> StateSnapshot {
     let parsed = serde_json::from_str::<Command>(line.trim());
     // #13: headless クライアントは DocumentEdit 系に制限する（GetState / Save /
-    // DocumentEdit のみ）。Open・選択移動・モード変更・コマンドベース編集・
-    // undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否し、状態と
-    // 世代を変えない（M1 と同じ扱い — 拒否で push も飛ばない）。CONTEXT.md の
-    // ドメインモデルどおり「TUI は Command のみ、agent は DocumentEdit のみ」
-    // をプロトコル層で強制する。
+    // WaitFor / DocumentEdit のみ）。Open・選択移動・モード変更・コマンドベース
+    // 編集・undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否し、
+    // 状態と世代を変えない（M1 と同じ扱い — 拒否で push も飛ばない）。
+    // CONTEXT.md のドメインモデルどおり「TUI は Command のみ、agent は
+    // DocumentEdit のみ」をプロトコル層で強制する。
     if source == EventSource::Headless {
         if let Ok(command) = &parsed {
-            if !matches!(command, Command::GetState | Command::Save) {
+            if !matches!(
+                command,
+                Command::GetState | Command::Save | Command::WaitFor { .. }
+            ) {
                 let d = daemon.lock().await;
                 return snapshot(
                     &d,
                     Some(
-                        "headless clients can only use GetState, Save, and DocumentEdit"
+                        "headless clients can only use GetState, Save, WaitFor, and DocumentEdit"
                             .into(),
                     ),
                 );
@@ -486,6 +490,36 @@ async fn process_command(
         }
     }
     match parsed {
+        // #12: 世代が `generation` を超えるまでブロックし、超えた時点の
+        // スナップショットを返す（読み取り専用・状態を変えない）。
+        // watch チャネル（ADR-0013）を再利用するのでポーリングも待機中の
+        // 通信もない。既に超えていれば即応答する。
+        //
+        // ponytail: 待機中にクライアントが切断（kill 等）されても、デーモン側の
+        // 待機は次の状態変化まで残る（次回の状態変化で応答書き込みが EPIPE に
+        // なり後始末される）。接続スロット（MAX_CONNECTIONS=4）の枯渇は
+        // 「agent 1 + TUI 1」の現実的な構成では起きないと判断。必要になったら
+        // タイムアウトを追加する。
+        Ok(Command::WaitFor { generation }) => {
+            let mut rx = push_tx.subscribe();
+            rx.borrow_and_update();
+            loop {
+                {
+                    let d = daemon.lock().await;
+                    if d.generation > generation {
+                        return snapshot(&d, None);
+                    }
+                }
+                // 次の状態変化を待つ（世代が進むたびに send され、値が変わら
+                // なければ changed() は完了しない）。
+                if rx.changed().await.is_err() {
+                    // push 送信元が消えた（daemon 終了）: 現状を返して接続を
+                    // 後始末に任せる。
+                    let d = daemon.lock().await;
+                    return snapshot(&d, Some("daemon terminated while waiting".into()));
+                }
+            }
+        }
         // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
         Ok(Command::Open { path }) => {
                 // CRITICAL C2: 受信パスを正規化してから「既存文書の再利用判定」と
@@ -1034,6 +1068,11 @@ fn preempt(daemon: &mut Daemon, conn_id: u64) {
 /// 世代/イベントの対象外。呼び出し側はこれで record_event をゲートする）。
 fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnapshot, bool) {
     match command {
+        Command::WaitFor { .. } => {
+            // process_command の専用アームで処理される（読み取り専用）。
+            // ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
         Command::Insert { text } => {
             // SEC-1/ADR-0008: Insert による無制限の文書成長を防ぐ。Open と同じ
             // MAX_FILE_SIZE（バイト数）を超える挿入は状態を変えず status で
@@ -1208,8 +1247,13 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
 fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
     let editor = &daemon.editor;
     let selection = editor.selection();
+    let text = editor.current_document().text().to_string();
     StateSnapshot {
-        text: editor.current_document().text().to_string(),
+        // ADR-0012 #12: 全文の FNV-1a を同梱し、エージェントが edit の
+        // checksum を再実装せずに済ませる。応答は既に全文をシリアライズ
+        // するため、ハッシュ計算は相対的に無視できるコスト。
+        checksum: fnv1a64(text.as_bytes()),
+        text,
         selection: selection
             .ranges()
             .iter()
@@ -3488,6 +3532,74 @@ mod tests {
         let snap = request(&mut tui, &Command::Insert { text: "Y".into() }).await;
         assert!(snap.status.is_none(), "Interactive の Insert は許可");
         assert!(snap.text.contains("Y"));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn wait_for_generation_blocks_until_change() {
+        // ADR-0012 #12: WaitFor は世代が target を超えるまでブロックし、
+        // 超えた時点のスナップショットを返す（エージェントのポーリング不要）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-12a-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-12a-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path }).await;
+        assert_eq!(snap.generation, 1);
+        assert_eq!(
+            snap.checksum,
+            fnv1a64(snap.text.as_bytes()),
+            "snapshot に全文 checksum が載る（edit にそのまま渡せる）"
+        );
+
+        // agent: 現在の世代（1）を超えるまで待つ（ブロック）
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let mut wait = tokio::spawn(async move {
+            request(&mut agent, &Command::WaitFor { generation: 1 }).await
+        });
+        // 編集前はまだ完了していない（ブロック中）
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut wait,
+        )
+        .await;
+        assert!(pending.is_err(), "編集前は WaitFor がブロックしている");
+
+        // tui の編集で世代が進む → 待機が完了して最新状態が返る
+        let _ = request(&mut tui, &Command::Insert { text: "X".into() }).await;
+        let snap = wait.await.unwrap();
+        assert!(
+            snap.generation > 1,
+            "編集後の世代が返る: {}",
+            snap.generation
+        );
+        assert_eq!(snap.text, "X");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn wait_for_generation_returns_immediately_when_already_passed() {
+        // ADR-0012 #12: 既に世代が target を超えていれば即応答する。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-12b-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-12b-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path }).await; // gen 1
+
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let snap = request(&mut agent, &Command::WaitFor { generation: 0 }).await;
+        assert!(snap.generation >= 1, "既に超えていれば即応答");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
