@@ -64,6 +64,14 @@ _Avoid_: frontend, viewer
 The response to every Command: the Daemon's complete editor state — document text, selection, mode, viewport, and diagnostics — serialized for Clients to render.
 _Avoid_: frame, update
 
+**Generation**:
+A monotonically increasing counter on the Daemon, bumped on every state-changing operation (edits, undo/redo, mode changes, Open/Save), never on pure reads. Clients compare generations to detect that something changed without re-reading the document. Carried in every StateSnapshot.
+_Avoid_: version, revision
+
+**ChangeEvent**:
+A record of one state-changing operation, tagged with its source (Interactive, Headless, or External) and kind. The Daemon keeps a bounded ring of recent ChangeEvents and carries it in every StateSnapshot.
+_Avoid_: event, log entry
+
 **Diagnostic**:
 A problem reported by the language server for a range of text — error, warning, info, or hint. Carried to Clients in the StateSnapshot.
 _Avoid_: lint, problem
