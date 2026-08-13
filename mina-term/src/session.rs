@@ -3,9 +3,11 @@
 //! - `mina session get` — 現在の状態を取得する（JSON で出力）
 //! - `mina session exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
 //! - `mina session edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
+//! - `mina session wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
 //!
 //! 例: `mina session exec '{"Insert": {"text": "hello"}}'`
-//! 例: `mina session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <全文の FNV-1a 64>}'`
+//! 例: `mina session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
+//! 例: `mina session wait 42`
 //!
 //! daemon が動いていなければ自動起動される（TUI と同じ挙動）。終了コード:
 //! 0 = 成功（適用・no-op 含む）、1 = トランスポート/JSON エラー、
@@ -38,6 +40,12 @@ pub async fn run(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("wait") {
+        let command = parse_wait(args)?;
+        let snapshot = execute(&command).await?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
     let command = parse_command(args)?;
     let snapshot = execute(&command).await?;
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -57,6 +65,17 @@ fn parse_command(args: &[String]) -> io::Result<Command> {
         Some(other) => Err(invalid(format!("未知の session サブコマンド: {other}（get / exec）"))),
         None => Err(invalid("session サブコマンドが必要です: get / exec")),
     }
+}
+
+/// `session wait <generation>` を [`Command::WaitFor`] に変換する。
+fn parse_wait(args: &[String]) -> io::Result<Command> {
+    let gen_str = args
+        .get(1)
+        .ok_or_else(|| invalid("wait には世代が必要です: mina session wait <generation>"))?;
+    let generation: u64 = gen_str
+        .parse()
+        .map_err(|e| invalid(format!("世代は数値で指定してください: {e}")))?;
+    Ok(Command::WaitFor { generation })
 }
 
 /// daemon に接続し、コマンドを実行してスナップショットを受け取る。
@@ -131,6 +150,16 @@ mod tests {
         };
         assert_eq!(edit_exit_code(&rejected), 2, "拒否は再試行可能な失敗");
         assert_eq!(edit_exit_code(&StateSnapshot::default()), 0);
+    }
+
+    #[test]
+    fn wait_parses_generation() {
+        assert_eq!(
+            parse_wait(&args(&["wait", "42"])).unwrap(),
+            Command::WaitFor { generation: 42 }
+        );
+        assert!(parse_wait(&args(&["wait"])).is_err(), "世代なしはエラー");
+        assert!(parse_wait(&args(&["wait", "abc"])).is_err(), "非数値はエラー");
     }
 
     #[test]
