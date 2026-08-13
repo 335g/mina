@@ -1,5 +1,5 @@
-# Request/response state-snapshot IPC, no push channel
+# リクエスト/レスポンスの状態スナップショット IPC、push チャネルなし
 
-> Status: the push-rejection below is superseded by [0013-push-channel-live-refresh.md](0013-push-channel-live-refresh.md). The request/response framing itself (and the rejected diff/partial snapshots and binary serialization) stands.
+> ステータス: 下記の push 却下は [0013-push-channel-live-refresh.md](0013-push-channel-live-refresh.md) によって置き換えられた。リクエスト/レスポンスのフレーミング自体 (および却下された diff/部分スナップショットとバイナリ直列化) は有効のまま。
 
-mina's IPC is request/response only: a Client sends a Command and the Daemon replies with a full StateSnapshot (document text, selection, mode, viewport, diagnostics), framed as NDJSON over a local unix socket. There is no server-initiated push or subscription channel in v1 — the TUI redraws after each command anyway, and LSP-derived state (Diagnostics) is carried in the next snapshot. Rejected for now: push/event channels (additive later if a client must react while idle), diffed/partial snapshots (deferred until large-file profiling demands), binary serialization (NDJSON kept for debuggability — agents can read the wire).
+mina の IPC はリクエスト/レスポンスのみである: Client は Command を送り、Daemon は完全な StateSnapshot (ドキュメントテキスト、選択、モード、ビューポート、診断) をローカル unix ソケット上の NDJSON として応答する。v1 にはサーバー発信の push やサブスクリプションチャネルはない — TUI はどのみち各コマンド後に再描画し、LSP 由来の状態 (Diagnostics) は次のスナップショットに載る。当面却下: push/イベントチャネル (アイドル中に反応する必要があるクライアントが出たら後から追加)、diff/部分スナップショット (大容量ファイルのプロファイリングが要求するまで延期)、バイナリ直列化 (デバッグ容易性のため NDJSON を維持 — エージェントはワイヤを読める)。

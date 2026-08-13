@@ -1,3 +1,3 @@
-# Functional core: Selection lives outside Document
+# 関数型コア: Selection は Document の外に置く
 
-The editing core is functional: primitives transform state instead of mutating it — `(document, selection) → (new_document, new_selection)`. A Document owns its text; the active Selection is not stored on it, it is passed into each operation. This mirrors Helix's decision to keep selections per-View (one document can be shown in several splits). Adopting it from day one avoids an API rewrite when views arrive.
+編集コアは関数型である: プリミティブは状態を変更するのではなく変換する — `(document, selection) → (new_document, new_selection)`。Document は自身のテキストを所有し、アクティブな Selection は Document に保存されず、各操作に渡される。これは Helix が Selection を View ごとに保持する決定 (1 つのドキュメントを複数のスプリットで表示できる) を踏襲している。初日から採用することで、View が登場したときの API 書き直しを回避できる。

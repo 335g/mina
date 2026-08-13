@@ -1,3 +1,3 @@
-# Workspace crate policy
+# ワークスペースの crate ポリシー
 
-mina is a Cargo workspace from day one: `mina-*` crate names, flat layout (`mina-core/` at the repo root, mirroring Helix). A new crate is created only when it has content and meets at least one split criterion — a new dependency direction (a layer that only looks downward), independent reuse by another consumer, or test/build isolation. Step 1 ships one populated crate, `mina-core`; `mina-view`, `mina-term`, `mina-lsp`, `mina-loader`, `mina-event` are declared future crates, split off when their work begins.
+mina は初日から Cargo ワークスペースである: `mina-*` の crate 名、フラットなレイアウト (`mina-core/` をリポジトリルートに、Helix を踏襲)。新しい crate は、中身があり、かつ分割基準の少なくとも 1 つを満たす場合にのみ作成される — 新しい依存の方向 (下方向のみを見る層)、他のコンシューマによる独立した再利用、テスト/ビルドの分離。Step 1 では 1 つの populated crate `mina-core` を出荷し、`mina-view`、`mina-term`、`mina-lsp`、`mina-loader`、`mina-event` は将来の crate として宣言され、作業が始まったときに分割される。

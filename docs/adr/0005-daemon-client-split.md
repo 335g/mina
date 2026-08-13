@@ -1,3 +1,3 @@
-# Daemon + client split from day one
+# 初日からの Daemon + Client 分割
 
-mina runs as a local daemon from v1: a persistent daemon process owns the editor state (documents, histories, LSP clients) and serves it over a local IPC channel, while the terminal UI, CLI, and agents connect as Clients that send Commands and receive state. Modeled on Hunk's session daemon (`hunk daemon serve` + `hunk session …`). The alternative — a single in-process editor with the process boundary retrofitted later — was rejected: the daemon is the product's core (agent-driven editing, warm LSP, fast attach), and retrofitting a process boundary after the fact is the expensive path. Commands-as-data and a shared protocol crate make the boundary real from the start.
+mina は v1 からローカルデーモンとして動作する: 永続的なデーモンプロセスがエディタの状態 (ドキュメント、履歴、LSP クライアント) を所有し、ローカル IPC チャネル経由で提供する。一方、ターミナル UI、CLI、エージェントは Client として接続し、Command を送って状態を受け取る。Hunk のセッションデーモン (`hunk daemon serve` + `hunk session …`) をモデルにしている。代替案 — プロセス境界を後から導入する単一プロセスのエディタ — は却下された: デーモンは製品の中核 (エージェント駆動の編集、ウォームな LSP、高速なアタッチ) であり、事後にプロセス境界を導入するのは高コストな道である。データとしての Command と共有プロトコル crate が、境界を最初から実在させる。

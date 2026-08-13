@@ -1,3 +1,3 @@
-# Clean-room implementation modeled on Helix
+# Helix をモデルにしたクリーンルーム実装
 
-mina is modeled on the Helix editor (MPL-2.0), but every line of implementation is written from scratch. We study Helix's concepts and type design — anchor/head ranges, OT-style transactions, workspace crate layout — and reimplement them in our own code; we never copy source files. This keeps mina free of MPL-2.0's file-level obligations and forces us to actually understand the design we borrow.
+mina は Helix エディタ (MPL-2.0) をモデルにしているが、実装の各行はすべてスクラッチで書かれている。Helix の概念と型設計 — anchor/head レンジ、OT 風トランザクション、ワークスペースの crate レイアウト — を研究し、自前のコードに再実装する。ソースファイルのコピーは決して行わない。これにより mina は MPL-2.0 のファイル単位の義務から解放され、借用する設計を実際に理解することが強制される。

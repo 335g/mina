@@ -1,14 +1,14 @@
-# Server-initiated push channel for live refresh (supersedes the "no push" part of 0006)
+# サーバー発信 push チャネルによるライブ更新 (0006 の「push なし」部分を置き換える)
 
-The TUI must react to other clients' changes while idle (an agent editing the same document). ADR-0006's request/response-only framing leaves the TUI stale until the user's next keypress — the screen shows old text and the user cannot watch the agent work. So the daemon gains a push channel: after any state-changing command it broadcasts the resulting StateSnapshot to subscribed (Interactive) clients, and the TUI redraws on arrival.
+TUI はアイドル中に他のクライアントの変更 (同じドキュメントを編集するエージェント) に反応しなければならない。ADR-0006 のリクエスト/レスポンスのみのフレーミングでは、TUI はユーザーの次のキー押下まで古いままである — 画面は古いテキストを表示し、ユーザーはエージェントの作業を観察できない。そこでデーモンは push チャネルを獲得する: 状態を変更するコマンドの後、結果の StateSnapshot を購読中の (Interactive) クライアントにブロードキャストし、TUI は到着時に再描画する。
 
-Mechanics:
+仕組み:
 
-- **Wire**: every daemon→client message is a tagged envelope, `{"type":"response"|"push","snapshot":{...}}` (NDJSON, one message per line). Responses used to be bare snapshots; the uniform envelope is deliberately breaking for CLI compatibility — one message shape keeps the spec and the reader simple. One-shot headless clients never receive pushes, so the `session` CLI still reads exactly one line per command.
-- **Subscription**: only Interactive clients (the TUI) subscribe. Headless one-shot clients are never pushed to — a push would corrupt their "one command, one response" contract.
-- **Trigger**: the daemon keeps a `tokio::sync::watch` channel holding the latest snapshot. On every command it sends only when `generation` advanced (watch's `send` wakes receivers on every send, not only on value change — so unchanged responses such as GetState, rejected edits, and no-ops must not be sent). The originator also receives its own pushes; the TUI drops pushes whose generation equals its last drawn state (self-edit is already drawn from the response).
-- **Ordering/backpressure**: `watch` holds only the latest value, so slow subscribers miss intermediate generations but always converge to the newest — full snapshots make skipped pushes harmless. The connection handler `select!`s between the next command line and push notification; command lines are read via `Lines::next_line` (tokio documents it cancel-safe, unlike `read_line`).
+- **ワイヤ**: daemon→client のすべてのメッセージはタグ付きエンベロープ、`{"type":"response"|"push","snapshot":{...}}` (NDJSON、1 行 1 メッセージ) である。応答は以前は裸のスナップショットだった。統一エンベロープは CLI 互換性の観点から意図的に破壊的である — 1 つのメッセージ形状が仕様とリーダーを単純に保つ。ワンショットのヘッドレスクライアントは push を受け取らないので、`session` CLI はコマンドごとに正確に 1 行を読み続ける。
+- **購読**: Interactive クライアント (TUI) のみが購読する。ヘッドレスのワンショットクライアントには決して push されない — push は「1 コマンド 1 応答」の契約を壊すからである。
+- **トリガー**: デーモンは最新スナップショットを保持する `tokio::sync::watch` チャネルを持つ。各コマンドで `generation` が進んだときのみ送信する (watch の `send` は値の変更時だけでなく毎回受信者を起こす — したがって GetState などの不変の応答、拒否された編集、no-op は送ってはならない)。発信者も自身の push を受け取る。TUI は最後に描画した状態と generation が等しい push を破棄する (自己編集は既に応答から描画済み)。
+- **順序/背圧**: `watch` は最新の値のみ保持するので、遅い購読者は中間の世代を逃すが常に最新に収束する — 完全スナップショットはスキップされた push を無害にする。接続ハンドラは次のコマンド行と push 通知の間で `select!` する。コマンド行は `Lines::next_line` で読まれる (tokio は `read_line` と違いキャンセル安全と文書化している)。
 
-Chosen over TUI-side polling: push is instant, costs nothing while idle, and the latency is not tied to an interval. Chosen over daemon-side originator exclusion: sending to everyone and deduping by generation client-side needs no connection registry and is only one extra snapshot write per state change.
+TUI 側ポーリングより選択された: push は即時的で、アイドル中はコストがゼロ、レイテンシは間隔に依存しない。デーモン側の発信者除外より選択された: 全員に送ってクライアント側で generation により重複排除するのは、接続レジストリが不要で、状態変更ごとにスナップショット書き込みが 1 回増えるだけである。
 
-Consequences: the TUI exits when the daemon dies even while idle (EOF on the push/response stream), instead of only on the next keypress. Auto-restart of a dead daemon is deferred. Pushes that change viewport state without advancing generation (multi-TUI SetViewport) are not redrawn — deduping by generation misses them; acceptable for the agent+one-TUI case.
+結果: TUI はアイドル中でもデーモンが死ぬと終了する (push/応答ストリームの EOF) — 次のキー押下まで生き続けるのではなく。死んだデーモンの自動再起動は延期する。generation を進めずにビューポート状態を変える push (複数 TUI の SetViewport) は再描画されない — generation による重複排除はそれを見逃す。エージェント + 1 TUI のケースでは許容できる。

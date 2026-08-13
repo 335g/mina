@@ -1,10 +1,10 @@
-# Agent monitoring: blocking wait and checksum in snapshot
+# エージェント監視: ブロッキング待機とスナップショット内のチェックサム
 
-Agents monitor a document without polling and without reimplementing FNV-1a.
+エージェントはポーリングなし、FNV-1a の再実装なしでドキュメントを監視する。
 
-- **`Command::WaitFor { generation }`** (new wire command, read-only): the daemon blocks the request until the global `generation` exceeds the given value, then replies with the snapshot. It reuses the watch channel introduced in ADR-0013 — no polling, no traffic while idle. Returns immediately when the generation already passed. Allowed for headless clients (added to the #13 allowlist). No timeout: Ctrl-C on the CLI aborts; a daemon-side wait outliving a killed client is accepted (self-heals on the next state change, when the response write fails).
-- **`StateSnapshot.checksum`** (new field): the FNV-1a 64 of the full document text, computed in the single `snapshot()` builder. An agent passes it straight into `DocumentEdit.checksum` — no reimplementation of the hash (previously each agent language had to duplicate `fnv1a64`).
+- **`Command::WaitFor { generation }`** (新しいワイヤコマンド、読み取り専用): デーモンはグローバルな `generation` が指定値を超えるまでリクエストをブロックし、その後スナップショットで応答する。ADR-0013 で導入された watch チャネルを再利用する — ポーリングなし、アイドル中のトラフィックなし。generation が既に過ぎている場合は即座に返る。ヘッドレスクライアントに許可される (#13 の許可リストに追加)。タイムアウトなし: CLI の Ctrl-C が中止する。デーモン側の待機が殺されたクライアントより長生きすることは許容される (次の状態変更時に応答の書き込みが失敗して自己回復する)。
+- **`StateSnapshot.checksum`** (新しいフィールド): 完全なドキュメントテキストの FNV-1a 64 であり、単一の `snapshot()` ビルダーで計算される。エージェントはそれを `DocumentEdit.checksum` に直接渡す — ハッシュの再実装なし (以前は各エージェント言語が `fnv1a64` を複製しなければならなかった)。
 
-Chosen over agent-side subscription to the ADR-0013 push channel: agents are one-shot CLI invocations, so a persistent push connection doesn't fit them; a blocking request keeps the one-command/one-response contract. Chosen over a CLI-side polling loop: the daemon already owns the change signal (watch), so the wait costs nothing while idle.
+ADR-0013 の push チャネルへのエージェント側サブスクリプションより選択された: エージェントはワンショットの CLI 呼び出しなので、永続的な push 接続は合わない。ブロッキングリクエストは 1 コマンド/1 応答の契約を保つ。CLI 側のポーリングループより選択された: デーモンは既に変更シグナル (watch) を所有しているので、待機はアイドル中にコストがかからない。
 
-The monitoring loop an agent previously wrote as "poll `session get` every N seconds" becomes a single `mina session wait <last_generation>`.
+エージェントが以前「`session get` を N 秒ごとにポーリング」と書いていた監視ループは、単一の `mina session wait <last_generation>` になる。
