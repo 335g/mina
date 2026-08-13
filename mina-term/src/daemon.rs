@@ -361,7 +361,12 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
         let snapshot = match serde_json::from_str(line.trim()) {
             // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
             Ok(Command::Open { path }) => {
-                let path_buf = PathBuf::from(&path);
+                // CRITICAL C2: 受信パスを正規化してから「既存文書の再利用判定」と
+                // 「保存パス」の両方に使う。正規化しないとパス表記（相対/絶対・
+                // `./x` と `x`・`a/../x`・symlink）が異なるだけで #7 の再利用が
+                // 効かず、ディスク再読込で新規文書が作られ未保存編集が失われる。
+                let path_buf = normalize_open_path(PathBuf::from(&path)).await;
+                let path_str = path_buf.to_string_lossy().into_owned();
                 // #7: 既に開かれているパスはディスク再読込せず、既存ドキュメントへ
                 // フォーカスし直す。未保存編集・dirty フラグ・undo ヒストリーを
                 // 保持する（再利用 = 「何も変えない」）。
@@ -404,7 +409,7 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                     // 未開パス: 従来どおりディスクから読む
                     // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
                     // （ADR-0008）。失敗時は状態を変えず status で報告する。
-                    let (contents, mut open_status) = read_open_target(&path).await;
+                    let (contents, mut open_status) = read_open_target(&path_str).await;
                     // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
                     // daemon ロック外で行う。失敗時は status に載せる。
                     let session = if contents.is_some() && lsp::server_for(&path_buf).is_some() {
@@ -646,8 +651,10 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
         // MEDIUM-2: 応答を読まないクライアントが socket バッファを詰まらせて
         // 接続スロットを永久に占有しないよう、書き込みにタイムアウトを付ける。
         // タイムアウト・切断のいずれも接続を閉じて後始末に進む。
+        eprintln!("[conn {}] writing {} bytes", conn_id, out.len());
         let wrote = timeout(RESPONSE_WRITE_TIMEOUT, write_half.write_all(out.as_bytes())).await;
         if !matches!(wrote, Ok(Ok(()))) {
+            eprintln!("[conn {}] write TIMED OUT: {:?}", conn_id, wrote);
             break; // 切断 or 書き込みタイムアウト
         }
     }
@@ -667,6 +674,53 @@ fn is_edit(command: &Command) -> bool {
             | Command::Undo
             | Command::Redo
     )
+}
+
+/// Open パスの同一性を正規化する（CRITICAL C2: パス表記の違いで #7 の再利用が
+/// 効かない問題の修正）。
+///
+/// 同一ファイルを指す異なる表記（相対/絶対・`./x` と `x`・`a/../x`・symlink）が
+/// 同じ文書として再利用されるよう、既存ファイルは canonicalize で実体パスに
+/// 解決する。ファイルが存在しない（新規ファイルの Open）場合は
+/// [`lexical_normalize`] にフォールバックする — canonicalize はパスの一部でも
+/// 存在しないと失敗するため。
+///
+/// 正規化したパスは「既存文書の再利用判定」（[`Editor::focus_open_path`]）と
+/// 「保存パス」（[`Editor::open_with_path`]）の両方に使われるため、LSP の
+/// workspace_root・診断・Save 先も一貫して同じ実体パスになる。
+///
+/// ponytail: 存在しないパスの symlink 解決はできない（canonicalize の制約）。
+/// ファイルが後から作られる場合は `.`/`..` を含まない表記同士なら同一視できる。
+async fn normalize_open_path(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
+        return canonical;
+    }
+    lexical_normalize(&path)
+}
+
+/// 存在しないパス向けの lexical 正規化: 絶対化 + `.` / `..` の解決。
+///
+/// 送信側（TUI / session CLI）は常に絶対化して送る（[`crate::client::absolutize`]）
+/// ため、相対パスが届くのは第三者の生クライアントだけ。その場合の解決基準は
+/// daemon の cwd（spawn 時に固定。ADR-0005）で、従来のディスク読込と同じ解釈。
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {} // . は無視
+            std::path::Component::ParentDir => {
+                // .. は1段戻る。ルートより上は pop が false になり無視される
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Open 対象を検証して読み込む。
@@ -746,20 +800,15 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
 /// 選択は読まず・変えない（履歴には before == after として記録されるので
 /// undo でも選択は動かない）。挿入 = `start == end`、削除 = `text` が空。
 fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<StateSnapshot> {
-    let (checksum_ok, in_bounds) = {
-        let text = daemon.editor.current_document().text().to_string();
-        (
-            fnv1a64(text.as_bytes()) == edit.checksum,
-            edit.start <= edit.end && edit.end <= text.chars().count(),
-        )
-    };
-    if !checksum_ok {
+    let text = daemon.editor.current_document().text().to_string();
+    let len = text.chars().count();
+    if fnv1a64(text.as_bytes()) != edit.checksum {
         return Some(snapshot(
             daemon,
             Some("document changed since read".into()),
         ));
     }
-    if !in_bounds {
+    if !(edit.start <= edit.end && edit.end <= len) {
         return Some(snapshot(daemon, Some("range out of bounds".into())));
     }
     // ADR-0007: 他クライアントの書き込みとして、開いた Insert グループを閉じる
@@ -768,6 +817,23 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
     let selection = Selection::new(vec![range], 0);
     let tx = Transaction::insert(daemon.editor.current_document(), &selection, &edit.text);
     let selection_after = daemon.editor.selection();
+    // CRITICAL C1: ADR-0011 の「選択を読まず・変えない」は、選択が文書の
+    // 範囲内にあることが前提。編集で文書が選択位置より短くなると選択が
+    // 範囲外に残り、直後の scroll_to_cursor（char_to_line）が panic し、
+    // 以降の Move/Delete も panic して daemon が wedge する。ここで適用後の
+    // 文書長へクランプして状態を有効に保つ。範囲内の選択は一切変わらない
+    // ので、通常時は ADR-0011 どおり不変。apply に渡すため履歴の
+    // selection_after もクランプされ、redo でも範囲外に戻らない。
+    let new_len = len - (edit.end - edit.start) + edit.text.chars().count();
+    let clamp = |pos: usize| pos.min(new_len);
+    let selection_after = Selection::new(
+        selection_after
+            .ranges()
+            .iter()
+            .map(|r| CoreRange::new(clamp(r.anchor()), clamp(r.head())))
+            .collect(),
+        selection_after.primary_index(),
+    );
     daemon.editor.apply(tx, selection_after);
     daemon.editor.scroll_to_cursor(daemon.viewport_height);
     None
@@ -1049,6 +1115,48 @@ mod tests {
         let s = open_in_editor(&mut d, "missing", None);
         assert!(s.status.is_some());
         assert!(s.path.is_none());
+    }
+
+    #[tokio::test]
+    async fn normalize_open_path_equates_notations_of_same_file() {
+        // CRITICAL C2: 同一ファイルを指す異なる表記（絶対・./ 付き・.. 付き・
+        // symlink）が同じ正規化パスに解決される（#7 の再利用判定の前提）。
+        let dir = std::env::temp_dir().join(format!("mina-c2-norm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let file = dir.join("sub").join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let plain = normalize_open_path(file.clone()).await;
+        let dot = normalize_open_path(dir.join("sub").join("./a.txt")).await;
+        let dotdot = normalize_open_path(dir.join("other").join("../sub/a.txt")).await;
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let via_link = normalize_open_path(link.clone()).await;
+
+        assert!(plain.is_absolute(), "正規化後は絶対パス: {}", plain.display());
+        assert_eq!(plain, dot, "./ 付き表記も同一");
+        assert_eq!(plain, dotdot, ".. 付き表記も同一");
+        assert_eq!(plain, via_link, "symlink 経由も同一");
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lexical_normalize_makes_absolute_and_resolves_dots() {
+        // 存在しないパス（新規ファイル Open のフォールバック）は絶対化 + . / .. 解決
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            lexical_normalize(Path::new("./a/../b.txt")),
+            cwd.join("b.txt")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/x/./y/../z.txt")),
+            PathBuf::from("/x/z.txt")
+        );
+        // ルートより上へは行かない（/../x は /x）
+        assert_eq!(lexical_normalize(Path::new("/../x")), PathBuf::from("/x"));
     }
 
     #[tokio::test]
@@ -1572,6 +1680,59 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    #[tokio::test]
+    async fn reopen_with_different_notation_reuses_document() {
+        // CRITICAL C2 e2e: 同一ファイルを異なる表記（絶対・./ 付き・.. 付き・
+        // symlink）で再 Open しても既存文書が再利用され、未保存編集・dirty・undo
+        // ヒストリーが保持されてディスク再読込されない。修正前は表記の違いで
+        // 一致せず、ディスクから新規文書が読み込まれ編集が消えた。
+        let dir = std::env::temp_dir().join(format!("mina-c2-sock-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let sock = dir.join("mina.sock");
+        let file = dir.join("sub").join("file.txt");
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        // TUI: ファイルを開いて編集（未保存）
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let plain = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path: plain.clone() }).await;
+        assert_eq!(snap.text, "base\n");
+        let snap = request(&mut tui, &Command::Insert { text: "X".into() }).await;
+        assert_eq!(snap.text, "Xbase\n");
+        assert!(snap.dirty);
+
+        // ディスクの中身を変えておく: 再 Open がディスクを読んだら X が消える
+        std::fs::write(&file, "changed\n").unwrap();
+
+        // 表記違いの再 Open: どれも既存文書へフォーカスし直す
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let notations = [
+            plain.clone(),                                      // 絶対
+            format!("{}/sub/./file.txt", dir.display()),        // ./ 付き
+            format!("{}/other/../sub/file.txt", dir.display()), // .. 付き
+            link.to_string_lossy().into_owned(),                // symlink 経由
+        ];
+        for path in notations {
+            let mut agent = connect_client(&sock, ClientKind::Headless).await;
+            let snap = request(&mut agent, &Command::Open { path }).await;
+            assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
+            assert!(snap.dirty, "dirty が保持される");
+        }
+
+        // undo も効く（ヒストリーが保持されている）
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let _ = request(&mut agent, &Command::Open { path: plain }).await;
+        let snap = request(&mut agent, &Command::Undo).await;
+        assert_eq!(snap.text, "base\n", "undo で挿入だけ戻る");
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// pkill を使う LSP テストの直列化（並行実行だと互いの mock を殺し合う）。
     static LSP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -1690,6 +1851,67 @@ mod tests {
         assert_eq!(snap.status, None, "成功時は status なし");
         assert_eq!(snap.selection[0].anchor, 0, "選択は不変");
         assert_eq!(snap.selection[0].head, 0, "選択は不変");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_shrinking_doc_with_cursor_after_range_does_not_panic() {
+        // CRITICAL C1: カーソルが編集範囲より後方にある DocumentEdit（文書短縮）
+        // で daemon が panic しない。応答が返り、generation/ChangeEvent が記録
+        // され、選択は文書末尾へクランプされるので後続の Move/Insert も panic
+        // しない（修正前は選択 [11,11] が範囲外に残り scroll_to_cursor の
+        // char_to_line が panic して wedge していた）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-c1-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-c1-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "hello world").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // カーソルを文末（11）へ — 編集範囲 [0,11) より後方
+        let _ = request(&mut c, &Command::Goto { target: GotoTarget::DocumentEnd }).await;
+
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 11,
+                text: "hi".into(),
+                checksum: fnv1a64(b"hello world"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "hi");
+        assert_eq!(snap.status, None, "成功時は status なし");
+        assert_eq!(
+            snap.selection[0].anchor, 2,
+            "範囲外になった選択は文書末尾へクランプされる"
+        );
+        assert_eq!(snap.selection[0].head, 2, "範囲外になった選択は文書末尾へクランプされる");
+        assert_eq!(snap.generation, 2, "Open + DocumentEdit で世代が進む");
+        assert_eq!(
+            snap.events.last().unwrap().kind,
+            EventKind::ReplaceRange,
+            "ChangeEvent が記録される"
+        );
+
+        // 後続の Move/Insert も panic しない（wedge しない）
+        let snap = request(
+            &mut c,
+            &Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "hi");
+        assert_eq!(snap.selection[0].head, 2, "クランプ済み選択から移動する");
+        let snap = request(&mut c, &Command::Insert { text: "!".into() }).await;
+        assert_eq!(snap.text, "hi!");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }

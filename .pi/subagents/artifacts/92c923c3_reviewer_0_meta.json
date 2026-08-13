@@ -1,0 +1,165 @@
+{
+  "runId": "92c923c3",
+  "agent": "reviewer",
+  "task": "[prompt redacted]",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 123258,
+    "output": 31620,
+    "cacheRead": 1755776,
+    "cacheWrite": 0,
+    "cost": 0.015512946400000002,
+    "turns": 27
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 123258,
+        "output": 31620,
+        "cacheRead": 1755776,
+        "cacheWrite": 0,
+        "cost": 0.015512946400000002,
+        "turns": 27
+      }
+    }
+  ],
+  "durationMs": 454000,
+  "toolCount": 43,
+  "launchContractDigest": "528a1a430d3401a62fd152c8bce303225e06084e1c170d1ff3e05438e1d97fcf",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "12 evidence-backed findings with file:line citations and severity (F1 MAJOR path-reuse bypass via lexical PathBuf equality + session exec non-absolutization; F2-F9 MINOR; F10-F16 CONFORMS verifications incl. full Save-window trace with no data-loss path, ADR-0002 functional core, transaction invertibility, fa1d46d movement fix and sibling edge cases, ADR-0007 ownership invariant, ADR-0012 generation/event consistency)."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test -p mina-core -p mina-view",
+          "result": "not-run",
+          "summary": "No shell tool in this reviewer session; suites inspected at code level, execution required by parent"
+        },
+        {
+          "command": "cargo test -p mina-term",
+          "result": "not-run",
+          "summary": "Daemon unit + socket e2e tests (H1/H3/SEC-1/ADR-0008/0011/0012) inspected, not executed"
+        },
+        {
+          "command": "gh issue view 1 2 3 4 7 8 9",
+          "result": "not-run",
+          "summary": "No gh tool; issue acceptance texts not fetched, semantics inferred from code comments/ADRs only"
+        }
+      ],
+      "validationOutput": [
+        "Slice D code read fully: mina-core/{document,edit,movement,search,selection,transaction}.rs, mina-view/{editor,history,mode,tree}.rs, mina-protocol/lib.rs, mina-term/{daemon,client,session,keymap,main}.rs, lsp.rs diagnostic conversion",
+        "Commit fa1d46d verified in movement.rs (relative-byte->char fix + regression test)",
+        "Dirty semantics: save window fully traced, no edit-loss or wrong-clear window (F11 CONFORMS)",
+        "Undo of still-open Insert group: possible at History level, group closed after undo, redo restores closed (F10 CONFORMS)"
+      ],
+      "residualRisks": [
+        "gh issue view not run - issues #1-#4 S0-S2 acceptance criteria unverified against original issue text",
+        "cargo test not executed - parent must run the three command groups listed",
+        "F1: duplicate documents possible when the same file is opened via different path spellings (relative/absolute, .., symlinks)",
+        "F5: Selection invariants are debug-only; duplicate-range selection would double-insert if ever constructed",
+        "F3/F8: dirty-on-undo and no-op-undo-preempt are documented/edge deviations that may surprise multi-client agents",
+        "Multi-View exists in mina-view but is not reachable through the daemon/protocol (v1 single-view)"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review-only slice D audit; no files changed",
+      "reviewFindings": [
+        "major: mina-term/src/session.rs + mina-view/src/editor.rs:186 - session exec Open sends un-absolutized paths; reuse matching is exact PathBuf equality, so issue-#7 reuse is bypassed and duplicate documents for one file are created",
+        "minor: mina-view/src/editor.rs:283 - no-op edits (empty Insert, delete-on-cursor) mark dirty",
+        "minor: mina-view/src/editor.rs:317 - undo/redo never clear dirty even when restored text equals saved text (documented ponytail simplification)",
+        "minor: mina-term/src/daemon.rs:410-440 - reuse-Open keeps stale diagnostics and disk_changed from the previous focused document",
+        "minor: mina-core/src/selection.rs:96 - invariants debug_assert only; duplicate ranges pass even in debug",
+        "minor: mina-core/src/transaction.rs:203 - map_pos doc comment wrong for replaced-range interiors (maps to start+len, not deletion start); no reachable wrong behavior",
+        "minor: mina-core/src/movement.rs:246 - word movement stops mid-grapheme on combining marks (no panic)",
+        "minor: mina-term/src/daemon.rs:847 - non-owner no-op Undo/Redo preempts the open Insert group with no event/generation bump",
+        "minor: mina-term/src/daemon.rs:322 - blocking metadata call under async daemon lock",
+        "no blockers in slice D core paths: ADR-0002 conformance, transaction invertibility, dirty/save window, fa1d46d fix and sibling edge cases, ADR-0007 ownership, ADR-0012 generation/events all CONFORMS"
+      ],
+      "manualNotes": "Reviewer had no shell/gh tooling, so the two required command groups (cargo test -p mina-core -p mina-view, gh issue view 1-4/7-9) were not executed; findings rest on full code reading including the git log. Parent should run the test commands and fold in the issue texts before accepting."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/92c923c3_reviewer_0_transcript.jsonl",
+  "timestamp": 1786613217106
+}

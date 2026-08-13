@@ -28,7 +28,8 @@ use crate::render;
 ///
 /// daemon の cwd は最初に spawn された場所で固定されるため（ADR-0005）、
 /// 相対パスは送信側で現在のディレクトリ基準に解決してから渡す。
-fn absolutize(path: &str) -> String {
+/// session CLI（[`crate::session`]）からも使う（pub(crate)）。
+pub(crate) fn absolutize(path: &str) -> String {
     let p = Path::new(path);
     if p.is_absolute() {
         return path.to_string();

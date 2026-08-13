@@ -61,7 +61,24 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
     client::send_hello(&mut write_half, ClientKind::Headless).await?;
-    client::request(&mut write_half, &mut reader, command).await
+    // CRITICAL C2: Open のパスは agent の cwd 基準で絶対化してから送る（TUI と
+    // 同一の契約）。そのまま送ると daemon の spawn cwd 基準で解決され、意図しない
+    // ファイルを開く恐れがある。
+    let command = absolutize_open(command.clone());
+    client::request(&mut write_half, &mut reader, &command).await
+}
+
+/// Open コマンドのパスを絶対化する（他のコマンドはそのまま）。
+///
+/// [`crate::client::absolutize`] を共通化して使う — daemon 側の cwd は spawn 時に
+/// 固定されるため、解決は送信側（agent の cwd）で行う。
+fn absolutize_open(command: Command) -> Command {
+    match command {
+        Command::Open { path } => Command::Open {
+            path: client::absolutize(&path),
+        },
+        other => other,
+    }
 }
 
 /// daemon に接続し、位置指定編集（DocumentEdit）を実行してスナップショットを受け取る。
@@ -108,5 +125,27 @@ mod tests {
     fn unknown_subcommand_is_rejected() {
         assert!(parse_command(&args(&["frobnicate"])).is_err());
         assert!(parse_command(&args(&[])).is_err());
+    }
+
+    #[test]
+    fn absolutize_open_absolutizes_open_path_only() {
+        // CRITICAL C2: Open のパスだけが agent の cwd 基準で絶対化される
+        // （daemon の spawn cwd で解決されないように）。他コマンドは素通し。
+        let cmd = absolutize_open(Command::Open { path: "rel/file.rs".into() });
+        match cmd {
+            Command::Open { path } => {
+                assert!(
+                    std::path::Path::new(&path).is_absolute(),
+                    "絶対化される: {path}"
+                );
+                assert!(path.ends_with("rel/file.rs"));
+            }
+            other => panic!("Open 以外が返った: {other:?}"),
+        }
+        assert_eq!(absolutize_open(Command::GetState), Command::GetState);
+        assert_eq!(
+            absolutize_open(Command::Insert { text: "x".into() }),
+            Command::Insert { text: "x".into() }
+        );
     }
 }

@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "id": "a5598aa2-0ef5-460a-a8a8-d5e11dc96632",
+  "title": "[prompt redacted]",
+  "objective": "[prompt redacted]",
+  "status": "waiting",
+  "createdAt": "2026-08-13T09:19:21.677Z",
+  "updatedAt": "2026-08-13T09:41:54.648Z",
+  "runs": [
+    {
+      "runId": "call_00_93hSIMAfqbhvFuiX6az24043",
+      "mode": "workflow",
+      "status": "paused",
+      "startedAt": "2026-08-13T09:27:07.724Z",
+      "completedAt": "2026-08-13T09:27:07.724Z",
+      "usage": {
+        "tokens": 641798
+      }
+    }
+  ],
+  "workflowChildren": [
+    {
+      "workflowRunId": "call_00_93hSIMAfqbhvFuiX6az24043",
+      "key": "A-adr12",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:19:22.037Z",
+      "updatedAt": "2026-08-13T09:24:20.590Z",
+      "artifactPaths": [
+        "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/8ec29859/run-0/session.jsonl"
+      ],
+      "runId": "8ec29859",
+      "agent": "reviewer",
+      "completedAt": "2026-08-13T09:24:20.590Z",
+      "sessionPath": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/8ec29859/run-0/session.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:24:20.590Z",
+        "status": "completed"
+      }
+    },
+    {
+      "workflowRunId": "call_00_93hSIMAfqbhvFuiX6az24043",
+      "key": "B-adr11-adr07",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:19:22.510Z",
+      "updatedAt": "2026-08-13T09:27:07.689Z",
+      "artifactPaths": [
+        "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/d34f0e86/run-0/session.jsonl"
+      ],
+      "runId": "d34f0e86",
+      "agent": "reviewer",
+      "completedAt": "2026-08-13T09:27:07.689Z",
+      "sessionPath": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/d34f0e86/run-0/session.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:27:07.689Z",
+        "status": "completed"
+      }
+    },
+    {
+      "workflowRunId": "call_00_93hSIMAfqbhvFuiX6az24043",
+      "key": "C-adr08-09-10",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:19:22.679Z",
+      "updatedAt": "2026-08-13T09:25:40.875Z",
+      "artifactPaths": [
+        "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/73c9928a/run-0/session.jsonl"
+      ],
+      "runId": "73c9928a",
+      "agent": "reviewer",
+      "completedAt": "2026-08-13T09:25:40.875Z",
+      "sessionPath": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/73c9928a/run-0/session.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:25:40.875Z",
+        "status": "completed"
+      }
+    },
+    {
+      "workflowRunId": "call_00_93hSIMAfqbhvFuiX6az24043",
+      "key": "D-domain",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:19:22.910Z",
+      "updatedAt": "2026-08-13T09:26:57.289Z",
+      "artifactPaths": [
+        "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/92c923c3/run-0/session.jsonl"
+      ],
+      "runId": "92c923c3",
+      "agent": "reviewer",
+      "completedAt": "2026-08-13T09:26:57.270Z",
+      "sessionPath": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/92c923c3/run-0/session.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:26:57.289Z",
+        "status": "completed"
+      }
+    },
+    {
+      "workflowRunId": "call_00_93hSIMAfqbhvFuiX6az24043",
+      "key": "E-tui-transport",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:19:23.089Z",
+      "updatedAt": "2026-08-13T09:41:54.648Z",
+      "artifactPaths": [],
+      "runId": "e87ea202",
+      "agent": "reviewer",
+      "sessionPath": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85/e87ea202/run-0/session.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:41:54.648Z",
+        "status": "completed"
+      }
+    }
+  ],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "output",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/8ec29859_reviewer_0_output.md"
+    },
+    {
+      "kind": "other",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/8ec29859_reviewer_0_transcript.jsonl",
+      "description": "Child transcript"
+    },
+    {
+      "kind": "output",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/d34f0e86_reviewer_0_output.md"
+    },
+    {
+      "kind": "other",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/d34f0e86_reviewer_0_transcript.jsonl",
+      "description": "Child transcript"
+    },
+    {
+      "kind": "output",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/73c9928a_reviewer_0_output.md"
+    },
+    {
+      "kind": "other",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/73c9928a_reviewer_0_transcript.jsonl",
+      "description": "Child transcript"
+    },
+    {
+      "kind": "output",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/92c923c3_reviewer_0_output.md"
+    },
+    {
+      "kind": "other",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/92c923c3_reviewer_0_transcript.jsonl",
+      "description": "Child transcript"
+    },
+    {
+      "kind": "output",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/e87ea202_reviewer_0_output.md"
+    },
+    {
+      "kind": "other",
+      "path": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/e87ea202_reviewer_0_transcript.jsonl",
+      "description": "Child transcript"
+    }
+  ],
+  "receipts": [],
+  "cwd": "/Users/335g/dev/other/mina",
+  "ownerSessionId": "/Users/335g/.pi/agent/sessions/--Users-335g-dev-other-mina--/2026-08-13T09-15-49-822Z_019ffa68-08be-7de4-b5e7-212204ee8c85.jsonl",
+  "summary": "Run fan-out: 5/64 used, 59 remaining\nWorkflow completed.\n\nReturn:\n[\n  {\n    \"key\": \"A-adr12\",\n    \"ok\": true,\n    \"agent\": \"reviewer\",\n    \"runId\": \"8ec29859\",\n    \"output\": \"All files read. Compiling the adversarial review now.\\n\\n## Summary\\n\\nADR-0012's core machinery (generation, 128-ring, Hello handshake, external-change detection) is implemented and well-tested end-to-end, but three adversarial findings hold: **rejected/no-op commands still bump the generation and log events** (spec says state unchanged → no bump), and **reuse-Open leaves the disk baseline stale, silently disabling focused-document monitoring** in multi-document flows. `cargo test` could not be executed (no shell tool in this session); tests were verified statically.\\n\\n## Findings\\n\\n### 1. MAJOR — Rejected operations still bump generation and log events (spec: state unchanged → no bump)\\n- **Spec**: ADR-0012 — \\\"bumped on every state-changing operation (edits, undo/redo, mode changes, Open/Save), never on pure reads\\\"; review target: \\\"Does a REJECTED operation (bad checksum, failed Open) bump? (Spec: state unchanged -> no bump.)\\\"\\n- **Evidence**: `mina-term/src/daemon.rs:520-546` — the event tuple is matched from the command *before* application, and `d.record_event(source, kind, range, text)` at line 546 runs unconditionally after `apply_from`, with no check that state actually changed. The oversized-Insert rejection at `daemon.rs:804-805` (`return snapshot(daemon, Some(\\\"file too large: insert rejected\\\".into()))`) provably changes nothing — test `rejected_insert_keeps_undo_group_open` asserts selection, mode, and undo-group are untouched and `!s.dirty`. Yet the wire path still records an `Insert` event and bumps `generation`. (The DocumentEdit path at `daemon.rs:604-606` is correctly guarded by `if rejected.is_none()`; failed Open at `daemon.rs:438-440` correctly does not record.)\\n- **Verdict**: DEVIATES — **MAJOR** (direct contradiction of the generation contract; rare trigger, ~16..."
+}

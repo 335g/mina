@@ -1,0 +1,159 @@
+{
+  "runId": "e87ea202",
+  "agent": "reviewer",
+  "task": "[prompt redacted]",
+  "exitCode": 0,
+  "usage": {
+    "input": 93732,
+    "output": 36905,
+    "cacheRead": 1597568,
+    "cacheWrite": 0,
+    "cost": 0.013964535200000001,
+    "turns": 27
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 93732,
+        "output": 36905,
+        "cacheRead": 1597568,
+        "cacheWrite": 0,
+        "cost": 0.013964535200000001,
+        "turns": 27
+      }
+    }
+  ],
+  "durationMs": 1351394,
+  "toolCount": 40,
+  "launchContractDigest": "9dddbd989f34ebf4ec1d0cd2e6030a7595b6e91be40dbc383ae372c9f085d998",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "9 concrete findings delivered with file:line evidence and severity (all MINOR; no CRITICAL/MAJOR). Key evidence: rejected-Insert false event/gen bump (daemon.rs:521-540, 809-811), no-op delete dirty+event (edit.rs no-op tests; editor.rs:319-337; daemon.rs:815-850), render lacks disk_changed/generation display (render.rs:216-268), SetViewport no re-scroll (daemon.rs:908-912), session exec Open not absolutized (session.rs:30-70 vs client.rs:91), daemon-death error message (client.rs:180-186), AltGr insert rejection (keymap.rs:256-261), Select-mode Goto collapse (daemon.rs:891-895), Ctrl-C quits in Insert (client.rs:142-147)."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test -p mina-term",
+          "result": "not-run",
+          "summary": "Reviewer has no shell tool; static review of in-tree tests only. Supervisor must run."
+        },
+        {
+          "command": "cargo check --workspace",
+          "result": "not-run",
+          "summary": "Reviewer has no shell tool. Supervisor must run."
+        },
+        {
+          "command": "gh issue view 2 3 6",
+          "result": "not-run",
+          "summary": "Reviewer has no shell tool; issue bodies unread. Commit history maps #7 (reopen preserves unsaved edits), #8 (DocumentEdit), #9 (ADR-0012 generation/events) to tests mina-7*/8*/9*."
+        }
+      ],
+      "validationOutput": [
+        "Full read of mina-term/src/{main,render,keymap,client,session,daemon}.rs, mina-protocol/src/lib.rs, mina-debug/src/main.rs, mina-core/src/{transaction,edit}.rs, mina-view/src/editor.rs; grep for DocumentEdit/Command across mina-term; workspace + crate manifests; git HEAD=851524ea (mina-debug latest). No CRITICAL/MAJOR findings."
+      ],
+      "residualRisks": [
+        "cargo test -p mina-term and cargo check --workspace unexecuted (no shell tool) - supervisor must run",
+        "GitHub issue bodies #2/#3/#6 unread (no gh) - verify scope mapping against issue text",
+        "Findings 1-2 (false events/gen bumps) are untested behaviors; tests assert text/dirty only",
+        "TUI end-to-end (raw terminal) untested; only unit-level coverage",
+        "mina-debug compile unverified (cliclack 0.5 API)"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review-only; no files changed by this reviewer.",
+      "reviewFindings": [
+        "minor: daemon.rs:521-540,809-811 - rejected Insert records false ChangeEvent + generation bump (ADR-0012; fix: record only on success like DocumentEdit path)",
+        "minor: edit.rs no-op deletes + editor.rs:319-337 + daemon.rs:815-850 - Backspace at doc start marks dirty, bumps gen, pushes empty undo entry + bogus Delete event",
+        "minor: render.rs:216-268 - disk_changed/generation never displayed; external-change clobber by Save is invisible to user",
+        "minor: daemon.rs:908-912 - SetViewport stores height without re-scroll; cursor off-screen first frame on short terminals/resize",
+        "minor: session.rs:30-70 vs client.rs:91 - session exec Open sends relative paths unresolvable against daemon cwd (wrong-file risk)",
+        "minor: client.rs:180-186 - daemon death surfaces as misleading 'invalid response'; no reconnect",
+        "minor: keymap.rs:256-261 - AltGr/Compose-modified printable chars cannot be inserted in Insert mode",
+        "minor: daemon.rs:891-895 - Goto in Select mode collapses selection instead of extending (vim convention divergence)",
+        "minor: client.rs:142-147 - Ctrl-C quits entire TUI in Insert mode (UX; no data loss - daemon persists)"
+      ],
+      "manualNotes": "Supervisor must run: cargo test -p mina-term, cargo check --workspace, and gh issue view 2 3 6 7 8 9 (issue bodies were required evidence I could not fetch without a shell). All 9 findings are MINOR; no CRITICAL/MAJOR. The two strongest fixes: skip event/generation recording when an operation was rejected or was a text no-op (Findings 1-2), and surface disk_changed in the status line (Finding 3)."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/e87ea202_reviewer_0_transcript.jsonl",
+  "timestamp": 1786614114653
+}

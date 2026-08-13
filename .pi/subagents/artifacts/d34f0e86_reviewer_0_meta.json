@@ -1,0 +1,154 @@
+{
+  "runId": "d34f0e86",
+  "agent": "reviewer",
+  "task": "[prompt redacted]",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 88510,
+    "output": 40391,
+    "cacheRead": 2006016,
+    "cacheWrite": 0,
+    "cost": 0.0146588624,
+    "turns": 28
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 88510,
+        "output": 40391,
+        "cacheRead": 2006016,
+        "cacheWrite": 0,
+        "cost": 0.0146588624,
+        "turns": 28
+      }
+    }
+  ],
+  "durationMs": 465009,
+  "toolCount": 48,
+  "launchContractDigest": "9de54dded5d291bb98094e78b158e75d798768505643cf711eba3c5cc1cc8f4e",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Concrete findings with file paths, line numbers, and severity: CRITICAL daemon.rs:770-772+editor.rs:389-393 (DocumentEdit out-of-range selection panics ropey char_to_line, edit applied without generation/event); MAJOR daemon.rs:909-933/171/783 + history.rs:66-81 (orphaned open undo group on doc switch mid-Insert merges cross-client edits); MINOR daemon.rs:748-777 (no MAX_FILE_SIZE cap in apply_edit); AMBIGUOUS daemon.rs:753-756 (non-char-boundary rejection un-implementable with char-index wire type)."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test -p mina-term -p mina-view -p mina-protocol",
+          "result": "not-run",
+          "summary": "Review environment has no shell/exec tool; supervisor must run. LSP tests skip unless target/debug/mock-server is built (cargo test --workspace)."
+        },
+        {
+          "command": "gh issue view 7 && gh issue view 8 && gh issue view 9",
+          "result": "not-run",
+          "summary": "No shell access; issue mapping derived from CONTEXT.md, ADR docs, and task statement."
+        }
+      ],
+      "validationOutput": [
+        "Read fully: mina-term/src/daemon.rs (2426 lines), mina-view/src/history.rs, mina-view/src/editor.rs, mina-term/src/session.rs, mina-protocol/src/lib.rs, mina-core transaction/document/selection/edit/movement, client.rs, keymap.rs, render.rs, main.rs, ADR-0007/0008/0011/0012, CONTEXT.md.",
+        "Verified conformant: checksum (FNV-1a64, full UTF-8 bytes, atomic under daemon lock), OOB rejection without state change, selection byte-identical on successful edits, shared Transaction/undo/dirty/LSP machinery, per-connection group ownership + preemption + owner-scoped disconnect, linear undo/redo stacks (no 2-stack/undo-tree), open-group undoable, session edit CLI present.",
+        "Found: CRITICAL panic path (DocumentEdit shortening doc before cursor -> daemon task panic, no generation/event, selection out of range), MAJOR orphaned undo group on doc switch mid-Insert (cross-client merge), MINOR missing size cap for DocumentEdit, AMBIGUOUS non-char-boundary rejection not detectable with char-index wire type."
+      ],
+      "residualRisks": [
+        "CRITICAL: daemon.rs:772 + editor.rs:393 — DocumentEdit shortening the doc before the cursor panics (ropey char_to_line), edit applied without generation bump/event, selection left out of range; subsequent Line moves panic until a clamping command runs.",
+        "MAJOR: open undo group orphaned (grouping=true, owner=None) on the source document when another client Opens a different path mid-Insert; next cross-client write merges into it, breaking ADR-0007 last-write-wins.",
+        "MINOR: DocumentEdit bypasses MAX_FILE_SIZE growth cap enforced for Command::Insert (daemon.rs:804).",
+        "MINOR: byte-miscounting clients get silent char-index semantics instead of rejection.",
+        "Tests for rejection zero-state-change (generation/events), cursor-past-edit-range selection, and session-edit CLI e2e are absent.",
+        "Mock-server-dependent LSP tests skip unless built; run cargo test --workspace."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review only — no files changed or staged.",
+      "reviewFindings": [
+        "blocker: mina-term/src/daemon.rs:770-772 (with mina-view/src/editor.rs:389-393) — DocumentEdit leaving the selection out of range panics in scroll_to_cursor/char_to_line; edit applied without generation/event (ADR-0012 violation); daemon selection wedged.",
+        "major: mina-term/src/daemon.rs:909-933,171,783 + mina-view/src/history.rs:66-81 — open undo group orphaned when focus leaves the doc mid-Insert; later foreign write merges into it (ADR-0007 violation).",
+        "minor: mina-term/src/daemon.rs:748-777 — DocumentEdit has no MAX_FILE_SIZE cap (asymmetric with Command::Insert at daemon.rs:804).",
+        "ambiguous/minor: mina-term/src/daemon.rs:753-756 — non-char-boundary rejection un-implementable with char-index wire type; no panic, no clamp.",
+        "minor: mina-view/src/editor.rs:186-196 — #7 reuse does not restore the re-opened doc's cursor position (documented choice)."
+      ],
+      "manualNotes": "I could not run cargo test or gh (no shell tool in this review environment). Supervisor should run: cargo test -p mina-term -p mina-view -p mina-protocol (build mock-server first: cargo test --workspace) and gh issue view 7 8 9. Recommended first fix: clamp the head used by scroll_to_cursor's char_to_line computation without mutating the stored selection (preserves ADR-0011 selection-identical requirement while removing the panic). Second: end_group on the previously focused document when Open/focus changes."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/d34f0e86_reviewer_0_transcript.jsonl",
+  "timestamp": 1786613227680
+}

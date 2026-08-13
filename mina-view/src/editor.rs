@@ -387,10 +387,18 @@ impl Editor {
     /// 合わせる。`height` はターミナルの表示行数。カーソル移動・編集の後に
     /// 呼ぶこと（自動ではスクロールしない）。カーソル位置は primary の head。
     pub fn scroll_to_cursor(&mut self, height: usize) {
-        let cursor_line = self
-            .current_document()
-            .text()
-            .char_to_line(self.view().selection.primary().head());
+        // CRITICAL C1: 文書がカーソル位置より短くなる編集（DocumentEdit の
+        // 短縮等）で選択が範囲外に残ると、ropey の char_to_line が範囲外
+        // char index で panic する。保存されている選択は変更せず、計算用に
+        // だけ文書末尾へクランプする。
+        let doc = self.current_document();
+        let head = self
+            .view()
+            .selection
+            .primary()
+            .head()
+            .min(doc.len_chars());
+        let cursor_line = doc.text().char_to_line(head);
         let first = self.view().first_line;
         if cursor_line < first {
             self.view_mut().first_line = cursor_line;
@@ -729,6 +737,26 @@ mod tests {
         editor.set_selection(Selection::point(27)); // 9行目
         editor.scroll_to_cursor(5);
         assert_eq!(editor.first_line(), 5);
+    }
+
+    #[test]
+    fn scroll_to_cursor_does_not_panic_on_out_of_range_selection() {
+        // CRITICAL C1: 文書がカーソル位置より短くなる編集（DocumentEdit の
+        // 短縮等）で選択が範囲外に残っても、scroll_to_cursor は計算用に
+        // 文書末尾へクランプして panic しない（保存された選択は変更しない）。
+        let mut editor = Editor::new();
+        editor.open(Document::from("hi"));
+        // 11 は 2文字の文書では範囲外
+        editor.set_selection(Selection::point(11));
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 0);
+        assert_eq!(editor.selection().primary().head(), 11, "保存選択は変更しない");
+
+        // 空文書で範囲外でも panic しない
+        let mut editor = Editor::new();
+        editor.set_selection(Selection::point(3));
+        editor.scroll_to_cursor(5);
+        assert_eq!(editor.first_line(), 0);
     }
 
     #[test]

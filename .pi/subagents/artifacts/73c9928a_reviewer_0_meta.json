@@ -1,0 +1,163 @@
+{
+  "runId": "73c9928a",
+  "agent": "reviewer",
+  "task": "[prompt redacted]",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 112239,
+    "output": 29765,
+    "cacheRead": 2660736,
+    "cacheWrite": 0,
+    "cost": 0.015748860400000002,
+    "turns": 35
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 112239,
+        "output": 29765,
+        "cacheRead": 2660736,
+        "cacheWrite": 0,
+        "cost": 0.015748860400000002,
+        "turns": 35
+      }
+    }
+  ],
+  "durationMs": 377987,
+  "toolCount": 46,
+  "launchContractDigest": "fe45fa09499a60fac88044701900e295420110c716041ccc308cdbf3c3a71b03",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Concrete findings with file:line and severity: F1 CRITICAL (session.rs:56-70 + daemon.rs:368-425 + editor.rs:141 — relative-path Open bypasses #7 reuse, disk re-read clobbers unsaved edits); F2 MAJOR (mina-lsp/src/lib.rs:41,66,83-84 — unbounded notification queue never drained in production; drain_into lsp.rs:391-413 never calls try_recv); F3 MINOR (daemon.rs:380-384 vs 410-413 — LSP init failure swallowed on reuse); F4 MINOR (daemon.rs:396-397 — spurious generation bump); F5 MINOR (daemon.rs:368-399 + watch_disk daemon.rs:243-247 — baseline not refreshed on reuse). CONFORMS items (ADR-0008/0009/0010, #7, position.rs) verified with evidence; test commands and gh issue views could not be executed from this session (no shell tool) and are flagged for the supervisor."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test -p mina-lsp -p mina-term",
+          "result": "not-run",
+          "summary": "No shell tool in this review session; supervisor must run. Note: mina-term LSP tests skip silently without target/debug/mock-server (build workspace first), and two tests pkill mock-server under a serialization lock."
+        },
+        {
+          "command": "cargo build --workspace",
+          "result": "not-run",
+          "summary": "Prerequisite so mina-term LSP daemon tests exercise the mock server instead of skipping."
+        },
+        {
+          "command": "gh issue view 5 / 7 / 8 / 9",
+          "result": "not-run",
+          "summary": "No shell tool; issue bodies inferred from ADRs, git history, and repo regression tests."
+        }
+      ],
+      "validationOutput": [
+        "Static verification of ADR-0008: metadata (is_file+size) before read, fd-based fstat re-check, bounded read, non-UTF-8 -> 'cannot read', rejection is status-only with no generation bump, 1MiB line cap enforced",
+        "Static verification of #7: focus_open_path preserves doc/history/dirty; only production open_with_path caller is the first-open branch",
+        "Static verification of ADR-0009: LspSession in Arc<Mutex>, all LSP awaits outside daemon lock, notify 2s / request 10s / lock 3s timeouts, try_lock drains, dead detection via channel close, respawn on .rs Open only",
+        "Static verification of ADR-0010: workspace_root Cargo.toml -> .git -> parent, per-root session map, no reaping, focused-doc-only diagnostics",
+        "Static verification of position.rs: UTF-8 byte col -> char index (floor at char boundary), UTF-16 col -> char index (surrogate pairs = 2 units), line-start index in char units"
+      ],
+      "residualRisks": [
+        "F1: relative-path Open via session CLI bypasses document reuse -> unsaved edits can be clobbered by disk re-read (CRITICAL, data loss when triggered)",
+        "F2: unbounded LSP notification queue in long-lived daemon (MAJOR memory growth)",
+        "F3-F5: minor ADR-0009/0012 deviations (init-failure status on reuse, spurious generation bump, disk-baseline not refreshed on reuse)",
+        "F6: FIFO-swap between metadata and open can block a tokio blocking-pool thread (acknowledged ponytail)",
+        "F7: pull-diagnostic in-progress empty can clear diagnostics until the next edit (acknowledged)",
+        "Tests were not executed in this session (no shell); rejection-state invariants and device/FIFO rejection lack direct test coverage"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review-only slice; no files changed.",
+      "reviewFindings": [
+        "critical: mina-term/src/session.rs:56-70 + mina-term/src/daemon.rs:368-425 + mina-view/src/editor.rs:141 - session exec Open with relative path misses #7 reuse (exact PathBuf equality, daemon never canonicalizes) -> disk re-read clobbers unsaved edits",
+        "major: mina-lsp/src/lib.rs:41,66,83-84 - unbounded notification channel never drained in production (try_recv only in tests; drain_into lsp.rs:391-413 checks is_dead/uri only) -> memory growth",
+        "minor: mina-term/src/daemon.rs:380-384 - LSP initialize failure swallowed (no status) on reuse-Open, contradicting ADR-0009 status-surfacing",
+        "minor: mina-term/src/daemon.rs:396-397 - generation bump + Open event on re-Open of already-focused doc (nothing changed)",
+        "minor: mina-term/src/daemon.rs:368-399 + 243-247 - disk baseline not refreshed on reuse -> external-change detection disabled for re-focused doc",
+        "note: daemon.rs:672-676 FIFO-swap TOCTOU and pull_after_edit empty-wipe (lsp.rs:467-484) are acknowledged ponytail tradeoffs",
+        "no blockers otherwise: ADR-0008 guards, ADR-0009 lock/timeout/respawn isolation, ADR-0010 root scoping, #7 editor-level reuse, and position conversion conform with evidence"
+      ],
+      "manualNotes": "Supervisor must run 'cargo test -p mina-lsp -p mina-term' (and 'cargo build --workspace' first so mina-term LSP tests don't skip on a missing mock-server) and 'gh issue view 5 7 8 9' — no shell tool exists in this review session. F1 is the one item I'd block on: the #7 data-loss fix is bypassable through the documented agent interface with a relative path."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/73c9928a_reviewer_0_transcript.jsonl",
+  "timestamp": 1786613140857
+}

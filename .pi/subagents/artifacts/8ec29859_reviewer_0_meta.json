@@ -1,0 +1,159 @@
+{
+  "runId": "8ec29859",
+  "agent": "reviewer",
+  "task": "[prompt redacted]",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 70875,
+    "output": 23002,
+    "cacheRead": 1115136,
+    "cacheWrite": 0,
+    "cost": 0.009742720400000002,
+    "turns": 21
+  },
+  "model": "opencode-go/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 70875,
+        "output": 23002,
+        "cacheRead": 1115136,
+        "cacheWrite": 0,
+        "cost": 0.009742720400000002,
+        "turns": 21
+      }
+    }
+  ],
+  "durationMs": 298034,
+  "toolCount": 30,
+  "launchContractDigest": "f30dc7ae1fdfcdbddd48e6e8999817d4944cfb7780e0d6cdcfcecd12a79642ce",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:ec28d34b35a7d38f"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Findings with file:line evidence and severity: MAJOR daemon.rs:520-546/804-805 (rejected Insert bumps generation, logs false event), MAJOR daemon.rs:397-401 vs 431-438/496-503 (reuse-Open leaves stale disk baseline, watch_disk daemon.rs:259-265 skips focused doc), MINOR daemon.rs:524-533 (no-op deletes bump), MINOR daemon.rs:538/preempt (takeover invisible in events); CONFORMS checklist for handshake, ring, sources, external-change detection with 5 passing-by-inspection socket tests."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test --workspace",
+          "result": "not-run",
+          "summary": "No shell tool in reviewer session; static verification only. Supervisor must run. LSP tests self-skip unless mock-server (mina-lsp bin) is built, which --workspace does."
+        },
+        {
+          "command": "cargo test -p mina-term",
+          "result": "not-run",
+          "summary": "Same shell limitation; 5 ADR-0012 socket tests verified statically."
+        },
+        {
+          "command": "gh issue view 9",
+          "result": "not-run",
+          "summary": "Same shell limitation; acceptance criteria taken from task text."
+        }
+      ],
+      "validationOutput": [
+        "Static trace of every mutation path (Open fresh/reuse, Save, Insert/Delete/Undo/Redo/SetMode, DocumentEdit, GetState/Move/Scroll/SetViewport, watch_disk) against ADR-0012",
+        "Event ring: bounded 128, oldest evicted, event.generation == snapshot.generation (daemon.rs:128-143)",
+        "Handshake: first-line Hello enforced, source derived from declared kind (daemon.rs:325-344, client.rs:76-79, session.rs:112-131)",
+        "External change: 2s poll, mismatch/deletion -> ExternalChange + bump + disk_changed, no auto-reload, baseline on fresh Open + Save"
+      ],
+      "residualRisks": [
+        "MAJOR: rejected oversized Insert (and other no-op/rejected ops) still bump generation and log events - record only on actual state change (daemon.rs:546)",
+        "MAJOR: reuse-Open does not refresh disk_baseline/disk_changed - after Open A -> Open B -> re-Open A, watch_disk skips (focused != baseline path) and external-change detection is silently off; disk_changed can describe the wrong doc (daemon.rs:397-401, 259-265)",
+        "MINOR: no-op deletes (pos-0 backspace, end-of-doc forward, point DeleteRange) bump generation and record Delete events",
+        "MINOR/AMBIGUOUS: SetMode takeover and preempt mode flips change undo grouping/mode without a SetMode event",
+        "Out-of-slice observation: DocumentEdit (apply_edit, daemon.rs:602) has no MAX_FILE_SIZE check, unlike Command::Insert - agent can grow memory beyond the ADR-0008 cap; flag to owner slice",
+        "cargo test --workspace / -p mina-term and gh issue view 9 unexecuted (no shell); static verification only"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Review only; no files changed.",
+      "reviewFindings": [
+        "MAJOR: daemon.rs:520-546,804-805 - rejected oversized Insert bumps generation and records a false Insert event (spec: state unchanged -> no bump); no-op deletes (daemon.rs:524-533) same",
+        "MAJOR: daemon.rs:397-401 vs 431-438/496-503 - reuse-Open skips baseline refresh; watch_disk (259-265) then never stats the focused doc after multi-doc refocus; disk_changed may reflect the wrong file",
+        "MINOR: daemon.rs:538 + preempt (771-781) - takeover/group-boundary changes not reflected in events (AMBIGUOUS vs spec)",
+        "No blockers found in Hello handshake, ring bound (128), source labeling, or no-auto-reload external-change path - all CONFORMS"
+      ],
+      "manualNotes": "Reviewer has no shell tool: cargo test --workspace, cargo test -p mina-term, and gh issue view 9 must be executed by the supervisor (marked not-run). The two MAJOR findings (F1 rejected-op bump, F3 stale baseline on reuse-Open) are both currently invisible to the test suite - F1 because unit tests call apply_from directly (bypassing record_event), F3 because no test covers multi-doc refocus + external change. Suggested fixes are one-liner-ish: gate record_event on actual state change; refresh baseline on every Open including reuse."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "/Users/335g/dev/other/mina/.pi/subagents/artifacts/8ec29859_reviewer_0_transcript.jsonl",
+  "timestamp": 1786613060542
+}
