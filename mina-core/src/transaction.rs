@@ -193,6 +193,20 @@ impl Transaction {
     pub fn operations(&self) -> &[Operation] {
         &self.operations
     }
+
+    /// このトランザクションが文書を実際に変えるか。
+    ///
+    /// 空文字の `Insert`（カーソル位置への空文字挿入）や `Retain` のみの列
+    /// （空範囲の削除・文書先頭の Backspace 等）は適用しても文書が変わらない。
+    /// 呼び出し側はこれを元に適用・undo 履歴・イベント記録をスキップできる
+    /// （ADR-0012: 状態を変えない操作は世代を進めない）。
+    pub fn is_noop(&self) -> bool {
+        self.operations.iter().all(|op| match op {
+            Operation::Retain(_) => true,
+            Operation::Delete(n) => *n == 0,
+            Operation::Insert(s) => s.is_empty(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +366,19 @@ mod tests {
                 Operation::Retain(5),
             ]
         );
+    }
+
+    #[test]
+    fn is_noop_detects_retain_only_and_empty_insert() {
+        let doc = Document::from("hello");
+        // 空範囲の削除（カーソル上の DeleteRange 等）は Retain のみ
+        assert!(Transaction::delete(&doc, &Selection::point(3)).is_noop());
+        // 空文字の挿入も状態を変えない
+        assert!(Transaction::insert(&doc, &Selection::point(3), "").is_noop());
+        // 実変更のあるトランザクションは no-op ではない
+        assert!(!Transaction::insert(&doc, &Selection::point(3), "X").is_noop());
+        assert!(!Transaction::delete(&doc, &sel(vec![(1, 4)], 0)).is_noop());
+        // 空文字挿入でも選択範囲があれば置換として実変更
+        assert!(!Transaction::insert(&doc, &sel(vec![(1, 4)], 0), "").is_noop());
     }
 }
