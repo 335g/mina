@@ -130,6 +130,7 @@ dependencies = [
  "mina-lsp",
  "mina-protocol",
  "mina-view",
+ "serde",
  "serde_json",
  "termina",
  "tokio",

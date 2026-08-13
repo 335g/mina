@@ -14,6 +14,7 @@ mina-core = { path = "../mina-core" }
 mina-view = { path = "../mina-view" }
 mina-protocol = { path = "../mina-protocol" }
 mina-lsp = { path = "../mina-lsp" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 libc.workspace = true
