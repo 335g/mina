@@ -464,7 +464,28 @@ async fn process_command(
     source: EventSource,
     line: &str,
 ) -> StateSnapshot {
-    match serde_json::from_str(line.trim()) {
+    let parsed = serde_json::from_str::<Command>(line.trim());
+    // #13: headless クライアントは DocumentEdit 系に制限する（GetState / Save /
+    // DocumentEdit のみ）。Open・選択移動・モード変更・コマンドベース編集・
+    // undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否し、状態と
+    // 世代を変えない（M1 と同じ扱い — 拒否で push も飛ばない）。CONTEXT.md の
+    // ドメインモデルどおり「TUI は Command のみ、agent は DocumentEdit のみ」
+    // をプロトコル層で強制する。
+    if source == EventSource::Headless {
+        if let Ok(command) = &parsed {
+            if !matches!(command, Command::GetState | Command::Save) {
+                let d = daemon.lock().await;
+                return snapshot(
+                    &d,
+                    Some(
+                        "headless clients can only use GetState, Save, and DocumentEdit"
+                            .into(),
+                    ),
+                );
+            }
+        }
+    }
+    match parsed {
         // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
         Ok(Command::Open { path }) => {
                 // CRITICAL C2: 受信パスを正規化してから「既存文書の再利用判定」と
@@ -2041,7 +2062,10 @@ mod tests {
         std::fs::write(&file, "changed\n").unwrap();
 
         // agent: 同じパスを Open し直す → 既存ドキュメントへフォーカス
-        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        // （#13 の制限対象外: テスト対象は Open 再利用の daemon 挙動であり、
+        // クライアント種別は本質ではないため Interactive で 2 番目のクライアント
+        // を演じる）
+        let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut agent, &Command::Open { path }).await;
         assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
         assert!(snap.dirty, "dirty が保持される");
@@ -2090,14 +2114,14 @@ mod tests {
             link.to_string_lossy().into_owned(),                // symlink 経由
         ];
         for path in notations {
-            let mut agent = connect_client(&sock, ClientKind::Headless).await;
+            let mut agent = connect_client(&sock, ClientKind::Interactive).await;
             let snap = request(&mut agent, &Command::Open { path }).await;
             assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
             assert!(snap.dirty, "dirty が保持される");
         }
 
         // undo も効く（ヒストリーが保持されている）
-        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let _ = request(&mut agent, &Command::Open { path: plain }).await;
         let snap = request(&mut agent, &Command::Undo).await;
         assert_eq!(snap.text, "base\n", "undo で挿入だけ戻る");
@@ -2525,7 +2549,9 @@ mod tests {
         assert_eq!(snap.text, "a");
 
         // agent: Y を Open → フォーカスは Y へ（X のグループは開いたまま）
-        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        // （#13: headless は Open できないため、2 番目のクライアントを
+        // Interactive で演じる。undo グループ境界は conn_id 基準で不変）
+        let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut agent, &Command::Open { path: path_y }).await;
         assert_eq!(snap.text, "");
         assert_eq!(snap.mode, Mode::Insert, "Open ではモードが変わらない");
@@ -2587,7 +2613,8 @@ mod tests {
         assert_eq!(snap.text, "a");
 
         // agent: Y を Open（フォーカスを X から Y へ移す）
-        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        // （#13: headless は Open できないため Interactive で演じる）
+        let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let _ = request(&mut agent, &Command::Open { path: path_y }).await;
 
         // 所有者（TUI）の切断 → フォーカスは Y のままでも X のグループが閉じ、
@@ -3392,5 +3419,76 @@ mod tests {
         .await;
         assert!(extra.is_err(), "GetState では push は飛ばない");
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn headless_client_is_restricted_to_document_edit_family() {
+        // #13: headless は GetState / Save / DocumentEdit のみ。それ以外の
+        // Command（Open・選択移動・モード変更・コマンドベース編集・undo/redo）
+        // は拒否され、状態・世代が変わらない。Interactive は従来どおり。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-13e-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-13e-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        let _ = recv_push(&mut tui).await; // Open の自己 push を消費
+
+        // 拒否されるコマンド: 状態・世代・モードは不変
+        for cmd in [
+            Command::Open { path: path.clone() },
+            Command::SetMode { mode: Mode::Insert },
+            Command::Move {
+                movement: Movement::Char,
+                direction: Direction::Forward,
+            },
+            Command::Insert { text: "X".into() },
+            Command::Undo,
+        ] {
+            let snap = request(&mut agent, &cmd).await;
+            assert!(
+                snap.status
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("headless clients can only use")),
+                "{cmd:?} は拒否される: {:?}",
+                snap.status
+            );
+            assert_eq!(snap.text, "base\n", "{cmd:?} で状態が変わらない");
+            assert_eq!(snap.generation, 1, "{cmd:?} で世代が進まない");
+            assert_eq!(snap.mode, Mode::Normal, "{cmd:?} でモードが変わらない");
+        }
+
+        // 許可される操作は従来どおり
+        let snap = request(&mut agent, &Command::GetState).await;
+        assert!(snap.status.is_none(), "GetState は許可");
+        let snap = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 4,
+                end: 4,
+                text: "Z".into(),
+                checksum: fnv1a64(b"base\n"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "baseZ\n", "DocumentEdit は許可");
+        let snap = request(&mut agent, &Command::Save).await;
+        assert!(
+            snap.status.as_deref().is_some_and(|s| s.starts_with("saved:")),
+            "Save は許可: {:?}",
+            snap.status
+        );
+
+        // Interactive は従来どおり全コマンドを使える
+        let snap = request(&mut tui, &Command::Insert { text: "Y".into() }).await;
+        assert!(snap.status.is_none(), "Interactive の Insert は許可");
+        assert!(snap.text.contains("Y"));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 }
