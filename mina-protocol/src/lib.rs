@@ -80,6 +80,35 @@ pub struct Range {
     pub head: usize,
 }
 
+/// 位置指定の文書編集（ADR-0011）。選択を読まない・変えない。
+///
+/// フォーカス文書に対して明示 char range で作用する:
+/// - insert: `start == end`
+/// - delete: `text` が空
+/// `checksum` はクライアントが最後に読んだ文書全文（UTF-8 バイト列）の
+/// FNV-1a 64。不一致（読み取り後に文書が変化）なら daemon は状態を変えず
+/// status で拒否する。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentEdit {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub checksum: u64,
+}
+
+/// FNV-1a 64 ハッシュ（[`DocumentEdit`] のチェックサム検証用）。
+///
+/// 安定性のため固定実装（`std::collections::DefaultHasher` は Rust バージョン
+/// 間で非安定）。検証用なので暗号学的強度は不要。
+pub fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// 診断の深刻度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
@@ -172,5 +201,25 @@ mod tests {
         let json = serde_json::to_string(&cmd).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn document_edit_round_trip() {
+        let edit = DocumentEdit {
+            start: 2,
+            end: 5,
+            text: "x".into(),
+            checksum: 42,
+        };
+        let json = serde_json::to_string(&edit).expect("serialize");
+        let back: DocumentEdit = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, edit);
+    }
+
+    #[test]
+    fn fnv1a64_is_stable_and_byte_based() {
+        // 実装がバージョン間で変わらないこと（クライアント/daemon 両側で一致が前提）
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"hi\n"), fnv1a64("hi\n".as_bytes()));
     }
 }
