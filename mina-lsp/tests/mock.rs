@@ -179,6 +179,67 @@ async fn cjk_publishes_utf16_character_offsets() {
 }
 
 #[tokio::test]
+async fn notification_channel_is_bounded() {
+    // M4: 通知チャネルは bounded。読まないまま容量を超える通知を生成しても
+    // キューに残るのは容量ぶんだけ（超過分は破棄され、メモリが成長しない）。
+    let (mut client, reader) = spawn_client(&[]).await;
+    client.request("initialize", json!({})).await.unwrap();
+    client.notify("initialized", json!({})).await.unwrap();
+    client
+        .notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///mock.rs",
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "TODO",
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    // 容量を超える didChange を送り、publishDiagnostics を flood させる
+    // （一切読まないのでキューが満杯になり、以降の通知は破棄される）。
+    let flood = mina_lsp::NOTIFICATION_CAPACITY * 2;
+    for i in 0..flood {
+        client
+            .notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": { "uri": "file:///mock.rs", "version": i + 2 },
+                    "contentChanges": [{ "text": "TODO" }],
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    // 後続リクエストの応答は先行する通知がすべて reader に処理された後に返る
+    // （フレームは順序どおり処理される）ため、ここでの drain は最終状態を表す。
+    client
+        .request(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": "file:///mock.rs" } }),
+        )
+        .await
+        .expect("flood 後もリクエストは処理される");
+
+    let mut count = 0;
+    while client.try_recv().is_ok() {
+        count += 1;
+    }
+    assert_eq!(
+        count, mina_lsp::NOTIFICATION_CAPACITY,
+        "キューは容量を超えて蓄積しない（超過分は破棄される）: {count}"
+    );
+
+    client.kill().await;
+    reader.abort();
+}
+
+#[tokio::test]
 async fn utf16_encoding_is_negotiated() {
     let (mut client, reader) = spawn_client(&["--cjk"]).await;
     let result = client.request("initialize", json!({})).await.unwrap();
