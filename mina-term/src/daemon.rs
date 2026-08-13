@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mina_core::{Transaction, extend_selection, move_selection};
-use mina_protocol::{Command, GotoTarget, Range, StateSnapshot};
+use mina_core::{Range as CoreRange, Selection, Transaction, extend_selection, move_selection};
+use mina_protocol::{Command, DocumentEdit, GotoTarget, Range, StateSnapshot, fnv1a64};
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -426,10 +426,51 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                 }
             }
             Err(_) => {
-                // M7: 壊れたコマンド行にも status 付きスナップショットを返す
-                // （応答なしだと送信元が永久待ちになる）
-                let d = daemon.lock().await;
-                snapshot(&d, Some("invalid command".into()))
+                // ADR-0011: Command として解釈できなければ DocumentEdit を試す
+                // （Command は外部タグ付き enum、DocumentEdit は構造体なので
+                // JSON 形状で衝突しない）。
+                match serde_json::from_str(line.trim()) {
+                    Ok(edit) => {
+                        let mut d = daemon.lock().await;
+                        // 拒否（checksum 不一致・範囲外）なら状態を変えず status を返す
+                        let rejected = apply_edit(&mut d, &edit, conn_id);
+                        let sync_target = if rejected.is_none() {
+                            // 編集後の LSP 同期（Command 編集と同じ経路。ADR-0009）
+                            d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
+                                let root = lsp::workspace_root(&path);
+                                d.lsp_sessions.get(&root).cloned().map(|session| {
+                                    let text = d.editor.current_document().text().to_string();
+                                    (session, path, text)
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        drop(d);
+                        if let Some(rejected) = rejected {
+                            rejected
+                        } else if let Some((session, path, text)) = sync_target {
+                            lsp::sync(&session, &path, &text).await;
+                            let pulled = lsp::pull_after_edit(&session, &path, &text).await;
+                            let mut d = daemon.lock().await;
+                            if let Some(diags) = pulled {
+                                d.diagnostics = diags;
+                            }
+                            lsp::drain_into(&mut d);
+                            snapshot(&d, None)
+                        } else {
+                            let mut d = daemon.lock().await;
+                            lsp::drain_into(&mut d);
+                            snapshot(&d, None)
+                        }
+                    }
+                    Err(_) => {
+                        // M7: 壊れたコマンド行にも status 付きスナップショットを返す
+                        // （応答なしだと送信元が永久待ちになる）
+                        let d = daemon.lock().await;
+                        snapshot(&d, Some("invalid command".into()))
+                    }
+                }
             }
         };
         let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
@@ -529,6 +570,39 @@ fn open_in_editor(daemon: &mut Daemon, path: &str, contents: Option<String>) -> 
 #[cfg(test)]
 fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
     apply_from(daemon, command, 0)
+}
+
+/// 位置指定編集（ADR-0011）を適用する。拒否時は status 付きスナップショットを
+/// 返し、状態は一切変えない（checksum 不一致・範囲外）。成功時は `None` を返す。
+///
+/// 選択は読まず・変えない（履歴には before == after として記録されるので
+/// undo でも選択は動かない）。挿入 = `start == end`、削除 = `text` が空。
+fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<StateSnapshot> {
+    let (checksum_ok, in_bounds) = {
+        let text = daemon.editor.current_document().text().to_string();
+        (
+            fnv1a64(text.as_bytes()) == edit.checksum,
+            edit.start <= edit.end && edit.end <= text.chars().count(),
+        )
+    };
+    if !checksum_ok {
+        return Some(snapshot(
+            daemon,
+            Some("document changed since read".into()),
+        ));
+    }
+    if !in_bounds {
+        return Some(snapshot(daemon, Some("range out of bounds".into())));
+    }
+    // ADR-0007: 他クライアントの書き込みとして、開いた Insert グループを閉じる
+    preempt(daemon, conn_id);
+    let range = CoreRange::new(edit.start, edit.end);
+    let selection = Selection::new(vec![range], 0);
+    let tx = Transaction::insert(daemon.editor.current_document(), &selection, &edit.text);
+    let selection_after = daemon.editor.selection();
+    daemon.editor.apply(tx, selection_after);
+    daemon.editor.scroll_to_cursor(daemon.viewport_height);
+    None
 }
 
 /// 書き込み競合の後勝ち奪取（HIGH-1 確定設計）: 別クライアントが開いた Insert
@@ -1197,6 +1271,20 @@ mod tests {
             .await
             .unwrap();
         stream.write_all(b"\n").await.unwrap();
+        recv_snapshot(stream).await
+    }
+
+    /// DocumentEdit（位置指定編集）を1つ送り、応答スナップショットを受け取る。
+    async fn request_edit(stream: &mut UnixStream, edit: &DocumentEdit) -> StateSnapshot {
+        stream
+            .write_all(serde_json::to_string(edit).unwrap().as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        recv_snapshot(stream).await
+    }
+
+    async fn recv_snapshot(stream: &mut UnixStream) -> StateSnapshot {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         loop {
@@ -1302,10 +1390,14 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// pkill を使う LSP テストの直列化（並行実行だと互いの mock を殺し合う）。
+    static LSP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn reopen_rs_path_respawns_lsp_and_reannounces_current_text() {
         // #7 + ADR-0009: 再利用 Open でも LSP フロー（ensure → didOpen → settle）が
         // 走る。サーバ死亡後は再 spawn され、現在のバッファ内容で診断が返る。
+        let _guard = LSP_TEST_LOCK.lock().await;
         let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../target/debug/mock-server");
         if !mock.exists() {
@@ -1379,6 +1471,310 @@ mod tests {
             snap.diagnostics[0].start, 13,
             "リスポーン後の診断は現在のバッファ内容に基づく"
         );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_replaces_range_without_touching_selection() {
+        // ADR-0011 e2e: DocumentEdit はフォーカス文書の指定 range を置換し、
+        // 選択を読まず・変えない。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "hello world").unwrap();
+        start_server(&sock).await;
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // 選択を先頭に置く（編集範囲とは別の位置）
+        let _ = request(&mut c, &Command::Goto { target: GotoTarget::DocumentStart }).await;
+
+        // [6,11) "world" → "W"（スペースは index 5）
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 6,
+                end: 11,
+                text: "W".into(),
+                checksum: fnv1a64(b"hello world"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "hello W");
+        assert!(snap.dirty, "編集で dirty になる");
+        assert_eq!(snap.status, None, "成功時は status なし");
+        assert_eq!(snap.selection[0].anchor, 0, "選択は不変");
+        assert_eq!(snap.selection[0].head, 0, "選択は不変");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_insert_and_delete_share_one_variant() {
+        // insert = start==end、delete = text=="" が同一バリアントで動作する
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8b-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8b-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+
+        // insert: [1,1) に "X"
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 1,
+                end: 1,
+                text: "X".into(),
+                checksum: fnv1a64(b"abc"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "aXbc");
+        // delete: [1,2) を空文字で置換
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 1,
+                end: 2,
+                text: String::new(),
+                checksum: fnv1a64(b"aXbc"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "abc");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_rejects_out_of_bounds_without_state_change() {
+        // 範囲外は status で拒否し、状態を変えず undo エントリも作らない
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8c-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8c-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        let cs = fnv1a64(b"abc");
+
+        // start > end
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 2,
+                end: 1,
+                text: "X".into(),
+                checksum: cs,
+            },
+        )
+        .await;
+        assert_eq!(snap.status.as_deref(), Some("range out of bounds"));
+        assert_eq!(snap.text, "abc", "文書は不変");
+        // end > 文書長
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 4,
+                text: "X".into(),
+                checksum: cs,
+            },
+        )
+        .await;
+        assert_eq!(snap.status.as_deref(), Some("range out of bounds"));
+        assert_eq!(snap.text, "abc", "文書は不変");
+        // undo しても変化しない（拒否は undo エントリを作らない）
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.text, "abc");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_rejects_stale_checksum() {
+        // クライアントの読み取り後に文書が変わっていたら status で拒否
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8d-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8d-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+
+        // 間違ったチェックサム → 拒否
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 1,
+                text: "X".into(),
+                checksum: 12345,
+            },
+        )
+        .await;
+        assert_eq!(snap.status.as_deref(), Some("document changed since read"));
+        assert_eq!(snap.text, "abc", "文書は不変");
+        // 正しいチェックサム → 適用
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 1,
+                text: "X".into(),
+                checksum: fnv1a64(b"abc"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "Xbc");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_is_undoable_as_one_group() {
+        // DocumentEdit は共有ヒストリーで1グループとして undo/redo される
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8e-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8e-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 0,
+                text: "X".into(),
+                checksum: fnv1a64(b"abc"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "Xabc");
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.text, "abc", "undo で1グループ分戻る");
+        let snap = request(&mut c, &Command::Redo).await;
+        assert_eq!(snap.text, "Xabc", "redo で再適用される");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_preempts_open_insert_group() {
+        // ADR-0007: エージェントの DocumentEdit は他クライアントの書き込みとして
+        // 開いた Insert グループを閉じ、Normal に戻す
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8f-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8f-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        // TUI: Insert モードで "a" を入力（グループを開く）
+        let mut tui = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path }).await;
+        let _ = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
+        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        assert_eq!(snap.mode, Mode::Insert);
+        assert_eq!(snap.text, "aabc");
+
+        // agent: DocumentEdit（別接続の書き込み → preempt）
+        let mut agent = UnixStream::connect(&sock).await.unwrap();
+        let snap = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 3,
+                end: 3,
+                text: "Z".into(),
+                checksum: fnv1a64(b"aabc"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "aabZc");
+        assert_eq!(snap.mode, Mode::Normal, "preempt で Insert グループが閉じて Normal に戻る");
+
+        // TUI の undo: 最後のグループ（DocumentEdit）が戻る
+        let snap = request(&mut tui, &Command::Undo).await;
+        assert_eq!(snap.text, "aabc", "DocumentEdit が1グループとして戻る");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn document_edit_syncs_lsp_full_text() {
+        // ADR-0009: DocumentEdit も編集後の全文 didChange 同期 + pull 診断に乗る
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-8lsp-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-8lsp-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "fn f() { TODO }\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // 初回解析: TODO（byte 9）の診断が反映されるまで待つ
+        let _ = poll_snapshot(
+            &mut c,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        // DocumentEdit: 先頭に挿入 → didChange 全文同期 → 診断位置が追従する
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 0,
+                text: "aaaa".into(),
+                checksum: fnv1a64(b"fn f() { TODO }\n"),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "aaaafn f() { TODO }\n");
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.diagnostics.iter().any(|d| d.start == 13),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(snap.diagnostics[0].start, 13, "didChange 同期後の位置に追従");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
