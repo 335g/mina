@@ -310,6 +310,9 @@ mod tests {
             path: None,
             dirty: false,
             status: None,
+            generation: 0,
+            events: Vec::new(),
+            disk_changed: false,
         }
     }
 
@@ -414,6 +417,9 @@ mod tests {
             path: Some("\x1b]0;evil\x07".into()),
             dirty: false,
             status: Some("\x1b[31m".into()),
+            generation: 0,
+            events: Vec::new(),
+            disk_changed: false,
         };
         let out = render_text(&state, &[], 40, 10);
         assert!(!out.contains("\x1b]0;evil"), "OSC を生出力しない: {out:?}");
@@ -443,6 +449,9 @@ mod tests {
             path: None,
             dirty: false,
             status: None,
+            generation: 0,
+            events: Vec::new(),
+            disk_changed: false,
         };
         let out = render_text(&state, &[], 40, 10);
         assert!(out.contains("\x1b[4mworld\x1b[0m"), "診断範囲に下線: {out:?}");
