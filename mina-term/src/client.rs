@@ -15,11 +15,12 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use mina_protocol::{ClientKind, Command, Hello, Mode, StateSnapshot};
+use mina_protocol::{ClientKind, Command, Hello, Mode, ServerMessage, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent, KeyEventKind};
 use termina::{Event, EventStream, PlatformTerminal, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
+use tokio::sync::mpsc;
 
 use crate::keymap::{Keymaps, Resolution};
 use crate::render;
@@ -77,12 +78,7 @@ impl Drop for TerminalGuard {
 pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let socket = crate::daemon::socket_path();
     ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    // ADR-0012: 接続直後に Hello（対話型宣言）を送る
-    send_hello(&mut write_half, ClientKind::Interactive).await?;
+    let mut session = Session::connect(&socket).await?;
 
     // 初回コマンド: ファイル指定があれば Open、なければ GetState。
     // Open のパスは絶対化して送る — daemon は常駐で cwd が起動時のディレクトリの
@@ -93,7 +89,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         None => Command::GetState,
     };
     // M5: 初回応答（Open の失敗 status など）を破棄せず保持する
-    let mut state = request(&mut write_half, &mut reader, &first).await?;
+    let mut state = session.request(&first).await?;
     let first_status = state.status.take();
 
     // 端末セットアップ（raw モード + 代替画面 + カーソル非表示）
@@ -108,14 +104,11 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let size = terminal.get_dimensions()?;
     let mut width = size.cols;
     let mut height = size.rows;
-    let mut state = request(
-        &mut write_half,
-        &mut reader,
-        &Command::SetViewport {
+    let mut state = session
+        .request(&Command::SetViewport {
             height: height as usize,
-        },
-    )
-    .await?;
+        })
+        .await?;
     // M5: SetViewport の応答は status を持たないので、初回応答の status を引き継ぐ
     if state.status.is_none() {
         state.status = first_status;
@@ -128,43 +121,63 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     render::draw(&mut *terminal, &state, &pending, width, height)?;
     terminal.flush()?;
 
-    while let Some(event) = events.next().await {
-        let event = match event {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                // 終了: 全モードで Ctrl-C、Normal で q
-                let quit = key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(termina::event::Modifiers::CONTROL)
-                    || (state.mode == Mode::Normal && key.code == KeyCode::Char('q'));
-                if quit {
-                    break;
-                }
-                match keymaps.resolve_with_insert_fallback(state.mode, &mut pending, key) {
-                    Resolution::Command(command) => {
-                        state = request(&mut write_half, &mut reader, &command).await?;
+    // ADR-0013: キーイベントと daemon からの push を並列に待つ。push は
+    // 他クライアント（agent 等）の変更を即時反映する。generation が最後に
+    // 描画したものと同じなら捨てる（自分自身の変更は応答で描画済み）。
+    loop {
+        let mut redraw = false;
+        tokio::select! {
+            event = events.next() => {
+                let event = match event {
+                    Some(Ok(e)) => e,
+                    Some(Err(_)) => continue,
+                    None => break,
+                };
+                match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // 終了: 全モードで Ctrl-C、Normal で q
+                        let quit = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(termina::event::Modifiers::CONTROL)
+                            || (state.mode == Mode::Normal && key.code == KeyCode::Char('q'));
+                        if quit {
+                            break;
+                        }
+                        match keymaps.resolve_with_insert_fallback(state.mode, &mut pending, key) {
+                            Resolution::Command(command) => {
+                                state = session.request(&command).await?;
+                            }
+                            _ => {} // pending 変化の描画は共通ループ末尾で行う
+                        }
+                        redraw = true;
                     }
-                    _ => {} // pending 変化の描画は共通ループ末尾で行う
+                    Event::WindowResized(size) => {
+                        width = size.cols;
+                        height = size.rows;
+                        state = session
+                            .request(&Command::SetViewport {
+                                height: height as usize,
+                            })
+                            .await?;
+                        redraw = true;
+                    }
+                    _ => {}
                 }
             }
-            Event::WindowResized(size) => {
-                width = size.cols;
-                height = size.rows;
-                state = request(
-                    &mut write_half,
-                    &mut reader,
-                    &Command::SetViewport {
-                        height: height as usize,
-                    },
-                )
-                .await?;
+            push = session.pushes.recv() => {
+                match push {
+                    Some(snapshot) if snapshot.generation != state.generation => {
+                        state = snapshot;
+                        redraw = true;
+                    }
+                    Some(_) => {} // 自分自身の変更（応答で描画済み）
+                    None => break, // daemon の切断（EOF）
+                }
             }
-            _ => continue,
         }
-        render::draw(&mut *terminal, &state, &pending, width, height)?;
-        terminal.flush()?;
+        if redraw {
+            render::draw(&mut *terminal, &state, &pending, width, height)?;
+            terminal.flush()?;
+        }
     }
 
     // 終了処理は TerminalGuard の Drop が行う（M4: エラー経路でも必ず復旧する）
@@ -195,9 +208,96 @@ pub(crate) async fn request<T: serde::Serialize>(
     write_half.flush().await?;
     let mut response = String::new();
     reader.read_line(&mut response).await?;
-    serde_json::from_str(&response).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("不正な応答: {e}"))
-    })
+    // ADR-0013: 応答はタグ付きエンベロープになった。Headless のワンショット
+    // CLI は push を受け取らない（購読されない）ので常に Response だが、
+    // 形状の違いに依存しないようどちらでも取り出す。
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::Response { snapshot }) | Ok(ServerMessage::Push { snapshot }) => {
+            Ok(snapshot)
+        }
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("不正な応答: {e}"),
+        )),
+    }
+}
+
+/// TUI 用の永続接続（ADR-0013）。読み取りは専用タスクに任せ、コマンド応答
+/// （Response）とサーバー発の状態通知（Push）を振り分ける。Headless の
+/// ワンショット CLI（[`request`]）とは別経路。
+struct Session {
+    write: OwnedWriteHalf,
+    responses: mpsc::UnboundedReceiver<std::io::Result<StateSnapshot>>,
+    pushes: mpsc::UnboundedReceiver<StateSnapshot>,
+}
+
+impl Session {
+    /// 接続し、Hello（Interactive 宣言）を送り、読み取りタスクを起動する。
+    async fn connect(path: &std::path::Path) -> std::io::Result<Session> {
+        let stream = UnixStream::connect(path).await?;
+        let (read_half, mut write) = stream.into_split();
+        // ADR-0012: 接続直後に Hello（対話型宣言）を送る
+        send_hello(&mut write, ClientKind::Interactive).await?;
+        let (res_tx, responses) = mpsc::unbounded_channel();
+        let (push_tx, pushes) = mpsc::unbounded_channel();
+        tokio::spawn(read_loop(read_half, res_tx, push_tx));
+        Ok(Session {
+            write,
+            responses,
+            pushes,
+        })
+    }
+
+    /// コマンドを送り、応答スナップショットを待つ。push は [`Session::pushes`] に届く。
+    async fn request<T: serde::Serialize>(&mut self, message: &T) -> std::io::Result<StateSnapshot> {
+        let mut line = serde_json::to_string(message).expect("メッセージはシリアライズ可能");
+        line.push('\n');
+        self.write.write_all(line.as_bytes()).await?;
+        self.write.flush().await?;
+        self.responses.recv().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "daemon との接続が切れた")
+        })?
+    }
+}
+
+/// 接続の読み取り側: NDJSON を [`ServerMessage`] として解釈し、応答と push を
+/// 振り分ける。EOF/エラーでチャネルを閉じる（受信側が None/Err を受け取る）。
+async fn read_loop(
+    read_half: tokio::net::unix::OwnedReadHalf,
+    res_tx: mpsc::UnboundedSender<std::io::Result<StateSnapshot>>,
+    push_tx: mpsc::UnboundedSender<StateSnapshot>,
+) {
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break, // daemon の切断（EOF）: チャネルが閉じる
+            Ok(_) => {}
+            Err(e) => {
+                let _ = res_tx.send(Err(e));
+                return;
+            }
+        }
+        match serde_json::from_str::<ServerMessage>(line.trim()) {
+            Ok(ServerMessage::Response { snapshot }) => {
+                if res_tx.send(Ok(snapshot)).is_err() {
+                    return; // メインループが落ちた
+                }
+            }
+            Ok(ServerMessage::Push { snapshot }) => {
+                if push_tx.send(snapshot).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = res_tx.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("不正な応答: {e}"),
+                )));
+            }
+        }
+    }
 }
 
 /// daemon が動いていなければ自動起動し、socket が現れるまで待つ。TUI と session CLI の両方から使う。
