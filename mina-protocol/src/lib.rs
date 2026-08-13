@@ -109,6 +109,65 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
     hash
 }
 
+/// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKind {
+    /// 対話型 TUI。
+    Interactive,
+    /// ヘッドレスクライアント（session exec / edit）。
+    Headless,
+}
+
+/// 接続開始時のハンドシェイク（ADR-0012）。最初のメッセージでなければならない。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub kind: ClientKind,
+}
+
+/// イベントの発生源（ADR-0012）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventSource {
+    /// 対話型 TUI の操作。
+    Interactive,
+    /// ヘッドレスクライアントの操作。
+    Headless,
+    /// daemon 自身が検知した外部要因（ファイルの外部変更など）。
+    External,
+}
+
+/// 状態変化イベントの種類（ADR-0012）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Insert,
+    Delete,
+    /// 位置指定編集（DocumentEdit）。
+    ReplaceRange,
+    Undo,
+    Redo,
+    Open,
+    Save,
+    SetMode,
+    /// フォーカス文書が外部ツールによって変更された。
+    ExternalChange,
+}
+
+/// 状態を変える操作1件の記録（ADR-0012）。bounded リングで保持され、
+/// 全スナップショットに同梱される。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeEvent {
+    /// このイベント適用後の世代。
+    pub generation: u64,
+    pub source: EventSource,
+    pub kind: EventKind,
+    /// 影響範囲（ある場合のみ）。
+    pub range: Option<Range>,
+    /// 挿入・置換テキスト（ある場合のみ）。
+    pub text: Option<String>,
+}
+
 /// 診断の深刻度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
@@ -142,6 +201,12 @@ pub struct StateSnapshot {
     pub dirty: bool,
     /// 一時的なメッセージ（Open の失敗など）。ステータス行に表示される。
     pub status: Option<String>,
+    /// 状態を変える操作ごとに増加する世代（ADR-0012）。
+    pub generation: u64,
+    /// 直近の状態変化イベント（bounded リング。古いものから破棄）。
+    pub events: Vec<ChangeEvent>,
+    /// フォーカス文書が外部ツールによって変更されたか（ADR-0012）。
+    pub disk_changed: bool,
 }
 
 impl Default for StateSnapshot {
@@ -157,6 +222,9 @@ impl Default for StateSnapshot {
             path: None,
             dirty: false,
             status: None,
+            generation: 0,
+            events: Vec::new(),
+            disk_changed: false,
         }
     }
 }
@@ -182,6 +250,15 @@ mod tests {
             path: Some("test.rs".to_string()),
             dirty: true,
             status: Some("ok".to_string()),
+            generation: 7,
+            events: vec![ChangeEvent {
+                generation: 7,
+                source: EventSource::Interactive,
+                kind: EventKind::Insert,
+                range: None,
+                text: Some("x".to_string()),
+            }],
+            disk_changed: true,
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
