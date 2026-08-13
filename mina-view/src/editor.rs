@@ -317,6 +317,13 @@ impl Editor {
     /// assert!(editor.current_document().is_empty());
     /// ```
     pub fn apply(&mut self, transaction: Transaction, selection_after: Selection) {
+        // ADR-0012: 文書を変えないトランザクション（空範囲の削除・空文字挿入）は
+        // 適用も undo 履歴への記録も行わない。適用すると空グループが履歴に積まれ、
+        // undo 1回で何も起きない上、呼び出し側が誤ってイベント/世代を進める
+        // 原因になる。no-op の写像は恒等なので選択を変える必要もない。
+        if transaction.is_noop() {
+            return;
+        }
         let doc_id = self.view().doc;
         let old_doc = self.documents[&doc_id].clone();
         let selection_before = self.view().selection.clone();
