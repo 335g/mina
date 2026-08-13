@@ -89,7 +89,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         None => Command::GetState,
     };
     // M5: 初回応答（Open の失敗 status など）を破棄せず保持する
-    let mut state = request(&mut write_half, &mut reader, first).await?;
+    let mut state = request(&mut write_half, &mut reader, &first).await?;
     let first_status = state.status.take();
 
     // 端末セットアップ（raw モード + 代替画面 + カーソル非表示）
@@ -107,7 +107,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let mut state = request(
         &mut write_half,
         &mut reader,
-        Command::SetViewport {
+        &Command::SetViewport {
             height: height as usize,
         },
     )
@@ -140,7 +140,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 }
                 match keymaps.resolve_with_insert_fallback(state.mode, &mut pending, key) {
                     Resolution::Command(command) => {
-                        state = request(&mut write_half, &mut reader, command).await?;
+                        state = request(&mut write_half, &mut reader, &command).await?;
                     }
                     _ => {} // pending 変化の描画は共通ループ末尾で行う
                 }
@@ -151,7 +151,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 state = request(
                     &mut write_half,
                     &mut reader,
-                    Command::SetViewport {
+                    &Command::SetViewport {
                         height: height as usize,
                     },
                 )
@@ -167,13 +167,13 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// コマンドを送り、応答スナップショットを1つ受け取る。TUI と session CLI の両方から使う。
-pub(crate) async fn request(
+/// メッセージを送り、応答スナップショットを1つ受け取る。TUI と session CLI の両方から使う。
+pub(crate) async fn request<T: serde::Serialize>(
     write_half: &mut OwnedWriteHalf,
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    command: Command,
+    message: &T,
 ) -> std::io::Result<StateSnapshot> {
-    let mut line = serde_json::to_string(&command).expect("command はシリアライズ可能");
+    let mut line = serde_json::to_string(message).expect("メッセージはシリアライズ可能");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
