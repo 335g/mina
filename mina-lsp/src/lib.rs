@@ -18,6 +18,14 @@ use tokio::time::timeout;
 /// 1フレーム（LSP メッセージ）の最大バイト数（5f）。
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// 通知チャネルの容量（M4）。
+///
+/// 通知（publishDiagnostics 等）は production で誰も読まない（診断は pull で
+/// 取り込む方針のため）。unbounded のままだと daemon 稼働中ずっと蓄積して
+/// メモリが無制限に成長するため、bounded にして満杯の通知は破棄する。
+/// サーバ死の検知（送信側 drop → is_closed）は破棄の影響を受けない。
+pub const NOTIFICATION_CAPACITY: usize = 64;
+
 pub mod position;
 
 /// クライアントが受信した通知。
@@ -67,7 +75,7 @@ pub struct Client {
     child: Child,
     next_id: u64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    notifications: mpsc::UnboundedReceiver<Incoming>,
+    notifications: mpsc::Receiver<Incoming>,
 }
 
 impl Client {
@@ -84,7 +92,8 @@ impl Client {
         let stdout = child.stdout.take().expect("stdout は piped");
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::unbounded_channel();
+        // M4: unbounded だと読まれない通知が蓄積し続けるため bounded にする
+        let (tx, rx) = mpsc::channel(NOTIFICATION_CAPACITY);
         let reader_pending = pending.clone();
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -114,8 +123,12 @@ impl Client {
                     .unwrap_or_default()
                     .to_string();
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                if tx.send(Incoming::Notification { method, params }).is_err() {
-                    break; // 受信側が消えた
+                // M4: bounded チャネル + try_send。満杯の通知は破棄する
+                // （誰も読まないため。診断は pull で取り込む方針を崩さない）。
+                match tx.try_send(Incoming::Notification { method, params }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {} // 満杯: 破棄
+                    Err(mpsc::error::TrySendError::Closed(_)) => break, // 受信側が消えた
                 }
             }
         });
