@@ -1,9 +1,11 @@
 //! agent 用のヘッドレス CLI: daemon に接続してコマンドを実行し、スナップショットを表示する。
 //!
 //! - `mina session get` — 現在の状態を取得する（JSON で出力）
-//! - `mina session exec <JSON>` — コマンドを1つ実行する（JSON は wire の [`Command`] そのまま）
+//! - `mina session exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
+//! - `mina session edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
 //!
 //! 例: `mina session exec '{"Insert": {"text": "hello"}}'`
+//! 例: `mina session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <全文の FNV-1a 64>}'`
 //!
 //! daemon が動いていなければ自動起動される（TUI と同じ挙動）。成功時は exit 0、
 //! トランスポート/JSON エラー時は exit 1。コマンド自体の成否はスナップショットの
@@ -11,14 +13,24 @@
 
 use std::io;
 
-use mina_protocol::{Command, StateSnapshot};
+use mina_protocol::{Command, DocumentEdit, StateSnapshot};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 use crate::client;
 
-/// `mina session <get|exec ...>` を処理する。`args` はサブコマンド以降。
+/// `mina session <get|exec|edit ...>` を処理する。`args` はサブコマンド以降。
 pub async fn run(args: &[String]) -> io::Result<()> {
+    if args.first().map(String::as_str) == Some("edit") {
+        let json = args.get(1).ok_or_else(|| {
+            invalid("edit には DocumentEdit JSON が必要です: mina session edit '<json>'")
+        })?;
+        let edit: DocumentEdit = serde_json::from_str(json)
+            .map_err(|e| invalid(format!("DocumentEdit JSON を解釈できません: {e}")))?;
+        let snapshot = execute_edit(&edit).await?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
     let command = parse_command(args)?;
     let snapshot = execute(&command).await?;
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -47,7 +59,17 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
     let stream = UnixStream::connect(&path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    client::request(&mut write_half, &mut reader, command.clone()).await
+    client::request(&mut write_half, &mut reader, command).await
+}
+
+/// daemon に接続し、位置指定編集（DocumentEdit）を実行してスナップショットを受け取る。
+async fn execute_edit(edit: &DocumentEdit) -> io::Result<StateSnapshot> {
+    let path = crate::daemon::socket_path();
+    client::ensure_daemon(&path).await?;
+    let stream = UnixStream::connect(&path).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::request(&mut write_half, &mut reader, edit).await
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
