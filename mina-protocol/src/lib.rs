@@ -109,6 +109,22 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
     hash
 }
 
+/// daemon → client のメッセージ（ADR-0013）。NDJSON 1行 = メッセージ1件。
+///
+/// コマンドへの応答（[`ServerMessage::Response`]）と、他クライアントの変更に
+/// よるサーバー発の状態通知（[`ServerMessage::Push`]）をタグで区別する。
+/// 従来の応答（タグなしの素の StateSnapshot）を置き換える（CLI の互換性は
+/// 考慮しない決定 — シリアライズ形状が単一で仕様が単純になる）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    /// クライアントのコマンドに対する応答。
+    Response { snapshot: StateSnapshot },
+    /// サーバーが能動的に通知する最新状態（他クライアントの変更など）。
+    /// 購読（Interactive クライアント）にのみ届く。
+    Push { snapshot: StateSnapshot },
+}
+
 /// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -278,6 +294,25 @@ mod tests {
         let json = serde_json::to_string(&cmd).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn server_message_round_trip() {
+        let snap = StateSnapshot::default();
+        for msg in [
+            ServerMessage::Response {
+                snapshot: snap.clone(),
+            },
+            ServerMessage::Push { snapshot: snap },
+        ] {
+            let json = serde_json::to_string(&msg).expect("serialize");
+            let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, msg);
+            assert!(
+                json.starts_with("{\"type\":\"") && json.contains("\"snapshot\":"),
+                "タグ付きエンベロープ: {json}"
+            );
+        }
     }
 
     #[test]
