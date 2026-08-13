@@ -10,6 +10,10 @@ How the engineering skills should consume this repo's domain documentation when 
 
 If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/domain-modeling` skill (reached via `/grill-with-docs` and `/improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
 
+## ADR language
+
+All ADRs in `docs/adr/` are written in **Japanese** (日本語). The title, context, decision, and consequences are all in Japanese; keep English only for terms that are inherently English (crate names, CLI flags, protocol field names).
+
 ## File structure
 
 Single-context repo (most repos):
