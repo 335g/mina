@@ -302,6 +302,7 @@ mod tests {
     fn state_with(text: &str, selection: Vec<Range>, primary: usize) -> StateSnapshot {
         StateSnapshot {
             text: text.into(),
+            checksum: 0, // 描画テスト用 fixture: checksum は検証対象外
             selection,
             primary_index: primary,
             mode: Mode::Normal,
@@ -408,6 +409,7 @@ mod tests {
         // 制御文字は � に置換され、生の ESC が端末に流れない。
         let state = StateSnapshot {
             text: "hello".into(),
+            checksum: 0, // fixture
             selection: vec![Range { anchor: 0, head: 0 }],
             primary_index: 0,
             mode: Mode::Normal,
@@ -436,6 +438,7 @@ mod tests {
     fn diagnostics_get_underlined_and_counted() {
         let state = StateSnapshot {
             text: "hello world".into(),
+            checksum: 0, // fixture
             selection: vec![Range { anchor: 0, head: 0 }],
             primary_index: 0,
             mode: Mode::Normal,
