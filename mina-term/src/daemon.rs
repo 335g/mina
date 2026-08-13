@@ -402,6 +402,54 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                     }
                     let mut d = daemon.lock().await;
                     lsp::drain_into(&mut d);
+                    // ADR-0012: 再利用 Open でもフォーカス文書のベースラインを再 stat
+                    // して更新する（watch_disk は baseline.path == フォーカス前提で照合
+                    // するため、更新を怠るとフォーカス復帰後の外部変更検知が停止する =
+                    // MAJOR M2）。
+                    // disk_changed は「フォーカス文書が直近ベースラインから乖離して
+                    // いる」フラグ: 直前ベースラインが同一文書のもので stat が乖離した
+                    // ままなら維持（乖離は実在するので報告を消さない。Save/新規 Open で
+                    // 解消される）、別文書のフラグ（他文書の乖離）は引き継がない。
+                    let (diverged, baseline) = match std::fs::metadata(&path_buf) {
+                        Ok(md) => {
+                            let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                            let size = md.len();
+                            let diverged = d.disk_baseline.as_ref().is_some_and(|b| {
+                                b.path == path_buf && (b.size != size || b.mtime != mtime)
+                            });
+                            (diverged, DiskBaseline {
+                                path: path_buf.clone(),
+                                mtime,
+                                size,
+                            })
+                        }
+                        // 外部で削除済み: パスだけ張り替え、watch_disk の metadata
+                        // エラー判定（削除 = 乖離）に検知を委ねる
+                        Err(_) => (
+                            true,
+                            DiskBaseline {
+                                path: path_buf.clone(),
+                                mtime: std::time::UNIX_EPOCH,
+                                size: 0,
+                            },
+                        ),
+                    };
+                    d.disk_baseline = Some(baseline);
+                    if diverged {
+                        // 未検知の乖離（watch_disk の 2 秒周期より先にここで検知）。
+                        // 既にフラグが立っている（= イベント記録済み）場合は重複しない。
+                        if !d.disk_changed {
+                            d.record_event(
+                                EventSource::External,
+                                EventKind::ExternalChange,
+                                None,
+                                None,
+                            );
+                        }
+                        d.disk_changed = true;
+                    } else {
+                        d.disk_changed = false;
+                    }
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
                     snapshot(&d, None)
@@ -2327,6 +2375,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_mode_normal_after_focus_switch_closes_orphaned_group() {
+        // M3 e2e: 文書切替時に開きっぱなしの Insert undo グループが孤児化し、
+        // 別クライアントの編集が混入するバグの再現・修正確認。
+        //
+        // X で Insert セッション中に別クライアントが Y を Open するとフォーカスが
+        // Y へ移る。その状態で TUI の SetMode(Normal) は「フォーカス中の文書」で
+        // はなく「グループが開いている文書 X」に対して end_group を実行する必要が
+        // ある（修正前は Y への end_group が no-op で X のグループが孤児化し、
+        // 後に agent が X へ書き込むと同一 undo グループに混入した）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m3-sock-{}.sock", std::process::id()));
+        let file_x = dir.join(format!("mina-m3-x-{}.txt", std::process::id()));
+        let file_y = dir.join(format!("mina-m3-y-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file_x, "").unwrap();
+        std::fs::write(&file_y, "").unwrap();
+        start_server(&sock).await;
+
+        // TUI: X を開いて Insert モードで "a" を入力（X の履歴にグループを開く）
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path_x = file_x.to_string_lossy().into_owned();
+        let path_y = file_y.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path_x.clone() }).await;
+        let _ = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
+        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        assert_eq!(snap.text, "a");
+
+        // agent: Y を Open → フォーカスは Y へ（X のグループは開いたまま）
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let snap = request(&mut agent, &Command::Open { path: path_y }).await;
+        assert_eq!(snap.text, "");
+        assert_eq!(snap.mode, Mode::Insert, "Open ではモードが変わらない");
+
+        // TUI: SetMode(Normal) — フォーカスは Y だが、閉じるのは X のグループ
+        let snap = request(&mut tui, &Command::SetMode { mode: Mode::Normal }).await;
+        assert_eq!(snap.mode, Mode::Normal);
+
+        // agent: X にフォーカス復帰 → DocumentEdit で書き込み
+        let snap = request(&mut agent, &Command::Open { path: path_x }).await;
+        assert_eq!(snap.text, "a", "再利用 Open で X の内容が保持される");
+        let snap = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 1,
+                end: 1,
+                text: "Z".into(),
+                checksum: fnv1a64(snap.text.as_bytes()),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "aZ");
+
+        // undo: agent の編集だけが戻る（修正前は TUI の "a" も一緒に戻った）
+        let snap = request(&mut agent, &Command::Undo).await;
+        assert_eq!(
+            snap.text, "a",
+            "undo は agent の編集のみを戻す（TUI の編集が混入しない）"
+        );
+        let snap = request(&mut agent, &Command::Undo).await;
+        assert_eq!(snap.text, "", "2回目の undo で TUI のセッションも別グループとして戻る");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_x);
+        let _ = std::fs::remove_file(&file_y);
+    }
+
+    #[tokio::test]
+    async fn owner_disconnect_after_focus_switch_closes_orphaned_group() {
+        // M3 e2e: フォーカスが別文書（Y）に移った状態で所有者（TUI）が切断しても、
+        // グループが開いている文書 X のグループが閉じる。修正前は切断ハンドラの
+        // end_group がフォーカス文書 Y に対して実行され no-op となり、X のグループ
+        // が孤児化して agent の書き込みが混入した。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m3d-sock-{}.sock", std::process::id()));
+        let file_x = dir.join(format!("mina-m3d-x-{}.txt", std::process::id()));
+        let file_y = dir.join(format!("mina-m3d-y-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file_x, "").unwrap();
+        std::fs::write(&file_y, "").unwrap();
+        start_server(&sock).await;
+
+        // TUI: X を開いて Insert モードで "a" を入力（グループは X に開く）
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path_x = file_x.to_string_lossy().into_owned();
+        let path_y = file_y.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path_x.clone() }).await;
+        let _ = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
+        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        assert_eq!(snap.text, "a");
+
+        // agent: Y を Open（フォーカスを X から Y へ移す）
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let _ = request(&mut agent, &Command::Open { path: path_y }).await;
+
+        // 所有者（TUI）の切断 → フォーカスは Y のままでも X のグループが閉じ、
+        // モードが Normal に戻るまで待つ（切断処理は非同期）
+        drop(tui);
+        let snap = poll_snapshot(
+            &mut agent,
+            |s| s.mode == Mode::Normal,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(snap.mode, Mode::Normal, "切断で Insert が閉じて Normal に戻る");
+
+        // agent: X に戻って書き込み → undo は agent の編集のみを戻す
+        let snap = request(&mut agent, &Command::Open { path: path_x }).await;
+        assert_eq!(snap.text, "a");
+        let snap = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 1,
+                end: 1,
+                text: "Z".into(),
+                checksum: fnv1a64(snap.text.as_bytes()),
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "aZ");
+        let snap = request(&mut agent, &Command::Undo).await;
+        assert_eq!(
+            snap.text, "a",
+            "undo は agent の編集のみを戻す（切断時にグループが閉じている）"
+        );
+        let snap = request(&mut agent, &Command::Undo).await;
+        assert_eq!(snap.text, "", "2回目の undo で切断前のセッションも戻る");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_x);
+        let _ = std::fs::remove_file(&file_y);
+    }
+
+    #[tokio::test]
     async fn document_edit_syncs_lsp_full_text() {
         // ADR-0009: DocumentEdit も編集後の全文 didChange 同期 + pull 診断に乗る
         let _guard = LSP_TEST_LOCK.lock().await;
@@ -2559,6 +2738,116 @@ mod tests {
         )
         .await;
         assert!(!snap.disk_changed, "Save でベースラインが更新される");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn reuse_open_restats_baseline_so_external_change_is_detected() {
+        // MAJOR M2: 再利用 Open（既存文書へのフォーカス復帰）でベースラインが更新
+        // されず watch_disk が毎回スキップし、フォーカス文書の外部変更検知が停止
+        // する。修正後は再利用 Open でベースラインがフォーカス文書に張り替わり、
+        // その後の外部変更が検知される。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m2r-sock-{}.sock", std::process::id()));
+        let file_a = dir.join(format!("mina-m2r-a-{}.txt", std::process::id()));
+        let file_b = dir.join(format!("mina-m2r-b-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+        std::fs::write(&file_a, "a-base\n").unwrap();
+        std::fs::write(&file_b, "b-base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let pa = file_a.to_string_lossy().into_owned();
+        let pb = file_b.to_string_lossy().into_owned();
+        // Open A → Open B → 再利用 Open A（フォーカス復帰）
+        let snap = request(&mut c, &Command::Open { path: pa.clone() }).await;
+        assert_eq!(snap.text, "a-base\n");
+        let snap = request(&mut c, &Command::Open { path: pb.clone() }).await;
+        assert_eq!(snap.text, "b-base\n");
+        let snap = request(&mut c, &Command::Open { path: pa.clone() }).await;
+        assert_eq!(snap.text, "a-base\n", "再利用で A にフォーカス復帰");
+        assert!(!snap.disk_changed, "再利用直後はまだ乖離していない");
+
+        // 再利用 Open 後に A を外部変更 → 検知される（修正前はベースラインが B の
+        // ままで watch_disk が毎回スキップし、8 秒待っても検知されない）
+        std::fs::write(&file_a, "changed by external tool\n").unwrap();
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.disk_changed,
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(snap.text, "a-base\n", "自動リロードしない（メモリ内容は不変）");
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::ExternalChange && e.source == EventSource::External
+        }));
+
+        // ベースラインが A に張り替わっていること: Save で A の現状を基準にした後、
+        // B を外部変更してもフォーカス文書 A のフラグは立たない（B の状態を A に
+        // 誤報告しない）
+        let snap = request(&mut c, &Command::Save).await;
+        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
+        let snap = poll_snapshot(
+            &mut c,
+            |s| !s.disk_changed,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!snap.disk_changed);
+        std::fs::write(&file_b, "b changed by external tool\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let snap = request(&mut c, &Command::GetState).await;
+        assert!(!snap.disk_changed, "B の変更を A に誤報告しない");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+    }
+
+    #[tokio::test]
+    async fn reuse_open_keeps_disk_changed_while_same_doc_still_diverges() {
+        // MAJOR M2: 同一文書がまだディスクと乖離している状態で再利用 Open しても
+        // disk_changed は維持される（乖離は実在するので報告を消さない）。
+        // ベースラインはフォーカス文書の現状に張り替わり、Save で解消される。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m2k-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-m2k-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert!(!snap.disk_changed);
+
+        // 外部ツールがファイルを書き換える → 検知される
+        std::fs::write(&file, "external\n").unwrap();
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.disk_changed,
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+        assert!(snap.disk_changed);
+
+        // 同じ文書へ再利用 Open → 乖離は残っているのでフラグは維持される
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert!(snap.disk_changed, "乖離が残る限りフラグを消さない");
+
+        // Save でベースラインが更新され、フラグが下がる
+        let snap = request(&mut c, &Command::Save).await;
+        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
+        let snap = poll_snapshot(
+            &mut c,
+            |s| !s.disk_changed,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!snap.disk_changed);
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
