@@ -378,8 +378,20 @@ impl Editor {
     }
 
     /// グループ化を終了する。
+    ///
+    /// グループは文書ごとの履歴に属するが、開くのはフォーカス中の文書に対する
+    /// [`Editor::begin_group`] だけ。フォーカスが別文書へ移った後（Open・View
+    /// 切替等）も、開いたグループは閉じる（ADR-0007）: フォーカス中の文書だけを
+    /// 閉じると、元の文書のグループが孤児化して開きっぱなしになり、そこへの
+    /// 後続の書き込みが別クライアントの編集と同一 undo グループに混入する（M3）。
+    ///
+    /// 同時に開けるグループは高々1つ（モード・所有者は daemon グローバル）なので
+    /// 全履歴を走査して閉じるのは安全。開いていない履歴への end_group は no-op
+    /// なので、対象が無くても影響はない。
     pub fn end_group(&mut self) {
-        self.history_mut().end_group();
+        for history in self.histories.values_mut() {
+            history.end_group();
+        }
     }
 
     /// 表示範囲の先頭行（viewport の上端）。
@@ -672,6 +684,46 @@ mod tests {
         editor.redo();
         assert_eq!(editor.current_document().text().to_string(), "hello");
         assert_eq!(editor.selection(), Selection::point(5));
+    }
+
+    #[test]
+    fn end_group_closes_group_on_non_focused_document() {
+        // M3: グループは文書ごとの履歴に開くが、フォーカスが別文書へ移った後も
+        // end_group は開いたグループを閉じる。フォーカス文書だけ閉じると元の
+        // 文書のグループが孤児化し、そこへの後続の書き込みが同一 undo グループに
+        // 混入する（ADR-0007 違反）。
+        let mut editor = Editor::new();
+        let x = editor.open_with_path(PathBuf::from("/tmp/x.txt"), "");
+        editor.begin_group();
+        let sel = Selection::point(0);
+        let tx = Transaction::insert(editor.current_document(), &sel, "a");
+        editor.apply(tx.clone(), tx.map_selection(&sel, true));
+
+        // 別文書 Y へフォーカスが移る → X のグループは開いたまま
+        let y = editor.open_with_path(PathBuf::from("/tmp/y.txt"), "");
+        assert_ne!(x, y);
+
+        // フォーカスが Y にある状態での end_group が X のグループも閉じる
+        editor.end_group();
+
+        // X に戻って書き込み → 別グループ（undo 1回で追記分のみ戻る）
+        editor.focus_open_path(Path::new("/tmp/x.txt"));
+        let sel2 = Selection::point(1);
+        editor.set_selection(sel2.clone());
+        let tx2 = Transaction::insert(editor.current_document(), &sel2, "Z");
+        editor.apply(tx2.clone(), tx2.map_selection(&sel2, true));
+        assert_eq!(editor.current_document().text().to_string(), "aZ");
+        editor.undo();
+        assert_eq!(
+            editor.current_document().text().to_string(),
+            "a",
+            "undo は閉じたグループへの追記分だけを戻す"
+        );
+        editor.undo();
+        assert!(
+            editor.current_document().is_empty(),
+            "2回目の undo で元のセッションも別グループとして戻る"
+        );
     }
 
     #[test]
