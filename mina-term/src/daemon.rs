@@ -7,13 +7,17 @@
 //! peer uid を検証して別ユーザの接続を拒否する（MEDIUM-3）。
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mina_core::{Range as CoreRange, Selection, Transaction, extend_selection, move_selection};
-use mina_protocol::{Command, DocumentEdit, GotoTarget, Range, StateSnapshot, fnv1a64};
+use mina_protocol::{
+    ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
+    Range, StateSnapshot, fnv1a64,
+};
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -98,9 +102,49 @@ pub struct Daemon {
     /// 閉じモードを戻し、非所有者の書き込みは後勝ちで奪取する（preempt）。
     /// 不変条件: mode == Insert ⟺ insert_owner == Some(_)。
     pub(crate) insert_owner: Option<u64>,
+    /// 状態を変える操作ごとに増加する世代（ADR-0012）。
+    generation: u64,
+    /// 直近の状態変化イベントの bounded リング（ADR-0012）。
+    events: VecDeque<ChangeEvent>,
+    /// 外部変更検知のベースライン（フォーカス文書。Open/Save で更新）。
+    disk_baseline: Option<DiskBaseline>,
+    /// フォーカス文書が外部ツールによって変更されたか（Open/Save でクリア）。
+    disk_changed: bool,
 }
 
+/// 外部変更検知のベースライン（mtime+size。ADR-0012 のヒューリスティック）。
+#[derive(Clone, Debug)]
+struct DiskBaseline {
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    size: u64,
+}
+
+/// イベントリングの上限（ADR-0012）。超過分は古いものから破棄。
+const MAX_EVENTS: usize = 128;
+
 impl Daemon {
+    /// 状態を変える操作を記録する（世代を増やし、イベントをリングに積む）。
+    fn record_event(
+        &mut self,
+        source: EventSource,
+        kind: EventKind,
+        range: Option<Range>,
+        text: Option<String>,
+    ) {
+        self.generation += 1;
+        self.events.push_back(ChangeEvent {
+            generation: self.generation,
+            source,
+            kind,
+            range,
+            text,
+        });
+        while self.events.len() > MAX_EVENTS {
+            self.events.pop_front();
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             editor: Editor::new(),
@@ -108,6 +152,10 @@ impl Daemon {
             lsp_sessions: HashMap::new(),
             diagnostics: Vec::new(),
             insert_owner: None,
+            generation: 0,
+            events: VecDeque::new(),
+            disk_baseline: None,
+            disk_changed: false,
         }
     }
 
@@ -168,6 +216,11 @@ fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 /// ブレイン防止）、前回の異常終了の残骸（stale）なら除去して再試行する。
 pub async fn serve(path: &Path) -> std::io::Result<()> {
     let daemon = Arc::new(Mutex::new(Daemon::new()));
+    // ADR-0012: 外部変更監視（フォーカス文書の mtime+size をポーリング）
+    {
+        let daemon_task = daemon.clone();
+        tokio::spawn(watch_disk(daemon_task));
+    }
     match bind_listener(path) {
         Ok(listener) => accept_loop(listener, daemon).await,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
@@ -183,6 +236,45 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
             accept_loop(listener, daemon).await
         }
         Err(e) => Err(e),
+    }
+}
+
+/// 外部変更検知タスク（ADR-0012）: フォーカス文書の mtime+size を定期的に
+/// ベースラインと照合し、不一致なら `ExternalChange` イベントを記録して
+/// `disk_changed` を立てる。自動リロードはしない（メモリ状態を壊さない）。
+///
+/// ponytail: mtime+size はヒューリスティック（mtime を保存するツールや粗い
+/// mtime 粒度の FS では見逃しうる）。イベントは検知ごとに1回（Open/Save で
+/// ベースラインが更新されるまで再発しない）。
+async fn watch_disk(daemon: Arc<Mutex<Daemon>>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        interval.tick().await;
+        let mut d = daemon.lock().await;
+        let Some(baseline) = d.disk_baseline.clone() else {
+            continue; // ファイル未オープン
+        };
+        if d.disk_changed {
+            continue; // 検知済み（ベースライン更新まで維持）
+        }
+        // フォーカスが別の文書へ移っていれば対象外（Open でベースラインが
+        // 更新されるはず）
+        if d.editor.focused_path().map(Path::to_path_buf).as_deref()
+            != Some(baseline.path.as_path())
+        {
+            continue;
+        }
+        let mismatch = match std::fs::metadata(&baseline.path) {
+            Ok(md) => {
+                md.len() != baseline.size
+                    || md.modified().unwrap_or(std::time::UNIX_EPOCH) != baseline.mtime
+            }
+            Err(_) => true, // 外部で削除された
+        };
+        if mismatch {
+            d.disk_changed = true;
+            d.record_event(EventSource::External, EventKind::ExternalChange, None, None);
+        }
     }
 }
 
@@ -229,26 +321,36 @@ async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std:
 async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_id: u64) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut first_command = true;
+
+    // ADR-0012: 最初のメッセージは Hello（クライアント種別の宣言）でなければ
+    // ならない。Hello でない・不正な kind は即切断する。
+    // MEDIUM-5: 無言接続がスロットを永久に占有しないよう Hello にタイムアウトを付ける。
+    let mut hello_line = String::new();
+    let read = {
+        let mut bounded = (&mut reader).take(MAX_CMD_LINE as u64 + 1);
+        timeout(FIRST_COMMAND_TIMEOUT, bounded.read_line(&mut hello_line)).await
+    };
+    let kind = match read {
+        Ok(Ok(0)) => return,
+        Ok(Ok(_)) => match serde_json::from_str::<Hello>(hello_line.trim()) {
+            Ok(hello) => hello.kind,
+            Err(_) => return, // Hello でない・不正な kind: 切断
+        },
+        Ok(Err(_)) => return,
+        Err(_) => return, // 無言接続: タイムアウトで切断
+    };
+    let source = match kind {
+        ClientKind::Interactive => EventSource::Interactive,
+        ClientKind::Headless => EventSource::Headless,
+    };
+
     loop {
         let mut line = String::new();
         // SEC-1: 改行のない無限ストリームで行バッファが無制限に育たないよう、
         // 上限を超える行は接続を閉じる
         let mut bounded = (&mut reader).take(MAX_CMD_LINE as u64 + 1);
         let read_line = bounded.read_line(&mut line);
-        // MEDIUM-5: 最初のコマンドだけタイムアウトを付ける — 接続後に何も
-        // 送らない無言接続がスロット（MAX_CONNECTIONS）を永久に占有しないよう
-        // 切断する。コマンドを送った後のアイドル（読書中の TUI）は切断しない。
-        let read = if first_command {
-            first_command = false;
-            match timeout(FIRST_COMMAND_TIMEOUT, read_line).await {
-                Ok(r) => r,
-                Err(_) => break, // 無言接続: タイムアウトで切断
-            }
-        } else {
-            read_line.await
-        };
-        match read {
+        match read_line.await {
             Ok(0) => break, // クライアントの切断
             Ok(_) => {}
             Err(_) => break,
@@ -295,6 +397,8 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                     }
                     let mut d = daemon.lock().await;
                     lsp::drain_into(&mut d);
+                    // ADR-0012: 再利用も Open として記録（フォーカス変更）
+                    d.record_event(source, EventKind::Open, None, None);
                     snapshot(&d, None)
                 } else {
                     // 未開パス: 従来どおりディスクから読む
@@ -322,6 +426,16 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                             let height = d.viewport_height;
                             d.editor.scroll_to_cursor(height);
                             d.diagnostics.clear();
+                            // ADR-0012: ベースライン更新 + Open イベント
+                            if let Ok(md) = std::fs::metadata(&path_buf) {
+                                d.disk_baseline = Some(DiskBaseline {
+                                    path: path_buf.clone(),
+                                    mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
+                                    size: md.len(),
+                                });
+                            }
+                            d.disk_changed = false;
+                            d.record_event(source, EventKind::Open, None, None);
                             (contents.clone(), session.is_some())
                         }
                         None => (String::new(), false),
@@ -375,6 +489,19 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                             .as_ref()
                             .expect("書き込み成功ならパスはある")
                             .display();
+                        // ADR-0012: 保存後にベースライン更新（外部変更検知の基準を
+                        // 現在のディスク状態に合わせる）
+                        if let Some(p) = &path {
+                            if let Ok(md) = std::fs::metadata(p) {
+                                d.disk_baseline = Some(DiskBaseline {
+                                    path: p.clone(),
+                                    mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
+                                    size: md.len(),
+                                });
+                            }
+                            d.disk_changed = false;
+                            d.record_event(source, EventKind::Save, None, None);
+                        }
                         let status = if clean {
                             format!("saved: {shown}")
                         } else {
@@ -387,8 +514,37 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
             }
             Ok(command) => {
                 let mut d = daemon.lock().await;
+                // ADR-0012: 状態を変える操作（編集・undo/redo・モード変更）だけを
+                // イベントとして記録する。Move/Extend/Goto/Scroll/SetViewport は
+                // 現在値がスナップショットに載るため対象外。
+                let event = match &command {
+                    Command::Insert { text } => {
+                        Some((EventKind::Insert, None, Some(text.clone())))
+                    }
+                    Command::DeleteBackward | Command::DeleteForward | Command::DeleteRange => {
+                        // 削除範囲 = 適用前の選択（primary）
+                        let r = d.editor.selection().primary();
+                        Some((
+                            EventKind::Delete,
+                            Some(Range {
+                                anchor: r.start(),
+                                head: r.end(),
+                            }),
+                            None,
+                        ))
+                    }
+                    Command::Undo if d.editor.can_undo() => Some((EventKind::Undo, None, None)),
+                    Command::Redo if d.editor.can_redo() => Some((EventKind::Redo, None, None)),
+                    Command::SetMode { mode } if convert_mode(*mode) != d.editor.mode() => {
+                        Some((EventKind::SetMode, None, None))
+                    }
+                    _ => None,
+                };
                 let is_edit = is_edit(&command);
                 apply_from(&mut d, command, conn_id);
+                if let Some((kind, range, text)) = event {
+                    d.record_event(source, kind, range, text);
+                }
                 // M1/ADR-0009: 同期対象（セッション・パス・テキスト）をロック内で
                 // 取り出し、didChange はロック外で await する（サーバ遅延で全
                 // クライアントがブロックしない）。
@@ -434,6 +590,18 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                         let mut d = daemon.lock().await;
                         // 拒否（checksum 不一致・範囲外）なら状態を変えず status を返す
                         let rejected = apply_edit(&mut d, &edit, conn_id);
+                        if rejected.is_none() {
+                            // ADR-0012: 適用された DocumentEdit を記録（成功時のみ）
+                            d.record_event(
+                                source,
+                                EventKind::ReplaceRange,
+                                Some(Range {
+                                    anchor: edit.start,
+                                    head: edit.end,
+                                }),
+                                Some(edit.text.clone()),
+                            );
+                        }
                         let sync_target = if rejected.is_none() {
                             // 編集後の LSP 同期（Command 編集と同じ経路。ADR-0009）
                             d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
@@ -801,6 +969,9 @@ fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
         dirty: editor.is_dirty(),
         status,
+        generation: daemon.generation,
+        events: daemon.events.iter().cloned().collect(),
+        disk_changed: daemon.disk_changed,
     }
 }
 
@@ -1298,6 +1469,17 @@ mod tests {
         serde_json::from_slice(&buf).unwrap()
     }
 
+    /// 接続して Hello（クライアント種別）を送る。イベントの source 判定に使う。
+    async fn connect_client(sock: &std::path::Path, kind: ClientKind) -> UnixStream {
+        let mut stream = UnixStream::connect(sock).await.expect("接続できる");
+        stream
+            .write_all(serde_json::to_string(&Hello { kind }).unwrap().as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        stream
+    }
+
     /// 述語が満たされるまで GetState を繰り返す（非同期の LSP 診断反映待ち用）。
     async fn poll_snapshot(
         stream: &mut UnixStream,
@@ -1328,14 +1510,14 @@ mod tests {
         start_server(&sock).await;
 
         // TUI: Insert モードで "a" を入力（グループを開く）
-        let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
         assert_eq!(snap.mode, Mode::Insert);
         let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
         assert_eq!(snap.text, "a");
 
         // agent ワンショット: 読み取り専用 GetState → 切断
-        let mut agent = UnixStream::connect(&sock).await.unwrap();
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let snap = request(&mut agent, &Command::GetState).await;
         assert_eq!(snap.text, "a");
         assert_eq!(snap.mode, Mode::Insert, "agent にも現状のモードが見える");
@@ -1366,7 +1548,7 @@ mod tests {
         start_server(&sock).await;
 
         // TUI: ファイルを開いて編集（未保存）
-        let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
         assert_eq!(snap.text, "base\n");
@@ -1378,7 +1560,7 @@ mod tests {
         std::fs::write(&file, "changed\n").unwrap();
 
         // agent: 同じパスを Open し直す → 既存ドキュメントへフォーカス
-        let mut agent = UnixStream::connect(&sock).await.unwrap();
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let snap = request(&mut agent, &Command::Open { path }).await;
         assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
         assert!(snap.dirty, "dirty が保持される");
@@ -1422,7 +1604,7 @@ mod tests {
         std::fs::write(&file, "fn f() { TODO }\n").unwrap();
         start_server(&sock).await;
 
-        let mut tui = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
         // 初回解析: TODO（byte 9）の診断が反映されるまで待つ
@@ -1486,7 +1668,7 @@ mod tests {
         std::fs::write(&file, "hello world").unwrap();
         start_server(&sock).await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
         // 選択を先頭に置く（編集範囲とは別の位置）
@@ -1522,7 +1704,7 @@ mod tests {
         std::fs::write(&file, "abc").unwrap();
         start_server(&sock).await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
 
@@ -1564,7 +1746,7 @@ mod tests {
         std::fs::write(&file, "abc").unwrap();
         start_server(&sock).await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
         let cs = fnv1a64(b"abc");
@@ -1612,7 +1794,7 @@ mod tests {
         std::fs::write(&file, "abc").unwrap();
         start_server(&sock).await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
 
@@ -1655,7 +1837,7 @@ mod tests {
         std::fs::write(&file, "abc").unwrap();
         start_server(&sock).await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
         let snap = request_edit(
@@ -1698,7 +1880,7 @@ mod tests {
         assert_eq!(snap.text, "aabc");
 
         // agent: DocumentEdit（別接続の書き込み → preempt）
-        let mut agent = UnixStream::connect(&sock).await.unwrap();
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let snap = request_edit(
             &mut agent,
             &DocumentEdit {
@@ -1745,7 +1927,7 @@ mod tests {
         std::fs::write(&file, "fn f() { TODO }\n").unwrap();
         start_server(&sock).await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
         // 初回解析: TODO（byte 9）の診断が反映されるまで待つ
@@ -1796,7 +1978,7 @@ mod tests {
         start_server(&sock).await;
 
         // 巨大文書を読み込んでおく（GetState の応答を大きくするため）
-        let mut loader = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut loader = connect_client(&sock, ClientKind::Interactive).await;
         let _ = request(&mut loader, &Command::Open { path: big_str }).await;
         drop(loader);
 
