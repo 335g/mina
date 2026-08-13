@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use mina_protocol::{fnv1a64, ClientKind, Command, DocumentEdit, Hello, StateSnapshot};
+use mina_protocol::{fnv1a64, ClientKind, Command, DocumentEdit, Hello, ServerMessage, StateSnapshot};
 use serde::Serialize;
 
 /// daemon のソケットパス（mina-term の `daemon::socket_path()` と一致させること）。
@@ -212,6 +212,8 @@ impl Conn {
     }
 
     /// メッセージを送り、応答スナップショットを 1 つ受け取る。
+    /// ADR-0013: 応答はタグ付き ServerMessage エンベロープ。Headless は
+    /// push を受け取らない（購読されない）が、形状に依存しないようどちらでも取り出す。
     fn request<T: Serialize>(&mut self, message: &T) -> std::io::Result<StateSnapshot> {
         let mut line = serde_json::to_string(message).map_err(io_err)?;
         line.push('\n');
@@ -219,8 +221,15 @@ impl Conn {
         self.stream.flush()?;
         let mut response = String::new();
         self.reader.read_line(&mut response)?;
-        serde_json::from_str(&response)
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, format!("不正な応答: {e}")))
+        match serde_json::from_str::<ServerMessage>(&response) {
+            Ok(ServerMessage::Response { snapshot }) | Ok(ServerMessage::Push { snapshot }) => {
+                Ok(snapshot)
+            }
+            Err(e) => Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("不正な応答: {e}"),
+            )),
+        }
     }
 }
 
