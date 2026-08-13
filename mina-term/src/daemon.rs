@@ -1871,7 +1871,7 @@ mod tests {
         start_server(&sock).await;
 
         // TUI: Insert モードで "a" を入力（グループを開く）
-        let mut tui = UnixStream::connect(&sock).await.unwrap();
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path }).await;
         let _ = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
@@ -1962,6 +1962,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_increments_on_state_changes_only() {
+        // ADR-0012: 世代は状態を変える操作（Open/編集/undo）で増加し、
+        // GetState（読み取り）では不変。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-9a-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-9a-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.generation, 1, "Open で増加");
+        let snap = request(&mut c, &Command::Insert { text: "X".into() }).await;
+        assert_eq!(snap.generation, 2, "編集で増加");
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.generation, 3, "undo で増加");
+        let snap = request(&mut c, &Command::SetMode { mode: Mode::Insert }).await;
+        assert_eq!(snap.generation, 4, "モード変更で増加");
+        let snap = request(&mut c, &Command::SetMode { mode: Mode::Insert }).await;
+        assert_eq!(snap.generation, 4, "同じモードへの SetMode は増加しない");
+        let snap = request(&mut c, &Command::GetState).await;
+        assert_eq!(snap.generation, 4, "GetState では不変");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn events_carry_correct_source() {
+        // ADR-0012: イベントの source は Hello で宣言したクライアント種別で決まる
+        // （TUI = Interactive、agent = Headless）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-9b-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-9b-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        // TUI（Interactive）: Open + Insert
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::Open && e.source == EventSource::Interactive
+        }));
+        let snap = request(&mut tui, &Command::Insert { text: "X".into() }).await;
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::Insert
+                && e.source == EventSource::Interactive
+                && e.text.as_deref() == Some("X")
+        }));
+
+        // agent（Headless）: DocumentEdit → ReplaceRange
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let snap = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 1,
+                end: 1,
+                text: "Y".into(),
+                checksum: fnv1a64(b"Xabc"),
+            },
+        )
+        .await;
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::ReplaceRange
+                && e.source == EventSource::Headless
+                && e.text.as_deref() == Some("Y")
+        }));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn event_ring_is_bounded_and_evicts_oldest() {
+        // ADR-0012: リングは bounded(128)。超過分は古いものから破棄される。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-9c-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-9c-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await; // gen 1
+        // 130 回編集 → 合計 131 イベント。リングは 128 に収まる
+        for i in 0..130 {
+            let _ = request(&mut c, &Command::Insert { text: format!("{i}") }).await;
+        }
+        let snap = request(&mut c, &Command::GetState).await;
+        assert_eq!(snap.events.len(), 128, "リングは 128 に bounded");
+        assert_eq!(snap.events[0].kind, EventKind::Insert, "Open イベントは破棄されている");
+        assert_eq!(
+            snap.events[127].kind, EventKind::Insert,
+            "最新イベントは保持される"
+        );
+        assert_eq!(snap.generation, 131, "世代は全状態変化分進んでいる");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn hello_handshake_rejects_non_hello() {
+        // ADR-0012: 最初のメッセージが Hello でない・不正な kind なら切断される。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-9d-sock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        // Hello でなくコマンドを直接送る → 切断（EOF）
+        let mut raw = UnixStream::connect(&sock).await.unwrap();
+        raw.write_all(b"{\"GetState\": null}\n").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = raw.read(&mut buf).await;
+        assert!(
+            matches!(n, Ok(0) | Err(_)),
+            "Hello でない最初のメッセージは切断される: {n:?}"
+        );
+
+        // 不正な kind → 切断（EOF）
+        let mut raw = UnixStream::connect(&sock).await.unwrap();
+        raw.write_all(b"{\"kind\": \"bogus\"}\n").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = raw.read(&mut buf).await;
+        assert!(matches!(n, Ok(0) | Err(_)), "不正な kind は切断される: {n:?}");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn external_change_is_detected_without_auto_reload() {
+        // ADR-0012: 外部ツールによるファイル変更を検知して disk_changed + イベントを
+        // 出すが、自動リロードはしない。Save でベースラインが更新されフラグが下がる。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-9e-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-9e-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.text, "base\n");
+        assert!(!snap.disk_changed);
+
+        // 外部ツールがファイルを書き換える（daemon は知らない）
+        std::fs::write(&file, "changed by external tool\n").unwrap();
+
+        // 監視タスク（2秒周期）が検知するのを待つ
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.disk_changed,
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(snap.text, "base\n", "自動リロードしない（メモリ内容は不変）");
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::ExternalChange && e.source == EventSource::External
+        }));
+
+        // Save でベースラインが更新され、フラグが下がる
+        let snap = request(&mut c, &Command::Save).await;
+        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
+        let snap = poll_snapshot(
+            &mut c,
+            |s| !s.disk_changed,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!snap.disk_changed, "Save でベースラインが更新される");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
     async fn stalled_response_writer_is_dropped_and_daemon_recovers() {
         // MEDIUM-2: 応答を読まないクライアントは書き込みタイムアウトで切断され、
         // 接続スロット（MAX_CONNECTIONS=4）を永久に占有しない。占有は「新しい
@@ -1984,7 +2161,7 @@ mod tests {
 
         // DoS シナリオ: GetState を送って一切読まないクライアントを放置する
         // （書き込みがバッファで詰まり、テストでは 500ms のタイムアウトで切断）
-        let mut wedged = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut wedged = connect_client(&sock, ClientKind::Interactive).await;
         let mut line = serde_json::to_string(&Command::GetState).unwrap();
         line.push('\n');
         wedged.write_all(line.as_bytes()).await.unwrap();
@@ -1992,7 +2169,7 @@ mod tests {
 
         // 新しいクライアント: タイムアウトでスロットが解放されるまで待って応答を
         // 受け取れる。修正前は wedged のスロットが戻らず 5 秒待っても応答が来ない。
-        let mut fresh = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut fresh = connect_client(&sock, ClientKind::Interactive).await;
         let snap = timeout(
             std::time::Duration::from_secs(5),
             request(&mut fresh, &Command::GetState),
@@ -2024,7 +2201,7 @@ mod tests {
 
         // 5 台目: 最初はスロット待ちだが、無言接続がタイムアウトで切断されると
         // accept されて応答が返る。修正前は永久に待つ（5 秒でタイムアウト判定）。
-        let mut fresh = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut fresh = connect_client(&sock, ClientKind::Interactive).await;
         let snap = timeout(
             std::time::Duration::from_secs(5),
             request(&mut fresh, &Command::GetState),
