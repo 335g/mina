@@ -546,9 +546,14 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                     _ => None,
                 };
                 let is_edit = is_edit(&command);
-                apply_from(&mut d, command, conn_id);
-                if let Some((kind, range, text)) = event {
-                    d.record_event(source, kind, range, text);
+                let (_, changed) = apply_from(&mut d, command, conn_id);
+                // ADR-0012: 実際に状態が変わった場合のみイベントを記録する。
+                // 拒否（サイズ超過等）・no-op（空削除・空挿入・履歴のない
+                // undo/redo・モード不変の SetMode）は世代もイベントも進めない。
+                if changed {
+                    if let Some((kind, range, text)) = event {
+                        d.record_event(source, kind, range, text);
+                    }
                 }
                 // M1/ADR-0009: 同期対象（セッション・パス・テキスト）をロック内で
                 // 取り出し、didChange はロック外で await する（サーバ遅延で全
@@ -791,11 +796,12 @@ fn open_in_editor(daemon: &mut Daemon, path: &str, contents: Option<String>) -> 
 /// 接続 ID なし（テストの既定 = 接続 0）で適用する。
 #[cfg(test)]
 fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
-    apply_from(daemon, command, 0)
+    apply_from(daemon, command, 0).0
 }
 
-/// 位置指定編集（ADR-0011）を適用する。拒否時は status 付きスナップショットを
-/// 返し、状態は一切変えない（checksum 不一致・範囲外）。成功時は `None` を返す。
+/// 位置指定編集（ADR-0011）を適用する。拒否・無変化時はスナップショットを返し、
+/// 状態は一切変えない（checksum 不一致・範囲外・空置換の no-op）。成功時は
+/// `None` を返す。
 ///
 /// 選択は読まず・変えない（履歴には before == after として記録されるので
 /// undo でも選択は動かない）。挿入 = `start == end`、削除 = `text` が空。
@@ -816,6 +822,11 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
     let range = CoreRange::new(edit.start, edit.end);
     let selection = Selection::new(vec![range], 0);
     let tx = Transaction::insert(daemon.editor.current_document(), &selection, &edit.text);
+    if tx.is_noop() {
+        // ADR-0012: 空範囲への空文字置換など状態を変えない編集は、拒否と同じ
+        // 扱いでイベント・世代・undo 履歴を進めない（M1）。
+        return Some(snapshot(daemon, None));
+    }
     let selection_after = daemon.editor.selection();
     // CRITICAL C1: ADR-0011 の「選択を読まず・変えない」は、選択が文書の
     // 範囲内にあることが前提。編集で文書が選択位置より短くなると選択が
@@ -858,7 +869,10 @@ fn preempt(daemon: &mut Daemon, conn_id: u64) {
 
 /// 接続 ID 付きでコマンドを状態に適用する（接続ハンドラから呼ばれる）。
 /// `conn_id` は undo グループの所有者判定に使う。
-fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnapshot {
+///
+/// 戻り値の `bool` は「状態を実際に変えたか」（ADR-0012: 拒否・no-op は
+/// 世代/イベントの対象外。呼び出し側はこれで record_event をゲートする）。
+fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnapshot, bool) {
     match command {
         Command::Insert { text } => {
             // SEC-1/ADR-0008: Insert による無制限の文書成長を防ぐ。Open と同じ
@@ -868,15 +882,21 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
             // 開閉（SetMode の group 管理）には一切干渉しない。
             let doc_bytes = daemon.editor.current_document().text().len_bytes() as u64;
             if doc_bytes + text.len() as u64 > MAX_FILE_SIZE {
-                return snapshot(daemon, Some("file too large: insert rejected".into()));
+                return (
+                    snapshot(daemon, Some("file too large: insert rejected".into())),
+                    false,
+                );
             }
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = Transaction::insert(daemon.editor.current_document(), &selection, &text);
+            // 空文字挿入は状態を変えない（apply 側で no-op トランザクションは
+            // スキップされる）。選択範囲への空文字挿入は置換として実変更。
+            let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, true);
             daemon.editor.apply(tx, selection_after);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), changed)
         }
         Command::DeleteBackward => {
             preempt(daemon, conn_id);
@@ -885,10 +905,12 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
                 daemon.editor.current_document(),
                 &selection,
             );
+            // 文書先頭での Backspace 等は no-op（状態を変えない）
+            let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
             daemon.editor.apply(tx, selection_after);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), changed)
         }
         Command::DeleteForward => {
             preempt(daemon, conn_id);
@@ -897,15 +919,19 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
                 daemon.editor.current_document(),
                 &selection,
             );
+            // 文末での Delete 等は no-op（状態を変えない）
+            let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
             daemon.editor.apply(tx, selection_after);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), changed)
         }
         Command::DeleteRange => {
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
             let tx = Transaction::delete(daemon.editor.current_document(), &selection);
+            // カーソル上の DeleteRange は no-op（状態を変えない）
+            let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
             daemon.editor.apply(tx, selection_after);
             // 選択を消したら Select モードを抜ける（vim の d と同様）
@@ -913,20 +939,24 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
                 daemon.editor.set_mode(mina_view::Mode::Normal);
             }
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), changed)
         }
         Command::Undo => {
             // Undo/Redo も書き込みとして扱う（単一の共有履歴・グローバル undo）
             preempt(daemon, conn_id);
+            // 履歴が無い undo は no-op（no-op トランザクションが履歴に積まれない
+            // ため、can_undo が真なら undo は必ず実変更を戻す）
+            let changed = daemon.editor.can_undo();
             daemon.editor.undo();
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), changed)
         }
         Command::Redo => {
             preempt(daemon, conn_id);
+            let changed = daemon.editor.can_redo();
             daemon.editor.redo();
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), changed)
         }
         Command::Move {
             movement,
@@ -939,7 +969,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
             };
             daemon.editor.set_selection(moved);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), false)
         }
         Command::Extend {
             movement,
@@ -952,7 +982,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
             };
             daemon.editor.set_selection(extended);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), false)
         }
         Command::Goto { target } => {
             let pos = match target {
@@ -961,7 +991,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
             };
             daemon.editor.set_selection(mina_core::Selection::point(pos));
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), false)
         }
         Command::Scroll { pages } => {
             // 壊れた/悪意あるページ数でスクロール計算が overflow しないよう
@@ -970,7 +1000,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
             daemon
                 .editor
                 .scroll_pages(pages, daemon.viewport_height);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), false)
         }
         Command::SetMode { mode } => {
             let new_mode = convert_mode(mode);
@@ -1001,14 +1031,14 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> StateSnaps
                 daemon.insert_owner = None;
             }
             daemon.editor.set_mode(new_mode);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), new_mode != current)
         }
         Command::SetViewport { height } => {
             // 壊れた/悪意ある高さでスクロール計算が overflow しないよう clamp
             daemon.viewport_height = height.min(MAX_VIEWPORT_HEIGHT);
-            snapshot(daemon, None)
+            (snapshot(daemon, None), false)
         }
-        Command::GetState => snapshot(daemon, None),
+        Command::GetState => (snapshot(daemon, None), false),
         Command::Open { .. } | Command::Save => {
             unreachable!("I/O コマンドは接続ハンドラで処理される")
         }
@@ -1358,6 +1388,179 @@ mod tests {
     }
 
     #[test]
+    fn rejected_and_noop_ops_keep_state_and_undo_history() {
+        // ADR-0012（M1）: 拒否・no-op 操作は状態・undo 履歴を変えず、changed
+        // フラグも false（record_event のゲート）になる。修正前は no-op の
+        // 削除/挿入でもトランザクションが履歴に積まれ、拒否/no-op でも
+        // イベントが記録されていた。（世代・イベントの観測は socket 経由の
+        // m1_rejected_and_noop_ops_do_not_advance_generation_or_events で行う
+        // — record_event は接続ハンドラ側の責務のため。）
+        let mut d = daemon();
+        open(&mut d, "hello");
+        assert!(!d.editor.can_undo());
+        // 文書先頭で Backspace: no-op（changed=false）
+        let (s, changed) = apply_from(&mut d, Command::DeleteBackward, 0);
+        assert_eq!(s.text, "hello", "状態は変わらない");
+        assert!(!changed, "no-op 削除は changed=false");
+        // 文末で Delete・カーソル上の DeleteRange・空文字挿入も no-op
+        apply(
+            &mut d,
+            Command::Goto {
+                target: GotoTarget::DocumentEnd,
+            },
+        );
+        apply(&mut d, Command::DeleteForward);
+        apply(
+            &mut d,
+            Command::Goto {
+                target: GotoTarget::DocumentStart,
+            },
+        );
+        apply(&mut d, Command::DeleteRange);
+        apply(&mut d, Command::Insert { text: "".into() });
+        apply(&mut d, Command::Undo); // 履歴なし: no-op
+        let s = apply(&mut d, Command::GetState);
+        assert_eq!(s.text, "hello", "状態は変わらない");
+        assert!(!d.editor.can_undo(), "no-op 操作で undo 履歴が増えない");
+        // 拒否された Insert（サイズ超過）も状態・履歴を変えず changed=false
+        // （16MiB 応答は debug の書き込みタイムアウトと競合するため、ソケット
+        // 経由ではなく changed フラグで直接検証する）
+        let (s, changed) = apply_from(
+            &mut d,
+            Command::Insert {
+                text: "x".repeat(MAX_FILE_SIZE as usize + 1),
+            },
+            0,
+        );
+        assert!(s.status.as_deref().unwrap().starts_with("file too large"));
+        assert_eq!(s.text, "hello");
+        assert!(!changed, "拒否は changed=false");
+        assert!(!d.editor.can_undo(), "拒否で undo 履歴が増えない");
+    }
+
+    #[test]
+    fn noop_document_edit_keeps_state_and_undo_history() {
+        // ADR-0012（M1）: 状態を変えない DocumentEdit（空範囲への空文字置換）も
+        // 拒否と同じ扱いでスナップショットを返し、状態・undo 履歴を変えない。
+        let mut d = daemon();
+        open(&mut d, "hello");
+        let s = apply_edit(
+            &mut d,
+            &DocumentEdit {
+                start: 2,
+                end: 2,
+                text: "".into(),
+                checksum: fnv1a64(b"hello"),
+            },
+            0,
+        )
+        .expect("no-op 編集は拒否と同じ扱いでスナップショットを返す");
+        assert_eq!(s.status, None, "no-op は拒否ではない（status なし）");
+        assert_eq!(s.text, "hello", "状態は変わらない");
+        assert!(!d.editor.can_undo(), "undo 履歴も増えない");
+    }
+
+    #[tokio::test]
+    async fn m1_rejected_and_noop_ops_do_not_advance_generation_or_events() {
+        // ADR-0012（M1 回帰）: 拒否・no-op 操作は generation を進めず、偽の
+        // ChangeEvent も記録しない。正常な操作は従来どおり世代・イベントが
+        // 進む（修正前: 拒否/no-op でも record_event が無条件に走っていた）。
+        //
+        // サイズ超過の拒否は unit テスト（rejected_and_noop_ops_keep_state_and_
+        // undo_history）で changed フラグを直接検証する — 16MiB の応答は debug
+        // の書き込みタイムアウト（RESPONSE_WRITE_TIMEOUT）と競合してソケット
+        // 経由のテストが不安定になるため。ここでは checksum 不一致の拒否経路を
+        // 検証する。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m1-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-m1-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "hello").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.generation, 1, "Open で増加");
+
+        // 文書先頭で Backspace（no-op 削除）
+        let snap = request(&mut c, &Command::DeleteBackward).await;
+        assert_eq!(snap.text, "hello", "状態は変わらない");
+        assert_eq!(snap.generation, 1, "no-op 削除で世代は進まない");
+        assert!(
+            snap.events.iter().all(|e| e.kind != EventKind::Delete),
+            "偽 Delete イベントが記録されない"
+        );
+
+        // 文末で Delete（no-op 削除）
+        let _ = request(
+            &mut c,
+            &Command::Goto {
+                target: GotoTarget::DocumentEnd,
+            },
+        )
+        .await;
+        let snap = request(&mut c, &Command::DeleteForward).await;
+        assert_eq!(snap.generation, 1, "no-op 削除で世代は進まない");
+
+        // カーソル上の DeleteRange・空文字挿入も no-op
+        let _ = request(
+            &mut c,
+            &Command::Goto {
+                target: GotoTarget::DocumentStart,
+            },
+        )
+        .await;
+        let snap = request(&mut c, &Command::DeleteRange).await;
+        assert_eq!(snap.generation, 1, "no-op DeleteRange で世代は進まない");
+        let snap = request(&mut c, &Command::Insert { text: "".into() }).await;
+        assert_eq!(snap.generation, 1, "空文字挿入で世代は進まない");
+
+        // 履歴が無いので undo も no-op
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.generation, 1, "no-op undo で世代は進まない");
+
+        // 拒否された DocumentEdit（checksum 不一致）→ 世代不変・イベントなし
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 1,
+                end: 1,
+                text: "Y".into(),
+                checksum: fnv1a64(b"wrong"),
+            },
+        )
+        .await;
+        assert!(snap.status.is_some(), "拒否される");
+        assert_eq!(snap.generation, 1, "拒否で世代は進まない");
+        assert!(
+            snap.events.iter().all(|e| e.kind != EventKind::ReplaceRange),
+            "偽 ReplaceRange イベントが記録されない"
+        );
+
+        // 正常な挿入は従来どおり世代・イベントが進む
+        let snap = request(&mut c, &Command::Insert { text: "X".into() }).await;
+        assert_eq!(snap.text, "Xhello");
+        assert_eq!(snap.generation, 2, "正常な編集は世代が進む");
+        assert_eq!(snap.events.last().unwrap().kind, EventKind::Insert);
+
+        // 正常な削除も従来どおり Delete イベントが記録される
+        let _ = request(
+            &mut c,
+            &Command::Goto {
+                target: GotoTarget::DocumentStart,
+            },
+        )
+        .await;
+        let snap = request(&mut c, &Command::DeleteForward).await;
+        assert_eq!(snap.text, "hello");
+        assert_eq!(snap.generation, 3, "正常な削除で世代が進む");
+        assert_eq!(snap.events.last().unwrap().kind, EventKind::Delete);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
     fn delete_backward_and_undo() {
         let mut d = daemon();
         open(&mut d, "hello");
@@ -1480,7 +1683,7 @@ mod tests {
         apply(&mut d, Command::SetMode { mode: Mode::Insert }); // TUI（接続 0）
         apply(&mut d, Command::Insert { text: "a".into() }); // グループ [a]
         let s = apply_from(&mut d, Command::Insert { text: "X".into() }, 9); // agent: 奪取
-        assert_eq!(s.text, "aX");
+        assert_eq!(s.0.text, "aX");
         assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "奪取で Normal に戻る");
         assert_eq!(d.insert_owner, None, "奪取後は所有者がいない");
         // undo は後勝ち順: agent の編集 [X] → 人間のセッション [a]
