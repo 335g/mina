@@ -7,8 +7,10 @@
 //! 例: `mina session exec '{"Insert": {"text": "hello"}}'`
 //! 例: `mina session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <全文の FNV-1a 64>}'`
 //!
-//! daemon が動いていなければ自動起動される（TUI と同じ挙動）。成功時は exit 0、
-//! トランスポート/JSON エラー時は exit 1。コマンド自体の成否はスナップショットの
+//! daemon が動いていなければ自動起動される（TUI と同じ挙動）。終了コード:
+//! 0 = 成功（適用・no-op 含む）、1 = トランスポート/JSON エラー、
+//! 2 = `edit` が daemon に拒否された（checksum 不一致・範囲外。
+//! 再読み込みして再試行可能）。拒否理由の詳細はスナップショットの
 //! `status` フィールドに載る。
 
 use std::io;
@@ -29,6 +31,11 @@ pub async fn run(args: &[String]) -> io::Result<()> {
             .map_err(|e| invalid(format!("DocumentEdit JSON を解釈できません: {e}")))?;
         let snapshot = execute_edit(&edit).await?;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        // #11: daemon の拒否（status 付き応答）を exit code 2 で明示する。
+        // エージェントは $? だけで失敗を検知し、再読み込み→再試行できる。
+        if edit_exit_code(&snapshot) != 0 {
+            std::process::exit(edit_exit_code(&snapshot));
+        }
         return Ok(());
     }
     let command = parse_command(args)?;
@@ -97,12 +104,33 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.into())
 }
 
+/// `session edit` の終了コード: daemon が拒否（status 付き応答）なら 2、
+/// それ以外（適用・no-op）は 0。
+fn edit_exit_code(snapshot: &StateSnapshot) -> i32 {
+    if snapshot.status.is_some() {
+        2
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rejected_edit_status_yields_exit_code_2() {
+        // #11: 拒否（status 付き応答）は exit 2、成功・no-op（status なし）は 0。
+        let rejected = StateSnapshot {
+            status: Some("document changed since read".into()),
+            ..Default::default()
+        };
+        assert_eq!(edit_exit_code(&rejected), 2, "拒否は再試行可能な失敗");
+        assert_eq!(edit_exit_code(&StateSnapshot::default()), 0);
     }
 
     #[test]
