@@ -16,12 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mina_core::{Range as CoreRange, Selection, Transaction, extend_selection, move_selection};
 use mina_protocol::{
     ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
-    Range, StateSnapshot, fnv1a64,
+    Range, ServerMessage, StateSnapshot, fnv1a64,
 };
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::net::{UnixListener, UnixStream, unix::OwnedWriteHalf};
+use tokio::sync::{Mutex, watch};
 use tokio::time::{Duration, timeout};
 
 use crate::lsp;
@@ -216,13 +216,19 @@ fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 /// ブレイン防止）、前回の異常終了の残骸（stale）なら除去して再試行する。
 pub async fn serve(path: &Path) -> std::io::Result<()> {
     let daemon = Arc::new(Mutex::new(Daemon::new()));
+    // ADR-0013: 全購読クライアント（Interactive）へ最新 StateSnapshot を配る
+    // push チャネル。watch は「最新1件だけ保持・値が変わらなければ受信側を
+    // 起こさない」ので、no-op 応答で購読者に push が飛ぶことはない
+    // （オーバーフローも失われるのは中間世代のみで、フルスナップショット
+    // なので最新に収束する）。
+    let (push_tx, _) = watch::channel(StateSnapshot::default());
     // ADR-0012: 外部変更監視（フォーカス文書の mtime+size をポーリング）
     {
         let daemon_task = daemon.clone();
         tokio::spawn(watch_disk(daemon_task));
     }
     match bind_listener(path) {
-        Ok(listener) => accept_loop(listener, daemon).await,
+        Ok(listener) => accept_loop(listener, daemon, push_tx).await,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
             if UnixStream::connect(path).await.is_ok() {
                 return Err(io::Error::new(
@@ -233,7 +239,7 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
             // stale socket: 除去して再試行
             let _ = std::fs::remove_file(path);
             let listener = bind_listener(path)?;
-            accept_loop(listener, daemon).await
+            accept_loop(listener, daemon, push_tx).await
         }
         Err(e) => Err(e),
     }
@@ -288,7 +294,11 @@ fn is_peer_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 }
 
 /// 接続を受け付け、接続ごとにコマンド処理タスクを立てる。
-async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std::io::Result<()> {
+async fn accept_loop(
+    listener: UnixListener,
+    daemon: Arc<Mutex<Daemon>>,
+    push_tx: watch::Sender<StateSnapshot>,
+) -> std::io::Result<()> {
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     // MEDIUM-3: daemon 自身の uid。共有 /tmp では別ユーザの接続を拒否する。
     let daemon_uid = unsafe { libc::getuid() };
@@ -306,19 +316,26 @@ async fn accept_loop(listener: UnixListener, daemon: Arc<Mutex<Daemon>>) -> std:
             Err(_) => return Ok(()), // セマフォが閉じられた（起きない）
         };
         let daemon = daemon.clone();
+        let push_tx = push_tx.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _permit = permit; // 接続処理中は許可を保持
-            handle_connection(stream, daemon, conn_id).await;
+            handle_connection(stream, daemon, conn_id, push_tx).await;
         });
     }
 }
 
 /// 1接続分: NDJSON でコマンドを読み、応答スナップショットを返す。
+/// Interactive クライアントには他クライアントの変更も push する（ADR-0013）。
 ///
 /// ponytail: 接続ごとに全状態スナップショットを返す（O(n)/コマンド）。
 /// 巨大ファイルで問題になったら差分送信に差し替える。
-async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_id: u64) {
+async fn handle_connection(
+    stream: UnixStream,
+    daemon: Arc<Mutex<Daemon>>,
+    conn_id: u64,
+    push_tx: watch::Sender<StateSnapshot>,
+) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -344,23 +361,112 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
         ClientKind::Headless => EventSource::Headless,
     };
 
+    // ADR-0013: Interactive クライアントだけが push を購読する。Headless の
+    // ワンショット CLI は応答1行を読んで切断するので、push が混ざると壊れる。
+    // 初期値を既読にしておく（購読直後に偽の push を送らない）。
+    let mut push_rx = (kind == ClientKind::Interactive).then(|| push_tx.subscribe());
+    if let Some(rx) = &mut push_rx {
+        rx.borrow_and_update();
+    }
+
+    // SEC-1: 改行のない無限ストリームで行バッファが無制限に育たないよう、
+    // 読み取りバイト数自体を take で上限する（超過行は後段で切断）。
+    // lines() は next_line が cancel safe（tokio 保証）なので、push 受信との
+    // select! でコマンド行を失わない（read_line は cancel unsafe のため不可）。
+    let mut lines = reader.take(MAX_CMD_LINE as u64 + 1).lines();
+
     loop {
-        let mut line = String::new();
-        // SEC-1: 改行のない無限ストリームで行バッファが無制限に育たないよう、
-        // 上限を超える行は接続を閉じる
-        let mut bounded = (&mut reader).take(MAX_CMD_LINE as u64 + 1);
-        let read_line = bounded.read_line(&mut line);
-        match read_line.await {
-            Ok(0) => break, // クライアントの切断
-            Ok(_) => {}
-            Err(_) => break,
+        let next = if let Some(rx) = &mut push_rx {
+            tokio::select! {
+                l = lines.next_line() => ReadNext::Command(l),
+                c = rx.changed() => ReadNext::Push(c),
+            }
+        } else {
+            ReadNext::Command(lines.next_line().await)
+        };
+        match next {
+            // ADR-0013: 他クライアント（および自分自身）の状態変化を購読者へ配る。
+            // watch は最新1件を保持するので、中間世代の欠落は許容（フルスナップ
+            // ショットなので必ず最新に収束する）。
+            ReadNext::Push(Ok(())) => {
+                let snapshot = push_rx
+                    .as_mut()
+                    .expect("push 分岐は購読時のみ")
+                    .borrow_and_update()
+                    .clone();
+                if !write_message(&mut write_half, conn_id, ServerMessage::Push { snapshot }).await
+                {
+                    break; // 切断 or 書き込みタイムアウト
+                }
+            }
+            ReadNext::Push(Err(_)) => break, // push 送信元が消えた（daemon 終了）
+            ReadNext::Command(Ok(Some(line))) => {
+                if line.len() > MAX_CMD_LINE {
+                    break; // 過大なコマンド行: クライアントが壊れているか悪意がある
+                }
+                let snapshot = process_command(&daemon, conn_id, source, &line).await;
+                // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
+                // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
+                // 応答（GetState・拒否・no-op など）で送ると無駄な push が飛ぶ。
+                // 発信元も購読者なので自分にも届く — クライアント側で generation
+                // 重複を捨てて再描画しない（#10 の決定）。
+                let changed = push_tx.borrow().generation != snapshot.generation;
+                if changed {
+                    let _ = push_tx.send(snapshot.clone());
+                }
+                if !write_message(&mut write_half, conn_id, ServerMessage::Response { snapshot })
+                    .await
+                {
+                    break; // 切断 or 書き込みタイムアウト
+                }
+            }
+            ReadNext::Command(Ok(None)) | ReadNext::Command(Err(_)) => break, // クライアントの切断
         }
-        if line.len() > MAX_CMD_LINE {
-            break; // 過大なコマンド行: クライアントが壊れているか悪意がある
-        }
-        let snapshot = match serde_json::from_str(line.trim()) {
-            // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
-            Ok(Command::Open { path }) => {
+    }
+    // 切断の後始末: 所有者（グループを開いたクライアント）ならグループを閉じ
+    // モードを Normal に戻す（ADR-0007 / HIGH-1）。
+    daemon.lock().await.on_client_disconnect(conn_id);
+}
+
+/// コマンドループの1周で読み取るもの（コマンド行 or push 通知）。
+enum ReadNext {
+    Command(io::Result<Option<String>>),
+    Push(Result<(), watch::error::RecvError>),
+}
+
+/// メッセージ1件を NDJSON で書き込む。成功なら true、切断・書き込み
+/// タイムアウトなら false。
+async fn write_message(
+    write_half: &mut OwnedWriteHalf,
+    conn_id: u64,
+    message: ServerMessage,
+) -> bool {
+    let mut out = serde_json::to_string(&message).expect("メッセージはシリアライズ可能");
+    out.push('\n');
+    // MEDIUM-2: 応答を読まないクライアントが socket バッファを詰まらせて
+    // 接続スロットを永久に占有しないよう、書き込みにタイムアウトを付ける。
+    // タイムアウト・切断のいずれも接続を閉じて後始末に進む。
+    eprintln!("[conn {}] writing {} bytes", conn_id, out.len());
+    let wrote = timeout(RESPONSE_WRITE_TIMEOUT, write_half.write_all(out.as_bytes())).await;
+    if !matches!(wrote, Ok(Ok(()))) {
+        eprintln!("[conn {}] write TIMED OUT: {:?}", conn_id, wrote);
+        return false;
+    }
+    true
+}
+
+/// コマンド行1件を処理して応答スナップショットを返す（ADR-0013 で
+/// handle_connection から切り出し。I/O コマンドはロックを握ったまま
+/// ブロックしないよう接続ハンドラ側で async 実行する）。
+async fn process_command(
+    daemon: &Arc<Mutex<Daemon>>,
+    conn_id: u64,
+    source: EventSource,
+    line: &str,
+) -> StateSnapshot {
+    match serde_json::from_str(line.trim()) {
+        // I/O コマンドはロックを握ったままブロックしないよう、接続ハンドラで処理する
+        Ok(Command::Open { path }) => {
                 // CRITICAL C2: 受信パスを正規化してから「既存文書の再利用判定」と
                 // 「保存パス」の両方に使う。正規化しないとパス表記（相対/絶対・
                 // `./x` と `x`・`a/../x`・symlink）が異なるだけで #7 の再利用が
@@ -698,22 +804,7 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, conn_
                     }
                 }
             }
-        };
-        let mut out = serde_json::to_string(&snapshot).expect("snapshot はシリアライズ可能");
-        out.push('\n');
-        // MEDIUM-2: 応答を読まないクライアントが socket バッファを詰まらせて
-        // 接続スロットを永久に占有しないよう、書き込みにタイムアウトを付ける。
-        // タイムアウト・切断のいずれも接続を閉じて後始末に進む。
-        eprintln!("[conn {}] writing {} bytes", conn_id, out.len());
-        let wrote = timeout(RESPONSE_WRITE_TIMEOUT, write_half.write_all(out.as_bytes())).await;
-        if !matches!(wrote, Ok(Ok(()))) {
-            eprintln!("[conn {}] write TIMED OUT: {:?}", conn_id, wrote);
-            break; // 切断 or 書き込みタイムアウト
         }
-    }
-    // 切断の後始末: 所有者（グループを開いたクライアント）ならグループを閉じ
-    // モードを Normal に戻す（ADR-0007 / HIGH-1）。
-    daemon.lock().await.on_client_disconnect(conn_id);
 }
 
 /// 編集系コマンドか（LSP 全文同期の対象）。
@@ -1794,60 +1885,91 @@ mod tests {
         panic!("daemon が起動しなかった");
     }
 
-    /// NDJSON 1 コマンドを送り、応答スナップショット 1 行を受け取る。
-    async fn request(stream: &mut UnixStream, cmd: &Command) -> StateSnapshot {
-        stream
-            .write_all(serde_json::to_string(cmd).unwrap().as_bytes())
-            .await
-            .unwrap();
-        stream.write_all(b"\n").await.unwrap();
-        recv_snapshot(stream).await
+    /// テスト用クライアント: UnixStream + 行読みバッファ（NDJSON 1行 = メッセージ1件）。
+    ///
+    /// 応答（Response）と他クライアント変更の通知（Push）が同じソケットに流れるため
+    /// （ADR-0013）、読み取りは行単位で種別を判別する。
+    struct TestClient {
+        reader: BufReader<UnixStream>,
+    }
+
+    impl TestClient {
+        fn new(stream: UnixStream) -> Self {
+            Self {
+                reader: BufReader::new(stream),
+            }
+        }
+
+        async fn send(&mut self, bytes: &[u8]) {
+            self.reader.get_mut().write_all(bytes).await.unwrap();
+            self.reader.get_mut().flush().await.unwrap();
+        }
+
+        /// メッセージ1件（NDJSON 1行）を読む。
+        async fn recv_message(&mut self) -> ServerMessage {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).await.expect("応答を読む");
+            assert!(!line.is_empty(), "応答が来ない（接続が閉じた）");
+            serde_json::from_str(line.trim()).expect("ServerMessage をパース")
+        }
+    }
+
+    /// NDJSON 1 コマンドを送り、応答スナップショットを受け取る。
+    /// 間に push が挟まっていれば読み飛ばす（既存テストの観測対象は応答）。
+    async fn request(c: &mut TestClient, cmd: &Command) -> StateSnapshot {
+        let mut line = serde_json::to_string(cmd).unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        recv_snapshot(c).await
     }
 
     /// DocumentEdit（位置指定編集）を1つ送り、応答スナップショットを受け取る。
-    async fn request_edit(stream: &mut UnixStream, edit: &DocumentEdit) -> StateSnapshot {
-        stream
-            .write_all(serde_json::to_string(edit).unwrap().as_bytes())
-            .await
-            .unwrap();
-        stream.write_all(b"\n").await.unwrap();
-        recv_snapshot(stream).await
+    async fn request_edit(c: &mut TestClient, edit: &DocumentEdit) -> StateSnapshot {
+        let mut line = serde_json::to_string(edit).unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        recv_snapshot(c).await
     }
 
-    async fn recv_snapshot(stream: &mut UnixStream) -> StateSnapshot {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
+    /// 応答スナップショット1件を読む（途中の push は読み飛ばす）。
+    async fn recv_snapshot(c: &mut TestClient) -> StateSnapshot {
         loop {
-            let n = stream.read(&mut chunk).await.expect("応答を読む");
-            assert!(n > 0, "応答が来ない（接続が閉じた）");
-            buf.extend_from_slice(&chunk[..n]);
-            if chunk[..n].contains(&b'\n') {
-                break;
+            match c.recv_message().await {
+                ServerMessage::Response { snapshot } => return snapshot,
+                ServerMessage::Push { .. } => continue,
             }
         }
-        serde_json::from_slice(&buf).unwrap()
+    }
+
+    /// push 1件を読む（途中の応答は読み飛ばす）。ADR-0013 の購読テスト用。
+    async fn recv_push(c: &mut TestClient) -> StateSnapshot {
+        loop {
+            match c.recv_message().await {
+                ServerMessage::Push { snapshot } => return snapshot,
+                ServerMessage::Response { .. } => continue,
+            }
+        }
     }
 
     /// 接続して Hello（クライアント種別）を送る。イベントの source 判定に使う。
-    async fn connect_client(sock: &std::path::Path, kind: ClientKind) -> UnixStream {
-        let mut stream = UnixStream::connect(sock).await.expect("接続できる");
-        stream
-            .write_all(serde_json::to_string(&Hello { kind }).unwrap().as_bytes())
-            .await
-            .unwrap();
-        stream.write_all(b"\n").await.unwrap();
-        stream
+    async fn connect_client(sock: &std::path::Path, kind: ClientKind) -> TestClient {
+        let stream = UnixStream::connect(sock).await.expect("接続できる");
+        let mut c = TestClient::new(stream);
+        let mut hello = serde_json::to_string(&Hello { kind }).unwrap();
+        hello.push('\n');
+        c.send(hello.as_bytes()).await;
+        c
     }
 
     /// 述語が満たされるまで GetState を繰り返す（非同期の LSP 診断反映待ち用）。
     async fn poll_snapshot(
-        stream: &mut UnixStream,
+        c: &mut TestClient,
         predicate: impl Fn(&StateSnapshot) -> bool,
         timeout: std::time::Duration,
     ) -> StateSnapshot {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let snap = request(stream, &Command::GetState).await;
+            let snap = request(c, &Command::GetState).await;
             if predicate(&snap) {
                 return snap;
             }
@@ -2878,7 +3000,7 @@ mod tests {
         let mut wedged = connect_client(&sock, ClientKind::Interactive).await;
         let mut line = serde_json::to_string(&Command::GetState).unwrap();
         line.push('\n');
-        wedged.write_all(line.as_bytes()).await.unwrap();
+        wedged.send(line.as_bytes()).await;
         // wedged はこの後一切読まない（ソケットは開いたまま）
 
         // 新しいクライアント: タイムアウトでスロットが解放されるまで待って応答を
@@ -3135,5 +3257,140 @@ mod tests {
         assert!(is_peer_allowed(uid, uid), "同一 uid は許可");
         assert!(!is_peer_allowed(uid.wrapping_add(1), uid), "別ユーザは拒否");
         assert!(!is_peer_allowed(0, uid), "root でも別 uid なら拒否");
+    }
+
+    #[tokio::test]
+    async fn interactive_client_receives_push_of_headless_edit() {
+        // ADR-0013: Interactive クライアントは他クライアント（headless）の編集を
+        // push で受ける。push はタグ付きエンベロープで届き、テキスト・世代が
+        // 応答と整合する。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-13a-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-13a-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path }).await;
+        // Open の自分の push（空文書）を先に消費しておく
+        let _ = recv_push(&mut tui).await;
+
+        // agent の位置指定編集 → TUI へ push が届く
+        let resp = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 0,
+                end: 0,
+                text: "hi".into(),
+                checksum: fnv1a64(b""),
+            },
+        )
+        .await;
+        assert_eq!(resp.text, "hi");
+
+        let pushed = recv_push(&mut tui).await;
+        assert_eq!(pushed.text, "hi");
+        assert_eq!(pushed.generation, resp.generation);
+        assert!(
+            pushed
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ReplaceRange && e.source == EventSource::Headless),
+            "push に headless 編集の ChangeEvent が載る"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn self_edit_push_reaches_originator_with_same_generation() {
+        // ADR-0013: 発信元（自分自身）にも push が届く。generation は応答と
+        // 同じなので、TUI 側で重複を捨てられる（#10 の決定）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-13b-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-13b-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path }).await;
+
+        let resp = request(&mut c, &Command::Insert { text: "x".into() }).await;
+        let pushed = recv_push(&mut c).await;
+        assert_eq!(
+            pushed.generation, resp.generation,
+            "自分の編集の push は応答と同じ世代"
+        );
+        assert_eq!(pushed.text, "x");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn headless_client_never_receives_push() {
+        // ADR-0013: Headless（ワンショット CLI）は購読されない。応答の後に
+        // 追加のメッセージが届かない（応答1行で切断する CLI が壊れない）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-13c-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-13c-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path }).await;
+        let _ = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 0,
+                end: 0,
+                text: "hi".into(),
+                checksum: fnv1a64(b""),
+            },
+        )
+        .await;
+
+        // agent のソケットに push は混ざらない
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            agent.recv_message(),
+        )
+        .await;
+        assert!(extra.is_err(), "headless に push は届かない");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn no_push_for_read_only_command() {
+        // ADR-0013: 状態を変えないコマンド（GetState）では値が変わらず、
+        // watch が受信側を起こさない → push は飛ばない。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-13d-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-13d-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path }).await;
+        // Open の自分の push を消費しておく
+        let _ = recv_push(&mut tui).await;
+
+        // agent の読み取り（GetState）は状態を変えない
+        let _ = request(&mut agent, &Command::GetState).await;
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tui.recv_message(),
+        )
+        .await;
+        assert!(extra.is_err(), "GetState では push は飛ばない");
+        let _ = std::fs::remove_file(&sock);
     }
 }
