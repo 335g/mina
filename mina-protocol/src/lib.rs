@@ -21,6 +21,10 @@ pub enum Mode {
 pub enum Command {
     /// 現在の状態スナップショットを要求する。
     GetState,
+    /// 世代が `generation` を超えるまでブロックし、超えた時点のスナップショットを
+    /// 返す（ADR-0012 #12）。状態は変えない。エージェントのモニタリングが
+    /// ポーリングの代わりに1リクエストで変化を待てる。
+    WaitFor { generation: u64 },
     /// ファイルを読み込んで開く（読み込み失敗は StateSnapshot.status に報告）。
     Open { path: String },
     /// 選択を点に潰して移動する。
@@ -206,6 +210,9 @@ pub struct Diagnostic {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub text: String,
+    /// 全文の FNV-1a 64（[`DocumentEdit`] の checksum 検証用）。エージェントは
+    /// これをそのまま edit に渡すだけでよい（FNV-1a の再実装不要。ADR-0012 #12）。
+    pub checksum: u64,
     pub selection: Vec<Range>,
     pub primary_index: usize,
     pub mode: Mode,
@@ -230,6 +237,7 @@ impl Default for StateSnapshot {
     fn default() -> Self {
         Self {
             text: String::new(),
+            checksum: fnv1a64(b""),
             selection: vec![Range { anchor: 0, head: 0 }],
             primary_index: 0,
             mode: Mode::Normal,
@@ -253,6 +261,7 @@ mod tests {
     fn state_snapshot_round_trip() {
         let snapshot = StateSnapshot {
             text: "hello\nworld".to_string(),
+            checksum: fnv1a64(b"hello\nworld"),
             selection: vec![Range { anchor: 2, head: 5 }],
             primary_index: 0,
             mode: Mode::Insert,
@@ -294,6 +303,11 @@ mod tests {
         let json = serde_json::to_string(&cmd).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, cmd);
+
+        let wait = Command::WaitFor { generation: 42 };
+        let json = serde_json::to_string(&wait).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, wait);
     }
 
     #[test]
