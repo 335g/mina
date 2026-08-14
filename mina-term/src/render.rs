@@ -688,6 +688,17 @@ mod tests {
     }
 
     #[test]
+    fn vivid_scheme_renders_different_group_colors() {
+        // スキーム切替が描画に反映される（DEFAULT: keyword 36 → VIVID: 35 マゼンタ）
+        let mut state = state_with("abc", vec![Range { anchor: 3, head: 3 }], 0);
+        state.highlights =
+            vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::Keyword }];
+        let out = render_text(&crate::colorscheme::VIVID, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[35mabc"), "VIVID の keyword はマゼンタ: {out:?}");
+        assert!(!out.contains("\x1b[36mabc"), "DEFAULT の cyan を出さない: {out:?}");
+    }
+
+    #[test]
     fn scheme_styles_are_merged_fully() {
         // 勝利ロールの Style は全フィールドが尊重される（bg だけ・reverse だけの
         // 部分抽出でないこと — 敵対的検証で発見したバグの回帰テスト）
