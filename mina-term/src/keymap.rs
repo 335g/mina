@@ -149,7 +149,7 @@ impl Keymaps {
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         normal.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         normal.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
-        normal.insert(&[plain(KeyCode::Char('s'))], Command::Save);
+        // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
 
         // Select: 拡張移動 + 解除
         let mut select = Node::default();
@@ -440,9 +440,10 @@ mod tests {
             km.resolve(Mode::Normal, &mut pending, k('U')),
             Resolution::Command(Command::Redo)
         ));
+        // 保存は `:` コマンド（:w）に移行したので s は未定義
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('s')),
-            Resolution::Command(Command::Save)
+            Resolution::NoMatch
         ));
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, KeyCode::Backspace.into()),
