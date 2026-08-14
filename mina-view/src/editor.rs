@@ -10,7 +10,7 @@ use crate::history::History;
 use crate::tree::{SplitDirection, Tree, ViewId};
 
 /// 文書を一意に識別する ID。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentId(pub usize);
 
 /// 1つの表示領域（スプリット1つ分）を表す。
@@ -159,6 +159,11 @@ impl Editor {
     /// スクラッチ（未保存）文書は含まれない。
     pub fn open_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.paths.values()
+    }
+
+    /// 保持している全文書の ID（Syntax キャッシュの掃除などで使う）。
+    pub fn document_ids(&self) -> impl Iterator<Item = DocumentId> + '_ {
+        self.documents.keys().copied()
     }
 
     /// パスに対応する文書 ID（未オープンなら None）。
