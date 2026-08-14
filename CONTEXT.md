@@ -83,3 +83,7 @@ _Avoid_: event, log entry
 **Diagnostic**:
 A problem reported by the language server for a range of text — error, warning, info, or hint. Carried to Clients in the StateSnapshot.
 _Avoid_: lint, problem
+
+**Colorscheme**:
+A named mapping from semantic roles — UI elements such as the cursor or status line, and syntax highlight groups once those exist — to terminal colors and attributes.
+_Avoid_: theme, palette
