@@ -5,6 +5,7 @@
 //! - `mina [file]` — クライアント（S0 では GetState の表示のみ。TUI は S1）
 
 mod client;
+mod colorscheme;
 mod daemon;
 mod keymap;
 mod lsp;
