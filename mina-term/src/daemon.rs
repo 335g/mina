@@ -361,15 +361,16 @@ async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnap
                 ));
             }
         }
-        // フェーズ4（ロック外）: LSP 全文同期 + pull 診断（編集と同経路）
+        // フェーズ4（ロック外）: LSP 全文同期 + pull 診断（編集と同経路）。
+        // セッションの取り出しと await を分離する（if-let のスコルチニーに一時
+        // MutexGuard を置くと本体までロックが生き残り、非再入 Mutex の再ロック
+        // で自己デッドロックする — 実サーバで発症した）。
         if let Some((path, text)) = &lsp_sync {
-            if let Some(session) = daemon
-                .lock()
-                .await
-                .lsp_sessions
-                .get(&lsp::workspace_root(path))
-                .cloned()
-            {
+            let session = {
+                let d = daemon.lock().await;
+                d.lsp_sessions.get(&lsp::workspace_root(path)).cloned()
+            };
+            if let Some(session) = session {
                 lsp::sync(&session, path, text).await;
                 let pulled = lsp::pull_after_edit(&session, path, text).await;
                 let mut d = daemon.lock().await;
@@ -2403,6 +2404,69 @@ mod tests {
         assert_eq!(
             snap.diagnostics[0].start, 13,
             "リスポーン後の診断は現在のバッファ内容に基づく"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn external_change_reloads_rs_file_and_syncs_lsp() {
+        // ADR-0015 + 回帰: .rs ファイルの外部変更リロードは LSP 全文同期を伴う。
+        // watch_disk の LSP 同期が daemon ロックを握ったまま await すると非再入
+        // Mutex の再ロックで自己デッドロックし、以後の全コマンドが固まる
+        // （実 rust-analyzer で発症。if-let スコルチニーの一時 MutexGuard の寿命
+        // が本体まで伸びるため）。リロード後の GetState が応答することで
+        // デッドロックしていないことを検証する。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-rl-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-rl-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "fn f() { TODO }\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // LSP セッションが生きている（診断が返る = settle が動いている）
+        let snap = poll_snapshot(
+            &mut c,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(snap.diagnostics[0].start, 9, "TODO は byte 9 から");
+
+        // 外部変更 → watch_disk がリロードし LSP 全文同期 + pull する
+        std::fs::write(&file, "fn g() { TODO }\n").unwrap();
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.text == "fn g() { TODO }\n",
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+        // ここに到達できる = リロード後の LSP 同期でデッドロックしていない
+        assert!(!snap.dirty, "リロード後は clean");
+        // pull 診断が再同期されている（TODO の位置は byte 9 のまま）
+        assert!(
+            snap.diagnostics.iter().any(|d| d.start == 9),
+            "診断が再同期される: {:?}",
+            snap.diagnostics
         );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
