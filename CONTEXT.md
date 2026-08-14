@@ -85,5 +85,13 @@ A problem reported by the language server for a range of text — error, warning
 _Avoid_: lint, problem
 
 **Colorscheme**:
-A named mapping from semantic roles — UI elements such as the cursor or status line, and syntax highlight groups once those exist — to terminal colors and attributes.
+A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes.
 _Avoid_: theme, palette
+
+**Syntax**:
+The parsed syntactic representation of a Document's text, produced from a tree-sitter grammar and kept current with every edit by the Daemon — alongside LSP analysis, for every edit source (interactive, headless, or external reload).
+_Avoid_: syntax tree, parse tree
+
+**HighlightGroup**:
+A named class of tokens (comment, keyword, string, function, …) that text is assigned to for styling by the Daemon's per-language highlight queries. The unit a Colorscheme maps to colors and attributes.
+_Avoid_: scope, token type
