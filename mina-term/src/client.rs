@@ -22,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::mpsc;
 
+use crate::colorscheme;
 use crate::keymap::{Keymaps, Resolution};
 use crate::render;
 
@@ -125,6 +126,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
 
     render::draw(
         &mut *terminal,
+        &colorscheme::DEFAULT,
         &state,
         &pending,
         command_line.as_deref(),
@@ -250,6 +252,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         if redraw {
             render::draw(
                 &mut *terminal,
+                &colorscheme::DEFAULT,
                 &state,
                 &pending,
                 command_line.as_deref(),

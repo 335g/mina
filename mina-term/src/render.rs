@@ -5,6 +5,7 @@
 
 use std::io::Write;
 
+use crate::colorscheme::{Color, Colorscheme, UiRole};
 use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, Mode, Range, Severity, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthChar;
@@ -59,7 +60,9 @@ impl LineIndex {
 ///
 /// `command_line`: コマンドモードの入力バッファ（`Some` ならステータス行を `:` プロンプトに置き換える）。
 /// `flash`: クライアント側の一時メッセージ（未知コマンド等。次のキーで消える）。
+#[allow(clippy::too_many_arguments)] // 純粋関数: 全描画状態を引数で受ける（scheme 追加で上限超え）
 pub fn render_text(
+    scheme: &Colorscheme,
     state: &StateSnapshot,
     pending: &[KeyEvent],
     command_line: Option<&str>,
@@ -97,6 +100,7 @@ pub fn render_text(
                     &state.selection,
                     &state.diagnostics,
                     &state.highlights,
+                    scheme,
                     Some(head),
                     width,
                 );
@@ -108,7 +112,7 @@ pub fn render_text(
     // ステータス行
     s.push_str(&format!("\x1b[{};1H", height.max(1)));
     s.push_str("\x1b[K");
-    draw_status(&mut s, state, pending, command_line, flash, width);
+    draw_status(&mut s, scheme, state, pending, command_line, flash, width);
 
     // 外部削除ポップアップ（ADR-0015）: 中央にモーダル表示。入力をブロックする
     // のはクライアント側（任意キーで Close が送られる）。
@@ -133,7 +137,7 @@ pub fn render_text(
         let left = width.saturating_sub(box_w) / 2;
         for (i, line) in lines.iter().take(box_h).enumerate() {
             s.push_str(&format!("\x1b[{};{}H", top + i + 1, left + 1));
-            s.push_str("\x1b[7m");
+            s.push_str(&ui_sgr(scheme, UiRole::Popup));
             let mut padded = line.clone();
             let mut w = line_width(&padded);
             while w < box_w {
@@ -157,8 +161,10 @@ pub fn render_text(
 }
 
 /// 画面を描画する（`out` への書き込み）。テストではバッファへ書き出せる。
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     out: &mut impl Write,
+    scheme: &Colorscheme,
     state: &StateSnapshot,
     pending: &[KeyEvent],
     command_line: Option<&str>,
@@ -166,7 +172,7 @@ pub fn draw(
     width: u16,
     height: u16,
 ) -> std::io::Result<()> {
-    out.write_all(render_text(state, pending, command_line, flash, width, height).as_bytes())
+    out.write_all(render_text(scheme, state, pending, command_line, flash, width, height).as_bytes())
 }
 
 /// 1行分を描画する。選択範囲は反転、診断範囲は下線、ハイライトグループは前景色、
@@ -175,6 +181,7 @@ pub fn draw(
 /// ターミナルカーソルは `\x1b[?25l` で隠しているため、カーソル位置はこの
 /// セル描画でのみ可視化される（修正前はどこにも見えず、ステータス行の座標だけが
 /// 手がかりだった）。
+#[allow(clippy::too_many_arguments)] // 行描画に必要な状態をすべて引数で受ける
 fn draw_line(
     s: &mut String,
     line: &str,
@@ -182,11 +189,12 @@ fn draw_line(
     selection: &[Range],
     diagnostics: &[Diagnostic],
     highlights: &[HighlightRange],
+    scheme: &Colorscheme,
     cursor: Option<usize>,
     width: usize,
 ) {
     let mut out_width = 0usize;
-    let mut style = (false, false, false, None); // (カーソル, 選択中, 診断中, グループ)
+    let mut style = (false, false, None, None); // (カーソル, 選択中, 診断ロール, グループ)
     let mut hl_idx = 0usize; // highlights は start 昇順・非重複（mina-loader の不変条件）
     for (i, ch) in line.chars().enumerate() {
         // CRLF の \r: 非表示文字。生出力するとターミナルがカーソルを行頭へ戻し、
@@ -202,9 +210,10 @@ fn draw_line(
         let in_sel = selection
             .iter()
             .any(|r| char_global >= r.anchor.min(r.head) && char_global < r.anchor.max(r.head));
-        let in_diag = diagnostics
+        let diag_role = diagnostics
             .iter()
-            .any(|d| char_global >= d.start && char_global < d.end);
+            .find(|d| char_global >= d.start && char_global < d.end)
+            .map(diag_role);
         // グループは昇順・非重複の範囲から、1 char ずつ進むポインタで引く
         let group = loop {
             match highlights.get(hl_idx) {
@@ -213,10 +222,10 @@ fn draw_line(
                 _ => break None,
             }
         };
-        let new_style = (is_cursor, in_sel, in_diag, group);
+        let new_style = (is_cursor, in_sel, diag_role, group);
         if new_style != style {
             style = new_style;
-            s.push_str(&style_sgr(style));
+            s.push_str(&style_sgr(scheme, style));
         }
         if out_width + w > width {
             break; // 幅超過で切り詰め（行末の全角文字は途中で切れる — ponytail）
@@ -231,66 +240,96 @@ fn draw_line(
     // カーソルが行末（最後の文字の直後）にある場合: 青背景の空白で可視化する
     if let Some(c) = cursor {
         if c == line_char_start + line.chars().count() && out_width < width {
-            let in_diag = diagnostics.iter().any(|d| d.start <= c && c < d.end);
-            s.push_str(if in_diag { "\x1b[4;44m" } else { "\x1b[44m" });
+            let diag_role = diagnostics
+                .iter()
+                .find(|d| d.start <= c && c < d.end)
+                .map(diag_role);
+            s.push_str(&style_sgr(scheme, (true, false, diag_role, None)));
             s.push(' ');
             s.push_str("\x1b[0m");
         }
     }
-    if style != (false, false, false, None) {
+    if style != (false, false, None, None) {
         s.push_str("\x1b[0m");
     }
     s.push_str("\x1b[K"); // 行末までクリア
 }
 
+/// 診断の severity → UI ロール。Info/Hint も Warning 扱い（ステータスの [nE nW] と整合）。
+fn diag_role(d: &Diagnostic) -> UiRole {
+    match d.severity {
+        Severity::Error => UiRole::DiagnosticError,
+        _ => UiRole::DiagnosticWarning,
+    }
+}
+
 /// スタイル状態 → SGR シーケンス。優先順位: カーソル > 選択 > 診断 > グループ。
 ///
-/// カーソル・選択はグループ色を置換し、診断の下線はグループ色と共存する
-/// （仕様書 M3）。既存の SGR 文字列（"4;44" 等）を維持するため、
-/// 診断 → カーソル/選択 → グループの順でコードを積む。
-fn style_sgr(style: (bool, bool, bool, Option<HighlightGroup>)) -> String {
-    let (cursor, in_sel, in_diag, group) = style;
-    let mut parts: Vec<&str> = Vec::new();
-    if in_diag {
-        parts.push("4"); // 下線
-    }
+/// カーソル・選択はグループ色を置換し、診断の下線はカーソル/選択と合成する
+/// （現行 4;44 / 4;7 を維持）。診断範囲内では「下線 + 診断色」がグループ色を
+/// 置換する（M4 で M3 の共存ルールを置き換え — 仕様書 M3 の優先順位と整合）。
+fn style_sgr(
+    scheme: &Colorscheme,
+    style: (bool, bool, Option<UiRole>, Option<HighlightGroup>),
+) -> String {
+    let (cursor, in_sel, diag_role, group) = style;
+    let mut underline = false;
+    let mut reverse = false;
+    let mut fg = None;
+    let mut bg = None;
     if cursor {
-        parts.push("44"); // 青背景
-    } else if in_sel {
-        parts.push("7"); // 反転
-    }
-    if !cursor && !in_sel {
-        if let Some(code) = group.and_then(group_sgr) {
-            parts.push(code);
+        if let Some(s) = scheme.ui_style(UiRole::Cursor) {
+            bg = s.bg;
         }
+        underline = diag_role.is_some(); // カーソル + 診断 = 青背景 + 下線
+    } else if in_sel {
+        if let Some(s) = scheme.ui_style(UiRole::Selection) {
+            reverse = s.reverse;
+        }
+        underline = diag_role.is_some(); // 選択 + 診断 = 反転 + 下線
+    } else if let Some(role) = diag_role {
+        // 診断 > グループ: 診断の Style（下線 + 診断色）がグループを置換
+        if let Some(s) = scheme.ui_style(role) {
+            fg = s.fg;
+            underline = s.underline;
+        }
+    } else if let Some(group) = group {
+        if let Some(s) = scheme.syntax_style(group) {
+            fg = s.fg;
+            underline = s.underline;
+        }
+    }
+    emit_sgr(underline, reverse, fg, bg)
+}
+
+/// UI ロールの SGR（未定義ならリセット）。ステータス行・プロンプト・ポップアップ用。
+fn ui_sgr(scheme: &Colorscheme, role: UiRole) -> String {
+    match scheme.ui_style(role) {
+        Some(s) => emit_sgr(s.underline, s.reverse, s.fg, s.bg),
+        None => "\x1b[0m".to_string(),
+    }
+}
+
+/// SGR シーケンスを組み立てる。属性 → 色の順（既存の "4;44" / "4;7" 等を維持）。
+fn emit_sgr(underline: bool, reverse: bool, fg: Option<Color>, bg: Option<Color>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if underline {
+        parts.push("4".to_string()); // 下線
+    }
+    if reverse {
+        parts.push("7".to_string()); // 反転
+    }
+    if let Some(c) = fg {
+        parts.push(c.fg_sgr());
+    }
+    if let Some(b) = bg {
+        parts.push(b.bg_sgr());
     }
     if parts.is_empty() {
         "\x1b[0m".to_string()
     } else {
         format!("\x1b[{}m", parts.join(";"))
     }
-}
-
-/// 暫定パレット (issue #17): グループ → SGR 末尾コード。
-///
-/// Colorscheme セッションで外部化される既定値（ADR-0018）。ANSI16 固定、
-/// 色能力検出なし。parameter / operator / punctuation は既定テキストのまま。
-fn group_sgr(group: HighlightGroup) -> Option<&'static str> {
-    Some(match group {
-        HighlightGroup::Comment => "90",
-        HighlightGroup::Keyword => "36",
-        HighlightGroup::String => "32",
-        HighlightGroup::Number => "33",
-        HighlightGroup::Constant => "35",
-        HighlightGroup::Function => "34",
-        HighlightGroup::Type => "96",
-        HighlightGroup::Parameter => return None,
-        HighlightGroup::Field => "94",
-        HighlightGroup::Operator => return None,
-        HighlightGroup::Punctuation => return None,
-        HighlightGroup::Attribute => "95",
-        HighlightGroup::Error => "91;4", // 明るい赤 + 下線
-    })
 }
 
 /// 制御文字（ESC 等）を � に置換する（端末インジェクション対策 — SEC-2）。
@@ -307,6 +346,7 @@ fn sanitize_status_data(s: &str) -> String {
 /// それ以外は `[モード] パス 行:列 [pending] [status|flash]`
 fn draw_status(
     s: &mut String,
+    scheme: &Colorscheme,
     state: &StateSnapshot,
     pending: &[KeyEvent],
     command_line: Option<&str>,
@@ -318,7 +358,7 @@ fn draw_status(
     let mut status = String::new();
     if let Some(buf) = command_line {
         // コマンドモード: 行全体を反転し `:` + バッファ + カーソルを表示する
-        status.push_str("\x1b[7m");
+        status.push_str(&ui_sgr(scheme, UiRole::CommandLine));
         let mut line = String::from(":");
         line.push_str(&sanitize_status_data(buf));
         // カーソルは常に見えるよう 1 セル空けてから `_` を付ける
@@ -332,7 +372,7 @@ fn draw_status(
             Mode::Insert => "INSERT",
             Mode::Select => "SELECT",
         };
-        status.push_str("\x1b[7m");
+        status.push_str(&ui_sgr(scheme, UiRole::StatusLine));
         status.push_str(mode);
         status.push_str("\x1b[0m");
         // 診断カウントは mode の直後（パスより前）に置く — 長いパスで truncate
@@ -448,7 +488,7 @@ mod tests {
     #[test]
     fn renders_text_status_and_cursor() {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         // 選択ハイライトとカーソルセルで "hello" は分割されるので部分で検証
         assert!(out.contains("he"), "{out:?}");
         assert!(out.contains("NORMAL"), "{out:?}");
@@ -460,7 +500,7 @@ mod tests {
     #[test]
     fn selection_is_highlighted() {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         // 選択（char 2）は反転、カーソル（head=3）は青背景で区別される
         assert!(out.contains("\x1b[7ml\x1b[44ml"), "{out:?}");
     }
@@ -473,7 +513,7 @@ mod tests {
             HighlightRange { start: 8, end: 12, group: HighlightGroup::String },
             HighlightRange { start: 14, end: 16, group: HighlightGroup::Comment },
         ];
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[32m\"hi\""), "string が緑で描画される: {out:?}");
         assert!(out.contains("\x1b[90m//"), "comment が灰で描画される: {out:?}");
         assert!(!out.contains("\x1b[32m;"), "範囲外にグループ色を出さない: {out:?}");
@@ -484,7 +524,7 @@ mod tests {
         let mut state = state_with("abc", vec![Range { anchor: 2, head: 2 }], 0);
         state.highlights =
             vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::Keyword }];
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         // グループ全体は cyan (36) だが、カーソル (char 2) は青背景 (44) で置換される
         assert!(out.contains("\x1b[36mab"), "グループ色: {out:?}");
         assert!(out.contains("\x1b[44mc"), "カーソルセルは青背景: {out:?}");
@@ -496,7 +536,7 @@ mod tests {
         let mut state = state_with("abc", vec![Range { anchor: 1, head: 2 }], 0);
         state.highlights =
             vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::Keyword }];
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         // 選択 (char 1) は反転 (7) で、グループ色は出ない
         assert!(out.contains("\x1b[36ma"), "グループ色: {out:?}");
         assert!(out.contains("\x1b[7mb"), "選択は反転: {out:?}");
@@ -504,7 +544,8 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_and_group_coexist() {
+    fn diagnostic_replaces_group_color() {
+        // M4: 診断 > グループ の優先順位。診断範囲内は「下線 + 診断色」がグループ色を置換する
         let mut state = state_with("abc", vec![Range { anchor: 0, head: 0 }], 0);
         state.diagnostics = vec![Diagnostic {
             start: 1,
@@ -514,23 +555,48 @@ mod tests {
         }];
         state.highlights =
             vec![HighlightRange { start: 1, end: 2, group: HighlightGroup::String }];
-        let out = render_text(&state, &[], None, None, 40, 10);
-        // 診断下のグループ: 下線 (4) + グループ色 (32) が共存する
-        assert!(out.contains("\x1b[4;32mb"), "下線 + グループ色: {out:?}");
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        // 下線 (4) + エラー色 (91)。グループ色 (32) は出ない
+        assert!(out.contains("\x1b[4;91mb"), "下線 + 診断色: {out:?}");
+        assert!(!out.contains("\x1b[32mb"), "グループ色を出さない: {out:?}");
+    }
+
+    #[test]
+    fn diagnostic_severity_colors_differ() {
+        // Error は赤 (91)、Warning は黄 (93)。カーソル (char 0) と重ならないよう char 1 に置く
+        let mut state = state_with("abc", vec![Range { anchor: 0, head: 0 }], 0);
+        state.diagnostics = vec![Diagnostic {
+            start: 1,
+            end: 2,
+            severity: Severity::Error,
+            message: "e".into(),
+        }];
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[4;91mb"), "Error: {out:?}");
+
+        let mut state = state_with("abc", vec![Range { anchor: 0, head: 0 }], 0);
+        state.diagnostics = vec![Diagnostic {
+            start: 1,
+            end: 2,
+            severity: Severity::Warning,
+            message: "w".into(),
+        }];
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[4;93mb"), "Warning: {out:?}");
     }
 
     #[test]
     fn cursor_at_line_end_is_visible() {
         // カーソルが行末（最後の文字の直後）にあっても青背景の空白で見える
         let state = state_with("hi", vec![Range { anchor: 2, head: 2 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[44m "), "行末カーソルの青背景空白: {out:?}");
     }
 
     #[test]
     fn status_shows_pending_keys() {
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[plain(KeyCode::Char('g'))], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[plain(KeyCode::Char('g'))], None, None, 40, 10);
         assert!(out.contains("<g>"), "{out:?}");
     }
 
@@ -538,21 +604,21 @@ mod tests {
     fn wide_char_truncation_respects_display_width() {
         // "あ" は表示幅2。幅3なら "あ" で切れ、"あい" にはならない
         let state = state_with("あいうえお", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], None, None, 3, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 3, 10);
         assert!(out.contains("あ") && !out.contains("あい"), "{out:?}");
     }
 
     #[test]
     fn empty_document_renders_blank() {
         let state = state_with("", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[K"), "{out:?}");
     }
 
     #[test]
     fn multi_line_renders_all_rows() {
         let state = state_with("a\nb\nc", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(!out.contains("a\n"), "行内に生の改行を出さない: {out:?}");
         assert!(out.contains("\x1b[2;1H"), "2行目へ移動: {out:?}");
     }
@@ -562,7 +628,7 @@ mod tests {
         // H2: CRLF の \r を生出力すると直後の \x1b[K で行全体が消える。
         // \r は非表示文字としてスキップし、両行とも描画される。
         let state = state_with("a\r\nb\r\n", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(!out.contains('\r'), "生の \\r を出力しない: {out:?}");
         assert!(out.contains("a"), "1行目が描画される: {out:?}");
         assert!(out.contains("b"), "2行目が描画される: {out:?}");
@@ -573,7 +639,7 @@ mod tests {
         // 制御文字（ESC 等）は � に置換（端末インジェクション対策）。
         // 文書内の \x1b[31m がそのまま端末へ流れないことを確認する。
         let state = state_with("\x1b[31mred", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(!out.contains("\x1b[31m"), "ESC シーケンスを生出力しない: {out:?}");
         assert!(out.contains('\u{FFFD}'), "制御文字は � に置換される: {out:?}");
     }
@@ -606,7 +672,7 @@ mod tests {
             events: Vec::new(),
             deleted: None,
         };
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(!out.contains("\x1b]0;evil"), "OSC を生出力しない: {out:?}");
         assert!(!out.contains("\x1b[31m"), "status の ESC を生出力しない: {out:?}");
     }
@@ -640,8 +706,8 @@ mod tests {
             events: Vec::new(),
             deleted: None,
         };
-        let out = render_text(&state, &[], None, None, 40, 10);
-        assert!(out.contains("\x1b[4mworld\x1b[0m"), "診断範囲に下線: {out:?}");
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[4;91mworld\x1b[0m"), "診断範囲に下線 + エラー色: {out:?}");
         assert!(out.contains("[1E 0W]"), "ステータスにカウント: {out:?}");
     }
 
@@ -650,14 +716,14 @@ mod tests {
         // ADR-0015: 外部削除ポップアップが中央に描画される。dirty なら警告が付く。
         let mut state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
         state.deleted = Some("/tmp/x.txt".into());
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(out.contains("file deleted on disk"), "{out:?}");
         assert!(out.contains("x.txt"), "パスが表示される: {out:?}");
         assert!(out.contains("press any key to close"), "{out:?}");
         assert!(!out.contains("unsaved changes will be lost"), "{out:?}");
 
         state.dirty = true;
-        let out = render_text(&state, &[], None, None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(out.contains("unsaved changes will be lost"), "{out:?}");
     }
 
@@ -665,7 +731,7 @@ mod tests {
     fn command_line_replaces_status_with_prompt() {
         // コマンドモード中はステータス行全体が `:` プロンプトに置き換わる
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], Some("w"), None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], Some("w"), None, 40, 10);
         assert!(out.contains(":w_"), "`:` + バッファ + カーソル: {out:?}");
         assert!(!out.contains("NORMAL"), "モード表示はプロンプトに置き換わる: {out:?}");
     }
@@ -674,10 +740,10 @@ mod tests {
     fn flash_shows_in_status_slot_and_yields_to_status() {
         // クライアント側メッセージ（flash）は status スロットに表示される
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], None, Some("unknown command: foo"), 120, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, Some("unknown command: foo"), 120, 10);
         assert!(out.contains("unknown command: foo"), "{out:?}");
         // コマンドモード中は flash ではなくプロンプトが優先される
-        let out = render_text(&state, &[], Some("q"), Some("unknown command: foo"), 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], Some("q"), Some("unknown command: foo"), 40, 10);
         assert!(out.contains(":q_") && !out.contains("unknown"), "{out:?}");
     }
 
@@ -685,10 +751,10 @@ mod tests {
     fn command_line_is_sanitized_and_truncated_with_cursor() {
         // SEC-2: コマンドラインの制御文字は � に置換され、生の ESC が流れない
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], Some("\x1b[31m"), None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], Some("\x1b[31m"), None, 40, 10);
         assert!(!out.contains("\x1b[31m"), "ESC を生出力しない: {out:?}");
         // 幅5のプロンプト: カーソル `_` は常に 1 セル確保される
-        let out = render_text(&state, &[], Some("abcd"), None, 5, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], Some("abcd"), None, 5, 10);
         assert!(out.contains(":abc_"), "カーソルが残る: {out:?}");
     }
 
