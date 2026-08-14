@@ -100,6 +100,25 @@ impl Transaction {
         }
     }
 
+    /// 文書全体を `new_text` に置き換えるトランザクションを作る（Reload 用）。
+    ///
+    /// 操作列は `[Delete(全文), Insert(new_text)]`、逆変換は `[Delete(new_text),
+    /// Insert(旧全文)]` なので、適用結果に `invert()` を適用すると元の文書に
+    /// 戻る（undo で外部変更前の状態を回復できる — ADR-0015）。
+    pub fn replace_all(doc: &Document, new_text: &str) -> Self {
+        let old_text = doc.text().to_string();
+        Self {
+            operations: vec![
+                Operation::Delete(doc.len_chars()),
+                Operation::Insert(new_text.to_string()),
+            ],
+            inverse: vec![
+                Operation::Delete(new_text.chars().count()),
+                Operation::Insert(old_text),
+            ],
+        }
+    }
+
     /// このトランザクションを `doc` に適用した新しい文書を返す。
     ///
     /// # Panics
@@ -294,6 +313,18 @@ mod tests {
 
         let restored = tx.invert().apply(&new_doc);
         assert_eq!(restored.text().to_string(), "");
+    }
+
+    #[test]
+    fn replace_all_inverts_to_original() {
+        let doc = Document::from("old text");
+        let tx = Transaction::replace_all(&doc, "new text");
+
+        let new_doc = tx.apply(&doc);
+        assert_eq!(new_doc.text().to_string(), "new text");
+
+        let restored = tx.invert().apply(&new_doc);
+        assert_eq!(restored.text().to_string(), "old text");
     }
 
     #[test]
