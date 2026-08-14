@@ -53,6 +53,8 @@ pub enum Command {
     Redo,
     /// 現在の文書をファイルに書き込む（結果は status に報告）。
     Save,
+    /// フォーカス文書を閉じる。残りの文書があればそこへ移り、無ければ空状態に戻る（ADR-0015）。
+    Close,
 }
 
 /// 移動の種類（wire 型）。
@@ -169,6 +171,8 @@ pub enum EventKind {
     Redo,
     Open,
     Save,
+    /// フォーカス文書を閉じる（Command::Close）。
+    Close,
     SetMode,
     /// フォーカス文書が外部ツールによって変更された。
     ExternalChange,
@@ -228,8 +232,9 @@ pub struct StateSnapshot {
     pub generation: u64,
     /// 直近の状態変化イベント（bounded リング。古いものから破棄）。
     pub events: Vec<ChangeEvent>,
-    /// フォーカス文書が外部ツールによって変更されたか（ADR-0012）。
-    pub disk_changed: bool,
+    /// フォーカス文書が外部で削除され、Close を待っている状態（ADR-0015）。
+    /// 値は削除されたパス。
+    pub deleted: Option<String>,
 }
 
 impl Default for StateSnapshot {
@@ -248,7 +253,7 @@ impl Default for StateSnapshot {
             status: None,
             generation: 0,
             events: Vec::new(),
-            disk_changed: false,
+            deleted: None,
         }
     }
 }
@@ -283,7 +288,7 @@ mod tests {
                 range: None,
                 text: Some("x".to_string()),
             }],
-            disk_changed: true,
+            deleted: Some("test.rs".to_string()),
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
