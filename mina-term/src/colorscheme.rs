@@ -51,6 +51,15 @@ impl Style {
     pub const fn new() -> Self {
         Self { fg: None, bg: None, underline: false, reverse: false }
     }
+    /// 後勝ちマージ（None は base を維持、属性は OR）。レンダラの優先順位合成で使う。
+    pub(crate) fn merged(self, other: Style) -> Style {
+        Style {
+            fg: other.fg.or(self.fg),
+            bg: other.bg.or(self.bg),
+            underline: self.underline || other.underline,
+            reverse: self.reverse || other.reverse,
+        }
+    }
     const fn fg(color: Color) -> Self {
         Self { fg: Some(color), ..Self::new() }
     }
