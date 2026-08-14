@@ -116,9 +116,22 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
 
     let keymaps = Keymaps::new();
     let mut pending: Vec<KeyEvent> = Vec::new();
+    // コマンドモード（Helix 流の `:` プロンプト）の入力バッファ。
+    // Some の間はキー入力がプロンプト編集になり、ステータス行に `:` が表示される。
+    let mut command_line: Option<String> = None;
+    // クライアント側の一時メッセージ（未知コマンド等）。次のキーで消える。
+    let mut flash: Option<String> = None;
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
 
-    render::draw(&mut *terminal, &state, &pending, width, height)?;
+    render::draw(
+        &mut *terminal,
+        &state,
+        &pending,
+        command_line.as_deref(),
+        flash.as_deref(),
+        width,
+        height,
+    )?;
     terminal.flush()?;
 
     // ADR-0013: キーイベントと daemon からの push を並列に待つ。push は
@@ -137,14 +150,63 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         // ADR-0015: 外部削除ポップアップ表示中は入力をブロックし、
                         // 任意キーで Close（空画面へ戻る）
+                        flash = None; // 一時メッセージは次のキーで消える
                         if state.deleted.is_some() {
+                            command_line = None;
                             state = session.request(&Command::Close).await?;
+                        } else if let Some(buf) = &mut command_line {
+                            // コマンドモード: 文字はバッファへ、Backspace で1文字削除、
+                            // Enter で実行、Esc / Ctrl-C でキャンセル
+                            match key.code {
+                                KeyCode::Char(c)
+                                    if key.modifiers.is_empty()
+                                        || key.modifiers == termina::event::Modifiers::SHIFT =>
+                                {
+                                    buf.push(c);
+                                }
+                                KeyCode::Char('c')
+                                    if key.modifiers
+                                        .contains(termina::event::Modifiers::CONTROL) =>
+                                {
+                                    command_line = None;
+                                }
+                                KeyCode::Backspace => {
+                                    buf.pop();
+                                }
+                                KeyCode::Escape => command_line = None,
+                                KeyCode::Enter => {
+                                    let action = parse_command(buf);
+                                    command_line = None;
+                                    match action {
+                                        CommandLineAction::Save => {
+                                            state = session.request(&Command::Save).await?;
+                                        }
+                                        CommandLineAction::Quit => break,
+                                        CommandLineAction::SaveThenQuit => {
+                                            state = session.request(&Command::Save).await?;
+                                            // 保存失敗・保存中の追記で dirty が残る場合は
+                                            // 終了しない（daemon の status が理由を示す）
+                                            if !state.dirty {
+                                                break;
+                                            }
+                                        }
+                                        CommandLineAction::Unknown(cmd) => {
+                                            flash = Some(format!("unknown command: {cmd}"));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if key.code == KeyCode::Char(':')
+                            && state.mode != Mode::Insert
+                        {
+                            // `:` でコマンドモードに入る（Insert では `:` は文字入力）
+                            pending.clear();
+                            command_line = Some(String::new());
                         } else {
-                            // 終了: 全モードで Ctrl-C、Normal で q
+                            // 終了: 全モードで Ctrl-C（保存は :w、終了は :q）
                             let quit = key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(termina::event::Modifiers::CONTROL)
-                                || (state.mode == Mode::Normal
-                                    && key.code == KeyCode::Char('q'));
+                                && key.modifiers.contains(termina::event::Modifiers::CONTROL);
                             if quit {
                                 break;
                             }
@@ -186,13 +248,44 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
             }
         }
         if redraw {
-            render::draw(&mut *terminal, &state, &pending, width, height)?;
+            render::draw(
+                &mut *terminal,
+                &state,
+                &pending,
+                command_line.as_deref(),
+                flash.as_deref(),
+                width,
+                height,
+            )?;
             terminal.flush()?;
         }
     }
 
     // 終了処理は TerminalGuard の Drop が行う（M4: エラー経路でも必ず復旧する）
     Ok(())
+}
+
+/// コマンドラインの実行アクション（`:w` 等）。
+#[derive(Debug, PartialEq, Eq)]
+enum CommandLineAction {
+    /// `:w` — 保存して続行。
+    Save,
+    /// `:q` / `:q!` — 終了。daemon が文書状態を保持し続けるので破棄はない。
+    Quit,
+    /// `:wq` — 保存してから終了（保存に失敗したら終了しない）。
+    SaveThenQuit,
+    /// 未知のコマンド。
+    Unknown(String),
+}
+
+/// コマンドライン文字列を解釈する（テスト容易性のため純粋関数）。
+fn parse_command(input: &str) -> CommandLineAction {
+    match input.trim() {
+        "w" => CommandLineAction::Save,
+        "q" | "q!" => CommandLineAction::Quit,
+        "wq" => CommandLineAction::SaveThenQuit,
+        other => CommandLineAction::Unknown(other.to_string()),
+    }
 }
 
 /// 接続直後に Hello（クライアント種別の宣言）を送る（ADR-0012）。
@@ -363,5 +456,23 @@ mod tests {
         let abs = absolutize("rel/file.rs");
         assert!(std::path::Path::new(&abs).is_absolute());
         assert!(abs.ends_with("rel/file.rs"));
+    }
+
+    #[test]
+    fn parse_command_maps_w_q_and_wq() {
+        assert_eq!(parse_command("w"), CommandLineAction::Save);
+        assert_eq!(parse_command(" w "), CommandLineAction::Save, "前後空白は無視");
+        assert_eq!(parse_command("q"), CommandLineAction::Quit);
+        assert_eq!(parse_command("q!"), CommandLineAction::Quit);
+        assert_eq!(parse_command("wq"), CommandLineAction::SaveThenQuit);
+        assert_eq!(
+            parse_command("frobnicate"),
+            CommandLineAction::Unknown("frobnicate".into())
+        );
+        assert_eq!(
+            parse_command(""),
+            CommandLineAction::Unknown("".into()),
+            "空コマンドもエラー表示"
+        );
     }
 }
