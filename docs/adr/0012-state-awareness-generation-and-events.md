@@ -1,5 +1,7 @@
 # 状態認識: 世代カウンタ、変更イベントログ、外部変更の検出
 
+Status: 自動リロードと `disk_changed` の条項は ADR-0015 で覆された (外部変更は検知と同時に自動リロードされる)。
+
 クライアントはドキュメント全体を読み直さずに、エディタの状態に何が起きたかを知る必要がある。すべての StateSnapshot は単調な `generation` を持つ — 状態を変更する操作 (編集、undo/redo、モード変更、Open/Save) ごとに増加し、純粋な読み取りでは決して増えない — ので、クライアントは前回のスナップショット以降に何かが変わったかを一目でわかる。デーモンはまた、ChangeEvent の有界リング (128) を保持する: 状態を変更する操作ごとに 1 つ、そのソース (TUI は Interactive、session exec/edit は Headless、帯域外のファイル変更は External) と種類 (Insert、Delete、ReplaceRange、Undo、Redo、Open、Save、SetMode、ExternalChange、…) でタグ付けされる。リングはすべてのスナップショットに載るので、ワンショットクライアントは自己完結する。
 
 ソースはクライアント種別のハンドシェイクで決まる: 接続の最初のメッセージは `Hello { kind }` である (LSP の initialize を踏襲)。TUI は `interactive` を宣言し、それ以外はすべて `headless` である。メッセージ型だけではユーザーとエージェントを区別できない — session exec でエディタを駆動するエージェントは TUI と同じ Command メッセージを送る — ので宣言が必要である。

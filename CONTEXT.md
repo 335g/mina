@@ -28,6 +28,14 @@ _Avoid_: change, edit
 A Document that has been edited since it was last saved to its Path. Cleared by a successful Save only if the document text is unchanged since the save began — an edit landing while the save is writing leaves the flag set, so unsaved edits are never reported as saved. Scoped to the Document, not the View — saving one Document must not clear another's flag.
 _Avoid_: unsaved, modified
 
+**Reload**:
+Replacing a Document's text with the current contents of its Path after an external change to the file. A Transaction, so undoable; it never changes the Document's identity (ID, Path, LSP association) and clears Dirty, since the text again matches disk.
+_Avoid_: refresh, follow
+
+**Deleted**:
+A Document whose Path no longer exists on disk, held open pending a Client's acknowledgement (Close). Saving recreates the file and clears the state.
+_Avoid_: missing, removed
+
 **Mode**:
 The active editing mode — Normal, Insert, or Select. Determines which Keymap resolves key presses.
 _Avoid_: state
