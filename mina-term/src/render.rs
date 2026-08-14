@@ -99,6 +99,42 @@ pub fn render_text(state: &StateSnapshot, pending: &[KeyEvent], width: u16, heig
     s.push_str("\x1b[K");
     draw_status(&mut s, state, pending, width);
 
+    // 外部削除ポップアップ（ADR-0015）: 中央にモーダル表示。入力をブロックする
+    // のはクライアント側（任意キーで Close が送られる）。
+    if let Some(deleted_path) = &state.deleted {
+        let mut lines = vec![
+            "file deleted on disk".to_string(),
+            format!("  {}", sanitize_status_data(deleted_path)),
+        ];
+        if state.dirty {
+            lines.push("unsaved changes will be lost".to_string());
+        }
+        lines.push("(press any key to close)".to_string());
+        let line_width = |l: &str| l.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+        let box_w = lines
+            .iter()
+            .map(|l| line_width(l))
+            .max()
+            .unwrap_or(0)
+            .min(width.saturating_sub(2));
+        let box_h = lines.len().min(body_rows);
+        let top = body_rows.saturating_sub(box_h) / 2;
+        let left = width.saturating_sub(box_w) / 2;
+        for (i, line) in lines.iter().take(box_h).enumerate() {
+            s.push_str(&format!("\x1b[{};{}H", top + i + 1, left + 1));
+            s.push_str("\x1b[7m");
+            let mut padded = line.clone();
+            let mut w = line_width(&padded);
+            while w < box_w {
+                padded.push(' ');
+                w += 1;
+            }
+            truncate_wide(&mut padded, box_w);
+            s.push_str(&padded);
+            s.push_str("\x1b[0m\x1b[K");
+        }
+    }
+
     // ターミナルカーソルを primary head へ
     let (row, _, colw) = cursor_pos(&state.text, head);
     let term_row = row.saturating_sub(state.first_line) + 1;
@@ -313,7 +349,7 @@ mod tests {
             status: None,
             generation: 0,
             events: Vec::new(),
-            disk_changed: false,
+            deleted: None,
         }
     }
 
@@ -421,7 +457,7 @@ mod tests {
             status: Some("\x1b[31m".into()),
             generation: 0,
             events: Vec::new(),
-            disk_changed: false,
+            deleted: None,
         };
         let out = render_text(&state, &[], 40, 10);
         assert!(!out.contains("\x1b]0;evil"), "OSC を生出力しない: {out:?}");
@@ -454,11 +490,27 @@ mod tests {
             status: None,
             generation: 0,
             events: Vec::new(),
-            disk_changed: false,
+            deleted: None,
         };
         let out = render_text(&state, &[], 40, 10);
         assert!(out.contains("\x1b[4mworld\x1b[0m"), "診断範囲に下線: {out:?}");
         assert!(out.contains("[1E 0W]"), "ステータスにカウント: {out:?}");
+    }
+
+    #[test]
+    fn deleted_state_renders_central_popup() {
+        // ADR-0015: 外部削除ポップアップが中央に描画される。dirty なら警告が付く。
+        let mut state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
+        state.deleted = Some("/tmp/x.txt".into());
+        let out = render_text(&state, &[], 40, 10);
+        assert!(out.contains("file deleted on disk"), "{out:?}");
+        assert!(out.contains("x.txt"), "パスが表示される: {out:?}");
+        assert!(out.contains("press any key to close"), "{out:?}");
+        assert!(!out.contains("unsaved changes will be lost"), "{out:?}");
+
+        state.dirty = true;
+        let out = render_text(&state, &[], 40, 10);
+        assert!(out.contains("unsaved changes will be lost"), "{out:?}");
     }
 
     fn plain(code: KeyCode) -> KeyEvent {
