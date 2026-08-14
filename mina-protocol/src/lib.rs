@@ -210,6 +210,38 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// 構文ハイライトのグループ（ADR-0018: フラットな正規集合）。
+///
+/// wire 形式は小文字（serde `rename_all`）。tree-sitter のハイライトクエリの
+/// capture 名と一致させる（mina-loader のクエリで使用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HighlightGroup {
+    Comment,
+    Keyword,
+    String,
+    Number,
+    Constant,
+    Function,
+    Type,
+    Parameter,
+    Field,
+    Operator,
+    Punctuation,
+    Attribute,
+    Error,
+}
+
+/// テキストの1区間に割り当てられたハイライトグループ（char インデックス）。
+///
+/// 範囲は重複しない（同じ char は1つのグループに属する。仕様書の不変条件）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightRange {
+    pub start: usize, // char index (inclusive)
+    pub end: usize,   // char index (exclusive)
+    pub group: HighlightGroup,
+}
+
 /// daemon が返す編集状態の全体像（ADR-0006: 毎コマンドに全量を返す）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
@@ -222,6 +254,9 @@ pub struct StateSnapshot {
     pub mode: Mode,
     pub first_line: usize,
     pub diagnostics: Vec<Diagnostic>,
+    /// フォーカス文書の構文ハイライト（ADR-0016/0017。同じスナップショットの
+    /// テキストと一致する範囲。grammar 不在の言語は空）。
+    pub highlights: Vec<HighlightRange>,
     /// 開いているファイルのパス（未開なら None）。
     pub path: Option<String>,
     /// 保存済み状態から編集されているか。
@@ -248,6 +283,7 @@ impl Default for StateSnapshot {
             mode: Mode::Normal,
             first_line: 0,
             diagnostics: Vec::new(),
+            highlights: Vec::new(),
             path: None,
             dirty: false,
             status: None,
@@ -263,6 +299,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn highlight_types_round_trip_with_lowercase_names() {
+        // wire 形式は小文字（HighlightGroup の rename_all）
+        let json = serde_json::to_string(&HighlightGroup::Function).unwrap();
+        assert_eq!(json, "\"function\"");
+        let back: HighlightGroup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HighlightGroup::Function);
+
+        let range = HighlightRange {
+            start: 4,
+            end: 7,
+            group: HighlightGroup::Keyword,
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        assert_eq!(json, "{\"start\":4,\"end\":7,\"group\":\"keyword\"}");
+        let back: HighlightRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, range);
+    }
+
+    #[test]
     fn state_snapshot_round_trip() {
         let snapshot = StateSnapshot {
             text: "hello\nworld".to_string(),
@@ -276,6 +331,11 @@ mod tests {
                 end: 5,
                 severity: Severity::Warning,
                 message: "unused".to_string(),
+            }],
+            highlights: vec![HighlightRange {
+                start: 0,
+                end: 5,
+                group: HighlightGroup::Comment,
             }],
             path: Some("test.rs".to_string()),
             dirty: true,
