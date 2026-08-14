@@ -117,13 +117,13 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef>;
 - ハイライトクエリ (.scm) は各言語の `highlights/` に置き、`include_str!` で同梱。capture 名は **HighlightGroup の小文字名に一致させる**（`@comment`, `@keyword`, `@string` …）。クエリは自前実装（ADR-0001・ADR-0018）。
 - 対応表は lsp.rs の `.rs → rust-analyzer` と同じ対応（将来は言語定義ファイルへ移行）。
 
-## Renderer（M3）
+## Renderer（M3/M4）
 
-`draw_line` のスタイル状態を `(カーソル, 選択中, 診断中)` タプルから **`(カーソル, 選択中, 診断中, グループ)`** に拡張する。
+`draw_line` のスタイル状態を `(カーソル, 選択中, 診断中)` タプルから **`(カーソル, 選択中, 診断ロール, グループ)`** に拡張する。
 
-**優先順位**: カーソル > 選択 > 診断 > グループ。上位は下位を置換し、属性は現行どおり合成する（カーソル+診断 = 青背景+下線、選択+診断 = 反転+下線）。グループ色はカーソル・選択・診断のいずれでもないセルにのみ適用する。診断範囲内のグループは「下線 + グループ色」で共存する。
+**優先順位**: カーソル > 選択 > 診断 > グループ。上位は下位を置換し、属性は現行どおり合成する（カーソル+診断 = 青背景+下線、選択+診断 = 反転+下線）。勝利ロールの Style は全フィールドが尊重される。診断範囲内は「下線 + 診断色（Error/Warning で異なる）」がグループ色を置換する（M4 で確定。M3 の「下線 + グループ色」共存ルールは置き換え）。
 
-**暫定パレット**（Colorscheme セッションで外部化される既定値。hardcode const テーブル）:
+**暫定パレット**（M4 で `mina-term/src/colorscheme.rs` の `DEFAULT` スキームとしてデータ化済み。以下はその当初の定義）:
 
 | グループ | SGR |
 |---|---|
@@ -148,7 +148,7 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef>;
 - **M1 — mina-loader**: クレート新設、レジストリ、rust grammar + ハイライトクエリ。検証: スニペットをパースして期待グループが得られるユニットテスト。
 - **M2 — プロトコル + daemon**: `HighlightGroup` / `HighlightRange` / `StateSnapshot.highlights`、daemon の SyntaxStore（編集ごとのインクリメンタル再パース、Open/Close/Reload のライフサイクル、スナップショット生成時に範囲を充填）。
 - **M3 — renderer**: `draw_line` のグループ次元、暫定パレット、優先順位。検証: 既存の render テストを拡張（グループ付き行のエスケープ列検証）。
-- **M4 — Colorscheme 機構（次回セッション）**: 名前付きスキームと切替（`:colorscheme` には引数パース追加が必要）、暫定パレットの外部化、色能力検出、診断 Error/Warning の色分け、UI ロールの enum 化。今回の taxonomy と暫定パレットが入力になる。
+- **M4 — Colorscheme 機構**: 名前付きスキームと切替（`:colorscheme` には引数パース追加が必要）、暫定パレットの外部化、色能力検出、診断 Error/Warning の色分け、UI ロールの enum 化。**M4-1 (#18) は完了** — `Colorscheme` データモデル + `DEFAULT` スキーム + renderer のスキーム参照化。M4-2 (#19: `:colorscheme` 切替) / M4-3 (#20: 色能力検出) が残り。
 
 ## 関連文書
 
