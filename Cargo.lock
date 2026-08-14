@@ -245,6 +245,7 @@ dependencies = [
 name = "mina-loader"
 version = "0.1.0"
 dependencies = [
+ "mina-protocol",
  "tree-sitter",
  "tree-sitter-rust",
 ]
@@ -273,6 +274,7 @@ dependencies = [
  "futures-lite",
  "libc",
  "mina-core",
+ "mina-loader",
  "mina-lsp",
  "mina-protocol",
  "mina-view",

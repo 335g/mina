@@ -380,6 +380,7 @@ mod tests {
             mode: Mode::Normal,
             first_line: 0,
             diagnostics: Vec::new(),
+            highlights: Vec::new(),
             path: None,
             dirty: false,
             status: None,
@@ -487,6 +488,7 @@ mod tests {
             mode: Mode::Normal,
             first_line: 0,
             diagnostics: Vec::new(),
+            highlights: Vec::new(),
             // OSC シーケンス（ターミナルタイトル変更）と SGR（色変更）の注入を試みる
             path: Some("\x1b]0;evil\x07".into()),
             dirty: false,
@@ -521,6 +523,7 @@ mod tests {
                 severity: mina_protocol::Severity::Error,
                 message: "oops".into(),
             }],
+            highlights: Vec::new(),
             path: None,
             dirty: false,
             status: None,

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mina_core::{Range as CoreRange, Selection, Transaction, extend_selection, move_selection};
 use mina_protocol::{
     ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
-    Range, ServerMessage, StateSnapshot, fnv1a64,
+    HighlightRange, Range, ServerMessage, StateSnapshot, fnv1a64,
 };
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -110,6 +110,20 @@ pub struct Daemon {
     baselines: HashMap<PathBuf, DiskBaseline>,
     /// フォーカス文書が外部で削除され、Close を待っているパス（ADR-0015）。
     deleted: Option<String>,
+    /// 文書ごとの構文ハイライトキャッシュ（ADR-0016: Syntax は Daemon 所有）。
+    ///
+    /// スナップショット生成時にテキストの checksum が変わっていれば再計算
+    /// （mina-loader のクエリ経由）。破棄された文書（Open の上限 evict）の
+    /// エントリは参照時に掃除する。
+    syntax: HashMap<mina_view::DocumentId, SyntaxCache>,
+}
+
+/// 1文書分の Syntax キャッシュ。`text_checksum` が現在のテキストと一致する
+/// 間は `highlights` を再利用する（スナップショットは generation 前進ごとに
+/// 作られるため、変更時のみ再パースすれば不変条件は満たせる）。
+struct SyntaxCache {
+    text_checksum: u64,
+    highlights: Vec<HighlightRange>,
 }
 
 /// 外部変更検知のベースライン（mtime+size。ADR-0012/0015 のヒューリスティック）。
@@ -123,6 +137,39 @@ struct DiskBaseline {
 const MAX_EVENTS: usize = 128;
 
 impl Daemon {
+    /// フォーカス文書のハイライト範囲を返す（キャッシュがあれば再利用）。
+    ///
+    /// テキストがキャッシュ時点と変わっていれば tree-sitter で再計算する。
+    /// パス未登録（スクラッチ）・grammar 不在の言語は空。
+    ///
+    /// ponytail: 全文再パース（インクリメンタルは編集範囲の追跡が各編集源に
+    /// 必要になるため、巨大ファイルのプロファイル後に導入する）。
+    fn syntax_highlights(&mut self, text: &str, checksum: u64) -> Vec<HighlightRange> {
+        let doc_id = self.editor.focused_doc_id();
+        // 破棄された文書（Open の上限 evict）のキャッシュを落とす
+        let live: Vec<_> = self.editor.document_ids().collect();
+        self.syntax.retain(|id, _| live.contains(id));
+        if let Some(cached) = self.syntax.get(&doc_id) {
+            if cached.text_checksum == checksum {
+                return cached.highlights.clone();
+            }
+        }
+        let highlights = self
+            .editor
+            .focused_path()
+            .and_then(|p| mina_loader::language_for_path(&p.to_string_lossy()))
+            .map(|def| mina_loader::compute_highlights(def, text))
+            .unwrap_or_default();
+        self.syntax.insert(
+            doc_id,
+            SyntaxCache {
+                text_checksum: checksum,
+                highlights: highlights.clone(),
+            },
+        );
+        highlights
+    }
+
     /// 状態を変える操作を記録する（世代を増やし、イベントをリングに積む）。
     fn record_event(
         &mut self,
@@ -155,6 +202,7 @@ impl Daemon {
             events: VecDeque::new(),
             baselines: HashMap::new(),
             deleted: None,
+            syntax: HashMap::new(),
         }
     }
 
@@ -356,7 +404,7 @@ async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnap
             }
             if reloaded || focused_deleted || focused_reappeared {
                 snap = Some(snapshot(
-                    &d,
+                    &mut d,
                     reloaded.then(|| "reloaded from disk".into()),
                 ));
             }
@@ -380,7 +428,7 @@ async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnap
                 lsp::drain_into(&mut d);
                 // pull 診断は generation を変えないので、スナップショットを
                 // 作り直して push する（診断の変化を購読者へ届ける）
-                snap = Some(snapshot(&d, snap.and_then(|s| s.status)));
+                snap = Some(snapshot(&mut d, snap.and_then(|s| s.status)));
             }
         }
         // 世代が進んでいれば全購読者へ配る（ADR-0013 と同条件）
@@ -587,9 +635,9 @@ async fn process_command(
                 command,
                 Command::GetState | Command::Save | Command::WaitFor { .. }
             ) {
-                let d = daemon.lock().await;
+                let mut d = daemon.lock().await;
                 return snapshot(
-                    &d,
+                    &mut d,
                     Some(
                         "headless clients can only use GetState, Save, WaitFor, and DocumentEdit"
                             .into(),
@@ -614,9 +662,9 @@ async fn process_command(
             rx.borrow_and_update();
             loop {
                 {
-                    let d = daemon.lock().await;
+                    let mut d = daemon.lock().await;
                     if d.generation > generation {
-                        return snapshot(&d, None);
+                        return snapshot(&mut d, None);
                     }
                 }
                 // 次の状態変化を待つ（世代が進むたびに send され、値が変わら
@@ -624,8 +672,8 @@ async fn process_command(
                 if rx.changed().await.is_err() {
                     // push 送信元が消えた（daemon 終了）: 現状を返して接続を
                     // 後始末に任せる。
-                    let d = daemon.lock().await;
-                    return snapshot(&d, Some("daemon terminated while waiting".into()));
+                    let mut d = daemon.lock().await;
+                    return snapshot(&mut d, Some("daemon terminated while waiting".into()));
                 }
             }
         }
@@ -738,7 +786,7 @@ async fn process_command(
                     lsp::drain_into(&mut d);
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
-                    snapshot(&d, None)
+                    snapshot(&mut d, None)
                 } else {
                     // 未開パス: 従来どおりディスクから読む
                     // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
@@ -803,7 +851,7 @@ async fn process_command(
                     }
                     let mut d = daemon.lock().await;
                     lsp::drain_into(&mut d);
-                    snapshot(&d, open_status)
+                    snapshot(&mut d, open_status)
                 }
             }
             Ok(Command::Save) => {
@@ -855,9 +903,9 @@ async fn process_command(
                         } else {
                             format!("saved: {shown} (edited during save, still dirty)")
                         };
-                        snapshot(&d, Some(status))
+                        snapshot(&mut d, Some(status))
                     }
-                    Err(e) => snapshot(&d, Some(format!("save failed: {e}"))),
+                    Err(e) => snapshot(&mut d, Some(format!("save failed: {e}"))),
                 }
             }
             Ok(command) => {
@@ -928,11 +976,11 @@ async fn process_command(
                         d.diagnostics = diags;
                     }
                     lsp::drain_into(&mut d);
-                    snapshot(&d, None)
+                    snapshot(&mut d, None)
                 } else {
                     let mut d = daemon.lock().await;
                     lsp::drain_into(&mut d);
-                    snapshot(&d, None)
+                    snapshot(&mut d, None)
                 }
             }
             Err(_) => {
@@ -979,18 +1027,18 @@ async fn process_command(
                                 d.diagnostics = diags;
                             }
                             lsp::drain_into(&mut d);
-                            snapshot(&d, None)
+                            snapshot(&mut d, None)
                         } else {
                             let mut d = daemon.lock().await;
                             lsp::drain_into(&mut d);
-                            snapshot(&d, None)
+                            snapshot(&mut d, None)
                         }
                     }
                     Err(_) => {
                         // M7: 壊れたコマンド行にも status 付きスナップショットを返す
                         // （応答なしだと送信元が永久待ちになる）
-                        let d = daemon.lock().await;
-                        snapshot(&d, Some("invalid command".into()))
+                        let mut d = daemon.lock().await;
+                        snapshot(&mut d, Some("invalid command".into()))
                     }
                 }
             }
@@ -1389,15 +1437,17 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
     }
 }
 
-fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
+fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnapshot {
+    let text = daemon.editor.current_document().text().to_string();
+    let checksum = fnv1a64(text.as_bytes());
+    let highlights = daemon.syntax_highlights(&text, checksum);
     let editor = &daemon.editor;
     let selection = editor.selection();
-    let text = editor.current_document().text().to_string();
     StateSnapshot {
         // ADR-0012 #12: 全文の FNV-1a を同梱し、エージェントが edit の
         // checksum を再実装せずに済ませる。応答は既に全文をシリアライズ
         // するため、ハッシュ計算は相対的に無視できるコスト。
-        checksum: fnv1a64(text.as_bytes()),
+        checksum,
         text,
         selection: selection
             .ranges()
@@ -1411,6 +1461,8 @@ fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
         mode: convert_mode_back(editor.mode()),
         first_line: editor.first_line(),
         diagnostics: daemon.diagnostics.clone(),
+        // 不変条件: 同じスナップショットのテキストと一致する範囲（ADR-0016）。
+        highlights,
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
         dirty: editor.is_dirty(),
         status,
@@ -1463,7 +1515,7 @@ pub fn socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mina_protocol::{Direction, GotoTarget, Mode, Movement};
+    use mina_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
 
     fn daemon() -> Daemon {
         Daemon::new()
@@ -1475,6 +1527,17 @@ mod tests {
 
     fn open_path(d: &mut Daemon, path: &str, text: &str) -> StateSnapshot {
         open_in_editor(d, path, Some(text.into()))
+    }
+
+    /// ハイライト範囲の不変条件（仕様書）: 昇順・重複なし・テキスト内。
+    fn assert_highlights_valid(text: &str, highlights: &[HighlightRange]) {
+        let n = text.chars().count();
+        let mut prev_end = 0usize;
+        for r in highlights {
+            assert!(r.start < r.end && r.end <= n, "範囲がテキスト内: {r:?}");
+            assert!(r.start >= prev_end, "昇順・重複なし: {r:?}");
+            prev_end = r.end;
+        }
     }
 
     #[test]
@@ -1494,6 +1557,94 @@ mod tests {
         let s = open_in_editor(&mut d, "missing", None);
         assert!(s.status.is_some());
         assert!(s.path.is_none());
+    }
+
+    #[test]
+    fn rust_file_highlights_in_snapshot() {
+        // ADR-0016: .rs は tree-sitter でパースされ、スナップショットに載る
+        let mut d = daemon();
+        let s = open_path(&mut d, "test.rs", "// comment\nfn add(a: i32) -> i32 { a + 1 }\n");
+        assert_highlights_valid(&s.text, &s.highlights);
+        let keyword = s
+            .highlights
+            .iter()
+            .find(|r| &s.text[r.start..r.end] == "fn")
+            .expect("fn が keyword でハイライトされる");
+        assert_eq!(keyword.group, HighlightGroup::Keyword);
+        let comment = s
+            .highlights
+            .iter()
+            .find(|r| r.group == HighlightGroup::Comment)
+            .expect("コメントがハイライトされる");
+        assert_eq!(&s.text[comment.start..comment.end], "// comment");
+    }
+
+    #[test]
+    fn unknown_extension_has_no_highlights() {
+        // grammar 不在の拡張子は空 Vec（ADR-0017 のフォールバックなし方針）
+        let mut d = daemon();
+        let s = open(&mut d, "// not a comment in txt\nfn f() {}\n");
+        assert!(s.highlights.is_empty(), ".txt は空: {:?}", s.highlights);
+        // スクラッチ（パスなし）も空
+        let s = apply(&mut d, Command::GetState);
+        assert!(s.highlights.is_empty(), "スクラッチは空: {:?}", s.highlights);
+    }
+
+    #[test]
+    fn insert_edit_reparses_highlights() {
+        // 編集 → スナップショットの highlights がテキストと一致（再パース）
+        let mut d = daemon();
+        open_path(&mut d, "test.rs", "fn f() {}\n");
+        let s = apply(&mut d, Command::Insert { text: "// note\n".into() });
+        assert_highlights_valid(&s.text, &s.highlights);
+        assert!(
+            s.highlights.iter().any(|r| r.group == HighlightGroup::Comment),
+            "挿入後にコメントがハイライトされる: {:?}",
+            s.highlights
+        );
+    }
+
+    #[test]
+    fn document_edit_reparses_highlights() {
+        // headless（DocumentEdit）経路でも再パースされる（ADR-0016 の全編集源）
+        let mut d = daemon();
+        let before = open_path(&mut d, "test.rs", "fn f() {}\n");
+        let edit = DocumentEdit {
+            start: 0,
+            end: 0,
+            text: "// agent note\n".into(),
+            checksum: before.checksum,
+        };
+        assert!(apply_edit(&mut d, &edit, 0).is_none(), "適用に成功する");
+        let s = apply(&mut d, Command::GetState);
+        assert_highlights_valid(&s.text, &s.highlights);
+        assert!(
+            s.highlights.iter().any(|r| r.group == HighlightGroup::Comment),
+            "DocumentEdit 後にコメントがハイライトされる: {:?}",
+            s.highlights
+        );
+    }
+
+    #[test]
+    fn external_reload_reparses_highlights() {
+        // 外部リロード（ADR-0015）後のスナップショットも highlights が一致する
+        let mut d = daemon();
+        open_path(&mut d, "test.rs", "fn f() {}\n");
+        let doc_id = d.editor.focused_doc_id();
+        let new_text = "// replaced\nfn g() {}\n";
+        assert!(d.editor.reload_doc(doc_id, new_text), "リロードで置換される");
+        let s = apply(&mut d, Command::GetState);
+        assert_highlights_valid(&s.text, &s.highlights);
+        assert!(
+            s.highlights.iter().any(|r| r.group == HighlightGroup::Comment),
+            "リロード後のコメントがハイライトされる: {:?}",
+            s.highlights
+        );
+        assert!(
+            s.highlights.iter().any(|r| &s.text[r.start..r.end] == "fn"),
+            "リロード後の fn がハイライトされる: {:?}",
+            s.highlights
+        );
     }
 
     #[tokio::test]
@@ -3501,7 +3652,7 @@ mod tests {
         let p = p.expect("パスがある");
         std::fs::write(&p, text.as_bytes()).unwrap();
         assert!(d.editor.mark_saved_doc(doc_id, &text));
-        let s = snapshot(&d, Some("saved".into()));
+        let s = snapshot(&mut d, Some("saved".into()));
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
         assert!(!s.dirty);
@@ -3537,7 +3688,7 @@ mod tests {
         assert!(d.editor.mark_saved_doc(doc_id_a, &text_a));
 
         // スナップショットはフォーカス（B）の状態: B の未保存編集は dirty のまま
-        let s = snapshot(&d, Some("saved".into()));
+        let s = snapshot(&mut d, Some("saved".into()));
         assert!(s.dirty, "B の未保存編集が保存済み扱いにならない: {}", s.dirty);
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
@@ -3565,7 +3716,7 @@ mod tests {
         // 書き込み完了 → 古いテキストでは dirty が消えない
         std::fs::write(&path, text.as_bytes()).unwrap();
         assert!(!d.editor.mark_saved_doc(doc_id, &text));
-        let s = snapshot(&d, Some("saved".into()));
+        let s = snapshot(&mut d, Some("saved".into()));
         assert!(s.dirty, "書き込み中に編集された文書が保存済み扱いにならない: {}", s.dirty);
         let _ = std::fs::remove_file(&path);
     }
