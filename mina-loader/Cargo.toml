@@ -6,5 +6,6 @@ rust-version.workspace = true
 description = "Language registry for mina: tree-sitter grammars and highlight queries"
 
 [dependencies]
+mina-protocol = { path = "../mina-protocol" }
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
