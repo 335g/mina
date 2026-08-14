@@ -125,7 +125,7 @@ fn report(after: &StateSnapshot, start: usize, end: usize, text: &str) -> std::i
         after.generation,
         after.dirty,
         event.as_deref().unwrap_or("-"),
-        if after.disk_changed { " disk_changed" } else { "" }
+        if after.deleted.is_some() { " deleted" } else { "" }
     ))?;
     cliclack::note("スニペット", snippet(&after.text, start, 1))?;
     Ok(())
