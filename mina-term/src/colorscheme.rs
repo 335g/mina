@@ -88,7 +88,6 @@ pub enum UiRole {
 
 /// 役割 → スタイルの写像。未掲載の役割は既定テキスト (無色)。
 pub struct Colorscheme {
-    #[allow(dead_code)] // 名前付きレジストリで使用 (#19)
     pub name: &'static str,
     pub syntax: &'static [(HighlightGroup, Style)],
     pub ui: &'static [(UiRole, Style)],
@@ -108,6 +107,17 @@ impl Colorscheme {
 
 /// 既定スキーム。M3 までのハードコード SGR をそのままデータ化し、
 /// 診断 Error/Warning の色分けを加えたもの (issue #18)。
+/// UI ロールの既定スタイル（DEFAULT と VIVID で共用 — 切替の実証は構文色で行う）。
+const DEFAULT_UI: &[(UiRole, Style)] = &[
+    (UiRole::Cursor, Style::bg(Color::Ansi(4))), // 44 青背景
+    (UiRole::Selection, Style::reverse()), // 7
+    (UiRole::DiagnosticError, Style::fg_underline(Color::Ansi(9))), // 4;91
+    (UiRole::DiagnosticWarning, Style::fg_underline(Color::Ansi(11))), // 4;93
+    (UiRole::StatusLine, Style::reverse()),
+    (UiRole::CommandLine, Style::reverse()),
+    (UiRole::Popup, Style::reverse()),
+];
+
 pub static DEFAULT: Colorscheme = Colorscheme {
     name: "default",
     syntax: &[
@@ -123,16 +133,34 @@ pub static DEFAULT: Colorscheme = Colorscheme {
         (HighlightGroup::Error, Style::fg_underline(Color::Ansi(9))), // 91 + 下線
         // parameter / operator / punctuation は無色のまま
     ],
-    ui: &[
-        (UiRole::Cursor, Style::bg(Color::Ansi(4))), // 44 青背景
-        (UiRole::Selection, Style::reverse()), // 7
-        (UiRole::DiagnosticError, Style::fg_underline(Color::Ansi(9))), // 4;91
-        (UiRole::DiagnosticWarning, Style::fg_underline(Color::Ansi(11))), // 4;93
-        (UiRole::StatusLine, Style::reverse()),
-        (UiRole::CommandLine, Style::reverse()),
-        (UiRole::Popup, Style::reverse()),
-    ],
+    ui: DEFAULT_UI,
 };
+
+/// DEFAULT と異なる配色の軽量スキーム（`:colorscheme vivid` で切替を実証）。ANSI16 のみ。
+pub static VIVID: Colorscheme = Colorscheme {
+    name: "vivid",
+    syntax: &[
+        (HighlightGroup::Comment, Style::fg(Color::Ansi(2))), // 32 緑
+        (HighlightGroup::Keyword, Style::fg(Color::Ansi(5))), // 35 マゼンタ
+        (HighlightGroup::String, Style::fg(Color::Ansi(6))), // 36 シアン
+        (HighlightGroup::Number, Style::fg(Color::Ansi(11))), // 93 明るい黄
+        (HighlightGroup::Constant, Style::fg(Color::Ansi(1))), // 31 赤
+        (HighlightGroup::Function, Style::fg(Color::Ansi(14))), // 96 明るいシアン
+        (HighlightGroup::Type, Style::fg(Color::Ansi(4))), // 34 青
+        (HighlightGroup::Field, Style::fg(Color::Ansi(3))), // 33 黄
+        (HighlightGroup::Attribute, Style::fg(Color::Ansi(13))), // 95 明るいマゼンタ
+        (HighlightGroup::Error, Style::fg_underline(Color::Ansi(9))), // 91 + 下線
+    ],
+    ui: DEFAULT_UI,
+};
+
+/// 名前付きスキームの静的レジストリ（設定ファイル・永続化なし — issue #19）。
+static SCHEMES: &[&Colorscheme] = &[&DEFAULT, &VIVID];
+
+/// 名前からスキームを引く（未登録名は None）。
+pub fn scheme_by_name(name: &str) -> Option<&'static Colorscheme> {
+    SCHEMES.iter().copied().find(|s| s.name == name)
+}
 
 #[cfg(test)]
 mod tests {
@@ -178,5 +206,28 @@ mod tests {
         assert_eq!(Color::Ansi(6).fg_sgr(), "36");
         assert_eq!(Color::Index(196).fg_sgr(), "38;5;196");
         assert_eq!(Color::Rgb(255, 0, 0).fg_sgr(), "38;2;255;0;0");
+    }
+
+    #[test]
+    fn scheme_by_name_resolves_registry() {
+        assert_eq!(scheme_by_name("default").map(|s| s.name), Some("default"));
+        assert_eq!(scheme_by_name("vivid").map(|s| s.name), Some("vivid"));
+        assert!(scheme_by_name("nope").is_none());
+        assert!(scheme_by_name("").is_none());
+    }
+
+    #[test]
+    fn vivid_differs_from_default_on_groups() {
+        // 切替が実証できるよう、構文色が DEFAULT と異なること
+        assert_ne!(
+            DEFAULT.syntax_style(HighlightGroup::Keyword),
+            VIVID.syntax_style(HighlightGroup::Keyword)
+        );
+        assert_eq!(
+            VIVID.syntax_style(HighlightGroup::Keyword),
+            Some(Style::fg(Color::Ansi(5))) // 35 マゼンタ
+        );
+        // UI ロールは共有（切替の実証は構文色で行う）
+        assert_eq!(DEFAULT.ui_style(UiRole::Cursor), VIVID.ui_style(UiRole::Cursor));
     }
 }
