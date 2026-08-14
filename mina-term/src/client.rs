@@ -22,7 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-use crate::colorscheme;
+use crate::colorscheme::{self, Colorscheme};
 use crate::keymap::{Keymaps, Resolution};
 use crate::render;
 
@@ -122,11 +122,13 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let mut command_line: Option<String> = None;
     // クライアント側の一時メッセージ（未知コマンド等）。次のキーで消える。
     let mut flash: Option<String> = None;
+    // 現在の Colorscheme（`:colorscheme` で切替。クライアントローカル — daemon 非関与）。
+    let mut scheme: &'static Colorscheme = &colorscheme::DEFAULT;
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
 
     render::draw(
         &mut *terminal,
-        &colorscheme::DEFAULT,
+        scheme,
         &state,
         &pending,
         command_line.as_deref(),
@@ -195,6 +197,13 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                                         CommandLineAction::Unknown(cmd) => {
                                             flash = Some(format!("unknown command: {cmd}"));
                                         }
+                                        CommandLineAction::Colorscheme(name) => {
+                                            if let Some(msg) =
+                                                apply_colorscheme(&mut scheme, name.as_deref())
+                                            {
+                                                flash = Some(msg);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -252,7 +261,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         if redraw {
             render::draw(
                 &mut *terminal,
-                &colorscheme::DEFAULT,
+                scheme,
                 &state,
                 &pending,
                 command_line.as_deref(),
@@ -277,17 +286,45 @@ enum CommandLineAction {
     Quit,
     /// `:wq` — 保存してから終了（保存に失敗したら終了しない）。
     SaveThenQuit,
+    /// `:colorscheme [name]` — 引数なしは現在のスキーム名を表示。
+    Colorscheme(Option<String>),
     /// 未知のコマンド。
     Unknown(String),
 }
 
 /// コマンドライン文字列を解釈する（テスト容易性のため純粋関数）。
+///
+/// 引数付きコマンド（`:colorscheme <name>`）は空白区切りで解釈する。
+/// 単語コマンド（`w` / `q` / `q!` / `wq`）の挙動は従来どおりで、
+/// 引数が付いた入力は Unknown に丸ごと載せる（例: `w foo`）。
 fn parse_command(input: &str) -> CommandLineAction {
-    match input.trim() {
-        "w" => CommandLineAction::Save,
-        "q" | "q!" => CommandLineAction::Quit,
-        "wq" => CommandLineAction::SaveThenQuit,
-        other => CommandLineAction::Unknown(other.to_string()),
+    let trimmed = input.trim();
+    match trimmed {
+        "w" => return CommandLineAction::Save,
+        "q" | "q!" => return CommandLineAction::Quit,
+        "wq" => return CommandLineAction::SaveThenQuit,
+        _ => {}
+    }
+    let mut parts = trimmed.split_whitespace();
+    if parts.next() == Some("colorscheme") {
+        return CommandLineAction::Colorscheme(parts.next().map(str::to_string));
+    }
+    CommandLineAction::Unknown(trimmed.to_string())
+}
+
+/// `:colorscheme [name]` の適用（純粋関数 — テスト容易性）。
+///
+/// 既知名は `scheme` を差し替えて None、不明名・引数なしは表示すべき flash を返す。
+fn apply_colorscheme(scheme: &mut &'static Colorscheme, name: Option<&str>) -> Option<String> {
+    match name {
+        Some(name) => match colorscheme::scheme_by_name(name) {
+            Some(s) => {
+                *scheme = s;
+                None
+            }
+            None => Some(format!("unknown colorscheme: {name}")),
+        },
+        None => Some(format!("colorscheme: {}", scheme.name)),
     }
 }
 
@@ -476,6 +513,56 @@ mod tests {
             parse_command(""),
             CommandLineAction::Unknown("".into()),
             "空コマンドもエラー表示"
+        );
+        // 単語コマンドに引数が付いたら従来どおり Unknown（丸ごと flash）
+        assert_eq!(
+            parse_command("w foo"),
+            CommandLineAction::Unknown("w foo".into())
+        );
+    }
+
+    #[test]
+    fn parse_command_colorscheme_with_args() {
+        assert_eq!(
+            parse_command("colorscheme vivid"),
+            CommandLineAction::Colorscheme(Some("vivid".into()))
+        );
+        assert_eq!(
+            parse_command(" colorscheme  vivid "),
+            CommandLineAction::Colorscheme(Some("vivid".into())),
+            "前後空白・複数空白を無視"
+        );
+        assert_eq!(
+            parse_command("colorscheme"),
+            CommandLineAction::Colorscheme(None),
+            "引数なし"
+        );
+        assert_eq!(
+            parse_command("colorschemefoo"),
+            CommandLineAction::Unknown("colorschemefoo".into()),
+            "接頭辞だけでは colorscheme と解釈しない"
+        );
+    }
+
+    #[test]
+    fn apply_colorscheme_switches_and_flashes() {
+        let mut scheme: &'static Colorscheme = &colorscheme::DEFAULT;
+        // 既知名: 切替され flash なし
+        assert_eq!(apply_colorscheme(&mut scheme, Some("vivid")), None);
+        assert_eq!(scheme.name, "vivid");
+        // 戻せる
+        assert_eq!(apply_colorscheme(&mut scheme, Some("default")), None);
+        assert_eq!(scheme.name, "default");
+        // 不明名: flash を返し切替しない
+        assert_eq!(
+            apply_colorscheme(&mut scheme, Some("nope")),
+            Some("unknown colorscheme: nope".into())
+        );
+        assert_eq!(scheme.name, "default");
+        // 引数なし: 現在のスキーム名を flash
+        assert_eq!(
+            apply_colorscheme(&mut scheme, None),
+            Some("colorscheme: default".into())
         );
     }
 }
