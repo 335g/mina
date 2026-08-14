@@ -154,6 +154,114 @@ impl Editor {
         self.view().doc
     }
 
+    /// ファイルに紐づいている全文書のパス（監視対象 — ADR-0015）。
+    ///
+    /// スクラッチ（未保存）文書は含まれない。
+    pub fn open_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.paths.values()
+    }
+
+    /// パスに対応する文書 ID（未オープンなら None）。
+    pub fn doc_id_for_path(&self, path: &Path) -> Option<DocumentId> {
+        self.paths
+            .iter()
+            .find(|(_, p)| p.as_path() == path)
+            .map(|(id, _)| *id)
+    }
+
+    /// 指定文書のテキストをディスクの内容で置き換える（Reload — ADR-0015）。
+    ///
+    /// 全文置換の Transaction としてその文書の履歴に記録されるので undo で
+    /// 外部変更前の状態に戻れる。置換後、テキストはディスクと一致するため
+    /// dirty はクリアされる。文書を表示している View の選択は新しい長さへ
+    /// クランプされる。テキストが既に一致していれば何もせず `false`。
+    pub fn reload_doc(&mut self, doc_id: DocumentId, new_text: &str) -> bool {
+        let old_text = self.documents[&doc_id].text().to_string();
+        if old_text == new_text {
+            return false;
+        }
+        let old_doc = self.documents[&doc_id].clone();
+        let tx = Transaction::replace_all(&old_doc, new_text);
+        let new_doc = tx.apply(&old_doc);
+        let new_len = new_doc.len_chars();
+        let clamp = |sel: &Selection| {
+            Selection::new(
+                sel.ranges()
+                    .iter()
+                    .map(|r| {
+                        mina_core::Range::new(r.anchor().min(new_len), r.head().min(new_len))
+                    })
+                    .collect(),
+                sel.primary_index(),
+            )
+        };
+        // 文書を表示している View の選択を新しい長さへクランプする。
+        // 表示していない文書は履歴記録用に点選択を使う。
+        let selection_after = self
+            .views
+            .iter()
+            .flatten()
+            .find(|v| v.doc == doc_id)
+            .map(|v| clamp(&v.selection))
+            .unwrap_or_else(|| Selection::point(0));
+        self.histories
+            .get_mut(&doc_id)
+            .expect("文書の履歴は存在する")
+            .push(tx, selection_after.clone(), selection_after.clone());
+        self.documents.insert(doc_id, new_doc);
+        for view in self.views.iter_mut().flatten() {
+            if view.doc == doc_id {
+                view.selection = clamp(&view.selection);
+            }
+        }
+        // テキストがディスクと一致するので dirty は解消する（ADR-0015）
+        self.dirty.remove(&doc_id);
+        true
+    }
+
+    /// フォーカス中の文書を閉じる（Close — ADR-0015）。
+    ///
+    /// 文書・履歴・パス・dirty を破棄し、フォーカスを残りの開いている文書
+    /// （パス順で最初）へ移す。残りが無ければスクラッチ（空画面）へ戻す。
+    /// ファイルに紐づいていない文書（スクラッチ）は閉じず `false`。
+    pub fn close_focused_document(&mut self) -> bool {
+        let doc_id = self.view().doc;
+        if !self.paths.contains_key(&doc_id) {
+            return false;
+        }
+        self.documents.remove(&doc_id);
+        self.histories.remove(&doc_id);
+        self.paths.remove(&doc_id);
+        self.dirty.remove(&doc_id);
+        // この文書を表示していた View を次へ移す
+        let next = self.paths.iter().next().map(|(id, _)| *id);
+        // 残りが無ければ空状態用のスクラッチを用意する（既存スクラッチ id 0 が
+        // 残っていればそれを使う）
+        let scratch = if next.is_none() && !self.documents.contains_key(&DocumentId(0)) {
+            Some(self.open(Document::new()))
+        } else {
+            None
+        };
+        for view in self.views.iter_mut().flatten() {
+            if view.doc == doc_id {
+                match next {
+                    Some(id) => {
+                        view.doc = id;
+                        view.selection = Selection::point(0);
+                        view.first_line = 0;
+                    }
+                    None => {
+                        // 空状態: スクラッチへ戻る
+                        view.doc = scratch.unwrap_or(DocumentId(0));
+                        view.selection = Selection::point(0);
+                        view.first_line = 0;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// フォーカス中の View が表示する文書が保存済み状態から編集されているか。
     ///
     /// ponytail: undo で保存時点まで戻っても dirty は残る（履歴に保存時点の
