@@ -1647,6 +1647,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focus_switch_keeps_highlights_per_document() {
+        // DocumentId キーのキャッシュ: フォーカスを往復しても各文書の
+        // highlights がその文書のテキストと一致する（ADR-0016 の不変条件）
+        let mut d = daemon();
+        open_path(&mut d, "a.rs", "fn a() {}\n");
+        apply(&mut d, Command::Insert { text: "// x\n".into() });
+        // 別文書へ移動 → txt は空・a.rs のキャッシュは保持
+        open_path(&mut d, "b.txt", "plain text\n");
+        let s = apply(&mut d, Command::GetState);
+        assert!(s.highlights.is_empty(), "b.txt は空: {:?}", s.highlights);
+        // a.rs にフォーカスを戻す → コメントのハイライトが一致したまま
+        d.editor.focus_open_path(std::path::Path::new("a.rs"));
+        let s = apply(&mut d, Command::GetState);
+        assert_highlights_valid(&s.text, &s.highlights);
+        assert!(
+            s.highlights.iter().any(|r| r.group == HighlightGroup::Comment),
+            "a.rs に戻ってもコメントがハイライトされる: {:?}",
+            s.highlights
+        );
+    }
+
+    #[test]
+    fn undo_removes_cleared_highlights() {
+        // 削除方向のキャッシュ無効化: undo で消えたコメントのハイライトが
+        // 残らない（checksum 不一致 → 再パース）
+        let mut d = daemon();
+        open_path(&mut d, "a.rs", "fn f() {}\n");
+        let s = apply(&mut d, Command::Insert { text: "// x\n".into() });
+        assert!(
+            s.highlights.iter().any(|r| r.group == HighlightGroup::Comment),
+            "挿入後はコメントがある: {:?}",
+            s.highlights
+        );
+        let s = apply(&mut d, Command::Undo);
+        assert_highlights_valid(&s.text, &s.highlights);
+        assert!(
+            !s.highlights.iter().any(|r| r.group == HighlightGroup::Comment),
+            "undo でコメントのハイライトが消える: {:?}",
+            s.highlights
+        );
+    }
+
     #[tokio::test]
     async fn normalize_open_path_equates_notations_of_same_file() {
         // CRITICAL C2: 同一ファイルを指す異なる表記（絶対・./ 付き・.. 付き・
