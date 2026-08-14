@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use crate::colorscheme::{Color, Colorscheme, UiRole};
+use crate::colorscheme::{Colorscheme, Style, UiRole};
 use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, Mode, Range, Severity, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthChar;
@@ -85,6 +85,9 @@ pub fn render_text(
     s.push_str("\x1b[H"); // カーソルをホームへ
 
     let body_rows = height.saturating_sub(1); // 最終行はステータス行
+    // highlights は行を跨いで昇順に進むため、ポインタを行ループの外に持つ
+    // （行ごとに 0 から歩き直すと O(行数×範囲数) — 敵対的検証で発見）。
+    let mut hl_idx = 0usize;
     for row in 0..body_rows {
         s.push_str(&format!("\x1b[{};1H", row + 1));
         let line_idx = state.first_line + row;
@@ -100,6 +103,7 @@ pub fn render_text(
                     &state.selection,
                     &state.diagnostics,
                     &state.highlights,
+                    &mut hl_idx,
                     scheme,
                     Some(head),
                     width,
@@ -189,13 +193,13 @@ fn draw_line(
     selection: &[Range],
     diagnostics: &[Diagnostic],
     highlights: &[HighlightRange],
+    hl_idx: &mut usize, // highlights は start 昇順・非重複（mina-loader の不変条件）
     scheme: &Colorscheme,
     cursor: Option<usize>,
     width: usize,
 ) {
     let mut out_width = 0usize;
     let mut style = (false, false, None, None); // (カーソル, 選択中, 診断ロール, グループ)
-    let mut hl_idx = 0usize; // highlights は start 昇順・非重複（mina-loader の不変条件）
     for (i, ch) in line.chars().enumerate() {
         // CRLF の \r: 非表示文字。生出力するとターミナルがカーソルを行頭へ戻し、
         // 直後の \x1b[K で行全体が消える（H2）。
@@ -216,19 +220,21 @@ fn draw_line(
             .map(diag_role);
         // グループは昇順・非重複の範囲から、1 char ずつ進むポインタで引く
         let group = loop {
-            match highlights.get(hl_idx) {
-                Some(r) if r.end <= char_global => hl_idx += 1,
+            match highlights.get(*hl_idx) {
+                Some(r) if r.end <= char_global => *hl_idx += 1,
                 Some(r) if r.start <= char_global => break Some(r.group),
                 _ => break None,
             }
         };
+        // 幅超過で切り詰め — 描画されない文字のスタイル遷移 (宙に浮く SGR) を
+        // 出さないため、スタイル遷移より先に判定する（敵対的検証で発見）。
+        if out_width + w > width {
+            break;
+        }
         let new_style = (is_cursor, in_sel, diag_role, group);
         if new_style != style {
             style = new_style;
             s.push_str(&style_sgr(scheme, style));
-        }
-        if out_width + w > width {
-            break; // 幅超過で切り詰め（行末の全角文字は途中で切れる — ponytail）
         }
         if is_ctrl {
             s.push('\u{FFFD}');
@@ -255,7 +261,9 @@ fn draw_line(
     s.push_str("\x1b[K"); // 行末までクリア
 }
 
-/// 診断の severity → UI ロール。Info/Hint も Warning 扱い（ステータスの [nE nW] と整合）。
+/// 診断の severity → UI ロール。Info/Hint も Warning 色を当てる（M4 以前の
+/// 全 severity 下線表示を維持するため。ステータスの [nE nW] には Error/Warning
+/// のみが数えられる — カウントとの不整合は仕様として許容）。
 fn diag_role(d: &Diagnostic) -> UiRole {
     match d.severity {
         Severity::Error => UiRole::DiagnosticError,
@@ -273,62 +281,66 @@ fn style_sgr(
     style: (bool, bool, Option<UiRole>, Option<HighlightGroup>),
 ) -> String {
     let (cursor, in_sel, diag_role, group) = style;
-    let mut underline = false;
-    let mut reverse = false;
-    let mut fg = None;
-    let mut bg = None;
+    // 勝利ロールの Style を全フィールド合成する（bg のみ・reverse のみ等の
+    // 部分抽出はスキーム作者が落とし穴になる — 敵対的検証で発見・修正）。
+    let mut st = Style::new();
     if cursor {
         if let Some(s) = scheme.ui_style(UiRole::Cursor) {
-            bg = s.bg;
+            st = st.merged(s);
         }
-        underline = diag_role.is_some(); // カーソル + 診断 = 青背景 + 下線
+        if diag_role.is_some() {
+            st.underline = true; // カーソル + 診断 = 青背景 + 下線
+        }
     } else if in_sel {
         if let Some(s) = scheme.ui_style(UiRole::Selection) {
-            reverse = s.reverse;
+            st = st.merged(s);
         }
-        underline = diag_role.is_some(); // 選択 + 診断 = 反転 + 下線
+        if diag_role.is_some() {
+            st.underline = true; // 選択 + 診断 = 反転 + 下線
+        }
     } else if let Some(role) = diag_role {
         // 診断 > グループ: 診断の Style（下線 + 診断色）がグループを置換
         if let Some(s) = scheme.ui_style(role) {
-            fg = s.fg;
-            underline = s.underline;
+            st = st.merged(s);
         }
     } else if let Some(group) = group {
         if let Some(s) = scheme.syntax_style(group) {
-            fg = s.fg;
-            underline = s.underline;
+            st = st.merged(s);
         }
     }
-    emit_sgr(underline, reverse, fg, bg)
+    emit_sgr(st)
 }
 
 /// UI ロールの SGR（未定義ならリセット）。ステータス行・プロンプト・ポップアップ用。
 fn ui_sgr(scheme: &Colorscheme, role: UiRole) -> String {
     match scheme.ui_style(role) {
-        Some(s) => emit_sgr(s.underline, s.reverse, s.fg, s.bg),
+        Some(s) => emit_sgr(s),
         None => "\x1b[0m".to_string(),
     }
 }
 
 /// SGR シーケンスを組み立てる。属性 → 色の順（既存の "4;44" / "4;7" 等を維持）。
-fn emit_sgr(underline: bool, reverse: bool, fg: Option<Color>, bg: Option<Color>) -> String {
+///
+/// 遷移時は必ず `\x1b[0m` を前置する — 旧属性（下線・反転・背景色）はリセット
+/// されるまで滲むため（例: 診断→グループで下線が残る。敵対的検証で発見）。
+fn emit_sgr(st: Style) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if underline {
+    if st.underline {
         parts.push("4".to_string()); // 下線
     }
-    if reverse {
+    if st.reverse {
         parts.push("7".to_string()); // 反転
     }
-    if let Some(c) = fg {
+    if let Some(c) = st.fg {
         parts.push(c.fg_sgr());
     }
-    if let Some(b) = bg {
+    if let Some(b) = st.bg {
         parts.push(b.bg_sgr());
     }
     if parts.is_empty() {
         "\x1b[0m".to_string()
     } else {
-        format!("\x1b[{}m", parts.join(";"))
+        format!("\x1b[0m\x1b[{}m", parts.join(";"))
     }
 }
 
@@ -367,14 +379,16 @@ fn draw_status(
         status.push('_');
         status.push_str("\x1b[0m");
     } else {
+        // テキストを SGR なしで組み立ててから幅で切り詰め、最後に mode を反転で
+        // 包む — エスケープを幅に数えると truncate がエスケープ途中で切れて
+        // 壊れた CSI を出力する（敵対的検証で発見）。
         let mode = match state.mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
             Mode::Select => "SELECT",
         };
-        status.push_str(&ui_sgr(scheme, UiRole::StatusLine));
-        status.push_str(mode);
-        status.push_str("\x1b[0m");
+        let mut text = String::new();
+        text.push_str(mode);
         // 診断カウントは mode の直後（パスより前）に置く — 長いパスで truncate
         // されてもカウントが消えないようにする（修正前は末尾だったため、実用の
         // 長いパスで [nE nW] が画面外に切れていた）。
@@ -389,7 +403,7 @@ fn draw_status(
             .filter(|d| d.severity == Severity::Warning)
             .count();
         if errors > 0 || warnings > 0 {
-            status.push_str(&format!("  [{errors}E {warnings}W]"));
+            text.push_str(&format!("  [{errors}E {warnings}W]"));
         }
         let path = sanitize_status_data(state.path.as_deref().unwrap_or("[no name]"));
         let dirty = if state.dirty { "*" } else { "" };
@@ -399,7 +413,7 @@ fn draw_status(
             .copied()
             .unwrap_or(Range { anchor: 0, head: 0 });
         let (row, col, _) = cursor_pos(&state.text, primary.head);
-        status.push_str(&format!(" {path}{dirty}  {row}:{col}"));
+        text.push_str(&format!(" {path}{dirty}  {row}:{col}"));
         if !pending.is_empty() {
             let keys: String = pending
                 .iter()
@@ -408,15 +422,26 @@ fn draw_status(
                     _ => None,
                 })
                 .collect();
-            status.push_str(&format!("  <{keys}>"));
+            text.push_str(&format!("  <{keys}>"));
         }
         // クライアント側の一時メッセージ（flash）は daemon の status より優先する
         // （flash が立つのは未知コマンド等で、status は古い情報のまま残っているため）
         let msg = flash.or(state.status.as_deref());
         if let Some(msg) = msg {
-            status.push_str(&format!("  {}", sanitize_status_data(msg)));
+            text.push_str(&format!("  {}", sanitize_status_data(msg)));
         }
-        truncate_wide(&mut status, width);
+        truncate_wide(&mut text, width);
+        status.push_str(&ui_sgr(scheme, UiRole::StatusLine));
+        if let Some(rest) = text.strip_prefix(mode) {
+            // mode が丸ごと残った: mode だけ反転で包み、残りは無地
+            status.push_str(mode);
+            status.push_str("\x1b[0m");
+            status.push_str(rest);
+        } else {
+            // 切り詰めが mode の途中に入った: 残り全部を反転で包む
+            status.push_str(&text);
+            status.push_str("\x1b[0m");
+        }
     }
     s.push_str(&status);
     s.push_str("\x1b[K");
@@ -502,7 +527,7 @@ mod tests {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
         let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         // 選択（char 2）は反転、カーソル（head=3）は青背景で区別される
-        assert!(out.contains("\x1b[7ml\x1b[44ml"), "{out:?}");
+        assert!(out.contains("\x1b[7ml\x1b[0m\x1b[44ml"), "{out:?}");
     }
 
     #[test]
@@ -583,6 +608,104 @@ mod tests {
         }];
         let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[4;93mb"), "Warning: {out:?}");
+    }
+
+    #[test]
+    fn triple_overlap_precedence() {
+        // カーソル > 選択 > 診断 > グループ: 全ロールが同じ行で重なる
+        let mut state = state_with("abcd", vec![Range { anchor: 1, head: 3 }], 0);
+        state.diagnostics = vec![Diagnostic {
+            start: 2,
+            end: 3,
+            severity: Severity::Error,
+            message: "e".into(),
+        }];
+        state.highlights =
+            vec![HighlightRange { start: 0, end: 4, group: HighlightGroup::String }];
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        // char 0: グループ (32) / char 1: 選択 (7) / char 2: 選択+診断 (4;7) / char 3: カーソル (44)
+        assert!(out.contains("\x1b[32ma"), "グループ: {out:?}");
+        assert!(out.contains("\x1b[7mb"), "選択: {out:?}");
+        assert!(out.contains("\x1b[4;7mc"), "選択+診断: {out:?}");
+        assert!(out.contains("\x1b[44md"), "カーソル: {out:?}");
+        assert!(!out.contains("\x1b[32mb"), "選択下でグループ色を出さない");
+        assert!(!out.contains("\x1b[32mc"), "選択+診断下でグループ色を出さない");
+        assert!(!out.contains("\x1b[32md"), "カーソル下でグループ色を出さない");
+    }
+
+    #[test]
+    fn group_spanning_lines() {
+        // 範囲が改行を跨ぐ（複数行文字列等）: 次の行の先頭も同グループ
+        let mut state = state_with("ab\ncd", vec![Range { anchor: 5, head: 5 }], 0);
+        state.highlights =
+            vec![HighlightRange { start: 0, end: 4, group: HighlightGroup::String }];
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[32mab"), "1行目: {out:?}");
+        assert!(out.contains("\x1b[32mc"), "2行目の先頭も同グループ: {out:?}");
+        assert!(!out.contains("\x1b[32mcd"), "範囲外 (char 4) に色を出さない: {out:?}");
+    }
+
+    #[test]
+    fn wide_char_truncation_inside_group() {
+        // 幅3: "あ" (2) まで描画。切り詰め時に宙に浮く SGR を出さない
+        let mut state = state_with("あいう", vec![Range { anchor: 3, head: 3 }], 0);
+        state.highlights =
+            vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::String }];
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 3, 10);
+        assert!(out.contains("\x1b[32mあ"), "グループ色で全角1文字: {out:?}");
+        assert!(!out.contains("い"), "幅超過で切り詰め: {out:?}");
+        assert!(!out.contains("\x1b[32m\x1b[0m"), "宙に浮く SGR を出さない: {out:?}");
+    }
+
+    #[test]
+    fn eof_cursor_after_trailing_newline_is_visible() {
+        // レビュー指摘の検証: 末尾 \n 直後の EOF カーソルが空白セルで見えるか
+        // （末尾空行の char_start は「\n の直後」なので既存の行末判定で一致する）
+        let state = state_with("ab\n", vec![Range { anchor: 3, head: 3 }], 0);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[44m "), "EOF カーソルが空白セルで見える: {out:?}");
+
+        let state = state_with("ab\ncd\n", vec![Range { anchor: 6, head: 6 }], 0);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[44m "), "複数行末尾の EOF カーソル: {out:?}");
+    }
+
+    #[test]
+    fn narrow_status_line_does_not_emit_broken_csi() {
+        // レビュー指摘: エスケープを幅に数えて truncate すると中途半端な CSI を
+        // 出力する。テキスト先行切り詰めに変えたので mode のラップとリセットが
+        // 壊れない（幅 10 < NORMAL 6 + 残りの幅）
+        let state = state_with("x", vec![Range { anchor: 0, head: 0 }], 0);
+        let out = render_text(&crate::colorscheme::DEFAULT, &state, &[], None, None, 10, 10);
+        assert!(
+            out.contains("\x1b[7mNORMAL\x1b[0m"),
+            "mode の反転ラップとリセットが壊れない: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[7mNORMAL\x1b[K"),
+            "エスケープが \x1b[K に飲み込まれない: {out:?}"
+        );
+    }
+
+    #[test]
+    fn scheme_styles_are_merged_fully() {
+        // 勝利ロールの Style は全フィールドが尊重される（bg だけ・reverse だけの
+        // 部分抽出でないこと — 敵対的検証で発見したバグの回帰テスト）
+        let scheme = Colorscheme {
+            name: "probe",
+            syntax: &[],
+            ui: &[(UiRole::Selection, Style {
+                fg: None,
+                bg: Some(crate::colorscheme::Color::Ansi(0)),
+                underline: false,
+                reverse: true,
+            })],
+        };
+        let state = state_with("ab", vec![Range { anchor: 0, head: 1 }], 0);
+        let out = render_text(&scheme, &state, &[], None, None, 40, 10);
+        // 選択 (char 0): reverse (7) + bg (40) が両方出る。カーソル (char 1) は未定義 → リセット
+        assert!(out.contains("\x1b[7;40ma"), "Selection の全フィールド: {out:?}");
+        assert!(!out.contains("\x1b[44m"), "未定義 Cursor に既定色を出さない: {out:?}");
     }
 
     #[test]
