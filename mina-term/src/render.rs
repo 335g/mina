@@ -56,7 +56,17 @@ impl LineIndex {
 }
 
 /// 画面全体の描画エスケープ列を生成する。`width`×`height` はターミナルのセル数。
-pub fn render_text(state: &StateSnapshot, pending: &[KeyEvent], width: u16, height: u16) -> String {
+///
+/// `command_line`: コマンドモードの入力バッファ（`Some` ならステータス行を `:` プロンプトに置き換える）。
+/// `flash`: クライアント側の一時メッセージ（未知コマンド等。次のキーで消える）。
+pub fn render_text(
+    state: &StateSnapshot,
+    pending: &[KeyEvent],
+    command_line: Option<&str>,
+    flash: Option<&str>,
+    width: u16,
+    height: u16,
+) -> String {
     let width = width as usize;
     let height = height as usize;
     let lines = LineIndex::new(&state.text);
@@ -97,7 +107,7 @@ pub fn render_text(state: &StateSnapshot, pending: &[KeyEvent], width: u16, heig
     // ステータス行
     s.push_str(&format!("\x1b[{};1H", height.max(1)));
     s.push_str("\x1b[K");
-    draw_status(&mut s, state, pending, width);
+    draw_status(&mut s, state, pending, command_line, flash, width);
 
     // 外部削除ポップアップ（ADR-0015）: 中央にモーダル表示。入力をブロックする
     // のはクライアント側（任意キーで Close が送られる）。
@@ -150,10 +160,12 @@ pub fn draw(
     out: &mut impl Write,
     state: &StateSnapshot,
     pending: &[KeyEvent],
+    command_line: Option<&str>,
+    flash: Option<&str>,
     width: u16,
     height: u16,
 ) -> std::io::Result<()> {
-    out.write_all(render_text(state, pending, width, height).as_bytes())
+    out.write_all(render_text(state, pending, command_line, flash, width, height).as_bytes())
 }
 
 /// 1行分を描画する。選択範囲は反転、診断範囲は下線、カーソルセルは青背景。
@@ -236,61 +248,85 @@ fn sanitize_status_data(s: &str) -> String {
         .collect()
 }
 
-/// ステータス行: `[モード] パス 行:列 [pending] [status]`
-fn draw_status(s: &mut String, state: &StateSnapshot, pending: &[KeyEvent], width: usize) {
+/// ステータス行: コマンドモード中は `:` + 入力バッファ（Helix 流）、
+/// それ以外は `[モード] パス 行:列 [pending] [status|flash]`
+fn draw_status(
+    s: &mut String,
+    state: &StateSnapshot,
+    pending: &[KeyEvent],
+    command_line: Option<&str>,
+    flash: Option<&str>,
+    width: usize,
+) {
     // ステータス文字列は別バッファで組み立ててから切り詰める
     // （出力全体の `s` を truncate すると画面が途中で消える）
     let mut status = String::new();
-    let mode = match state.mode {
-        Mode::Normal => "NORMAL",
-        Mode::Insert => "INSERT",
-        Mode::Select => "SELECT",
-    };
-    status.push_str("\x1b[7m");
-    status.push_str(mode);
-    status.push_str("\x1b[0m");
-    // 診断カウントは mode の直後（パスより前）に置く — 長いパスで truncate され
-    // てもカウントが消えないようにする（修正前は末尾だったため、実用の長い
-    // パスで [nE nW] が画面外に切れていた）。
-    let errors = state
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warnings = state
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
-    if errors > 0 || warnings > 0 {
-        status.push_str(&format!("  [{errors}E {warnings}W]"));
-    }
-    let path = sanitize_status_data(state.path.as_deref().unwrap_or("[no name]"));
-    let dirty = if state.dirty { "*" } else { "" };
-    let primary = state
-        .selection
-        .get(state.primary_index)
-        .copied()
-        .unwrap_or(Range { anchor: 0, head: 0 });
-    let (row, col, _) = cursor_pos(&state.text, primary.head);
-    status.push_str(&format!(" {path}{dirty}  {row}:{col}"));
-    if !pending.is_empty() {
-        let keys: String = pending
+    if let Some(buf) = command_line {
+        // コマンドモード: 行全体を反転し `:` + バッファ + カーソルを表示する
+        status.push_str("\x1b[7m");
+        let mut line = String::from(":");
+        line.push_str(&sanitize_status_data(buf));
+        // カーソルは常に見えるよう 1 セル空けてから `_` を付ける
+        truncate_wide(&mut line, width.saturating_sub(1));
+        status.push_str(&line);
+        status.push('_');
+        status.push_str("\x1b[0m");
+    } else {
+        let mode = match state.mode {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Select => "SELECT",
+        };
+        status.push_str("\x1b[7m");
+        status.push_str(mode);
+        status.push_str("\x1b[0m");
+        // 診断カウントは mode の直後（パスより前）に置く — 長いパスで truncate
+        // されてもカウントが消えないようにする（修正前は末尾だったため、実用の
+        // 長いパスで [nE nW] が画面外に切れていた）。
+        let errors = state
+            .diagnostics
             .iter()
-            .filter_map(|k| match k.code {
-                KeyCode::Char(c) => Some(c),
-                _ => None,
-            })
-            .collect();
-        status.push_str(&format!("  <{keys}>"));
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let warnings = state
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
+        if errors > 0 || warnings > 0 {
+            status.push_str(&format!("  [{errors}E {warnings}W]"));
+        }
+        let path = sanitize_status_data(state.path.as_deref().unwrap_or("[no name]"));
+        let dirty = if state.dirty { "*" } else { "" };
+        let primary = state
+            .selection
+            .get(state.primary_index)
+            .copied()
+            .unwrap_or(Range { anchor: 0, head: 0 });
+        let (row, col, _) = cursor_pos(&state.text, primary.head);
+        status.push_str(&format!(" {path}{dirty}  {row}:{col}"));
+        if !pending.is_empty() {
+            let keys: String = pending
+                .iter()
+                .filter_map(|k| match k.code {
+                    KeyCode::Char(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            status.push_str(&format!("  <{keys}>"));
+        }
+        // クライアント側の一時メッセージ（flash）は daemon の status より優先する
+        // （flash が立つのは未知コマンド等で、status は古い情報のまま残っているため）
+        let msg = flash.or(state.status.as_deref());
+        if let Some(msg) = msg {
+            status.push_str(&format!("  {}", sanitize_status_data(msg)));
+        }
+        truncate_wide(&mut status, width);
     }
-    if let Some(msg) = &state.status {
-        status.push_str(&format!("  {}", sanitize_status_data(msg)));
-    }
-    truncate_wide(&mut status, width);
     s.push_str(&status);
     s.push_str("\x1b[K");
 }
+
 
 /// 表示幅で `s` を切り詰める（全角2・結合文字0）。
 fn truncate_wide(s: &mut String, width: usize) {
@@ -356,7 +392,7 @@ mod tests {
     #[test]
     fn renders_text_status_and_cursor() {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         // 選択ハイライトとカーソルセルで "hello" は分割されるので部分で検証
         assert!(out.contains("he"), "{out:?}");
         assert!(out.contains("NORMAL"), "{out:?}");
@@ -368,7 +404,7 @@ mod tests {
     #[test]
     fn selection_is_highlighted() {
         let state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         // 選択（char 2）は反転、カーソル（head=3）は青背景で区別される
         assert!(out.contains("\x1b[7ml\x1b[44ml"), "{out:?}");
     }
@@ -377,14 +413,14 @@ mod tests {
     fn cursor_at_line_end_is_visible() {
         // カーソルが行末（最後の文字の直後）にあっても青背景の空白で見える
         let state = state_with("hi", vec![Range { anchor: 2, head: 2 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[44m "), "行末カーソルの青背景空白: {out:?}");
     }
 
     #[test]
     fn status_shows_pending_keys() {
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[plain(KeyCode::Char('g'))], 40, 10);
+        let out = render_text(&state, &[plain(KeyCode::Char('g'))], None, None, 40, 10);
         assert!(out.contains("<g>"), "{out:?}");
     }
 
@@ -392,21 +428,21 @@ mod tests {
     fn wide_char_truncation_respects_display_width() {
         // "あ" は表示幅2。幅3なら "あ" で切れ、"あい" にはならない
         let state = state_with("あいうえお", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], 3, 10);
+        let out = render_text(&state, &[], None, None, 3, 10);
         assert!(out.contains("あ") && !out.contains("あい"), "{out:?}");
     }
 
     #[test]
     fn empty_document_renders_blank() {
         let state = state_with("", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[K"), "{out:?}");
     }
 
     #[test]
     fn multi_line_renders_all_rows() {
         let state = state_with("a\nb\nc", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(!out.contains("a\n"), "行内に生の改行を出さない: {out:?}");
         assert!(out.contains("\x1b[2;1H"), "2行目へ移動: {out:?}");
     }
@@ -416,7 +452,7 @@ mod tests {
         // H2: CRLF の \r を生出力すると直後の \x1b[K で行全体が消える。
         // \r は非表示文字としてスキップし、両行とも描画される。
         let state = state_with("a\r\nb\r\n", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(!out.contains('\r'), "生の \\r を出力しない: {out:?}");
         assert!(out.contains("a"), "1行目が描画される: {out:?}");
         assert!(out.contains("b"), "2行目が描画される: {out:?}");
@@ -427,7 +463,7 @@ mod tests {
         // 制御文字（ESC 等）は � に置換（端末インジェクション対策）。
         // 文書内の \x1b[31m がそのまま端末へ流れないことを確認する。
         let state = state_with("\x1b[31mred", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(!out.contains("\x1b[31m"), "ESC シーケンスを生出力しない: {out:?}");
         assert!(out.contains('\u{FFFD}'), "制御文字は � に置換される: {out:?}");
     }
@@ -459,7 +495,7 @@ mod tests {
             events: Vec::new(),
             deleted: None,
         };
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(!out.contains("\x1b]0;evil"), "OSC を生出力しない: {out:?}");
         assert!(!out.contains("\x1b[31m"), "status の ESC を生出力しない: {out:?}");
     }
@@ -492,7 +528,7 @@ mod tests {
             events: Vec::new(),
             deleted: None,
         };
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[4mworld\x1b[0m"), "診断範囲に下線: {out:?}");
         assert!(out.contains("[1E 0W]"), "ステータスにカウント: {out:?}");
     }
@@ -502,15 +538,46 @@ mod tests {
         // ADR-0015: 外部削除ポップアップが中央に描画される。dirty なら警告が付く。
         let mut state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
         state.deleted = Some("/tmp/x.txt".into());
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(out.contains("file deleted on disk"), "{out:?}");
         assert!(out.contains("x.txt"), "パスが表示される: {out:?}");
         assert!(out.contains("press any key to close"), "{out:?}");
         assert!(!out.contains("unsaved changes will be lost"), "{out:?}");
 
         state.dirty = true;
-        let out = render_text(&state, &[], 40, 10);
+        let out = render_text(&state, &[], None, None, 40, 10);
         assert!(out.contains("unsaved changes will be lost"), "{out:?}");
+    }
+
+    #[test]
+    fn command_line_replaces_status_with_prompt() {
+        // コマンドモード中はステータス行全体が `:` プロンプトに置き換わる
+        let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
+        let out = render_text(&state, &[], Some("w"), None, 40, 10);
+        assert!(out.contains(":w_"), "`:` + バッファ + カーソル: {out:?}");
+        assert!(!out.contains("NORMAL"), "モード表示はプロンプトに置き換わる: {out:?}");
+    }
+
+    #[test]
+    fn flash_shows_in_status_slot_and_yields_to_status() {
+        // クライアント側メッセージ（flash）は status スロットに表示される
+        let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
+        let out = render_text(&state, &[], None, Some("unknown command: foo"), 120, 10);
+        assert!(out.contains("unknown command: foo"), "{out:?}");
+        // コマンドモード中は flash ではなくプロンプトが優先される
+        let out = render_text(&state, &[], Some("q"), Some("unknown command: foo"), 40, 10);
+        assert!(out.contains(":q_") && !out.contains("unknown"), "{out:?}");
+    }
+
+    #[test]
+    fn command_line_is_sanitized_and_truncated_with_cursor() {
+        // SEC-2: コマンドラインの制御文字は � に置換され、生の ESC が流れない
+        let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
+        let out = render_text(&state, &[], Some("\x1b[31m"), None, 40, 10);
+        assert!(!out.contains("\x1b[31m"), "ESC を生出力しない: {out:?}");
+        // 幅5のプロンプト: カーソル `_` は常に 1 セル確保される
+        let out = render_text(&state, &[], Some("abcd"), None, 5, 10);
+        assert!(out.contains(":abc_"), "カーソルが残る: {out:?}");
     }
 
     fn plain(code: KeyCode) -> KeyEvent {
