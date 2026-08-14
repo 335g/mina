@@ -106,16 +106,15 @@ pub struct Daemon {
     generation: u64,
     /// 直近の状態変化イベントの bounded リング（ADR-0012）。
     events: VecDeque<ChangeEvent>,
-    /// 外部変更検知のベースライン（フォーカス文書。Open/Save で更新）。
-    disk_baseline: Option<DiskBaseline>,
-    /// フォーカス文書が外部ツールによって変更されたか（Open/Save でクリア）。
-    disk_changed: bool,
+    /// 外部変更検知のベースライン（全オープン文書。Open/Save/Close で更新）。
+    baselines: HashMap<PathBuf, DiskBaseline>,
+    /// フォーカス文書が外部で削除され、Close を待っているパス（ADR-0015）。
+    deleted: Option<String>,
 }
 
-/// 外部変更検知のベースライン（mtime+size。ADR-0012 のヒューリスティック）。
+/// 外部変更検知のベースライン（mtime+size。ADR-0012/0015 のヒューリスティック）。
 #[derive(Clone, Debug)]
 struct DiskBaseline {
-    path: PathBuf,
     mtime: std::time::SystemTime,
     size: u64,
 }
@@ -154,8 +153,8 @@ impl Daemon {
             insert_owner: None,
             generation: 0,
             events: VecDeque::new(),
-            disk_baseline: None,
-            disk_changed: false,
+            baselines: HashMap::new(),
+            deleted: None,
         }
     }
 
@@ -222,10 +221,11 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
     // （オーバーフローも失われるのは中間世代のみで、フルスナップショット
     // なので最新に収束する）。
     let (push_tx, _) = watch::channel(StateSnapshot::default());
-    // ADR-0012: 外部変更監視（フォーカス文書の mtime+size をポーリング）
+    // ADR-0012/0015: 外部変更監視（全オープン文書の mtime+size をポーリング）
     {
         let daemon_task = daemon.clone();
-        tokio::spawn(watch_disk(daemon_task));
+        let push_task = push_tx.clone();
+        tokio::spawn(watch_disk(daemon_task, push_task));
     }
     match bind_listener(path) {
         Ok(listener) => accept_loop(listener, daemon, push_tx).await,
@@ -245,41 +245,149 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// 外部変更検知タスク（ADR-0012）: フォーカス文書の mtime+size を定期的に
-/// ベースラインと照合し、不一致なら `ExternalChange` イベントを記録して
-/// `disk_changed` を立てる。自動リロードはしない（メモリ状態を壊さない）。
+/// 外部変更検知タスク（ADR-0012/0015）: 全オープン文書の mtime+size を
+/// 定期的にベースラインと照合し、乖離を検知したら自動リロードする（Dirty でも
+/// 常時）。リロードは Transaction として記録されるため undo 可能で、dirty は
+/// 解消される（テキストがディスクと一致するため）。外部削除はフォーカス文書を
+/// `deleted` 状態として保留し、Close を待つ。検知した変更は push チャネルで
+/// 即時配信する（エージェントの WaitFor も wake される）。
 ///
 /// ponytail: mtime+size はヒューリスティック（mtime を保存するツールや粗い
-/// mtime 粒度の FS では見逃しうる）。イベントは検知ごとに1回（Open/Save で
-/// ベースラインが更新されるまで再発しない）。
-async fn watch_disk(daemon: Arc<Mutex<Daemon>>) {
+/// mtime 粒度の FS では見逃しうる）。文書ごとのベースラインは Open/Save/
+/// Close で更新される。
+async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnapshot>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         interval.tick().await;
-        let mut d = daemon.lock().await;
-        let Some(baseline) = d.disk_baseline.clone() else {
-            continue; // ファイル未オープン
-        };
-        if d.disk_changed {
-            continue; // 検知済み（ベースライン更新まで維持）
-        }
-        // フォーカスが別の文書へ移っていれば対象外（Open でベースラインが
-        // 更新されるはず）
-        if d.editor.focused_path().map(Path::to_path_buf).as_deref()
-            != Some(baseline.path.as_path())
-        {
-            continue;
-        }
-        let mismatch = match std::fs::metadata(&baseline.path) {
-            Ok(md) => {
-                md.len() != baseline.size
-                    || md.modified().unwrap_or(std::time::UNIX_EPOCH) != baseline.mtime
+        // フェーズ1（ロック内）: ベースラインと stat を照合し、リロード対象と
+        // フォーカス文書の削除/復活を判定する。
+        let (reload_targets, focused_deleted, focused_reappeared) = {
+            let d = daemon.lock().await;
+            let focused = d.editor.focused_path().map(Path::to_path_buf);
+            let mut reload_targets = Vec::new();
+            let mut focused_deleted = false;
+            let mut focused_reappeared = false;
+            for (path, baseline) in &d.baselines {
+                match std::fs::metadata(path) {
+                    Ok(md) => {
+                        let changed = md.len() != baseline.size
+                            || md.modified().unwrap_or(std::time::UNIX_EPOCH) != baseline.mtime;
+                        if changed {
+                            reload_targets.push(path.clone());
+                        }
+                        if focused.as_deref() == Some(path.as_path()) {
+                            focused_reappeared = true;
+                        }
+                    }
+                    Err(_) => {
+                        // 外部で削除された: フォーカス文書なら Close 待ちへ
+                        if focused.as_deref() == Some(path.as_path()) {
+                            focused_deleted = true;
+                        }
+                    }
+                }
             }
-            Err(_) => true, // 外部で削除された
+            (reload_targets, focused_deleted, focused_reappeared)
         };
-        if mismatch {
-            d.disk_changed = true;
-            d.record_event(EventSource::External, EventKind::ExternalChange, None, None);
+        // フェーズ2（ロック外）: リロード対象のテキストを読む
+        let mut contents = Vec::new();
+        for path in &reload_targets {
+            if let Ok(text) = tokio::fs::read_to_string(path).await {
+                contents.push((path.clone(), text));
+            }
+        }
+        // フェーズ3（ロック内）: リロード適用・削除状態更新・LSP 同期対象の決定
+        let mut snap = None;
+        let mut lsp_sync = None;
+        {
+            let mut d = daemon.lock().await;
+            if focused_deleted && d.deleted.is_none() {
+                if let Some(p) = d.editor.focused_path() {
+                    d.deleted = Some(p.to_string_lossy().into_owned());
+                    d.record_event(
+                        EventSource::External,
+                        EventKind::ExternalChange,
+                        None,
+                        None,
+                    );
+                }
+            } else if focused_reappeared && d.deleted.is_some() {
+                d.deleted = None;
+            }
+            let mut reloaded = false;
+            for (path, text) in &contents {
+                // 閉じられた文書のパスは対象外
+                let Some(doc_id) = d.editor.doc_id_for_path(path) else {
+                    continue;
+                };
+                // 外部書き込みとして Insert グループを閉じる（ADR-0007 と同原則）
+                if d.insert_owner.is_some() {
+                    d.editor.end_group();
+                    d.editor.set_mode(mina_view::Mode::Normal);
+                    d.insert_owner = None;
+                }
+                if d.editor.reload_doc(doc_id, text) {
+                    reloaded = true;
+                    if let Ok(md) = std::fs::metadata(path) {
+                        d.baselines.insert(
+                            path.clone(),
+                            DiskBaseline {
+                                mtime: md
+                                    .modified()
+                                    .unwrap_or(std::time::UNIX_EPOCH),
+                                size: md.len(),
+                            },
+                        );
+                    }
+                    d.record_event(
+                        EventSource::External,
+                        EventKind::ExternalChange,
+                        None,
+                        None,
+                    );
+                    // LSP 全文同期はフォーカス文書のときだけ（診断もフォーカス
+                    // 文書のものしか保持しない — drain_into の契約）
+                    if d.editor.focused_path().map(Path::to_path_buf).as_deref()
+                        == Some(path.as_path())
+                    {
+                        lsp_sync = Some((path.clone(), text.clone()));
+                    }
+                }
+            }
+            if reloaded || focused_deleted || focused_reappeared {
+                snap = Some(snapshot(
+                    &d,
+                    reloaded.then(|| "reloaded from disk".into()),
+                ));
+            }
+        }
+        // フェーズ4（ロック外）: LSP 全文同期 + pull 診断（編集と同経路）
+        if let Some((path, text)) = &lsp_sync {
+            if let Some(session) = daemon
+                .lock()
+                .await
+                .lsp_sessions
+                .get(&lsp::workspace_root(path))
+                .cloned()
+            {
+                lsp::sync(&session, path, text).await;
+                let pulled = lsp::pull_after_edit(&session, path, text).await;
+                let mut d = daemon.lock().await;
+                if let Some(diags) = pulled {
+                    d.diagnostics = diags;
+                }
+                lsp::drain_into(&mut d);
+                // pull 診断は generation を変えないので、スナップショットを
+                // 作り直して push する（診断の変化を購読者へ届ける）
+                snap = Some(snapshot(&d, snap.and_then(|s| s.status)));
+            }
+        }
+        // 世代が進んでいれば全購読者へ配る（ADR-0013 と同条件）
+        if let Some(snap) = snap {
+            let changed = push_tx.borrow().generation != snap.generation;
+            if changed {
+                let _ = push_tx.send(snap);
+            }
         }
     }
 }
@@ -538,7 +646,71 @@ async fn process_command(
                     // 間に他接続がフォーカスを動かしても、正しい文書に通知するため）
                     reused.map(|_| d.editor.current_document().text().to_string())
                 };
-                if let Some(text) = reuse_text {
+                if let Some(_) = reuse_text {
+                    // 既に開かれているパス: フォーカスは focus_open_path 済み（#7）。
+                    // 外部変更があれば自動リロードする（ADR-0015）。watch_disk の
+                    // 2 秒周期より先にここで stat して検知し、LSP にはリロード後の
+                    // テキストで didOpen を送る。
+                    let stat = {
+                        let _d = daemon.lock().await;
+                        std::fs::metadata(&path_buf).ok().map(|md| {
+                            (
+                                md.modified().unwrap_or(std::time::UNIX_EPOCH),
+                                md.len(),
+                            )
+                        })
+                    };
+                    let reload_text = match &stat {
+                        Some((mtime, size)) => {
+                            let diverged = {
+                                let d = daemon.lock().await;
+                                d.baselines.get(&path_buf).is_some_and(|b| {
+                                    b.size != *size || b.mtime != *mtime
+                                })
+                            };
+                            if diverged {
+                                tokio::fs::read_to_string(&path_buf).await.ok()
+                            } else {
+                                None
+                            }
+                        }
+                        None => None, // 削除済み: deleted は下のロック内で立てる
+                    };
+                    let text = {
+                        let mut d = daemon.lock().await;
+                        // ベースライン更新（削除済みなら保持し、復活検知に使う）
+                        if let Some((mtime, size)) = &stat {
+                            d.baselines.insert(
+                                path_buf.clone(),
+                                DiskBaseline {
+                                    mtime: *mtime,
+                                    size: *size,
+                                },
+                            );
+                            d.deleted = None;
+                        } else {
+                            d.deleted = Some(path_str.clone());
+                        }
+                        if let Some(new_text) = &reload_text {
+                            if let Some(doc_id) = d.editor.doc_id_for_path(&path_buf) {
+                                // 外部書き込みとして Insert グループを閉じる
+                                if d.insert_owner.is_some() {
+                                    d.editor.end_group();
+                                    d.editor.set_mode(mina_view::Mode::Normal);
+                                    d.insert_owner = None;
+                                }
+                                if d.editor.reload_doc(doc_id, new_text) {
+                                    d.record_event(
+                                        EventSource::External,
+                                        EventKind::ExternalChange,
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        d.editor.current_document().text().to_string()
+                    };
                     // LSP: ADR-0009 の「次回 Open でリスポーン」を維持するため、
                     // サーバが死んでいればここで再生成し、現在のバッファ内容で
                     // didOpen を再通知する（フルテキスト同期なので再利用への
@@ -563,54 +735,6 @@ async fn process_command(
                     }
                     let mut d = daemon.lock().await;
                     lsp::drain_into(&mut d);
-                    // ADR-0012: 再利用 Open でもフォーカス文書のベースラインを再 stat
-                    // して更新する（watch_disk は baseline.path == フォーカス前提で照合
-                    // するため、更新を怠るとフォーカス復帰後の外部変更検知が停止する =
-                    // MAJOR M2）。
-                    // disk_changed は「フォーカス文書が直近ベースラインから乖離して
-                    // いる」フラグ: 直前ベースラインが同一文書のもので stat が乖離した
-                    // ままなら維持（乖離は実在するので報告を消さない。Save/新規 Open で
-                    // 解消される）、別文書のフラグ（他文書の乖離）は引き継がない。
-                    let (diverged, baseline) = match std::fs::metadata(&path_buf) {
-                        Ok(md) => {
-                            let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-                            let size = md.len();
-                            let diverged = d.disk_baseline.as_ref().is_some_and(|b| {
-                                b.path == path_buf && (b.size != size || b.mtime != mtime)
-                            });
-                            (diverged, DiskBaseline {
-                                path: path_buf.clone(),
-                                mtime,
-                                size,
-                            })
-                        }
-                        // 外部で削除済み: パスだけ張り替え、watch_disk の metadata
-                        // エラー判定（削除 = 乖離）に検知を委ねる
-                        Err(_) => (
-                            true,
-                            DiskBaseline {
-                                path: path_buf.clone(),
-                                mtime: std::time::UNIX_EPOCH,
-                                size: 0,
-                            },
-                        ),
-                    };
-                    d.disk_baseline = Some(baseline);
-                    if diverged {
-                        // 未検知の乖離（watch_disk の 2 秒周期より先にここで検知）。
-                        // 既にフラグが立っている（= イベント記録済み）場合は重複しない。
-                        if !d.disk_changed {
-                            d.record_event(
-                                EventSource::External,
-                                EventKind::ExternalChange,
-                                None,
-                                None,
-                            );
-                        }
-                        d.disk_changed = true;
-                    } else {
-                        d.disk_changed = false;
-                    }
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
                     snapshot(&d, None)
@@ -640,15 +764,19 @@ async fn process_command(
                             let height = d.viewport_height;
                             d.editor.scroll_to_cursor(height);
                             d.diagnostics.clear();
-                            // ADR-0012: ベースライン更新 + Open イベント
+                            // ADR-0012/0015: ベースライン更新 + Open イベント
                             if let Ok(md) = std::fs::metadata(&path_buf) {
-                                d.disk_baseline = Some(DiskBaseline {
-                                    path: path_buf.clone(),
-                                    mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
-                                    size: md.len(),
-                                });
+                                d.baselines.insert(
+                                    path_buf.clone(),
+                                    DiskBaseline {
+                                        mtime: md
+                                            .modified()
+                                            .unwrap_or(std::time::UNIX_EPOCH),
+                                        size: md.len(),
+                                    },
+                                );
                             }
-                            d.disk_changed = false;
+                            d.deleted = None;
                             d.record_event(source, EventKind::Open, None, None);
                             (contents.clone(), session.is_some())
                         }
@@ -703,17 +831,22 @@ async fn process_command(
                             .as_ref()
                             .expect("書き込み成功ならパスはある")
                             .display();
-                        // ADR-0012: 保存後にベースライン更新（外部変更検知の基準を
-                        // 現在のディスク状態に合わせる）
+                        // ADR-0012/0015: 保存後にベースライン更新（外部変更検知の
+                        // 基準を現在のディスク状態に合わせる）。ファイルを再作成する
+                        // ことになるため、削除状態は解消する。
                         if let Some(p) = &path {
                             if let Ok(md) = std::fs::metadata(p) {
-                                d.disk_baseline = Some(DiskBaseline {
-                                    path: p.clone(),
-                                    mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
-                                    size: md.len(),
-                                });
+                                d.baselines.insert(
+                                    p.clone(),
+                                    DiskBaseline {
+                                        mtime: md
+                                            .modified()
+                                            .unwrap_or(std::time::UNIX_EPOCH),
+                                        size: md.len(),
+                                    },
+                                );
                             }
-                            d.disk_changed = false;
+                            d.deleted = None;
                             d.record_event(source, EventKind::Save, None, None);
                         }
                         let status = if clean {
@@ -749,6 +882,7 @@ async fn process_command(
                     }
                     Command::Undo if d.editor.can_undo() => Some((EventKind::Undo, None, None)),
                     Command::Redo if d.editor.can_redo() => Some((EventKind::Redo, None, None)),
+                    Command::Close => Some((EventKind::Close, None, None)),
                     Command::SetMode { mode } if convert_mode(*mode) != d.editor.mode() => {
                         Some((EventKind::SetMode, None, None))
                     }
@@ -1237,6 +1371,16 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             daemon.viewport_height = height.min(MAX_VIEWPORT_HEIGHT);
             (snapshot(daemon, None), false)
         }
+        Command::Close => {
+            let closed = daemon.editor.close_focused_document();
+            if closed {
+                // 閉じた文書のベースラインを落とす（開いている文書の分だけ残す）
+                let open: Vec<PathBuf> = daemon.editor.open_paths().cloned().collect();
+                daemon.baselines.retain(|p, _| open.contains(p));
+                daemon.deleted = None;
+            }
+            (snapshot(daemon, None), closed)
+        }
         Command::GetState => (snapshot(daemon, None), false),
         Command::Open { .. } | Command::Save => {
             unreachable!("I/O コマンドは接続ハンドラで処理される")
@@ -1271,7 +1415,7 @@ fn snapshot(daemon: &Daemon, status: Option<String>) -> StateSnapshot {
         status,
         generation: daemon.generation,
         events: daemon.events.iter().cloned().collect(),
-        disk_changed: daemon.disk_changed,
+        deleted: daemon.deleted.clone(),
     }
 }
 
@@ -2083,9 +2227,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_already_open_path_preserves_unsaved_edits() {
-        // #7 e2e: 実 socket で agent の Open が、開き済みパスの未保存編集を
-        // 破棄しない（ディスク再読込もしない）。
+    async fn reopen_diverged_path_reloads_but_undo_recovers_unsaved_edits() {
+        // #7 + ADR-0015: 開き済みパスの再 Open は文書を再利用する（#7: 同一性・
+        // ヒストリー保持）が、ディスクと乖離していれば自動リロードする（ADR-0015:
+        // Dirty でも常時）。未保存編集はリロードの undo で回復できる。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-7-sock-{}.sock", std::process::id()));
         let file = dir.join(format!("mina-7-file-{}.txt", std::process::id()));
@@ -2102,21 +2247,22 @@ mod tests {
         assert_eq!(snap.text, "Xbase\n");
         assert!(snap.dirty);
 
-        // ディスクの中身を変えておく: 再 Open がディスクを読んだら X が消える
+        // ディスクの中身を変えておく: 再 Open でリロードされたら X が消える
         std::fs::write(&file, "changed\n").unwrap();
 
-        // agent: 同じパスを Open し直す → 既存ドキュメントへフォーカス
-        // （#13 の制限対象外: テスト対象は Open 再利用の daemon 挙動であり、
-        // クライアント種別は本質ではないため Interactive で 2 番目のクライアント
-        // を演じる）
+        // 同じパスを Open し直す → 既存文書を再利用しつつ自動リロード
         let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut agent, &Command::Open { path }).await;
-        assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
-        assert!(snap.dirty, "dirty が保持される");
+        assert_eq!(snap.text, "changed\n", "乖離していれば再 Open でリロード");
+        assert!(!snap.dirty, "リロード後は clean");
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::ExternalChange && e.source == EventSource::External
+        }));
 
-        // undo も効く（ヒストリーが保持されている）
+        // undo で未保存編集が回復できる（ヒストリーが保持されている）
         let snap = request(&mut agent, &Command::Undo).await;
-        assert_eq!(snap.text, "base\n", "undo で挿入だけ戻る");
+        assert_eq!(snap.text, "Xbase\n", "undo でリロードを戻し未保存編集が回復");
+        assert!(snap.dirty);
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
@@ -2145,10 +2291,10 @@ mod tests {
         assert_eq!(snap.text, "Xbase\n");
         assert!(snap.dirty);
 
-        // ディスクの中身を変えておく: 再 Open がディスクを読んだら X が消える
+        // ディスクの中身を変えておく: 再 Open でリロードされたら X が消える
         std::fs::write(&file, "changed\n").unwrap();
 
-        // 表記違いの再 Open: どれも既存文書へフォーカスし直す
+        // 表記違いの再 Open: どれも既存文書へフォーカスし直す（C2）
         let link = dir.join("link.txt");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let notations = [
@@ -2157,18 +2303,21 @@ mod tests {
             format!("{}/other/../sub/file.txt", dir.display()), // .. 付き
             link.to_string_lossy().into_owned(),                // symlink 経由
         ];
-        for path in notations {
-            let mut agent = connect_client(&sock, ClientKind::Interactive).await;
-            let snap = request(&mut agent, &Command::Open { path }).await;
-            assert_eq!(snap.text, "Xbase\n", "未保存編集が保持される");
-            assert!(snap.dirty, "dirty が保持される");
+        let mut agent = connect_client(&sock, ClientKind::Interactive).await;
+        // 最初の再 Open はディスクと乖離しているので自動リロードされる（ADR-0015）
+        let snap = request(&mut agent, &Command::Open { path: notations[0].clone() }).await;
+        assert_eq!(snap.text, "changed\n", "乖離していれば再 Open でリロード");
+        assert!(!snap.dirty);
+        // 以降の表記違いの再 Open は乖離なし（ベースライン更新済み）: 文書を再利用
+        for path in &notations[1..] {
+            let snap = request(&mut agent, &Command::Open { path: path.clone() }).await;
+            assert_eq!(snap.text, "changed\n", "表記違いでも同一文書へ");
         }
 
         // undo も効く（ヒストリーが保持されている）
-        let mut agent = connect_client(&sock, ClientKind::Interactive).await;
-        let _ = request(&mut agent, &Command::Open { path: plain }).await;
         let snap = request(&mut agent, &Command::Undo).await;
-        assert_eq!(snap.text, "base\n", "undo で挿入だけ戻る");
+        assert_eq!(snap.text, "Xbase\n", "undo でリロードを戻し未保存編集が回復");
+        assert!(snap.dirty);
 
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2890,9 +3039,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_change_is_detected_without_auto_reload() {
-        // ADR-0012: 外部ツールによるファイル変更を検知して disk_changed + イベントを
-        // 出すが、自動リロードはしない。Save でベースラインが更新されフラグが下がる。
+    async fn external_change_auto_reloads_and_is_undoable() {
+        // ADR-0015: 外部ツールによるファイル変更は自動リロードされる（Dirty でも
+        // 常時）。リロードは Transaction なので undo で外部変更前の状態に戻れる。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-9e-sock-{}.sock", std::process::id()));
         let file = dir.join(format!("mina-9e-file-{}.txt", std::process::id()));
@@ -2904,143 +3053,269 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
         let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
         assert_eq!(snap.text, "base\n");
-        assert!(!snap.disk_changed);
+        assert!(snap.deleted.is_none());
 
         // 外部ツールがファイルを書き換える（daemon は知らない）
         std::fs::write(&file, "changed by external tool\n").unwrap();
 
-        // 監視タスク（2秒周期）が検知するのを待つ
+        // 監視タスク（2秒周期）が検知して自動リロードするのを待つ
         let snap = poll_snapshot(
             &mut c,
-            |s| s.disk_changed,
+            |s| s.text == "changed by external tool\n",
             std::time::Duration::from_secs(8),
         )
         .await;
-        assert_eq!(snap.text, "base\n", "自動リロードしない（メモリ内容は不変）");
         assert!(snap.events.iter().any(|e| {
             e.kind == EventKind::ExternalChange && e.source == EventSource::External
         }));
+        assert!(!snap.dirty, "リロード後はテキストがディスクと一致するので clean");
 
-        // Save でベースラインが更新され、フラグが下がる
+        // リロードは undo 可能（外部変更前の状態に戻れる）
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.text, "base\n", "undo で外部変更前の状態に戻る");
+
+        // Save でベースラインが更新される
         let snap = request(&mut c, &Command::Save).await;
         assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
-        let snap = poll_snapshot(
-            &mut c,
-            |s| !s.disk_changed,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-        assert!(!snap.disk_changed, "Save でベースラインが更新される");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
-    async fn reuse_open_restats_baseline_so_external_change_is_detected() {
-        // MAJOR M2: 再利用 Open（既存文書へのフォーカス復帰）でベースラインが更新
-        // されず watch_disk が毎回スキップし、フォーカス文書の外部変更検知が停止
-        // する。修正後は再利用 Open でベースラインがフォーカス文書に張り替わり、
-        // その後の外部変更が検知される。
+    async fn reuse_open_reloads_diverged_document() {
+        // ADR-0015: 再利用 Open（既存文書へのフォーカス復帰）でも、ディスクと
+        // 乖離していれば watch_disk の 2 秒周期を待たずに自動リロードする
+        // （TUI 再起動のシナリオ: 閉じている間に外部編集 → 再オープンで即反映）。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-m2r-sock-{}.sock", std::process::id()));
-        let file_a = dir.join(format!("mina-m2r-a-{}.txt", std::process::id()));
-        let file_b = dir.join(format!("mina-m2r-b-{}.txt", std::process::id()));
+        let file = dir.join(format!("mina-m2r-file-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&file_a);
-        let _ = std::fs::remove_file(&file_b);
-        std::fs::write(&file_a, "a-base\n").unwrap();
-        std::fs::write(&file_b, "b-base\n").unwrap();
-        start_server(&sock).await;
-
-        let mut c = connect_client(&sock, ClientKind::Interactive).await;
-        let pa = file_a.to_string_lossy().into_owned();
-        let pb = file_b.to_string_lossy().into_owned();
-        // Open A → Open B → 再利用 Open A（フォーカス復帰）
-        let snap = request(&mut c, &Command::Open { path: pa.clone() }).await;
-        assert_eq!(snap.text, "a-base\n");
-        let snap = request(&mut c, &Command::Open { path: pb.clone() }).await;
-        assert_eq!(snap.text, "b-base\n");
-        let snap = request(&mut c, &Command::Open { path: pa.clone() }).await;
-        assert_eq!(snap.text, "a-base\n", "再利用で A にフォーカス復帰");
-        assert!(!snap.disk_changed, "再利用直後はまだ乖離していない");
-
-        // 再利用 Open 後に A を外部変更 → 検知される（修正前はベースラインが B の
-        // ままで watch_disk が毎回スキップし、8 秒待っても検知されない）
-        std::fs::write(&file_a, "changed by external tool\n").unwrap();
-        let snap = poll_snapshot(
-            &mut c,
-            |s| s.disk_changed,
-            std::time::Duration::from_secs(8),
-        )
-        .await;
-        assert_eq!(snap.text, "a-base\n", "自動リロードしない（メモリ内容は不変）");
-        assert!(snap.events.iter().any(|e| {
-            e.kind == EventKind::ExternalChange && e.source == EventSource::External
-        }));
-
-        // ベースラインが A に張り替わっていること: Save で A の現状を基準にした後、
-        // B を外部変更してもフォーカス文書 A のフラグは立たない（B の状態を A に
-        // 誤報告しない）
-        let snap = request(&mut c, &Command::Save).await;
-        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
-        let snap = poll_snapshot(
-            &mut c,
-            |s| !s.disk_changed,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-        assert!(!snap.disk_changed);
-        std::fs::write(&file_b, "b changed by external tool\n").unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let snap = request(&mut c, &Command::GetState).await;
-        assert!(!snap.disk_changed, "B の変更を A に誤報告しない");
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&file_a);
-        let _ = std::fs::remove_file(&file_b);
-    }
-
-    #[tokio::test]
-    async fn reuse_open_keeps_disk_changed_while_same_doc_still_diverges() {
-        // MAJOR M2: 同一文書がまだディスクと乖離している状態で再利用 Open しても
-        // disk_changed は維持される（乖離は実在するので報告を消さない）。
-        // ベースラインはフォーカス文書の現状に張り替わり、Save で解消される。
-        let dir = std::env::temp_dir();
-        let sock = dir.join(format!("mina-m2k-sock-{}.sock", std::process::id()));
-        let file = dir.join(format!("mina-m2k-file-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&file);
         std::fs::write(&file, "base\n").unwrap();
         start_server(&sock).await;
 
         let mut c = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
         let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
-        assert!(!snap.disk_changed);
+        assert_eq!(snap.text, "base\n");
 
-        // 外部ツールがファイルを書き換える → 検知される
-        std::fs::write(&file, "external\n").unwrap();
+        // 外部ツールがファイルを書き換える（2 秒周期の検知より先に再利用 Open）
+        std::fs::write(&file, "changed by external tool\n").unwrap();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert_eq!(
+            snap.text,
+            "changed by external tool\n",
+            "再利用 Open で即リロードされる"
+        );
+        assert!(snap.events.iter().any(|e| {
+            e.kind == EventKind::ExternalChange && e.source == EventSource::External
+        }));
+
+        // ベースラインが新しくなっていること: 保存後は B を外部変更しても
+        // フォーカス文書 A のテキストは変わらない（B は別文書としてリロード
+        // されるが、スナップショットはフォーカス文書を見せる）
+        let snap = request(&mut c, &Command::Save).await;
+        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn external_delete_sets_deleted_until_close() {
+        // ADR-0015: フォーカス文書が外部削除されたら deleted 状態を立てて保留し、
+        // Command::Close で空画面（ファイル未オープン）に戻る。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m2k-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-m2k-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert!(snap.deleted.is_none());
+        let norm = snap.path.clone().expect("正規化されたパス");
+
+        // 外部ツールがファイルを削除する → 検知される
+        std::fs::remove_file(&file).unwrap();
         let snap = poll_snapshot(
             &mut c,
-            |s| s.disk_changed,
+            |s| s.deleted.is_some(),
             std::time::Duration::from_secs(8),
         )
         .await;
-        assert!(snap.disk_changed);
+        assert_eq!(snap.deleted.as_deref(), Some(norm.as_str()));
+        assert_eq!(snap.text, "base\n", "削除保留中はテキストを保持する");
 
-        // 同じ文書へ再利用 Open → 乖離は残っているのでフラグは維持される
-        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
-        assert!(snap.disk_changed, "乖離が残る限りフラグを消さない");
+        // Close で空画面（ファイル未オープン）に戻る
+        let snap = request(&mut c, &Command::Close).await;
+        assert!(snap.deleted.is_none());
+        assert!(snap.path.is_none(), "空画面: ファイル未オープン");
+        assert!(snap.events.iter().any(|e| e.kind == EventKind::Close));
+        let _ = std::fs::remove_file(&sock);
+    }
 
-        // Save でベースラインが更新され、フラグが下がる
-        let snap = request(&mut c, &Command::Save).await;
-        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
+    #[tokio::test]
+    async fn close_moves_to_next_document_then_empty() {
+        // ADR-0015: Close はフォーカス文書を閉じ、残りの文書があればそこへ移る。
+        // 最後の文書を閉じると空画面（スクラッチ）になる。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-cls-sock-{}.sock", std::process::id()));
+        let file_a = dir.join(format!("mina-cls-a-{}.txt", std::process::id()));
+        let file_b = dir.join(format!("mina-cls-b-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+        std::fs::write(&file_a, "a\n").unwrap();
+        std::fs::write(&file_b, "b\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let pa = file_a.to_string_lossy().into_owned();
+        let pb = file_b.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: pa.clone() }).await;
+        assert_eq!(snap.text, "a\n");
+        let pa_norm = snap.path.clone().expect("正規化されたパス");
+        let snap = request(&mut c, &Command::Open { path: pb.clone() }).await;
+        assert_eq!(snap.text, "b\n");
+
+        // B（フォーカス）を閉じる → 残りの A へ移る
+        let snap = request(&mut c, &Command::Close).await;
+        assert_eq!(
+            snap.path.as_deref(),
+            Some(pa_norm.as_str()),
+            "残りの文書 A へ移る"
+        );
+        assert_eq!(snap.text, "a\n");
+
+        // A を閉じる → 空画面
+        let snap = request(&mut c, &Command::Close).await;
+        assert!(snap.path.is_none(), "空画面: ファイル未オープン");
+        assert_eq!(snap.text, "", "空文書");
+
+        // スクラッチ（未保存）文書の Close は no-op
+        let gen_before = request(&mut c, &Command::GetState).await.generation;
+        let snap = request(&mut c, &Command::Close).await;
+        assert_eq!(
+            snap.generation, gen_before,
+            "スクラッチの Close は世代を進めない"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+    }
+
+    #[tokio::test]
+    async fn external_change_reloads_non_focused_open_document() {
+        // ADR-0015: 監視対象は全オープン文書（フォーカス限定でない）。
+        // 非フォーカスの文書が外部変更されてもリロードされ、フォーカス文書の
+        // テキストは変わらない。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m8-sock-{}.sock", std::process::id()));
+        let file_a = dir.join(format!("mina-m8-a-{}.txt", std::process::id()));
+        let file_b = dir.join(format!("mina-m8-b-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+        std::fs::write(&file_a, "a\n").unwrap();
+        std::fs::write(&file_b, "b\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let pa = file_a.to_string_lossy().into_owned();
+        let pb = file_b.to_string_lossy().into_owned();
+        request(&mut c, &Command::Open { path: pa.clone() }).await;
+        request(&mut c, &Command::Open { path: pb.clone() }).await;
+        let snap = request(&mut c, &Command::Open { path: pa }).await; // フォーカスを A へ戻す
+        assert_eq!(snap.text, "a\n");
+
+        // 非フォーカスの B を外部変更 → 検知され B だけがリロードされる
+        std::fs::write(&file_b, "b changed\n").unwrap();
         let snap = poll_snapshot(
             &mut c,
-            |s| !s.disk_changed,
-            std::time::Duration::from_secs(5),
+            |s| {
+                s.events.iter().any(|e| {
+                    e.kind == EventKind::ExternalChange && e.source == EventSource::External
+                })
+            },
+            std::time::Duration::from_secs(8),
         )
         .await;
-        assert!(!snap.disk_changed);
+        assert_eq!(snap.text, "a\n", "フォーカス文書 A は変わらない");
+
+        // B を再オープン: watch_disk が既にリロード・ベースライン更新済みなので
+        // 再利用で新しいテキストが見える
+        let snap = request(&mut c, &Command::Open { path: pb }).await;
+        assert_eq!(snap.text, "b changed\n", "非フォーカスでもリロードされている");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+    }
+
+    #[tokio::test]
+    async fn external_reload_closes_insert_group_and_returns_to_normal() {
+        // ADR-0007/0015: 外部リロードは Insert UndoGroup を閉じモードを Normal に
+        // 戻す（外部書き込みと同原則）。undo はリロードだけを戻し、挿入と混ざらない。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m9-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-m9-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.text, "base\n");
+        let snap = request(&mut c, &Command::SetMode { mode: Mode::Insert }).await;
+        assert_eq!(snap.mode, Mode::Insert);
+        let snap = request(&mut c, &Command::Insert { text: "X".into() }).await;
+        assert_eq!(snap.text, "Xbase\n");
+
+        // Insert セッション中に外部変更 → リロードでグループが閉じ Normal に戻る
+        std::fs::write(&file, "changed\n").unwrap();
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.text == "changed\n",
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(snap.mode, Mode::Normal, "外部リロードで Normal に戻る");
+
+        // undo はリロードだけを戻す（挿入と別グループ）
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.text, "Xbase\n", "undo でリロードだけ戻る");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn save_recreates_deleted_file_and_clears_state() {
+        // ADR-0015: 削除状態で Save するとファイルを再作成し、deleted が解消される。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-m10-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-m10-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        request(&mut c, &Command::Open { path: path.clone() }).await;
+        std::fs::remove_file(&file).unwrap();
+        let snap = poll_snapshot(
+            &mut c,
+            |s| s.deleted.is_some(),
+            std::time::Duration::from_secs(8),
+        )
+        .await;
+        assert!(snap.deleted.is_some());
+
+        // Save でファイルが再作成され、削除状態が解消される
+        let snap = request(&mut c, &Command::Save).await;
+        assert!(snap.status.as_deref().unwrap_or("").starts_with("saved:"));
+        assert!(snap.deleted.is_none(), "Save で削除状態が解消される");
+        assert!(std::fs::metadata(&file).is_ok(), "ファイルが再作成される");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
