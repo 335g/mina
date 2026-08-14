@@ -43,6 +43,9 @@
 (function_item name: (identifier) @function)
 (function_signature_item name: (identifier) @function)
 (call_expression function: (identifier) @function)
+; scoped パス呼び出し (HashMap::new() / foo::bar())。scoped_identifier の
+; name フィールド (= 最後のセグメント) を関数呼び出しとして捕捉する。
+(call_expression function: (scoped_identifier name: (identifier) @function))
 (call_expression function: (field_expression field: (field_identifier) @function))
 (macro_invocation macro: (identifier) @function)
 
