@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use mina_protocol::{Diagnostic, Mode, Range, Severity, StateSnapshot};
+use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, Mode, Range, Severity, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthChar;
 
@@ -96,6 +96,7 @@ pub fn render_text(
                     cs,
                     &state.selection,
                     &state.diagnostics,
+                    &state.highlights,
                     Some(head),
                     width,
                 );
@@ -168,7 +169,8 @@ pub fn draw(
     out.write_all(render_text(state, pending, command_line, flash, width, height).as_bytes())
 }
 
-/// 1行分を描画する。選択範囲は反転、診断範囲は下線、カーソルセルは青背景。
+/// 1行分を描画する。選択範囲は反転、診断範囲は下線、ハイライトグループは前景色、
+/// カーソルセルは青背景。
 ///
 /// ターミナルカーソルは `\x1b[?25l` で隠しているため、カーソル位置はこの
 /// セル描画でのみ可視化される（修正前はどこにも見えず、ステータス行の座標だけが
@@ -179,11 +181,13 @@ fn draw_line(
     line_char_start: usize,
     selection: &[Range],
     diagnostics: &[Diagnostic],
+    highlights: &[HighlightRange],
     cursor: Option<usize>,
     width: usize,
 ) {
     let mut out_width = 0usize;
-    let mut style = (false, false, false); // (カーソル, 選択中, 診断中)
+    let mut style = (false, false, false, None); // (カーソル, 選択中, 診断中, グループ)
+    let mut hl_idx = 0usize; // highlights は start 昇順・非重複（mina-loader の不変条件）
     for (i, ch) in line.chars().enumerate() {
         // CRLF の \r: 非表示文字。生出力するとターミナルがカーソルを行頭へ戻し、
         // 直後の \x1b[K で行全体が消える（H2）。
@@ -201,17 +205,18 @@ fn draw_line(
         let in_diag = diagnostics
             .iter()
             .any(|d| char_global >= d.start && char_global < d.end);
-        let new_style = (is_cursor, in_sel, in_diag);
+        // グループは昇順・非重複の範囲から、1 char ずつ進むポインタで引く
+        let group = loop {
+            match highlights.get(hl_idx) {
+                Some(r) if r.end <= char_global => hl_idx += 1,
+                Some(r) if r.start <= char_global => break Some(r.group),
+                _ => break None,
+            }
+        };
+        let new_style = (is_cursor, in_sel, in_diag, group);
         if new_style != style {
             style = new_style;
-            match style {
-                (true, _, true) => s.push_str("\x1b[4;44m"), // カーソル + 診断: 青背景 + 下線
-                (true, _, false) => s.push_str("\x1b[44m"),   // カーソル: 青背景
-                (false, true, true) => s.push_str("\x1b[4;7m"), // 下線 + 反転
-                (false, true, false) => s.push_str("\x1b[7m"),
-                (false, false, true) => s.push_str("\x1b[4m"), // 下線
-                (false, false, false) => s.push_str("\x1b[0m"),
-            }
+            s.push_str(&style_sgr(style));
         }
         if out_width + w > width {
             break; // 幅超過で切り詰め（行末の全角文字は途中で切れる — ponytail）
@@ -232,10 +237,60 @@ fn draw_line(
             s.push_str("\x1b[0m");
         }
     }
-    if style != (false, false, false) {
+    if style != (false, false, false, None) {
         s.push_str("\x1b[0m");
     }
     s.push_str("\x1b[K"); // 行末までクリア
+}
+
+/// スタイル状態 → SGR シーケンス。優先順位: カーソル > 選択 > 診断 > グループ。
+///
+/// カーソル・選択はグループ色を置換し、診断の下線はグループ色と共存する
+/// （仕様書 M3）。既存の SGR 文字列（"4;44" 等）を維持するため、
+/// 診断 → カーソル/選択 → グループの順でコードを積む。
+fn style_sgr(style: (bool, bool, bool, Option<HighlightGroup>)) -> String {
+    let (cursor, in_sel, in_diag, group) = style;
+    let mut parts: Vec<&str> = Vec::new();
+    if in_diag {
+        parts.push("4"); // 下線
+    }
+    if cursor {
+        parts.push("44"); // 青背景
+    } else if in_sel {
+        parts.push("7"); // 反転
+    }
+    if !cursor && !in_sel {
+        if let Some(code) = group.and_then(group_sgr) {
+            parts.push(code);
+        }
+    }
+    if parts.is_empty() {
+        "\x1b[0m".to_string()
+    } else {
+        format!("\x1b[{}m", parts.join(";"))
+    }
+}
+
+/// 暫定パレット (issue #17): グループ → SGR 末尾コード。
+///
+/// Colorscheme セッションで外部化される既定値（ADR-0018）。ANSI16 固定、
+/// 色能力検出なし。parameter / operator / punctuation は既定テキストのまま。
+fn group_sgr(group: HighlightGroup) -> Option<&'static str> {
+    Some(match group {
+        HighlightGroup::Comment => "90",
+        HighlightGroup::Keyword => "36",
+        HighlightGroup::String => "32",
+        HighlightGroup::Number => "33",
+        HighlightGroup::Constant => "35",
+        HighlightGroup::Function => "34",
+        HighlightGroup::Type => "96",
+        HighlightGroup::Parameter => return None,
+        HighlightGroup::Field => "94",
+        HighlightGroup::Operator => return None,
+        HighlightGroup::Punctuation => return None,
+        HighlightGroup::Attribute => "95",
+        HighlightGroup::Error => "91;4", // 明るい赤 + 下線
+    })
 }
 
 /// 制御文字（ESC 等）を � に置換する（端末インジェクション対策 — SEC-2）。
@@ -408,6 +463,60 @@ mod tests {
         let out = render_text(&state, &[], None, None, 40, 10);
         // 選択（char 2）は反転、カーソル（head=3）は青背景で区別される
         assert!(out.contains("\x1b[7ml\x1b[44ml"), "{out:?}");
+    }
+
+    #[test]
+    fn highlight_groups_get_colored() {
+        // グループ付きの行: string は緑 (32)、comment は灰 (90)
+        let mut state = state_with("let s = \"hi\"; // x", vec![], 0);
+        state.highlights = vec![
+            HighlightRange { start: 8, end: 12, group: HighlightGroup::String },
+            HighlightRange { start: 14, end: 16, group: HighlightGroup::Comment },
+        ];
+        let out = render_text(&state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[32m\"hi\""), "string が緑で描画される: {out:?}");
+        assert!(out.contains("\x1b[90m//"), "comment が灰で描画される: {out:?}");
+        assert!(!out.contains("\x1b[32m;"), "範囲外にグループ色を出さない: {out:?}");
+    }
+
+    #[test]
+    fn cursor_overrides_group_color() {
+        let mut state = state_with("abc", vec![Range { anchor: 2, head: 2 }], 0);
+        state.highlights =
+            vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::Keyword }];
+        let out = render_text(&state, &[], None, None, 40, 10);
+        // グループ全体は cyan (36) だが、カーソル (char 2) は青背景 (44) で置換される
+        assert!(out.contains("\x1b[36mab"), "グループ色: {out:?}");
+        assert!(out.contains("\x1b[44mc"), "カーソルセルは青背景: {out:?}");
+        assert!(!out.contains("\x1b[36mc"), "カーソル下でグループ色を出さない: {out:?}");
+    }
+
+    #[test]
+    fn selection_overrides_group_color() {
+        let mut state = state_with("abc", vec![Range { anchor: 1, head: 2 }], 0);
+        state.highlights =
+            vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::Keyword }];
+        let out = render_text(&state, &[], None, None, 40, 10);
+        // 選択 (char 1) は反転 (7) で、グループ色は出ない
+        assert!(out.contains("\x1b[36ma"), "グループ色: {out:?}");
+        assert!(out.contains("\x1b[7mb"), "選択は反転: {out:?}");
+        assert!(!out.contains("\x1b[36mb"), "選択下でグループ色を出さない: {out:?}");
+    }
+
+    #[test]
+    fn diagnostic_and_group_coexist() {
+        let mut state = state_with("abc", vec![Range { anchor: 0, head: 0 }], 0);
+        state.diagnostics = vec![Diagnostic {
+            start: 1,
+            end: 2,
+            severity: Severity::Error,
+            message: "oops".into(),
+        }];
+        state.highlights =
+            vec![HighlightRange { start: 1, end: 2, group: HighlightGroup::String }];
+        let out = render_text(&state, &[], None, None, 40, 10);
+        // 診断下のグループ: 下線 (4) + グループ色 (32) が共存する
+        assert!(out.contains("\x1b[4;32mb"), "下線 + グループ色: {out:?}");
     }
 
     #[test]
