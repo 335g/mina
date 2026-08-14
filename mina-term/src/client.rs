@@ -135,18 +135,29 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 };
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        // 終了: 全モードで Ctrl-C、Normal で q
-                        let quit = key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(termina::event::Modifiers::CONTROL)
-                            || (state.mode == Mode::Normal && key.code == KeyCode::Char('q'));
-                        if quit {
-                            break;
-                        }
-                        match keymaps.resolve_with_insert_fallback(state.mode, &mut pending, key) {
-                            Resolution::Command(command) => {
-                                state = session.request(&command).await?;
+                        // ADR-0015: 外部削除ポップアップ表示中は入力をブロックし、
+                        // 任意キーで Close（空画面へ戻る）
+                        if state.deleted.is_some() {
+                            state = session.request(&Command::Close).await?;
+                        } else {
+                            // 終了: 全モードで Ctrl-C、Normal で q
+                            let quit = key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(termina::event::Modifiers::CONTROL)
+                                || (state.mode == Mode::Normal
+                                    && key.code == KeyCode::Char('q'));
+                            if quit {
+                                break;
                             }
-                            _ => {} // pending 変化の描画は共通ループ末尾で行う
+                            match keymaps.resolve_with_insert_fallback(
+                                state.mode,
+                                &mut pending,
+                                key,
+                            ) {
+                                Resolution::Command(command) => {
+                                    state = session.request(&command).await?;
+                                }
+                                _ => {} // pending 変化の描画は共通ループ末尾で行う
+                            }
                         }
                         redraw = true;
                     }
