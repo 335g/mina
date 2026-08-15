@@ -270,6 +270,10 @@ pub enum WordMoveTarget {
 ///
 /// 単語カテゴリは [`categorize`] の4分類（Word/Whitespace/Eol/Other）。改行は
 /// 線結合的に越える（直後の改行を越える移動では anchor が行頭側に置かれる）。
+///
+/// 素の `w`/`b`/`e` は Helix と同様（`w` は単語+後続の空白を選択）。ただし
+/// `b` 直後の `w`（反転選択での `w`）だけは現在の単語の末尾までを選択し、
+/// `bw` で単語のみ（空白なし）が選択される（ユーザー要求）。
 pub fn word_move_selection(
     doc: &Document,
     selection: &Selection,
@@ -288,6 +292,15 @@ pub fn word_move_selection(
 fn word_move_range(text: &str, range: Range, target: WordMoveTarget) -> Range {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
+    // b 直後の w の調整: 反転選択（head < anchor — b の結果）で w を押すと、
+    // 「次の単語先頭」ではなく「現在の単語の末尾」までを選択する。これにより
+    // bw で単語のみ（空白なし）が選択される（ユーザー要求。素の w は従来どおり
+    // 単語+空白を選択する — この調整は b 由来の反転選択にしか効かない）。
+    let target = if target == WordMoveTarget::NextWordStart && range.anchor() > range.head() {
+        WordMoveTarget::NextWordEnd
+    } else {
+        target
+    };
     let is_prev = matches!(
         target,
         WordMoveTarget::PrevWordStart | WordMoveTarget::PrevWordEnd
@@ -1099,16 +1112,16 @@ mod tests {
     #[test]
     fn word_bw_selects_whole_word_then_delete() {
         // ユーザーが求めるフロー: 単語途中で b → 現在の単語、続けて w →
-        // 単語全体+空白が選択され、d で削除できる
+        // 単語全体（空白なし）が選択され、d で削除できる
         let doc = Document::from("hello world foo");
         let mut s2 = word_move_selection(&doc, &Selection::point(3), WordMoveTarget::PrevWordStart);
         assert_eq!(s2, sel(vec![(4, 0)], 0), "b: hell が選択");
         s2 = word_move_selection(&doc, &s2, WordMoveTarget::NextWordStart);
-        assert_eq!(s2, sel(vec![(0, 6)], 0), "bw: hello が選択");
-        // 削除すると単語が消える（daemon 側の DeleteRange と同義）
+        assert_eq!(s2, sel(vec![(0, 5)], 0), "bw: hello のみ選択（空白なし）");
+        // 削除すると単語だけが消える（空白は残る）
         let tx = crate::Transaction::delete(&doc, &s2);
         let new_doc = tx.apply(&doc);
-        assert_eq!(new_doc.text().to_string(), "world foo");
+        assert_eq!(new_doc.text().to_string(), " world foo");
     }
 
     #[test]
