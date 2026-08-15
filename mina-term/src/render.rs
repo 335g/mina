@@ -6,7 +6,7 @@
 use std::io::Write;
 
 use crate::colorscheme::{adapt_color, ColorCapability, Colorscheme, Style, UiRole};
-use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, Mode, Range, Severity, StateSnapshot};
+use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, InlayHint, Mode, Range, Severity, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthChar;
 
@@ -89,7 +89,9 @@ pub fn render_text(
     let body_rows = height.saturating_sub(1); // 最終行はステータス行
     // highlights は行を跨いで昇順に進むため、ポインタを行ループの外に持つ
     // （行ごとに 0 から歩き直すと O(行数×範囲数) — 敵対的検証で発見）。
+    // inlay_hints も同じ流儀（ADR-0020。position 昇順の不変条件）。
     let mut hl_idx = 0usize;
+    let mut hint_idx = 0usize;
     for row in 0..body_rows {
         s.push_str(&format!("\x1b[{};1H", row + 1));
         let line_idx = state.first_line + row;
@@ -106,6 +108,8 @@ pub fn render_text(
                     &state.diagnostics,
                     &state.highlights,
                     &mut hl_idx,
+                    &state.inlay_hints,
+                    &mut hint_idx,
                     scheme,
                     capability,
                     no_color,
@@ -168,8 +172,10 @@ pub fn render_text(
         }
     }
 
-    // ターミナルカーソルを primary head へ
-    let (row, _, colw) = cursor_pos(&state.text, head);
+    // ターミナルカーソルを primary head へ（Q4: ヒントは仮想テキストなので
+    // head より前のヒント幅を表示列に加算する。視覚カーソルは実キャラの
+    // スタイル描画のため影響を受けない）。
+    let (row, _, colw) = cursor_pos(&state.text, head, &state.inlay_hints);
     let term_row = row.saturating_sub(state.first_line) + 1;
     if term_row <= body_rows {
         s.push_str(&format!("\x1b[{};{}H", term_row, colw + 1));
@@ -199,7 +205,7 @@ pub fn draw(
 }
 
 /// 1行分を描画する。選択範囲は反転、診断範囲は下線、ハイライトグループは前景色、
-/// カーソルセルは青背景。
+/// カーソルセルは青背景。inlay hint は仮想テキストとして位置に挟み込む（ADR-0020）。
 ///
 /// ターミナルカーソルは `\x1b[?25l` で隠しているため、カーソル位置はこの
 /// セル描画でのみ可視化される（修正前はどこにも見えず、ステータス行の座標だけが
@@ -213,6 +219,8 @@ fn draw_line(
     diagnostics: &[Diagnostic],
     highlights: &[HighlightRange],
     hl_idx: &mut usize, // highlights は start 昇順・非重複（mina-loader の不変条件）
+    inlay_hints: &[InlayHint],
+    hint_idx: &mut usize, // inlay_hints は position 昇順（#22 の stable sort の不変条件）
     scheme: &Colorscheme,
     capability: ColorCapability,
     no_color: bool,
@@ -220,8 +228,24 @@ fn draw_line(
     width: usize,
 ) {
     let mut out_width = 0usize;
-    let mut style = (false, false, None, None); // (カーソル, 選択中, 診断ロール, グループ)
-    for (i, ch) in line.chars().enumerate() {
+    let mut style = (false, false, None, None, false); // (カーソル, 選択中, 診断ロール, グループ, ヒント)
+    // ヒントは行を跨いで昇順に進む。前行の終端を超えたヒントを読み飛ばす
+    // （行ごとに 0 から歩き直すと O(行数×ヒント数) — highlights と同じ流儀）。
+    while inlay_hints
+        .get(*hint_idx)
+        .is_some_and(|h| h.position < line_char_start)
+    {
+        *hint_idx += 1;
+    }
+    'line: for (i, ch) in line.chars().enumerate() {
+        let char_global = line_char_start + i;
+        // 位置 `char_global` のキャラの直前に、position 昇順のヒントを挟み込む
+        while let Some(h) = inlay_hints.get(*hint_idx).filter(|h| h.position == char_global) {
+            if !emit_hint(s, h, scheme, capability, no_color, &mut style, &mut out_width, width) {
+                break 'line; // ヒントが幅超過: 行末まで打ち切り（実キャラと同じ扱い）
+            }
+            *hint_idx += 1;
+        }
         // CRLF の \r: 非表示文字。生出力するとターミナルがカーソルを行頭へ戻し、
         // 直後の \x1b[K で行全体が消える（H2）。
         if ch == '\r' {
@@ -230,7 +254,6 @@ fn draw_line(
         let is_ctrl = ch.is_control() && ch != '\t';
         // 制御文字（ESC 等）は端末インジェクション対策で � に置換してから出力する
         let w = if is_ctrl { 1 } else { ch.width().unwrap_or(0) };
-        let char_global = line_char_start + i;
         let is_cursor = cursor == Some(char_global);
         let in_sel = selection
             .iter()
@@ -252,7 +275,7 @@ fn draw_line(
         if out_width + w > width {
             break;
         }
-        let new_style = (is_cursor, in_sel, diag_role, group);
+        let new_style = (is_cursor, in_sel, diag_role, group, false);
         if new_style != style {
             style = new_style;
             s.push_str(&style_sgr(scheme, capability, no_color, style));
@@ -264,22 +287,92 @@ fn draw_line(
         }
         out_width += w;
     }
+    // 行末（最後の文字の直後）のヒントを挟み込む
+    let line_end = line_char_start + line.chars().count();
+    while let Some(h) = inlay_hints.get(*hint_idx).filter(|h| h.position == line_end) {
+        if !emit_hint(s, h, scheme, capability, no_color, &mut style, &mut out_width, width) {
+            break;
+        }
+        *hint_idx += 1;
+    }
     // カーソルが行末（最後の文字の直後）にある場合: 青背景の空白で可視化する
     if let Some(c) = cursor {
-        if c == line_char_start + line.chars().count() && out_width < width {
+        if c == line_end && out_width < width {
             let diag_role = diagnostics
                 .iter()
                 .find(|d| d.start <= c && c < d.end)
                 .map(diag_role);
-            s.push_str(&style_sgr(scheme, capability, no_color, (true, false, diag_role, None)));
+            s.push_str(&style_sgr(scheme, capability, no_color, (true, false, diag_role, None, false)));
             s.push(' ');
             s.push_str("\x1b[0m");
         }
     }
-    if style != (false, false, None, None) {
+    if style != (false, false, None, None, false) {
         s.push_str("\x1b[0m");
     }
     s.push_str("\x1b[K"); // 行末までクリア
+}
+
+/// ヒント1件を仮想テキストとして描画する（padding 含む）。スタイルは常に
+/// `UiRole::InlayHint`（カーソル・選択・診断・グループの対象外 — 仮想テキスト）。
+///
+/// 幅予算は実キャラと同じ扱いで消費し、超過したら途中で打ち切って false を返す
+/// （呼び出し側は行描画を止める）。スタイル遷移より先に幅を判定する（宙に浮く
+/// SGR を出さない — 実キャラと同じ原則）。
+fn emit_hint(
+    s: &mut String,
+    h: &InlayHint,
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+    style: &mut (bool, bool, Option<UiRole>, Option<HighlightGroup>, bool),
+    out_width: &mut usize,
+    width: usize,
+) -> bool {
+    if h.padding_left && !emit_hint_char(s, ' ', scheme, capability, no_color, style, out_width, width) {
+        return false;
+    }
+    for c in h.text.chars() {
+        if !emit_hint_char(s, c, scheme, capability, no_color, style, out_width, width) {
+            return false;
+        }
+    }
+    if h.padding_right && !emit_hint_char(s, ' ', scheme, capability, no_color, style, out_width, width) {
+        return false;
+    }
+    true
+}
+
+/// ヒントの1キャラを描画する。幅超過で打ち切ったら false。
+fn emit_hint_char(
+    s: &mut String,
+    ch: char,
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+    style: &mut (bool, bool, Option<UiRole>, Option<HighlightGroup>, bool),
+    out_width: &mut usize,
+    width: usize,
+) -> bool {
+    let w = ch.width().unwrap_or(0);
+    if *out_width + w > width {
+        return false;
+    }
+    let hint_style = (false, false, None, None, true);
+    if hint_style != *style {
+        *style = hint_style;
+        s.push_str(&style_sgr(scheme, capability, no_color, hint_style));
+    }
+    s.push(ch);
+    *out_width += w;
+    true
+}
+
+/// ヒント1件の表示幅（padding のスペース + ラベル幅）。端末カーソル列の加算用。
+fn hint_display_width(h: &InlayHint) -> usize {
+    (h.padding_left as usize)
+        + h.text.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>()
+        + (h.padding_right as usize)
 }
 
 /// 診断の severity → UI ロール。Info/Hint も Warning 色を当てる（M4 以前の
@@ -293,6 +386,7 @@ fn diag_role(d: &Diagnostic) -> UiRole {
 }
 
 /// スタイル状態 → SGR シーケンス。優先順位: カーソル > 選択 > 診断 > グループ。
+/// ヒントは仮想テキストの専用スタイル（カーソル・選択・診断の対象外）。
 ///
 /// カーソル・選択はグループ色を置換し、診断の下線はカーソル/選択と合成する
 /// （現行 4;44 / 4;7 を維持）。診断範囲内では「下線 + 診断色」がグループ色を
@@ -301,9 +395,12 @@ fn style_sgr(
     scheme: &Colorscheme,
     capability: ColorCapability,
     no_color: bool,
-    style: (bool, bool, Option<UiRole>, Option<HighlightGroup>),
+    style: (bool, bool, Option<UiRole>, Option<HighlightGroup>, bool), // (カーソル, 選択, 診断, グループ, ヒント)
 ) -> String {
-    let (cursor, in_sel, diag_role, group) = style;
+    let (cursor, in_sel, diag_role, group, hint) = style;
+    if hint {
+        return ui_sgr(scheme, capability, no_color, UiRole::InlayHint);
+    }
     // 勝利ロールの Style を全フィールド合成する（bg のみ・reverse のみ等の
     // 部分抽出はスキーム作者が落とし穴になる — 敵対的検証で発見・修正）。
     let mut st = Style::new();
@@ -360,6 +457,12 @@ fn emit_sgr(st: Style, capability: ColorCapability, no_color: bool) -> String {
     }
     if st.reverse {
         parts.push("7".to_string()); // 反転
+    }
+    if st.dim {
+        parts.push("2".to_string()); // ディム
+    }
+    if st.italic {
+        parts.push("3".to_string()); // 斜体
     }
     if !no_color {
         if let Some(c) = st.fg {
@@ -447,7 +550,7 @@ fn draw_status(
             .get(state.primary_index)
             .copied()
             .unwrap_or(Range { anchor: 0, head: 0 });
-        let (row, col, _) = cursor_pos(&state.text, primary.head);
+        let (row, col, _) = cursor_pos(&state.text, primary.head, &[]);
         text.push_str(&format!(" {path}{dirty}  {row}:{col}"));
         if !pending.is_empty() {
             let keys: String = pending
@@ -501,10 +604,16 @@ fn truncate_wide(s: &mut String, width: usize) {
 }
 
 /// primary head の (行, 列[char数], 列[表示幅])。O(head)。
-fn cursor_pos(text: &str, head: usize) -> (usize, usize, usize) {
+///
+/// 表示幅には、head と同じ行内で head より前に挟み込まれる inlay hint の幅が
+/// 含まれる（Q4: 端末カーソル列は仮想テキスト分も右へずれる）。`hints` は
+/// position 昇順（#22 の不変条件）。
+fn cursor_pos(text: &str, head: usize, hints: &[InlayHint]) -> (usize, usize, usize) {
     let mut row = 0usize;
     let mut col = 0usize;
     let mut colw = 0usize;
+    let mut row_start = 0usize; // 現在行の先頭 char インデックス
+    let mut hint_i = 0usize;
     for (i, ch) in text.chars().enumerate() {
         if i >= head {
             break;
@@ -513,11 +622,28 @@ fn cursor_pos(text: &str, head: usize) -> (usize, usize, usize) {
             row += 1;
             col = 0;
             colw = 0;
+            row_start = i + 1;
         } else if ch != '\r' {
             // \r は非表示（CRLF）なので行・列に数えない（H2）
             col += 1;
             colw += ch.width().unwrap_or(0);
         }
+        // 位置 i のキャラの直前に挟まれるヒント（position == i）はそのキャラ以降の
+        // 表示位置を右へ押す。前行のヒントは行リセットで消えるため足さない。
+        while let Some(h) = hints.get(hint_i).filter(|h| h.position == i) {
+            if h.position >= row_start {
+                colw += hint_display_width(h);
+            }
+            hint_i += 1;
+        }
+    }
+    // head の位置のキャラ（または行末カーソル）の直前に挟まれるヒント
+    // （position == head）も端末カーソル列に影響する。
+    while let Some(h) = hints.get(hint_i).filter(|h| h.position == head) {
+        if h.position >= row_start {
+            colw += hint_display_width(h);
+        }
+        hint_i += 1;
     }
     (row, col, colw)
 }
@@ -795,6 +921,8 @@ mod tests {
                 bg: Some(crate::colorscheme::Color::Ansi(0)),
                 underline: false,
                 reverse: true,
+                dim: false,
+                italic: false,
             })],
         };
         let state = state_with("ab", vec![Range { anchor: 0, head: 1 }], 0);
@@ -866,8 +994,257 @@ mod tests {
     #[test]
     fn cursor_pos_ignores_carriage_return() {
         // \r は非表示なのでカーソル列（表示幅・表示列）に数えない
-        assert_eq!(cursor_pos("ab\r", 3), (0, 2, 2));
-        assert_eq!(cursor_pos("a\r\nb", 3), (1, 0, 0));
+        assert_eq!(cursor_pos("ab\r", 3, &[]), (0, 2, 2));
+        assert_eq!(cursor_pos("a\r\nb", 3, &[]), (1, 0, 0));
+    }
+
+    #[test]
+    fn cursor_pos_includes_hint_widths_before_head() {
+        // Q4: ヒントは仮想テキスト。head と同じ行内で head より前に挟まる
+        // ヒントの幅は端末カーソル列に加算される。
+        let hints = |text: &str| -> Vec<InlayHint> {
+            vec![InlayHint {
+                position: text.find("x").unwrap() + 1, // x の直後
+                text: ": i32".into(),
+                padding_left: false,
+                padding_right: false,
+            }]
+        };
+        // "let x = 5": x は char 4。ヒント位置 5（x の直後の空白）→ ラベル幅 5（": i32"）
+        let text = "let x = 5";
+        assert_eq!(cursor_pos(text, 6, &hints(text)), (0, 6, 11), "= の表示列にヒント幅が加算");
+        // head がヒント位置（x の直後の空白）でも同様: ヒントはそのキャラの直前に挟まる
+        assert_eq!(cursor_pos(text, 5, &hints(text)), (0, 5, 10));
+        // head がヒントより前なら加算しない
+        assert_eq!(cursor_pos(text, 3, &hints(text)), (0, 3, 3));
+        // 別の行のヒントは現在行のカーソル列に影響しない
+        let text2 = "let x = 5\nlet y = 1";
+        let h2 = vec![InlayHint {
+            position: 5,
+            text: ": i32".into(),
+            padding_left: false,
+            padding_right: false,
+        }];
+        assert_eq!(cursor_pos(text2, 12, &h2), (1, 2, 2), "1行目のヒントは2行目の列に影響しない");
+    }
+
+    // ---- inlay hint 描画（ADR-0020 / #24） ----
+
+    /// draw_line の出力を返す（テスト用。SGR 込み）。
+    fn draw_line_out(
+        line: &str,
+        char_start: usize,
+        hints: &[InlayHint],
+        cursor: Option<usize>,
+        width: usize,
+    ) -> String {
+        let mut s = String::new();
+        let mut hl = 0usize;
+        let mut hi = 0usize;
+        draw_line(
+            &mut s,
+            line,
+            char_start,
+            &[],
+            &[],
+            &[],
+            &mut hl,
+            hints,
+            &mut hi,
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            cursor,
+            width,
+        );
+        s
+    }
+
+    /// SGR・行クリア（\x1b[..m / \x1b[K）を除去してプレーン文字列にする。
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                chars.next(); // [
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn inlay_hint_renders_between_chars() {
+        // ヒントは位置のキャラの直前に仮想テキストとして挟まる（"let x" + ": i32" + " = 5"）
+        let hints = vec![InlayHint {
+            position: 5,
+            text: ": i32".into(),
+            padding_left: false,
+            padding_right: false,
+        }];
+        let out = draw_line_out("let x = 5", 0, &hints, None, 40);
+        assert_eq!(strip_sgr(&out), "let x: i32 = 5", "x と = の間に挟まる: {out:?}");
+        assert!(out.contains("\x1b[2;3m"), "既定スタイルはディム+斜体 (2;3): {out:?}");
+    }
+
+    #[test]
+    fn inlay_hint_padding_reflects_flags() {
+        // paddingLeft / paddingRight の空白がラベル前後に付く
+        let hints = vec![InlayHint {
+            position: 1,
+            text: "i32".into(),
+            padding_left: true,
+            padding_right: true,
+        }];
+        let out = draw_line_out("x = 5", 0, &hints, None, 40);
+        assert_eq!(strip_sgr(&out), "x i32  = 5", "padding の空白が反映される: {out:?}");
+    }
+
+    #[test]
+    fn inlay_hint_visible_without_color() {
+        // NO_COLOR でもディム+斜体は属性なので視認できる（色だけが落ちる）
+        let hints = vec![InlayHint {
+            position: 5,
+            text: ": i32".into(),
+            padding_left: false,
+            padding_right: false,
+        }];
+        let mut s = String::new();
+        let mut hl = 0usize;
+        let mut hi = 0usize;
+        draw_line(
+            &mut s,
+            "let x = 5",
+            0,
+            &[],
+            &[],
+            &[],
+            &mut hl,
+            &hints,
+            &mut hi,
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            true, // NO_COLOR
+            None,
+            40,
+        );
+        assert!(s.contains("\x1b[2;3m"), "NO_COLOR でも属性で視認できる: {s:?}");
+    }
+
+    #[test]
+    fn inlay_hints_at_same_position_keep_order() {
+        // 同 position の複数ヒントは応答順に挟まる（#22 の stable sort の不変条件）
+        let hints = vec![
+            InlayHint {
+                position: 1,
+                text: "a".into(),
+                padding_left: false,
+                padding_right: false,
+            },
+            InlayHint {
+                position: 1,
+                text: "b".into(),
+                padding_left: false,
+                padding_right: false,
+            },
+        ];
+        let out = draw_line_out("xy", 0, &hints, None, 40);
+        assert_eq!(strip_sgr(&out), "xaby", "同 position は応答順: {out:?}");
+    }
+
+    #[test]
+    fn inlay_hint_never_takes_cursor_or_selection_style() {
+        // カーソル・選択は実キャラにのみ適用され、ヒントは常に専用スタイル。
+        // "let x = 5": x=char4（選択）、ヒント位置 5、=は char6（カーソル）。
+        let hints = vec![InlayHint {
+            position: 5,
+            text: ": i32".into(),
+            padding_left: false,
+            padding_right: false,
+        }];
+        let mut s = String::new();
+        let mut hl = 0usize;
+        let mut hi = 0usize;
+        let sel = vec![Range { anchor: 4, head: 5 }];
+        draw_line(
+            &mut s,
+            "let x = 5",
+            0,
+            &sel,
+            &[],
+            &[],
+            &mut hl,
+            &hints,
+            &mut hi,
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            Some(6),
+            40,
+        );
+        assert!(s.contains("\x1b[2;3m: i32"), "ヒントは専用スタイル: {s:?}");
+        assert!(s.contains("\x1b[7mx"), "選択は x にのみ: {s:?}");
+        assert!(s.contains("\x1b[44m="), "カーソルは = にのみ: {s:?}");
+        assert!(!s.contains("\x1b[44m: i32"), "ヒントにカーソルスタイルを出さない: {s:?}");
+    }
+
+    #[test]
+    fn inlay_hint_truncates_mid_label() {
+        // 幅予算はヒント分も消費し、ヒントは実キャラと同じ扱いで途中で切れる。
+        // "let x"=5 + ": i"=3 → 8 ちょうど。次の '3' で幅超過（ラベル ": i32" の空白込み）。
+        let hints = vec![InlayHint {
+            position: 5,
+            text: ": i32".into(),
+            padding_left: false,
+            padding_right: false,
+        }];
+        let out = draw_line_out("let x = 5", 0, &hints, None, 8);
+        assert_eq!(strip_sgr(&out), "let x: i", "幅超過の途中で切れる: {out:?}");
+        assert!(out.ends_with("\x1b[0m\x1b[K"), "宙に浮くスタイルを残さない: {out:?}");
+    }
+
+    #[test]
+    fn inlay_hint_at_line_end_renders_after_last_char() {
+        // 行末（最後の文字の直後）のヒントも描画される
+        let hints = vec![InlayHint {
+            position: 5,
+            text: "// eol".into(),
+            padding_left: true,
+            padding_right: false,
+        }];
+        let out = draw_line_out("let x", 0, &hints, None, 40);
+        assert_eq!(strip_sgr(&out), "let x // eol", "行末ヒント: {out:?}");
+    }
+
+    #[test]
+    fn terminal_cursor_column_includes_hints() {
+        // Q4: 端末カーソル列はヒント幅を加算する（\x1b[{row};{col}H）
+        let mut state = state_with("let x = 5", vec![Range { anchor: 6, head: 6 }], 0);
+        state.inlay_hints = vec![InlayHint {
+            position: 5,
+            text: ": i32".into(),
+            padding_left: false,
+            padding_right: false,
+        }];
+        let out = render_text(
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            &state,
+            &[],
+            None,
+            None,
+            40,
+            10,
+        );
+        // head=6（= の位置）: 表示列 = char 6 + ヒント幅 5 = 11 → 1行目 col 12
+        assert!(out.contains("\x1b[1;12H"), "カーソル列にヒント幅が加算: {out:?}");
     }
 
     #[test]
