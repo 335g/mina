@@ -93,7 +93,7 @@ A read-only annotation rendered inline at a position in the text (inferred types
 _Avoid_: annotation, ghost text
 
 **Colorscheme**:
-A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes.
+A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes. Built-in schemes ship with mina; user schemes are TOML files in the colorschemes directory and take precedence over built-ins of the same name. A scheme is selected by name from the config file or the `:colorscheme` command.
 _Avoid_: theme, palette
 
 **Syntax**:
