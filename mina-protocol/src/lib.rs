@@ -271,7 +271,7 @@ pub struct InlayHint {
 ///
 /// wire 形式は小文字（serde `rename_all`）。tree-sitter のハイライトクエリの
 /// capture 名と一致させる（mina-loader のクエリで使用）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HighlightGroup {
     Comment,
