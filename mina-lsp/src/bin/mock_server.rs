@@ -147,8 +147,10 @@ fn todo_diagnostic(text: &str, utf16: bool) -> Value {
 }
 
 /// テキスト内の固定パターン inlay hint（LSP 座標）:
-/// - `let NAME ...` の NAME の直後に type ヒント `: i32`（右 padding）
-/// - `foo(` の `(` の直後に parameter ヒント `arg: i32`
+/// - `let NAME ...` の NAME の直後に type ヒント `: i32`（padding なし —
+///   rust-analyzer の bind_pat と同じ `pad_left = !render_colons`, `pad_right = false`）
+/// - `foo(` の直後の引数の直前に parameter ヒント `arg:`（右 padding —
+///   rust-analyzer の param_name と同じ）
 ///
 /// 位置は advertise した encoding の単位（`--cjk` なら UTF-16）。
 fn inlay_hints(text: &str, utf16: bool) -> Vec<Value> {
@@ -167,19 +169,19 @@ fn inlay_hints(text: &str, utf16: bool) -> Vec<Value> {
                     ": i32",
                     1, // Type
                     false,
-                    true,
+                    false,
                 ));
             }
         }
-        // parameter ヒント: `foo(` の `(` の直後
+        // parameter ヒント: `foo(` の直後の引数の直前に `arg:`
         if let Some(open) = line.find("foo(") {
             hints.push(hint_value(
                 line_idx as u32,
                 lsp_char_col(line, open + 4, utf16),
-                "arg: i32",
+                "arg:",
                 2, // Parameter
                 false,
-                false,
+                true,
             ));
         }
     }

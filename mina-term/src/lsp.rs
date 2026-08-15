@@ -1050,7 +1050,10 @@ mod tests {
         let h = &hints[0];
         assert_eq!(h.position, 7, "x の直後: {h:?}");
         assert_eq!(h.text, ": i32");
-        assert!(h.padding_right, "サーバ指定の padding が反映される: {h:?}");
+        assert!(
+            !h.padding_left && !h.padding_right,
+            "type ヒントは padding なし（rust-analyzer の bind_pat と同値）: {h:?}"
+        );
     }
 
     #[tokio::test]
@@ -1077,6 +1080,7 @@ mod tests {
         assert_eq!(hints[0].position, 5);
         assert_eq!(hints[0].text, ": i32");
         assert_eq!(hints[1].position, 14, "2行目の ( の直後: {hints:?}");
-        assert_eq!(hints[1].text, "arg: i32");
+        assert_eq!(hints[1].text, "arg:");
+        assert!(hints[1].padding_right, "param ヒントは右 padding: {hints:?}");
     }
 }

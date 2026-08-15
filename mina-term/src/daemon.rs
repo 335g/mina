@@ -4521,7 +4521,7 @@ mod tests {
         );
         assert_eq!(hints.len(), 1, "{hints:?}");
         assert_eq!(hints[0].position, 4, "foo( の直後: {hints:?}");
-        assert_eq!(hints[0].text, "arg: i32");
+        assert_eq!(hints[0].text, "arg:");
 
         // キャッシュ: 同じ B への再要求は同じヒントを返す（LSP 再解析なし）
         let (_p, _g, hints2) = request_hints(&mut agent, &path_b).await;
