@@ -225,6 +225,11 @@ impl Conn {
             Ok(ServerMessage::Response { snapshot }) | Ok(ServerMessage::Push { snapshot }) => {
                 Ok(snapshot)
             }
+            // #23: GetInlayHints の応答はこの CLI ではまだ使わない
+            Ok(ServerMessage::Hints { .. }) => Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "unexpected inlay hints response".to_string(),
+            )),
             Err(e) => Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!("不正な応答: {e}"),
