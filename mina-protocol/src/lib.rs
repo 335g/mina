@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// v4: `StateSnapshot.highlights` が全文ではなく可視範囲（first_line から
 /// viewport_height 行。ADR-0021）になった。
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: 編集コマンド拡張 — `Command::Change`（Helix の `c`）、
+/// `DeleteWordBackward`/`DeleteWordForward`（単語削除）、`Movement::WordEnd` /
+/// `LineStart`/`LineEnd`（単語末尾・行頭/行末）。追加のみで後方互換だが、
+/// 古い daemon に新コマンドを送っても動作しないため version を上げる。
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 編集モード（wire 型。mina-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
