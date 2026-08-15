@@ -605,6 +605,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tmp"
+version = "0.1.0"
+dependencies = [
+ "mina-loader",
+ "mina-protocol",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
