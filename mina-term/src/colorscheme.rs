@@ -97,6 +97,10 @@ pub enum UiRole {
     StatusLine,
     CommandLine,
     Popup,
+    /// 非カーソル行の行番号（ガター）。既定: 灰。
+    LineNumber,
+    /// カーソル行の行番号（ガター）。既定: 白。
+    LineNumberActive,
     /// inlay hint の仮想テキスト（ADR-0020。既定: ディム + 斜体）。
     InlayHint,
 }
@@ -131,6 +135,8 @@ const DEFAULT_UI: &[(UiRole, Style)] = &[
     (UiRole::StatusLine, Style::reverse()),
     (UiRole::CommandLine, Style::reverse()),
     (UiRole::Popup, Style::reverse()),
+    (UiRole::LineNumber, Style::fg(Color::Ansi(8))), // 90 灰
+    (UiRole::LineNumberActive, Style::fg(Color::Ansi(15))), // 97 白
     // ディム + 斜体: 属性のみ（NO_COLOR・ANSI16 でも視認できる）。
     // #24: colorscheme ファイルで上書き可能（ロールの既定はここで持ち、
     // スキームの ui テーブルで差し替える）。
@@ -358,6 +364,8 @@ mod tests {
             DEFAULT.ui_style(UiRole::DiagnosticWarning),
             Some(Style::fg_underline(Color::Ansi(11)))
         );
+        assert_eq!(DEFAULT.ui_style(UiRole::LineNumber), Some(Style::fg(Color::Ansi(8))));
+        assert_eq!(DEFAULT.ui_style(UiRole::LineNumberActive), Some(Style::fg(Color::Ansi(15))));
     }
 
     #[test]
