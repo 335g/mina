@@ -56,6 +56,10 @@ pub enum Command {
     DeleteBackward,
     /// 前方削除（Delete キー相当）。
     DeleteForward,
+    /// 後方単語削除（Alt-Backspace / Ctrl-w 相当）。
+    DeleteWordBackward,
+    /// 前方単語削除（Alt-d 相当）。
+    DeleteWordForward,
     /// 選択範囲を削除する。
     DeleteRange,
     /// 直近の変更グループを元に戻す。
@@ -77,6 +81,12 @@ pub enum Movement {
     Char,
     Line,
     Word,
+    /// 単語の末尾（Helix の `e`）。
+    WordEnd,
+    /// 行頭（列 0）。
+    LineStart,
+    /// 行末（改行の直前）。
+    LineEnd,
 }
 
 /// 移動方向（wire 型）。
@@ -422,6 +432,19 @@ mod tests {
         let json = serde_json::to_string(&wait).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, wait);
+
+        let del_word = Command::DeleteWordBackward;
+        let json = serde_json::to_string(&del_word).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, del_word);
+
+        let end = Command::Move {
+            movement: Movement::LineEnd,
+            direction: Direction::Forward,
+        };
+        let json = serde_json::to_string(&end).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, end);
 
         let hints = Command::GetInlayHints {
             path: "src/main.rs".into(),
