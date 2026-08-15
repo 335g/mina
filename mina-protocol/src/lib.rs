@@ -38,7 +38,9 @@ pub enum Command {
     WaitFor { generation: u64 },
     /// ファイルを読み込んで開く（読み込み失敗は StateSnapshot.status に報告）。
     Open { path: String },
-    /// 選択を点に潰して移動する。
+    /// 選択を点に潰して移動する。ただし単語移動（[`Movement::Word`] /
+    /// [`Movement::WordEnd`]）は Helix 流に anchor を保持し、移動した分を
+    /// 選択状態にする（単語途中の b で現在の単語が選択される）。
     Move { movement: Movement, direction: Direction },
     /// anchor を保ったまま head を移動する（選択の拡張・縮小）。
     Extend { movement: Movement, direction: Direction },
@@ -83,8 +85,9 @@ pub enum Command {
 pub enum Movement {
     Char,
     Line,
+    /// 単語の先頭（Helix の `w`/`b`。Move では anchor を保持して選択を残す）。
     Word,
-    /// 単語の末尾（Helix の `e`）。
+    /// 単語の末尾（Helix の `e`。Move では anchor を保持して選択を残す）。
     WordEnd,
     /// 行頭（列 0）。
     LineStart,
