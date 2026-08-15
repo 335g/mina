@@ -124,11 +124,15 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let mut flash: Option<String> = None;
     // 現在の Colorscheme（`:colorscheme` で切替。クライアントローカル — daemon 非関与）。
     let mut scheme: &'static Colorscheme = &colorscheme::DEFAULT;
+    // 色能力と NO_COLOR（起動時に 1 回検出 — ADR-0019）。
+    let (capability, no_color) = colorscheme::detect_from_env();
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
 
     render::draw(
         &mut *terminal,
         scheme,
+        capability,
+        no_color,
         &state,
         &pending,
         command_line.as_deref(),
@@ -262,6 +266,8 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
             render::draw(
                 &mut *terminal,
                 scheme,
+                capability,
+                no_color,
                 &state,
                 &pending,
                 command_line.as_deref(),
