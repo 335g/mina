@@ -53,6 +53,7 @@ fn main() {
                                     "interFileDependencies": false,
                                     "workspaceDiagnostics": false,
                                 },
+                                "inlayHintProvider": {},
                             },
                             "serverInfo": { "name": "mock-server" },
                         },
@@ -76,6 +77,19 @@ fn main() {
                             "resultId": "mock",
                             "items": diag.map(|d| vec![d]).unwrap_or_default(),
                         },
+                    });
+                    write_frame(&mut stdout, &resp);
+                }
+                "textDocument/inlayHint" => {
+                    // pull inlay hint: 固定パターンのヒント配列を返す
+                    let hints = current
+                        .as_ref()
+                        .map(|(_, text)| inlay_hints(text, utf16))
+                        .unwrap_or_default();
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": hints,
                     });
                     write_frame(&mut stdout, &resp);
                 }
@@ -129,6 +143,73 @@ fn todo_diagnostic(text: &str, utf16: bool) -> Value {
         "severity": 1,
         "source": "mock",
         "message": "mock: TODO found",
+    })
+}
+
+/// テキスト内の固定パターン inlay hint（LSP 座標）:
+/// - `let NAME ...` の NAME の直後に type ヒント `: i32`（右 padding）
+/// - `foo(` の `(` の直後に parameter ヒント `arg: i32`
+///
+/// 位置は advertise した encoding の単位（`--cjk` なら UTF-16）。
+fn inlay_hints(text: &str, utf16: bool) -> Vec<Value> {
+    let mut hints = Vec::new();
+    for (line_idx, line) in text.lines().enumerate() {
+        // type ヒント: `let NAME` の NAME の直後
+        if let Some(let_pos) = line.find("let ") {
+            let rest = &line[let_pos + 4..];
+            let name_end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if name_end > 0 {
+                hints.push(hint_value(
+                    line_idx as u32,
+                    lsp_char_col(line, let_pos + 4 + name_end, utf16),
+                    ": i32",
+                    1, // Type
+                    false,
+                    true,
+                ));
+            }
+        }
+        // parameter ヒント: `foo(` の `(` の直後
+        if let Some(open) = line.find("foo(") {
+            hints.push(hint_value(
+                line_idx as u32,
+                lsp_char_col(line, open + 4, utf16),
+                "arg: i32",
+                2, // Parameter
+                false,
+                false,
+            ));
+        }
+    }
+    hints
+}
+
+/// 行内バイト列 → LSP の character（advertise した encoding の単位）。
+fn lsp_char_col(line: &str, byte_off: usize, utf16: bool) -> u32 {
+    let byte_off = byte_off.min(line.len());
+    if utf16 {
+        line[..byte_off].encode_utf16().count() as u32
+    } else {
+        byte_off as u32
+    }
+}
+
+fn hint_value(
+    line: u32,
+    character: u32,
+    label: &str,
+    kind: u32,
+    padding_left: bool,
+    padding_right: bool,
+) -> Value {
+    json!({
+        "position": { "line": line, "character": character },
+        "label": label,
+        "kind": kind,
+        "paddingLeft": padding_left,
+        "paddingRight": padding_right,
     })
 }
 
