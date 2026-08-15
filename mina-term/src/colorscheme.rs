@@ -139,17 +139,19 @@ pub static DEFAULT: Colorscheme = Colorscheme {
 /// DEFAULT と異なる配色の軽量スキーム（`:colorscheme vivid` で切替を実証）。ANSI16 のみ。
 pub static VIVID: Colorscheme = Colorscheme {
     name: "vivid",
+    // 16 色端末では近似が元の ANSI16 色に一致するよう、xterm 16 色の RGB 値を選ぶ
+    // （truecolor 端末ではより豊かな色になる — issue #20）。
     syntax: &[
-        (HighlightGroup::Comment, Style::fg(Color::Ansi(2))), // 32 緑
-        (HighlightGroup::Keyword, Style::fg(Color::Ansi(5))), // 35 マゼンタ
-        (HighlightGroup::String, Style::fg(Color::Ansi(6))), // 36 シアン
-        (HighlightGroup::Number, Style::fg(Color::Ansi(11))), // 93 明るい黄
-        (HighlightGroup::Constant, Style::fg(Color::Ansi(1))), // 31 赤
-        (HighlightGroup::Function, Style::fg(Color::Ansi(14))), // 96 明るいシアン
-        (HighlightGroup::Type, Style::fg(Color::Ansi(4))), // 34 青
-        (HighlightGroup::Field, Style::fg(Color::Ansi(3))), // 33 黄
-        (HighlightGroup::Attribute, Style::fg(Color::Ansi(13))), // 95 明るいマゼンタ
-        (HighlightGroup::Error, Style::fg_underline(Color::Ansi(9))), // 91 + 下線
+        (HighlightGroup::Comment, Style::fg(Color::Rgb(0, 205, 0))), // 32 緑
+        (HighlightGroup::Keyword, Style::fg(Color::Rgb(205, 0, 205))), // 35 マゼンタ
+        (HighlightGroup::String, Style::fg(Color::Rgb(0, 205, 205))), // 36 シアン
+        (HighlightGroup::Number, Style::fg(Color::Rgb(255, 255, 0))), // 93 明るい黄
+        (HighlightGroup::Constant, Style::fg(Color::Rgb(205, 0, 0))), // 31 赤
+        (HighlightGroup::Function, Style::fg(Color::Rgb(0, 255, 255))), // 96 明るいシアン
+        (HighlightGroup::Type, Style::fg(Color::Rgb(0, 0, 238))), // 34 青
+        (HighlightGroup::Field, Style::fg(Color::Rgb(205, 205, 0))), // 33 黄
+        (HighlightGroup::Attribute, Style::fg(Color::Rgb(255, 0, 255))), // 95 明るいマゼンタ
+        (HighlightGroup::Error, Style::fg_underline(Color::Rgb(255, 0, 0))), // 91 + 下線
     ],
     ui: DEFAULT_UI,
 };
@@ -160,6 +162,148 @@ static SCHEMES: &[&Colorscheme] = &[&DEFAULT, &VIVID];
 /// 名前からスキームを引く（未登録名は None）。
 pub fn scheme_by_name(name: &str) -> Option<&'static Colorscheme> {
     SCHEMES.iter().copied().find(|s| s.name == name)
+}
+
+/// 端末の対応色深度 (ADR-0019)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorCapability {
+    TrueColor,
+    Palette256,
+    Ansi16,
+}
+
+/// 環境変数から能力と NO_COLOR を検出する（純粋関数 — テスト容易性）。
+///
+/// 優先順位: `NO_COLOR` (非空) > `COLORTERM` (truecolor|24bit) >
+/// `TERM` ("256color" 部分一致) > ANSI16 (ADR-0019)。
+pub fn detect_capability(
+    term: Option<&str>,
+    colorterm: Option<&str>,
+    no_color: Option<&str>,
+) -> (ColorCapability, bool) {
+    let no_color = no_color.is_some_and(|v| !v.is_empty());
+    if no_color {
+        return (ColorCapability::Ansi16, true);
+    }
+    if colorterm.is_some_and(|v| v == "truecolor" || v == "24bit") {
+        return (ColorCapability::TrueColor, false);
+    }
+    if term.is_some_and(|v| v.contains("256color")) {
+        return (ColorCapability::Palette256, false);
+    }
+    (ColorCapability::Ansi16, false)
+}
+
+/// 起動時に環境から検出する（クライアントが 1 回呼ぶ）。
+pub fn detect_from_env() -> (ColorCapability, bool) {
+    detect_capability(
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+    )
+}
+
+/// 16 色の基準 RGB（xterm の既定値。8 標準色 + 8 明るい色）。
+const ANSI16_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0), // 0 黒
+    (205, 0, 0), // 1 赤
+    (0, 205, 0), // 2 緑
+    (205, 205, 0), // 3 黄
+    (0, 0, 238), // 4 青
+    (205, 0, 205), // 5 マゼンタ
+    (0, 205, 205), // 6 シアン
+    (229, 229, 229), // 7 白
+    (127, 127, 127), // 8 明るい黒
+    (255, 0, 0), // 9 明るい赤
+    (0, 255, 0), // 10 明るい緑
+    (255, 255, 0), // 11 明るい黄
+    (92, 92, 255), // 12 明るい青
+    (255, 0, 255), // 13 明るいマゼンタ
+    (0, 255, 255), // 14 明るいシアン
+    (255, 255, 255), // 15 明るい白
+];
+
+/// xterm 256 パレットのキューブ階調（95 刻み。実装前に誤った 51 刻みを
+/// 提示したが、実際の xterm はこちら — ADR-0019）。
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// 256 パレットの RGB を再構成する（0-15 は ANSI16、16-231 はキューブ、232-255 はグレー）。
+pub fn index_256_rgb(n: u8) -> (u8, u8, u8) {
+    match n {
+        0..=15 => ANSI16_RGB[n as usize],
+        16..=231 => {
+            let k = n - 16;
+            let (r, g, b) = (k / 36, (k % 36) / 6, k % 6);
+            (
+                CUBE_LEVELS[r as usize],
+                CUBE_LEVELS[g as usize],
+                CUBE_LEVELS[b as usize],
+            )
+        }
+        _ => {
+            let gray = 8 + (n - 232) * 10;
+            (gray, gray, gray)
+        }
+    }
+}
+
+/// RGB を 256 パレットのインデックスへ（ユークリッド距離の最近傍）。
+pub fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
+    let d = |x: u8, y: u8| (x as i32 - y as i32).pow(2) as u32;
+    let mut best = 16u8;
+    let mut best_d = u32::MAX;
+    // キューブ 216 色
+    for (ri, &lr) in CUBE_LEVELS.iter().enumerate() {
+        for (gi, &lg) in CUBE_LEVELS.iter().enumerate() {
+            for (bi, &lb) in CUBE_LEVELS.iter().enumerate() {
+                let dist = d(r, lr) + d(g, lg) + d(b, lb);
+                if dist < best_d {
+                    best_d = dist;
+                    best = 16 + (ri * 36 + gi * 6 + bi) as u8;
+                }
+            }
+        }
+    }
+    // グレー 24 段（8 から 10 刻み）
+    for k in 0..24u8 {
+        let gray = 8 + k * 10;
+        let dist = d(r, gray) + d(g, gray) + d(b, gray);
+        if dist < best_d {
+            best_d = dist;
+            best = 232 + k;
+        }
+    }
+    best
+}
+
+/// RGB を 16 色のインデックスへ（xterm 基準 RGB へのユークリッド最近傍）。
+pub fn nearest_16(r: u8, g: u8, b: u8) -> u8 {
+    let d = |x: u8, y: u8| (x as i32 - y as i32).pow(2) as u32;
+    (0..16u8)
+        .min_by_key(|&i| {
+            let (cr, cg, cb) = ANSI16_RGB[i as usize];
+            d(r, cr) + d(g, cg) + d(b, cb)
+        })
+        .unwrap()
+}
+
+/// 色を端末の能力に合わせて変換する（能力が足りなければ近似。ADR-0019）。
+pub fn adapt_color(color: Color, capability: ColorCapability) -> Color {
+    match capability {
+        ColorCapability::TrueColor => color,
+        ColorCapability::Palette256 => match color {
+            Color::Rgb(r, g, b) => Color::Index(nearest_256(r, g, b)),
+            other => other,
+        },
+        ColorCapability::Ansi16 => match color {
+            Color::Rgb(r, g, b) => Color::Ansi(nearest_16(r, g, b)),
+            Color::Index(n) => {
+                let (r, g, b) = index_256_rgb(n);
+                Color::Ansi(nearest_16(r, g, b))
+            }
+            other => other,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -225,9 +369,88 @@ mod tests {
         );
         assert_eq!(
             VIVID.syntax_style(HighlightGroup::Keyword),
-            Some(Style::fg(Color::Ansi(5))) // 35 マゼンタ
+            Some(Style::fg(Color::Rgb(205, 0, 205))) // マゼンタ (16 色近似で 35)
         );
         // UI ロールは共有（切替の実証は構文色で行う）
         assert_eq!(DEFAULT.ui_style(UiRole::Cursor), VIVID.ui_style(UiRole::Cursor));
+    }
+
+    #[test]
+    fn detect_capability_precedence() {
+        // NO_COLOR (非空) が最優先
+        assert_eq!(
+            detect_capability(Some("xterm-256color"), Some("truecolor"), Some("1")),
+            (ColorCapability::Ansi16, true)
+        );
+        // 空の NO_COLOR は無効
+        assert_eq!(
+            detect_capability(Some("xterm-256color"), Some("truecolor"), Some("")),
+            (ColorCapability::TrueColor, false)
+        );
+        assert_eq!(
+            detect_capability(Some("xterm-256color"), Some("truecolor"), None),
+            (ColorCapability::TrueColor, false)
+        );
+        // COLORTERM: truecolor / 24bit
+        assert_eq!(
+            detect_capability(Some("xterm"), Some("truecolor"), None),
+            (ColorCapability::TrueColor, false)
+        );
+        assert_eq!(
+            detect_capability(Some("xterm"), Some("24bit"), None),
+            (ColorCapability::TrueColor, false)
+        );
+        // 未知の COLORTERM 値は無視して TERM 判定へ
+        assert_eq!(
+            detect_capability(Some("xterm-256color"), Some("1"), None),
+            (ColorCapability::Palette256, false)
+        );
+        // TERM: 256color 部分一致
+        assert_eq!(
+            detect_capability(Some("screen-256color"), None, None),
+            (ColorCapability::Palette256, false)
+        );
+        assert_eq!(
+            detect_capability(Some("tmux-256color"), None, None),
+            (ColorCapability::Palette256, false)
+        );
+        // それ以外は ANSI16
+        assert_eq!(
+            detect_capability(Some("xterm"), None, None),
+            (ColorCapability::Ansi16, false)
+        );
+        assert_eq!(detect_capability(None, None, None), (ColorCapability::Ansi16, false));
+    }
+
+    #[test]
+    fn rgb_to_256_conversion() {
+        assert_eq!(nearest_256(255, 0, 0), 196, "赤のキューブ代表");
+        assert_eq!(nearest_256(0, 0, 0), 16, "黒");
+        assert_eq!(nearest_256(128, 128, 128), 244, "グレー最近傍 (128)");
+        assert_eq!(index_256_rgb(196), (255, 0, 0));
+        assert_eq!(index_256_rgb(244), (128, 128, 128));
+        assert_eq!(index_256_rgb(16), (0, 0, 0));
+        assert_eq!(index_256_rgb(3), (205, 205, 0), "ANSI16 領域はそのまま");
+    }
+
+    #[test]
+    fn rgb_to_16_conversion() {
+        assert_eq!(nearest_16(255, 0, 0), 9, "明るい赤");
+        assert_eq!(nearest_16(205, 0, 205), 5, "マゼンタ");
+        assert_eq!(nearest_16(0, 0, 0), 0, "黒");
+    }
+
+    #[test]
+    fn adapt_color_per_capability() {
+        let red = Color::Rgb(255, 0, 0);
+        assert_eq!(adapt_color(red, ColorCapability::TrueColor), red);
+        assert_eq!(adapt_color(red, ColorCapability::Palette256), Color::Index(196));
+        assert_eq!(adapt_color(red, ColorCapability::Ansi16), Color::Ansi(9));
+        assert_eq!(adapt_color(Color::Index(196), ColorCapability::Ansi16), Color::Ansi(9));
+        assert_eq!(
+            adapt_color(Color::Ansi(6), ColorCapability::Palette256),
+            Color::Ansi(6),
+            "Ansi は能力に関わらずそのまま"
+        );
     }
 }
