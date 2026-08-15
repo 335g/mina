@@ -678,6 +678,7 @@ fn cursor_pos(text: &str, head: usize, hints: &[InlayHint]) -> (usize, usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     fn state_with(text: &str, selection: Vec<Range>, primary: usize) -> StateSnapshot {
         StateSnapshot {
@@ -972,16 +973,16 @@ mod tests {
         // 勝利ロールの Style は全フィールドが尊重される（bg だけ・reverse だけの
         // 部分抽出でないこと — 敵対的検証で発見したバグの回帰テスト）
         let scheme = Colorscheme {
-            name: "probe",
-            syntax: &[],
-            ui: &[(UiRole::Selection, Style {
+            name: Cow::Borrowed("probe"),
+            syntax: Cow::Borrowed(&[]),
+            ui: Cow::Borrowed(&[(UiRole::Selection, Style {
                 fg: None,
                 bg: Some(crate::colorscheme::Color::Ansi(0)),
                 underline: false,
                 reverse: true,
                 dim: false,
                 italic: false,
-            })],
+            })]),
         };
         let state = state_with("ab", vec![Range { anchor: 0, head: 1 }], 0);
         let out = render_text(&scheme, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
