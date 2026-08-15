@@ -1222,7 +1222,11 @@ async fn process_command(
                     Command::Insert { text } => {
                         Some((EventKind::Insert, None, Some(text.clone())))
                     }
-                    Command::DeleteBackward | Command::DeleteForward | Command::DeleteRange => {
+                    Command::DeleteBackward
+                    | Command::DeleteForward
+                    | Command::DeleteWordBackward
+                    | Command::DeleteWordForward
+                    | Command::DeleteRange => {
                         // 削除範囲 = 適用前の選択（primary）
                         let r = d.editor.selection().primary();
                         Some((
@@ -1366,6 +1370,8 @@ fn is_edit(command: &Command) -> bool {
         Command::Insert { .. }
             | Command::DeleteBackward
             | Command::DeleteForward
+            | Command::DeleteWordBackward
+            | Command::DeleteWordForward
             | Command::DeleteRange
             | Command::Undo
             | Command::Redo
@@ -1613,6 +1619,20 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), changed)
         }
+        Command::DeleteWordBackward => {
+            preempt(daemon, conn_id);
+            let selection = daemon.editor.selection();
+            let tx = mina_core::delete_word_backward_transaction(
+                daemon.editor.current_document(),
+                &selection,
+            );
+            // 文書先頭での単語削除は no-op
+            let changed = !tx.is_noop();
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
         Command::DeleteForward => {
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
@@ -1621,6 +1641,20 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 &selection,
             );
             // 文末での Delete 等は no-op（状態を変えない）
+            let changed = !tx.is_noop();
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::DeleteWordForward => {
+            preempt(daemon, conn_id);
+            let selection = daemon.editor.selection();
+            let tx = mina_core::delete_word_forward_transaction(
+                daemon.editor.current_document(),
+                &selection,
+            );
+            // 文末での単語削除は no-op
             let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
             daemon.editor.apply(tx, selection_after);
@@ -1804,6 +1838,9 @@ fn convert_movement(m: mina_protocol::Movement) -> mina_core::Movement {
         mina_protocol::Movement::Char => mina_core::Movement::Char,
         mina_protocol::Movement::Line => mina_core::Movement::Line,
         mina_protocol::Movement::Word => mina_core::Movement::Word,
+        mina_protocol::Movement::WordEnd => mina_core::Movement::WordEnd,
+        mina_protocol::Movement::LineStart => mina_core::Movement::LineStart,
+        mina_protocol::Movement::LineEnd => mina_core::Movement::LineEnd,
     }
 }
 
@@ -2537,6 +2574,38 @@ mod tests {
         open(&mut d, "hello");
         let s = apply(&mut d, Command::DeleteForward);
         assert_eq!(s.text, "ello");
+    }
+
+    #[test]
+    fn delete_word_forward_and_backward() {
+        let mut d = daemon();
+        open(&mut d, "hello world foo");
+        // 単語の途中（hello の 2 文字目）→ 現在の単語の残りを削除
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::DeleteWordForward);
+        assert_eq!(s.text, "he world foo");
+        // 文頭に戻って単語後方削除 → 文頭なので no-op
+        apply(&mut d, Command::Goto {
+            target: GotoTarget::DocumentStart,
+        });
+        let s = apply(&mut d, Command::DeleteWordBackward);
+        assert_eq!(s.text, "he world foo", "文頭での単語削除は no-op");
+        // 末尾へ移動して単語後方削除 → 直前の単語（と空白以外）が消える
+        apply(&mut d, Command::Goto {
+            target: GotoTarget::DocumentEnd,
+        });
+        let s = apply(&mut d, Command::DeleteWordBackward);
+        assert_eq!(s.text, "he world ", "直前の単語だけが消え、空白は残る");
+        // undo で戻る
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "he world foo");
     }
 
     #[test]
