@@ -1238,6 +1238,22 @@ async fn process_command(
                             None,
                         ))
                     }
+                    Command::Change => {
+                        // 選択があれば Delete、カーソル上なら SetMode 相当のイベント
+                        let r = d.editor.selection().primary();
+                        if r.is_cursor() {
+                            Some((EventKind::SetMode, None, None))
+                        } else {
+                            Some((
+                                EventKind::Delete,
+                                Some(Range {
+                                    anchor: r.start(),
+                                    head: r.end(),
+                                }),
+                                None,
+                            ))
+                        }
+                    }
                     Command::Undo if d.editor.can_undo() => Some((EventKind::Undo, None, None)),
                     Command::Redo if d.editor.can_redo() => Some((EventKind::Redo, None, None)),
                     Command::Close => Some((EventKind::Close, None, None)),
@@ -1373,6 +1389,7 @@ fn is_edit(command: &Command) -> bool {
             | Command::DeleteWordBackward
             | Command::DeleteWordForward
             | Command::DeleteRange
+            | Command::Change
             | Command::Undo
             | Command::Redo
     )
@@ -1675,6 +1692,25 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             }
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), changed)
+        }
+        Command::Change => {
+            // 選択（またはカーソル位置）を削除して Insert モードへ（Helix の `c`）。
+            // 削除はグループの外に積み、以後の入力は SetMode(Insert) と同じく
+            // 新規グループになる（ADR-0007。undo 1回で削除だけが戻る = Helix と同様）。
+            preempt(daemon, conn_id);
+            let selection = daemon.editor.selection();
+            let tx = Transaction::delete(daemon.editor.current_document(), &selection);
+            let deleted = !tx.is_noop();
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            let was_insert = daemon.editor.mode() == mina_view::Mode::Insert;
+            if !was_insert {
+                daemon.editor.begin_group();
+                daemon.insert_owner = Some(conn_id);
+            }
+            daemon.editor.set_mode(mina_view::Mode::Insert);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), deleted || !was_insert)
         }
         Command::Undo => {
             // Undo/Redo も書き込みとして扱う（単一の共有履歴・グローバル undo）
@@ -2606,6 +2642,41 @@ mod tests {
         // undo で戻る
         let s = apply(&mut d, Command::Undo);
         assert_eq!(s.text, "he world foo");
+    }
+
+    #[test]
+    fn change_deletes_selection_and_enters_insert() {
+        // Helix の `c`: 選択を削除して Insert モードへ。削除はグループの外に
+        // 積まれ、undo 1回で入力だけが戻る（削除と入力が別単位 = Helix と同様）。
+        let mut d = daemon();
+        open(&mut d, "hello world");
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        apply(&mut d, Command::Extend {
+            movement: Movement::Word,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::Change);
+        assert_eq!(s.text, "world", "選択（hello ）が削除される");
+        assert_eq!(s.mode, Mode::Insert, "Insert モードへ入る");
+        let s = apply(&mut d, Command::Insert { text: "bye ".into() });
+        assert_eq!(s.text, "bye world");
+        apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "world", "undo 1回目は入力だけを戻す");
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "hello world", "undo 2回目で削除も戻る");
+    }
+
+    #[test]
+    fn change_on_cursor_just_enters_insert() {
+        // カーソル上の `c` は削除なしで Insert モードへ（Helix と同じ）
+        let mut d = daemon();
+        open(&mut d, "hello");
+        let s = apply(&mut d, Command::Change);
+        assert_eq!(s.text, "hello");
+        assert_eq!(s.mode, Mode::Insert);
+        let s = apply(&mut d, Command::Insert { text: "X".into() });
+        assert_eq!(s.text, "Xhello");
     }
 
     #[test]
