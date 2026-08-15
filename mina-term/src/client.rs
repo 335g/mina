@@ -15,7 +15,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use mina_protocol::{ClientKind, Command, Hello, Mode, ServerMessage, StateSnapshot};
+use mina_protocol::{ClientKind, Command, Hello, InlayHint, Mode, ServerMessage, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent, KeyEventKind};
 use termina::{Event, EventStream, PlatformTerminal, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -344,6 +344,38 @@ pub(crate) async fn send_hello(
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await
+}
+
+/// 任意パスの inlay hint を取得する（ADR-0020）。`Command::GetInlayHints` の
+/// 応答はスナップショットでなく `ServerMessage::Hints` なので専用経路。
+/// エージェント（session CLI）が全文テキストなしで型構造を参照するためのもの。
+pub(crate) async fn request_hints(
+    write_half: &mut OwnedWriteHalf,
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    path: &str,
+) -> std::io::Result<(String, u64, Vec<InlayHint>)> {
+    let message = Command::GetInlayHints {
+        path: path.to_string(),
+    };
+    let mut line = serde_json::to_string(&message).expect("メッセージはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::Hints { path, generation, hints }) => Ok((path, generation, hints)),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected snapshot response",
+            ))
+        }
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("不正な応答: {e}"),
+        )),
+    }
 }
 
 /// メッセージを送り、応答スナップショットを1つ受け取る。TUI と session CLI の両方から使う。
