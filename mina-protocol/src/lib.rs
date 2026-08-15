@@ -5,6 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// IPC プロトコルのバージョン。**wire 形式が変わったら必ず上げる**。
+///
+/// ソケットパスに埋め込まれ（`mina-{PROTOCOL_VERSION}.sock`）、古い daemon が
+/// 新しいクライアントに拾われるのを防ぐ（古い daemon は古いソケットに残り、
+/// 新クライアントは新しいソケットで新 daemon を自動起動する — クライアントの
+/// `ensure_daemon` と合わせて、バージョン不一致の応答を一切受けない）。
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// 編集モード（wire 型。mina-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {

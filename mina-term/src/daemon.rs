@@ -1509,7 +1509,10 @@ fn convert_mode_back(m: mina_view::Mode) -> mina_protocol::Mode {
 /// は socket の 0600 化 + 接続時の peer uid 検証（MEDIUM-3）で行う。複数ユーザ
 /// を同時に扱う必要が出たら `<dir>/mina-<uid>.sock` にする。
 pub fn socket_path() -> PathBuf {
-    std::env::temp_dir().join("mina.sock")
+    // プロトコルバージョンをソケット名に埋める: プロトコルが変わると古い daemon は
+    // 別ソケットに残り、新クライアントは新 daemon を自動起動する（ADR-0019 の後、
+    // highlights 追加時に「古い daemon + 新クライアント」で起動失敗が発生した教訓）。
+    std::env::temp_dir().join(format!("mina-{}.sock", mina_protocol::PROTOCOL_VERSION))
 }
 
 #[cfg(test)]
