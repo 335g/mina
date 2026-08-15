@@ -282,6 +282,7 @@ dependencies = [
  "serde_json",
  "termina",
  "tokio",
+ "tree-sitter",
  "unicode-width",
 ]
 
