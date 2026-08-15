@@ -620,8 +620,17 @@ async fn accept_loop(
     loop {
         let (stream, _) = listener.accept().await?;
         // MEDIUM-3: peer uid が取れない（エラー）場合も含め、daemon の uid と
-        // 一致しない接続は即切断する（fail closed）。
-        let peer_uid = stream.peer_cred().map(|c| c.uid());
+        // 一致しない接続は即切断する（fail closed）。ただし macOS の getpeereid
+        // は accept 直後の短い間 ENOTCONN を返すことがあるため、数回リトライ
+        // してから判断する（リトライせず fail closed だと正当な接続が落ちる）。
+        let mut peer_uid = stream.peer_cred().map(|c| c.uid());
+        for _ in 0..10 {
+            if peer_uid.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            peer_uid = stream.peer_cred().map(|c| c.uid());
+        }
         if peer_uid.map_or(true, |uid| !is_peer_allowed(uid, daemon_uid)) {
             drop(stream);
             continue;
@@ -1739,7 +1748,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 match convert_movement(movement) {
                     // Helix 流: 単語移動（w/b/e）は anchor を保持して「移動した分」を
                     // 選択する。h/l/j/k や矢印は従来どおり点に潰す。
-                    m @ (mina_core::Movement::Word | mina_core::Movement::WordEnd) => {
+                    mina_core::Movement::Word | mina_core::Movement::WordEnd => {
                         mina_core::word_move_selection(
                             doc,
                             &selection,
