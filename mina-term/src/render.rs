@@ -81,12 +81,17 @@ pub fn render_text(
         .copied()
         .unwrap_or(Range { anchor: 0, head: 0 });
     let head = primary.head;
+    // カーソル行（ガターの LineNumberActive 判定と端末カーソル列で使う。O(head) は 1 回）
+    let (cursor_row, _, cursor_colw) = cursor_pos(&state.text, head, &state.inlay_hints);
 
     let mut s = String::new();
     s.push_str("\x1b[?2026h"); // synchronized output ON（未対応端末では無視される）
     s.push_str("\x1b[H"); // カーソルをホームへ
 
     let body_rows = height.saturating_sub(1); // 最終行はステータス行
+    // ガター幅 = 総行数の桁数 + 区切りの空白 1 つ（右詰めの絶対番号。横スクロール無しなので固定幅）
+    let gutter_shift = lines.byte_starts.len().to_string().len() + 1;
+    let text_width = width.saturating_sub(gutter_shift);
     // highlights は行を跨いで昇順に進むため、ポインタを行ループの外に持つ
     // （行ごとに 0 から歩き直すと O(行数×範囲数) — 敵対的検証で発見）。
     // inlay_hints も同じ流儀（ADR-0020。position 昇順の不変条件）。
@@ -97,6 +102,24 @@ pub fn render_text(
         let line_idx = state.first_line + row;
         match lines.byte_range(line_idx) {
             Some((bs, be)) => {
+                if width < gutter_shift {
+                    s.push_str("\x1b[K"); // 幅がガター未満: 行全体をクリア
+                    continue;
+                }
+                // ガター: 1 始まりの絶対番号。カーソル行だけ LineNumberActive（白）
+                let role = if line_idx == cursor_row {
+                    UiRole::LineNumberActive
+                } else {
+                    UiRole::LineNumber
+                };
+                s.push_str(&ui_sgr(scheme, capability, no_color, role));
+                s.push_str(&format!(
+                    "{:>width$}",
+                    line_idx + 1,
+                    width = gutter_shift - 1
+                ));
+                s.push(' ');
+                s.push_str("\x1b[0m");
                 let cs = lines
                     .char_start(line_idx)
                     .expect("byte_range があるなら char_start もある");
@@ -114,10 +137,10 @@ pub fn render_text(
                     capability,
                     no_color,
                     Some(head),
-                    width,
+                    text_width,
                 );
             }
-            None => s.push_str("\x1b[K"), // 行が無ければクリア
+            None => s.push_str("\x1b[K"), // 行が無ければクリア（ガターも空白のまま）
         }
     }
 
@@ -174,11 +197,14 @@ pub fn render_text(
 
     // ターミナルカーソルを primary head へ（Q4: ヒントは仮想テキストなので
     // head より前のヒント幅を表示列に加算する。視覚カーソルは実キャラの
-    // スタイル描画のため影響を受けない）。
-    let (row, _, colw) = cursor_pos(&state.text, head, &state.inlay_hints);
-    let term_row = row.saturating_sub(state.first_line) + 1;
+    // スタイル描画のため影響を受けない）。ガター幅分も右へずらす。
+    let term_row = cursor_row.saturating_sub(state.first_line) + 1;
     if term_row <= body_rows {
-        s.push_str(&format!("\x1b[{};{}H", term_row, colw + 1));
+        s.push_str(&format!(
+            "\x1b[{};{}H",
+            term_row,
+            cursor_colw + gutter_shift + 1
+        ));
     }
     s.push_str("\x1b[?2026l"); // synchronized output OFF
     s
@@ -551,7 +577,8 @@ fn draw_status(
             .copied()
             .unwrap_or(Range { anchor: 0, head: 0 });
         let (row, col, _) = cursor_pos(&state.text, primary.head, &[]);
-        text.push_str(&format!(" {path}{dirty}  {row}:{col}"));
+        // 行・列は 1 始まり（ガターの行番号と揃える — vim/helix と同じ表示規約）
+        text.push_str(&format!(" {path}{dirty}  {}:{}", row + 1, col + 1));
         if !pending.is_empty() {
             let keys: String = pending
                 .iter()
@@ -680,8 +707,39 @@ mod tests {
         assert!(out.contains("he"), "{out:?}");
         assert!(out.contains("NORMAL"), "{out:?}");
         assert!(out.contains("\x1b[44ml"), "カーソルセルが青背景で見える: {out:?}");
-        assert!(out.contains("\x1b[1;4H"), "カーソル位置エスケープ: {out:?}");
+        // ガター（幅 1 + 空白 1）分右へ: 表示列 3 → 端末列 6
+        assert!(out.contains("\x1b[1;6H"), "カーソル位置エスケープ: {out:?}");
         assert!(out.contains("\x1b[?2026l"), "同期出力 OFF で閉じる");
+    }
+
+    #[test]
+    fn gutter_shows_one_based_numbers_with_active_highlight() {
+        // ガター: 1 始まりの絶対番号。カーソル行（2 行目）は白 (97)、他は灰 (90)
+        let state = state_with("a\nb\nc", vec![Range { anchor: 3, head: 3 }], 0); // head = 2 行目末
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[90m1 \x1b[0ma"), "1行目: 灰の 1: {out:?}");
+        assert!(out.contains("\x1b[97m2 \x1b[0mb"), "2行目: 白の 2（カーソル行）: {out:?}");
+        assert!(out.contains("\x1b[90m3 \x1b[0mc"), "3行目: 灰の 3: {out:?}");
+    }
+
+    #[test]
+    fn gutter_pads_and_follows_viewport_offset() {
+        // 総行数 10 → ガター幅 2（右詰め）。first_line=5 → 6..10 を表示、EOF 以降は番号なし
+        let text = (0..10).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let mut state = state_with(&text, vec![Range { anchor: 0, head: 0 }], 0);
+        state.first_line = 5;
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
+        assert!(out.contains("\x1b[90m 6 \x1b[0m"), "1桁目が右詰め 2 桁: {out:?}");
+        assert!(out.contains("\x1b[90m10 \x1b[0m"), "2桁の番号: {out:?}");
+        assert!(!out.contains("\x1b[90m5 "), "first_line より前の行番号を出さない: {out:?}");
+    }
+
+    #[test]
+    fn status_line_is_one_based() {
+        // 行番号は 1 始まり（ガターと揃える）。head が 2 行目の 2 文字目 → "2:2"
+        let state = state_with("ab\ncd", vec![Range { anchor: 4, head: 4 }], 0);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
+        assert!(out.contains(" 2:2"), "ステータスの行:列は 1 始まり: {out:?}");
     }
 
     #[test]
@@ -809,11 +867,11 @@ mod tests {
 
     #[test]
     fn wide_char_truncation_inside_group() {
-        // 幅3: "あ" (2) まで描画。切り詰め時に宙に浮く SGR を出さない
+        // 幅5（ガター 2 を除きテキスト幅 3）: "あ" (2) まで描画。切り詰め時に宙に浮く SGR を出さない
         let mut state = state_with("あいう", vec![Range { anchor: 3, head: 3 }], 0);
         state.highlights =
             vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::String }];
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 3, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 5, 10);
         assert!(out.contains("\x1b[32mあ"), "グループ色で全角1文字: {out:?}");
         assert!(!out.contains("い"), "幅超過で切り詰め: {out:?}");
         assert!(!out.contains("\x1b[32m\x1b[0m"), "宙に浮く SGR を出さない: {out:?}");
@@ -949,9 +1007,9 @@ mod tests {
 
     #[test]
     fn wide_char_truncation_respects_display_width() {
-        // "あ" は表示幅2。幅3なら "あ" で切れ、"あい" にはならない
+        // "あ" は表示幅2。幅5（ガター 2 を除きテキスト幅 3）なら "あ" で切れ、"あい" にはならない
         let state = state_with("あいうえお", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 3, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 5, 10);
         assert!(out.contains("あ") && !out.contains("あい"), "{out:?}");
     }
 
@@ -1243,8 +1301,8 @@ mod tests {
             40,
             10,
         );
-        // head=6（= の位置）: 表示列 = char 6 + ヒント幅 5 = 11 → 1行目 col 12
-        assert!(out.contains("\x1b[1;12H"), "カーソル列にヒント幅が加算: {out:?}");
+        // head=6（= の位置）: 表示列 = char 6 + ヒント幅 5 = 11。ガター（2）を足し → 1行目 col 14
+        assert!(out.contains("\x1b[1;14H"), "カーソル列にヒント幅が加算: {out:?}");
     }
 
     #[test]
