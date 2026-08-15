@@ -89,8 +89,8 @@ pub fn render_text(
     s.push_str("\x1b[H"); // カーソルをホームへ
 
     let body_rows = height.saturating_sub(1); // 最終行はステータス行
-    // ガター幅 = 総行数の桁数 + 区切りの空白 1 つ（右詰めの絶対番号。横スクロール無しなので固定幅）
-    let gutter_shift = lines.byte_starts.len().to_string().len() + 1;
+    // ガター幅: 左余白 1 + 4 桁（右詰め）+ 区切りの空白 1 = 6（Helix に寄せた固定幅）
+    let gutter_shift = 1 + 4 + 1;
     let text_width = width.saturating_sub(gutter_shift);
     // highlights は行を跨いで昇順に進むため、ポインタを行ループの外に持つ
     // （行ごとに 0 から歩き直すと O(行数×範囲数) — 敵対的検証で発見）。
@@ -707,30 +707,30 @@ mod tests {
         assert!(out.contains("he"), "{out:?}");
         assert!(out.contains("NORMAL"), "{out:?}");
         assert!(out.contains("\x1b[44ml"), "カーソルセルが青背景で見える: {out:?}");
-        // ガター（幅 1 + 空白 1）分右へ: 表示列 3 → 端末列 6
-        assert!(out.contains("\x1b[1;6H"), "カーソル位置エスケープ: {out:?}");
+        // ガター（左余白 1 + 4 桁 + 空白 1 = 6）分右へ: 表示列 3 → 端末列 10
+        assert!(out.contains("\x1b[1;10H"), "カーソル位置エスケープ: {out:?}");
         assert!(out.contains("\x1b[?2026l"), "同期出力 OFF で閉じる");
     }
 
     #[test]
     fn gutter_shows_one_based_numbers_with_active_highlight() {
-        // ガター: 1 始まりの絶対番号。カーソル行（2 行目）は白 (97)、他は灰 (90)
+        // ガター: 左余白 1 + 4 桁右詰め + 空白 1。カーソル行（2 行目）は白 (97)、他は灰 (90)
         let state = state_with("a\nb\nc", vec![Range { anchor: 3, head: 3 }], 0); // head = 2 行目末
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
-        assert!(out.contains("\x1b[90m1 \x1b[0ma"), "1行目: 灰の 1: {out:?}");
-        assert!(out.contains("\x1b[97m2 \x1b[0mb"), "2行目: 白の 2（カーソル行）: {out:?}");
-        assert!(out.contains("\x1b[90m3 \x1b[0mc"), "3行目: 灰の 3: {out:?}");
+        assert!(out.contains("\x1b[90m    1 \x1b[0ma"), "1行目: 灰の 1: {out:?}");
+        assert!(out.contains("\x1b[97m    2 \x1b[0mb"), "2行目: 白の 2（カーソル行）: {out:?}");
+        assert!(out.contains("\x1b[90m    3 \x1b[0mc"), "3行目: 灰の 3: {out:?}");
     }
 
     #[test]
     fn gutter_pads_and_follows_viewport_offset() {
-        // 総行数 10 → ガター幅 2（右詰め）。first_line=5 → 6..10 を表示、EOF 以降は番号なし
+        // ガターは 4 桁固定（右詰め）。first_line=5 → 6..10 を表示、EOF 以降は番号なし
         let text = (0..10).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
         let mut state = state_with(&text, vec![Range { anchor: 0, head: 0 }], 0);
         state.first_line = 5;
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
-        assert!(out.contains("\x1b[90m 6 \x1b[0m"), "1桁目が右詰め 2 桁: {out:?}");
-        assert!(out.contains("\x1b[90m10 \x1b[0m"), "2桁の番号: {out:?}");
+        assert!(out.contains("\x1b[90m    6 \x1b[0m"), "1 桁の番号が 4 桁枠で右詰め: {out:?}");
+        assert!(out.contains("\x1b[90m   10 \x1b[0m"), "2 桁の番号も 4 桁枠内: {out:?}");
         assert!(!out.contains("\x1b[90m5 "), "first_line より前の行番号を出さない: {out:?}");
     }
 
@@ -867,11 +867,11 @@ mod tests {
 
     #[test]
     fn wide_char_truncation_inside_group() {
-        // 幅5（ガター 2 を除きテキスト幅 3）: "あ" (2) まで描画。切り詰め時に宙に浮く SGR を出さない
+        // 幅9（ガター 6 を除きテキスト幅 3）: "あ" (2) まで描画。切り詰め時に宙に浮く SGR を出さない
         let mut state = state_with("あいう", vec![Range { anchor: 3, head: 3 }], 0);
         state.highlights =
             vec![HighlightRange { start: 0, end: 3, group: HighlightGroup::String }];
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 5, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 9, 10);
         assert!(out.contains("\x1b[32mあ"), "グループ色で全角1文字: {out:?}");
         assert!(!out.contains("い"), "幅超過で切り詰め: {out:?}");
         assert!(!out.contains("\x1b[32m\x1b[0m"), "宙に浮く SGR を出さない: {out:?}");
@@ -1007,9 +1007,9 @@ mod tests {
 
     #[test]
     fn wide_char_truncation_respects_display_width() {
-        // "あ" は表示幅2。幅5（ガター 2 を除きテキスト幅 3）なら "あ" で切れ、"あい" にはならない
+        // "あ" は表示幅2。幅9（ガター 6 を除きテキスト幅 3）なら "あ" で切れ、"あい" にはならない
         let state = state_with("あいうえお", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 5, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 9, 10);
         assert!(out.contains("あ") && !out.contains("あい"), "{out:?}");
     }
 
@@ -1301,8 +1301,8 @@ mod tests {
             40,
             10,
         );
-        // head=6（= の位置）: 表示列 = char 6 + ヒント幅 5 = 11。ガター（2）を足し → 1行目 col 14
-        assert!(out.contains("\x1b[1;14H"), "カーソル列にヒント幅が加算: {out:?}");
+        // head=6（= の位置）: 表示列 = char 6 + ヒント幅 5 = 11。ガター（6）を足し → 1行目 col 18
+        assert!(out.contains("\x1b[1;18H"), "カーソル列にヒント幅が加算: {out:?}");
     }
 
     #[test]
