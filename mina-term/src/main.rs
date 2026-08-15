@@ -6,6 +6,7 @@
 
 mod client;
 mod colorscheme;
+mod config;
 mod daemon;
 mod keymap;
 mod lsp;
