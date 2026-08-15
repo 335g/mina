@@ -4,7 +4,9 @@
 //! （`docs/adr/0002-functional-core-selection.md` 参照）。内部で
 //! [`Transaction`] を作って適用する。
 
-use crate::movement::{next_grapheme_boundary, prev_grapheme_boundary};
+use crate::movement::{
+    next_grapheme_boundary, next_word_end, prev_grapheme_boundary, prev_word_start,
+};
 use crate::{Document, Range, Selection, Transaction};
 
 /// `selection` の各 Range を `text` で置き換える。
@@ -54,6 +56,34 @@ pub fn delete_backward_transaction(doc: &Document, selection: &Selection) -> Tra
     Transaction::delete(doc, &expanded)
 }
 
+/// 後方単語削除（Alt-Backspace / Ctrl-w 相当）。カーソルなら直前の単語
+/// （前の単語先頭からカーソルまで）を削除し、選択があれば選択全体を削除する。
+pub fn delete_word_backward(doc: &Document, selection: &Selection) -> (Document, Selection) {
+    let tx = delete_word_backward_transaction(doc, selection);
+    let new_doc = tx.apply(doc);
+    let new_selection = tx.map_selection(selection, false);
+    (new_doc, new_selection)
+}
+
+/// 後方単語削除のトランザクション。undo 履歴に記録する呼び出し側（Editor 層）向け。
+pub fn delete_word_backward_transaction(doc: &Document, selection: &Selection) -> Transaction {
+    let text = doc.text().to_string();
+    let ranges: Vec<Range> = selection
+        .ranges()
+        .iter()
+        .map(|r| {
+            if r.is_cursor() {
+                let start = prev_word_start(&text, r.head());
+                Range::new(r.head(), start) // [start, head) = 直前の単語
+            } else {
+                *r
+            }
+        })
+        .collect();
+    let expanded = Selection::new(ranges, selection.primary_index());
+    Transaction::delete(doc, &expanded)
+}
+
 /// 前方削除（Delete キー相当）。カーソルなら次の1書記素を削除し、
 /// 選択があれば選択全体を削除する。
 pub fn delete_forward(doc: &Document, selection: &Selection) -> (Document, Selection) {
@@ -73,6 +103,34 @@ pub fn delete_forward_transaction(doc: &Document, selection: &Selection) -> Tran
             if r.is_cursor() {
                 let next = next_grapheme_boundary(&text, r.head());
                 Range::new(r.head(), next) // [head, next) = 次の1書記素
+            } else {
+                *r
+            }
+        })
+        .collect();
+    let expanded = Selection::new(ranges, selection.primary_index());
+    Transaction::delete(doc, &expanded)
+}
+
+/// 前方単語削除（Alt-d 相当）。カーソルなら現在/次の単語の末尾までを削除し、
+/// 選択があれば選択全体を削除する。
+pub fn delete_word_forward(doc: &Document, selection: &Selection) -> (Document, Selection) {
+    let tx = delete_word_forward_transaction(doc, selection);
+    let new_doc = tx.apply(doc);
+    let new_selection = tx.map_selection(selection, false);
+    (new_doc, new_selection)
+}
+
+/// 前方単語削除のトランザクション。undo 履歴に記録する呼び出し側（Editor 層）向け。
+pub fn delete_word_forward_transaction(doc: &Document, selection: &Selection) -> Transaction {
+    let text = doc.text().to_string();
+    let ranges: Vec<Range> = selection
+        .ranges()
+        .iter()
+        .map(|r| {
+            if r.is_cursor() {
+                let end = next_word_end(&text, r.head());
+                Range::new(r.head(), end) // [head, end) = 次の単語（末尾まで）
             } else {
                 *r
             }
@@ -165,6 +223,69 @@ mod tests {
         let (new_doc, selection) = delete_backward(&doc, &Selection::point(2));
         assert_eq!(new_doc.text().to_string(), "い");
         assert_eq!(selection, Selection::point(0));
+    }
+
+    #[test]
+    fn delete_word_backward_deletes_previous_word() {
+        let doc = Document::from("hello world");
+        // カーソルは単語の直後。直前の単語だけが消え、空白は残る（Helix と同じ）
+        let (new_doc, selection) = delete_word_backward(&doc, &Selection::point(11));
+        assert_eq!(new_doc.text().to_string(), "hello ");
+        assert_eq!(selection, Selection::point(6));
+    }
+
+    #[test]
+    fn delete_word_backward_mid_word_deletes_whole_word() {
+        let doc = Document::from("hello world");
+        // 単語の途中なら単語先頭まで遡って削除（hel|lo → lo）
+        let (new_doc, selection) = delete_word_backward(&doc, &Selection::point(3));
+        assert_eq!(new_doc.text().to_string(), "lo world");
+        assert_eq!(selection, Selection::point(0));
+    }
+
+    #[test]
+    fn delete_word_backward_at_start_is_noop() {
+        let doc = Document::from("hello");
+        let (new_doc, selection) = delete_word_backward(&doc, &Selection::point(0));
+        assert_eq!(new_doc.text().to_string(), "hello");
+        assert_eq!(selection, Selection::point(0));
+    }
+
+    #[test]
+    fn delete_word_backward_with_selection_deletes_selection() {
+        let doc = Document::from("hello world");
+        let (new_doc, selection) = delete_word_backward(&doc, &sel(vec![(1, 4)], 0));
+        assert_eq!(new_doc.text().to_string(), "ho world");
+        assert_eq!(selection, Selection::point(1));
+    }
+
+    #[test]
+    fn delete_word_forward_deletes_next_word() {
+        let doc = Document::from("hello world");
+        // 単語の途中なら現在の単語の残りを削除（he|llo → he world）
+        let (new_doc, selection) = delete_word_forward(&doc, &Selection::point(2));
+        assert_eq!(new_doc.text().to_string(), "he world");
+        assert_eq!(selection, Selection::point(2));
+        // 単語先頭ならその単語全体
+        let (new_doc, selection) = delete_word_forward(&doc, &Selection::point(6));
+        assert_eq!(new_doc.text().to_string(), "hello ");
+        assert_eq!(selection, Selection::point(6));
+    }
+
+    #[test]
+    fn delete_word_forward_at_end_is_noop() {
+        let doc = Document::from("hello");
+        let (new_doc, selection) = delete_word_forward(&doc, &Selection::point(5));
+        assert_eq!(new_doc.text().to_string(), "hello");
+        assert_eq!(selection, Selection::point(5));
+    }
+
+    #[test]
+    fn delete_word_forward_with_selection_deletes_selection() {
+        let doc = Document::from("hello world");
+        let (new_doc, selection) = delete_word_forward(&doc, &sel(vec![(1, 4)], 0));
+        assert_eq!(new_doc.text().to_string(), "ho world");
+        assert_eq!(selection, Selection::point(1));
     }
 
     #[test]
