@@ -95,3 +95,7 @@ _Avoid_: syntax tree, parse tree
 **HighlightGroup**:
 A named class of tokens (comment, keyword, string, function, …) that text is assigned to for styling by the Daemon's per-language highlight queries. The unit a Colorscheme maps to colors and attributes.
 _Avoid_: scope, token type
+
+**ColorCapability**:
+The color depth a terminal supports — truecolor, a 256-color palette, or ANSI16 — detected once from the environment at Client startup. The renderer converts Colorscheme colors to this depth; `NO_COLOR` suppresses color output entirely while keeping attributes (underline, reverse).
+_Avoid_: color depth, terminal colors

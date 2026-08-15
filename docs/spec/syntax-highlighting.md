@@ -148,7 +148,7 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef>;
 - **M1 — mina-loader**: クレート新設、レジストリ、rust grammar + ハイライトクエリ。検証: スニペットをパースして期待グループが得られるユニットテスト。
 - **M2 — プロトコル + daemon**: `HighlightGroup` / `HighlightRange` / `StateSnapshot.highlights`、daemon の SyntaxStore（編集ごとのインクリメンタル再パース、Open/Close/Reload のライフサイクル、スナップショット生成時に範囲を充填）。
 - **M3 — renderer**: `draw_line` のグループ次元、暫定パレット、優先順位。検証: 既存の render テストを拡張（グループ付き行のエスケープ列検証）。
-- **M4 — Colorscheme 機構**: 名前付きスキームと切替（`:colorscheme` には引数パース追加が必要）、暫定パレットの外部化、色能力検出、診断 Error/Warning の色分け、UI ロールの enum 化。**M4-1 (#18) は完了** — `Colorscheme` データモデル + `DEFAULT` スキーム + renderer のスキーム参照化。M4-2 (#19: `:colorscheme` 切替) / M4-3 (#20: 色能力検出) が残り。
+- **M4 — Colorscheme 機構**: 名前付きスキームと切替（`:colorscheme`）、暫定パレットの外部化、色能力検出、診断 Error/Warning の色分け、UI ロールの enum 化。**全完了** — M4-1 (#18: データモデル + DEFAULT + renderer 参照化) / M4-2 (#19: `:colorscheme` 切替) / M4-3 (#20: 色能力検出、ADR-0019)。
 
 ## 関連文書
 
