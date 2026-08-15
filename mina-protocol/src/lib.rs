@@ -62,6 +62,9 @@ pub enum Command {
     DeleteWordForward,
     /// 選択範囲を削除する。
     DeleteRange,
+    /// 選択（またはカーソル位置）を削除して Insert モードへ入る（Helix の `c`）。
+    /// カーソル上では削除なしで Insert モードに入るだけ。削除は undo グループの外。
+    Change,
     /// 直近の変更グループを元に戻す。
     Undo,
     /// 直近に undo された変更グループをやり直す。
@@ -437,6 +440,11 @@ mod tests {
         let json = serde_json::to_string(&del_word).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, del_word);
+
+        let change = Command::Change;
+        let json = serde_json::to_string(&change).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, change);
 
         let end = Command::Move {
             movement: Movement::LineEnd,
