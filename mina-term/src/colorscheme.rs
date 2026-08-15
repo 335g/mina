@@ -1,9 +1,16 @@
 //! Colorscheme: 役割 → スタイルの名前付き写像 (ADR-0018, CONTEXT.md)。
 //!
-//! クライアントローカル (プロトコル非関与)。スキームは静的 const テーブルで、
-//! 設定ファイル・永続化はない (#19 で名前付きレジストリと切替が入る)。
+//! クライアントローカル (プロトコル非関与)。組み込みスキームは静的 const テーブル、
+//! ユーザー定義スキームは XDG の colorschemes/ にある TOML ファイルで、参照された時
+//! のみロードする (遅延ロード — ADR-0022)。解決はファイル優先: 同名のユーザーファイルが
+//! 組み込みを shadow する。
+
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use mina_protocol::HighlightGroup;
+use serde::Deserialize;
 
 /// 色の表現。既定スキームは Ansi のみ使用 (Rgb は #20 の色能力検出で使う)。
 /// `Ansi(u8)`: 16色インデックス (0-15)。
@@ -37,8 +44,45 @@ impl Color {
     }
 }
 
-/// 1つの役割に対する見た目。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// 色リテラルの解釈: `"#rrggbb"` → Rgb、`"ansi:N"` (0-15) → Ansi、`"index:N"` → Index。
+fn parse_color(s: &str) -> Option<Color> {
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb(r, g, b));
+        }
+        return None;
+    }
+    if let Some(n) = s.strip_prefix("ansi:") {
+        return n.parse::<u8>().ok().filter(|&v| v < 16).map(Color::Ansi);
+    }
+    if let Some(n) = s.strip_prefix("index:") {
+        return n.parse().ok().map(Color::Index);
+    }
+    None
+}
+
+impl<'de> Deserialize<'de> for Color {
+    /// 不正な色リテラルはファイル全体のロード失敗にする（黙って無視しない）。
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        parse_color(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid color {s:?} (expected #rrggbb, ansi:N, or index:N)"
+            ))
+        })
+    }
+}
+
+/// 1つの役割に対する見た目。TOML スキームファイルでもそのまま使う
+/// （`#[serde(default)]` — style テーブルは部分指定。未知キーはエラー）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
@@ -88,7 +132,9 @@ impl Style {
 }
 
 /// UI ロール (ADR-0018 の taxonomy。診断は Error/Warning に分割)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// TOML キーは小文字（serde rename_all）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UiRole {
     Cursor,
     Selection,
@@ -106,10 +152,14 @@ pub enum UiRole {
 }
 
 /// 役割 → スタイルの写像。未掲載の役割は既定テキスト (無色)。
+///
+/// 組み込みスキームは borrowed (`Cow::Borrowed`) の静的データ、ユーザー定義
+/// スキームはファイルからロードした owned データ (ADR-0022)。
+#[derive(Clone)]
 pub struct Colorscheme {
-    pub name: &'static str,
-    pub syntax: &'static [(HighlightGroup, Style)],
-    pub ui: &'static [(UiRole, Style)],
+    pub name: Cow<'static, str>,
+    pub syntax: Cow<'static, [(HighlightGroup, Style)]>,
+    pub ui: Cow<'static, [(UiRole, Style)]>,
 }
 
 impl Colorscheme {
@@ -138,14 +188,13 @@ const DEFAULT_UI: &[(UiRole, Style)] = &[
     (UiRole::LineNumber, Style::fg(Color::Ansi(8))), // 90 灰
     (UiRole::LineNumberActive, Style::fg(Color::Ansi(15))), // 97 白
     // ディム + 斜体: 属性のみ（NO_COLOR・ANSI16 でも視認できる）。
-    // #24: colorscheme ファイルで上書き可能（ロールの既定はここで持ち、
-    // スキームの ui テーブルで差し替える）。
+    // ロールの既定はここで持ち、ユーザースキームの ui テーブルでレイヤー上書きできる (ADR-0022)。
     (UiRole::InlayHint, Style { dim: true, italic: true, ..Style::new() }),
 ];
 
 pub static DEFAULT: Colorscheme = Colorscheme {
-    name: "default",
-    syntax: &[
+    name: Cow::Borrowed("default"),
+    syntax: Cow::Borrowed(&[
         (HighlightGroup::Comment, Style::fg(Color::Ansi(8))), // 90
         (HighlightGroup::Keyword, Style::fg(Color::Ansi(6))), // 36
         (HighlightGroup::String, Style::fg(Color::Ansi(2))), // 32
@@ -157,16 +206,16 @@ pub static DEFAULT: Colorscheme = Colorscheme {
         (HighlightGroup::Attribute, Style::fg(Color::Ansi(13))), // 95
         (HighlightGroup::Error, Style::fg_underline(Color::Ansi(9))), // 91 + 下線
         // parameter / operator / punctuation は無色のまま
-    ],
-    ui: DEFAULT_UI,
+    ]),
+    ui: Cow::Borrowed(DEFAULT_UI),
 };
 
 /// DEFAULT と異なる配色の軽量スキーム（`:colorscheme vivid` で切替を実証）。ANSI16 のみ。
 pub static VIVID: Colorscheme = Colorscheme {
-    name: "vivid",
+    name: Cow::Borrowed("vivid"),
     // 16 色端末では近似が元の ANSI16 色に一致するよう、xterm 16 色の RGB 値を選ぶ
     // （truecolor 端末ではより豊かな色になる — issue #20）。
-    syntax: &[
+    syntax: Cow::Borrowed(&[
         (HighlightGroup::Comment, Style::fg(Color::Rgb(0, 205, 0))), // 32 緑
         (HighlightGroup::Keyword, Style::fg(Color::Rgb(205, 0, 205))), // 35 マゼンタ
         (HighlightGroup::String, Style::fg(Color::Rgb(0, 205, 205))), // 36 シアン
@@ -177,16 +226,87 @@ pub static VIVID: Colorscheme = Colorscheme {
         (HighlightGroup::Field, Style::fg(Color::Rgb(205, 205, 0))), // 33 黄
         (HighlightGroup::Attribute, Style::fg(Color::Rgb(255, 0, 255))), // 95 明るいマゼンタ
         (HighlightGroup::Error, Style::fg_underline(Color::Rgb(255, 0, 0))), // 91 + 下線
-    ],
-    ui: DEFAULT_UI,
+    ]),
+    ui: Cow::Borrowed(DEFAULT_UI),
 };
 
-/// 名前付きスキームの静的レジストリ（設定ファイル・永続化なし — issue #19）。
-static SCHEMES: &[&Colorscheme] = &[&DEFAULT, &VIVID];
+/// 組み込みスキームを名前で引く（borrowed データの clone — 実体は静的なのでほぼ無コスト）。
+fn builtin_by_name(name: &str) -> Option<Colorscheme> {
+    match name {
+        "default" => Some(DEFAULT.clone()),
+        "vivid" => Some(VIVID.clone()),
+        _ => None,
+    }
+}
 
-/// 名前からスキームを引く（未登録名は None）。
-pub fn scheme_by_name(name: &str) -> Option<&'static Colorscheme> {
-    SCHEMES.iter().copied().find(|s| s.name == name)
+/// スキームファイルの TOML 形式 (ADR-0022)。
+/// キーは HighlightGroup / UiRole の小文字名（serde rename_all）。
+/// `name` は表示用メタデータ — 解決キーは常にファイル名 (stem) のため、
+/// 一致しない場合は警告するだけ（遅延ロードでは名前表が作れない）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemeFile {
+    name: Option<String>,
+    #[serde(default)]
+    syntax: BTreeMap<HighlightGroup, Style>,
+    #[serde(default)]
+    ui: BTreeMap<UiRole, Style>,
+}
+
+/// ベース（DEFAULT）に上書きを後勝ちマージした表を作る（レイヤー構造）。
+/// 未指定ロールは DEFAULT の値が残り、上書きの fg/bg は差し替え・属性は OR。
+fn layered<R: Copy + PartialEq>(
+    base: &[(R, Style)],
+    overrides: &[(R, Style)],
+) -> Vec<(R, Style)> {
+    let mut out = base.to_vec();
+    for (group, style) in overrides {
+        match out.iter_mut().find(|(g, _)| g == group) {
+            Some((_, base_style)) => *base_style = base_style.merged(*style),
+            None => out.push((*group, *style)),
+        }
+    }
+    out
+}
+
+/// TOML スキームファイルをロードする。構文不正・未知キー・不正な色は Err。
+fn load_scheme_file(path: &Path, stem: &str) -> Result<Colorscheme, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read: {e}"))?;
+    let file: SchemeFile = toml::from_str(&text).map_err(|e| e.to_string())?;
+    if let Some(name) = &file.name {
+        if name != stem {
+            eprintln!(
+                "warning: colorscheme file {stem}.toml declares name {name:?} but is referenced \
+                 as {stem:?}; using the file name"
+            );
+        }
+    }
+    let syntax: Vec<_> = file.syntax.into_iter().collect();
+    let ui: Vec<_> = file.ui.into_iter().collect();
+    Ok(Colorscheme {
+        name: Cow::Owned(stem.to_string()),
+        syntax: Cow::Owned(layered(&DEFAULT.syntax, &syntax)),
+        ui: Cow::Owned(layered(&DEFAULT.ui, &ui)),
+    })
+}
+
+/// 名前からスキームを解決する（遅延ロード — ADR-0022）。
+///
+/// 1. `schemes_dir/{name}.toml` が存在 → ロード（組み込みを shadow。失敗時は警告して続行）
+/// 2. 組み込み名（default / vivid）→ 使用
+/// 3. どちらも無ければ None（呼び出し側が警告 + DEFAULT に落とす）
+pub fn resolve(name: &str, schemes_dir: &Path) -> Option<Colorscheme> {
+    let file = schemes_dir.join(format!("{name}.toml"));
+    if file.is_file() {
+        return match load_scheme_file(&file, name) {
+            Ok(scheme) => Some(scheme),
+            Err(e) => {
+                eprintln!("warning: failed to load colorscheme {}: {e}", file.display());
+                builtin_by_name(name)
+            }
+        };
+    }
+    builtin_by_name(name)
 }
 
 /// 端末の対応色深度 (ADR-0019)。
@@ -379,12 +499,99 @@ mod tests {
         assert_eq!(Color::Rgb(255, 0, 0).fg_sgr(), "38;2;255;0;0");
     }
 
+    /// テスト用の独立した一時ディレクトリ（テスト間で衝突しない）。
+    fn temp_schemes_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mina-cs-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
-    fn scheme_by_name_resolves_registry() {
-        assert_eq!(scheme_by_name("default").map(|s| s.name), Some("default"));
-        assert_eq!(scheme_by_name("vivid").map(|s| s.name), Some("vivid"));
-        assert!(scheme_by_name("nope").is_none());
-        assert!(scheme_by_name("").is_none());
+    fn resolve_builtins_by_name() {
+        let dir = temp_schemes_dir("builtin");
+        assert_eq!(resolve("default", &dir).unwrap().name, "default");
+        assert_eq!(resolve("vivid", &dir).unwrap().name, "vivid");
+        assert!(resolve("nope", &dir).is_none());
+        assert!(resolve("", &dir).is_none());
+    }
+
+    #[test]
+    fn resolve_prefers_user_file_over_builtin() {
+        // 組み込みと同名のユーザーファイルが shadow する (ADR-0022)
+        let dir = temp_schemes_dir("shadow");
+        std::fs::write(
+            dir.join("vivid.toml"),
+            "[syntax]\nkeyword = { fg = \"#123456\" }\n",
+        )
+        .unwrap();
+        let scheme = resolve("vivid", &dir).unwrap();
+        assert_eq!(scheme.name, "vivid");
+        assert_eq!(
+            scheme.syntax_style(HighlightGroup::Keyword),
+            Some(Style::fg(Color::Rgb(0x12, 0x34, 0x56)))
+        );
+    }
+
+    #[test]
+    fn user_scheme_layers_over_default() {
+        // [syntax] だけのファイル: 未指定ロールは DEFAULT の値（レイヤー構造）
+        let dir = temp_schemes_dir("layer");
+        std::fs::write(
+            dir.join("moon.toml"),
+            "[syntax]\ncomment = { fg = \"#ff0000\" }\n",
+        )
+        .unwrap();
+        let scheme = resolve("moon", &dir).unwrap();
+        assert_eq!(scheme.name, "moon");
+        assert_eq!(
+            scheme.syntax_style(HighlightGroup::Comment),
+            Some(Style::fg(Color::Rgb(255, 0, 0)))
+        );
+        // 未指定の構文グループと UI ロールは DEFAULT を継承
+        assert_eq!(
+            scheme.syntax_style(HighlightGroup::Keyword),
+            DEFAULT.syntax_style(HighlightGroup::Keyword)
+        );
+        assert_eq!(scheme.ui_style(UiRole::Cursor), DEFAULT.ui_style(UiRole::Cursor));
+    }
+
+    #[test]
+    fn name_field_is_metadata_and_stem_wins() {
+        // name フィールドは解決キーにならない（遅延ロード）。不一致は警告のみ。
+        let dir = temp_schemes_dir("namefield");
+        std::fs::write(dir.join("moon.toml"), "name = \"sun\"\n[syntax]\n").unwrap();
+        let scheme = resolve("moon", &dir).unwrap();
+        assert_eq!(scheme.name, "moon");
+    }
+
+    #[test]
+    fn malformed_user_file_falls_back_to_builtin() {
+        // TOML 構文不正・未知グループ名・不正な色 → 警告 + その名前の組み込みに
+        // フォールバック（組み込みも無ければ None）
+        let dir = temp_schemes_dir("malformed");
+        std::fs::write(dir.join("vivid.toml"), "not [ valid toml").unwrap();
+        assert_eq!(resolve("vivid", &dir).unwrap().name, "vivid");
+
+        std::fs::write(dir.join("badgroup.toml"), "[syntax]\ncommentz = {}\n").unwrap();
+        assert!(resolve("badgroup", &dir).is_none());
+
+        std::fs::write(
+            dir.join("badcolor.toml"),
+            "[syntax]\nkeyword = { fg = \"hotpink\" }\n",
+        )
+        .unwrap();
+        assert!(resolve("badcolor", &dir).is_none());
+    }
+
+    #[test]
+    fn color_literal_parsing() {
+        assert_eq!(parse_color("#ff0000"), Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(parse_color("ansi:8"), Some(Color::Ansi(8)));
+        assert_eq!(parse_color("index:196"), Some(Color::Index(196)));
+        assert_eq!(parse_color("ansi:16"), None, "ansi は 0-15");
+        assert_eq!(parse_color("#fff"), None);
+        assert_eq!(parse_color("hotpink"), None);
     }
 
     #[test]
