@@ -1736,7 +1736,18 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             let moved = {
                 let doc = daemon.editor.current_document();
                 let selection = daemon.editor.selection();
-                move_selection(doc, &selection, convert_movement(movement), convert_direction(direction))
+                match convert_movement(movement) {
+                    // Helix 流: 単語移動（w/b/e）は anchor を保持して「移動した分」を
+                    // 選択する。h/l/j/k や矢印は従来どおり点に潰す。
+                    m @ (mina_core::Movement::Word | mina_core::Movement::WordEnd) => {
+                        mina_core::word_move_selection(
+                            doc,
+                            &selection,
+                            word_move_target(movement, direction),
+                        )
+                    }
+                    m => move_selection(doc, &selection, m, convert_direction(direction)),
+                }
             };
             daemon.editor.set_selection(moved);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
@@ -1877,6 +1888,32 @@ fn convert_movement(m: mina_protocol::Movement) -> mina_core::Movement {
         mina_protocol::Movement::WordEnd => mina_core::Movement::WordEnd,
         mina_protocol::Movement::LineStart => mina_core::Movement::LineStart,
         mina_protocol::Movement::LineEnd => mina_core::Movement::LineEnd,
+    }
+}
+
+/// 単語移動の wire 型（Movement + Direction）をコアの目標型へ変換する。
+fn word_move_target(
+    m: mina_protocol::Movement,
+    d: mina_protocol::Direction,
+) -> mina_core::WordMoveTarget {
+    match (m, d) {
+        (
+            mina_protocol::Movement::Word,
+            mina_protocol::Direction::Forward,
+        ) => mina_core::WordMoveTarget::NextWordStart,
+        (
+            mina_protocol::Movement::Word,
+            mina_protocol::Direction::Backward,
+        ) => mina_core::WordMoveTarget::PrevWordStart,
+        (
+            mina_protocol::Movement::WordEnd,
+            mina_protocol::Direction::Forward,
+        ) => mina_core::WordMoveTarget::NextWordEnd,
+        (
+            mina_protocol::Movement::WordEnd,
+            mina_protocol::Direction::Backward,
+        ) => mina_core::WordMoveTarget::PrevWordEnd,
+        _ => unreachable!("単語移動以外の movement はここに来ない"),
     }
 }
 
@@ -2642,6 +2679,48 @@ mod tests {
         // undo で戻る
         let s = apply(&mut d, Command::Undo);
         assert_eq!(s.text, "he world foo");
+    }
+
+    #[test]
+    fn word_move_bw_then_delete_removes_word() {
+        // Helix 流: 単語の途中で b → w で単語全体+空白を選択 → d で削除
+        let mut d = daemon();
+        open(&mut d, "hello world foo");
+        // hello の 2 文字目へ
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        // b: 現在の単語（hello の途中まで）が選択される
+        let s = apply(&mut d, Command::Move {
+            movement: Movement::Word,
+            direction: Direction::Backward,
+        });
+        assert_eq!(
+            s.selection[0].anchor,
+            3,
+            "b で anchor がカーソル位置（block cursor）に残る"
+        );
+        assert_eq!(s.selection[0].head, 0);
+        // w: 単語全体+空白まで拡張される
+        let s = apply(&mut d, Command::Move {
+            movement: Movement::Word,
+            direction: Direction::Forward,
+        });
+        assert_eq!(
+            (s.selection[0].anchor, s.selection[0].head),
+            (0, 6)
+        );
+        // d: 選択を削除
+        let s = apply(&mut d, Command::DeleteRange);
+        assert_eq!(s.text, "world foo", "hello が削除される");
+        // undo で戻る
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "hello world foo");
     }
 
     #[test]
