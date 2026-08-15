@@ -9,7 +9,8 @@
 //! parameter field operator punctuation attribute error。
 
 use mina_protocol::{HighlightGroup, HighlightRange};
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+use std::ops::Range;
+use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 /// 1言語分の定義。`grammar` はパース用、`highlights` はハイライトクエリ。
 pub struct LanguageDef {
@@ -61,10 +62,7 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef> {
 /// クエリ側で除外できないため、計算側で確定する（`priority` 参照）。
 ///
 /// 戻り値は start 昇順・重複しない範囲（仕様書の不変条件: 同じ char は1つの
-/// グループに属する）。
-///
-/// ponytail: 全文パース（インクリメンタルは編集範囲の追跡が各編集源に必要に
-/// なるため、巨大ファイルのプロファイル後に導入する）。
+/// グループに属する）。全文を対象にする（テスト・ツール用）。
 pub fn compute_highlights(def: &LanguageDef, text: &str) -> Vec<HighlightRange> {
     let mut parser = Parser::new();
     if parser.set_language(&(def.grammar)()).is_err() {
@@ -76,11 +74,42 @@ pub fn compute_highlights(def: &LanguageDef, text: &str) -> Vec<HighlightRange> 
     let Ok(query) = Query::new(&(def.grammar)(), def.highlights) else {
         return Vec::new();
     };
+    collect(&query, text, &tree, None)
+}
 
+/// 既存ツリー + コンパイル済みクエリで、`range`（byte 範囲）内のハイライト
+/// 範囲を計算する。パースもクエリコンパイルも行わない。
+///
+/// daemon はツリーとクエリを文書ごとにキャッシュし、編集のたびに差分ベースの
+/// インクリメンタルパースでツリーを更新してこの関数に渡す（ADR-0021: 全文再
+/// パースとクエリ再コンパイルを回避 — 計測: 214KB で 38ms + 20ms → 0.5ms）。
+///
+/// `range` は可視行の byte 範囲。窓の上端を跨ぐトークン（複数行コメント・
+/// 文字列等）は、範囲に交差するノードとして捕捉される（set_byte_range は
+/// 交差ノードを訪問する — 上端延長は不要）。
+pub fn highlight_ranges_in_window(
+    query: &Query,
+    text: &str,
+    tree: &Tree,
+    range: Range<usize>,
+) -> Vec<HighlightRange> {
+    collect(query, text, tree, Some(range))
+}
+
+/// クエリ走査 → 重複確定 → byte→char 変換の共通実装。`range` が `None` なら全文。
+fn collect(
+    query: &Query,
+    text: &str,
+    tree: &Tree,
+    range: Option<Range<usize>>,
+) -> Vec<HighlightRange> {
     let mut items: Vec<(usize, usize, HighlightGroup)> = Vec::new();
     {
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(&query, tree.root_node(), text.as_bytes());
+        if let Some(range) = &range {
+            cursor.set_byte_range(range.clone());
+        }
+        let mut captures = cursor.captures(query, tree.root_node(), text.as_bytes());
         while let Some((m, idx)) = captures.next() {
             let capture = &m.captures[*idx];
             let name = &query.capture_names()[capture.index as usize];
@@ -164,7 +193,7 @@ fn priority(group: HighlightGroup) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+    use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
     /// ADR-0018 の正規グループ (capture 名の正規集合)。
     const CANONICAL: [&str; 13] = [
@@ -345,5 +374,72 @@ fn add(a: i32, b: i32) -> i32 {
             .find(|r| text_of(src, r) == "1")
             .expect("1 が number");
         assert_eq!(number.group, HighlightGroup::Number);
+    }
+
+    /// 窓付き計算用のツリーとクエリ（compute_highlights のパース・コンパイルを共有）。
+    fn window_fixture(def: &LanguageDef, src: &str) -> (Query, Tree) {
+        let mut parser = Parser::new();
+        parser.set_language(&(def.grammar)()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let query = Query::new(&(def.grammar)(), def.highlights).unwrap();
+        (query, tree)
+    }
+
+    /// 窓（行 [first, first+count) の byte 範囲）を返す。
+    fn window_bytes(src: &str, first: usize, count: usize) -> Range<usize> {
+        let newlines: Vec<usize> = src.match_indices('\n').map(|(i, _)| i + 1).collect();
+        let start = if first == 0 {
+            0
+        } else {
+            newlines.get(first - 1).copied().unwrap_or(src.len())
+        };
+        let end = newlines
+            .get(first + count - 1)
+            .copied()
+            .unwrap_or(src.len());
+        start..end
+    }
+
+    #[test]
+    fn windowed_ranges_are_subset_of_full_file() {
+        // 窓付きは全文の部分集合（窓に交差する範囲のみ）。窓が全文なら一致する。
+        let def = language_by_name("rust").unwrap();
+        let src = "fn a() {}\n// c1\nfn b() -> i32 { 42 }\n// c2\nfn c() {}\n";
+        let (query, tree) = window_fixture(def, src);
+        let full = compute_highlights(def, src);
+        assert_valid_ranges(src, &full);
+
+        // 窓 = 行1〜2（"// c1" と fn b）
+        let window = window_bytes(src, 1, 2);
+        let windowed = highlight_ranges_in_window(&query, src, &tree, window.clone());
+        assert_valid_ranges(src, &windowed);
+        assert!(!windowed.is_empty(), "窓内にハイライトがある: {windowed:?}");
+        // 窓と交差する全文範囲だけが残る（start < 窓end かつ end > 窓start）
+        let expected: Vec<_> = full
+            .iter()
+            .filter(|r| {
+                r.start < window.end && r.end > window.start
+            })
+            .cloned()
+            .collect();
+        assert_eq!(windowed, expected, "窓内範囲 == 全文範囲の交差部分");
+    }
+
+    #[test]
+    fn window_captures_tokens_crossing_top_boundary() {
+        // 窓上端を跨ぐトークン（複数行ブロックコメント）は捕捉される
+        // （set_byte_range は交差ノードを訪問する）。
+        let def = language_by_name("rust").unwrap();
+        let src = "fn a() {}\n/*\n * block\n * comment\n */\nfn b() {}\n";
+        let (query, tree) = window_fixture(def, src);
+        // 窓 = 行2〜3（ブロックコメントの途中）
+        let window = window_bytes(src, 2, 2);
+        let windowed = highlight_ranges_in_window(&query, src, &tree, window);
+        assert_valid_ranges(src, &windowed);
+        let comment = windowed
+            .iter()
+            .find(|r| r.group == HighlightGroup::Comment)
+            .expect("窓内にコメントがある: {windowed:?}");
+        assert_eq!(text_of(src, comment), "/*\n * block\n * comment\n */", "コメント全体が捕捉される: {windowed:?}");
     }
 }
