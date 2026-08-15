@@ -333,30 +333,28 @@ fn range_to_target(
         head.checked_sub(1).and_then(|i| chars.get(i)).copied()
     };
     // 直後の改行を越える（Helix と同じ。anchor は越えた後の位置に畳む）
-    let mut head0 = head;
     loop {
         let next = if is_prev {
-            head0.checked_sub(1).map(|i| chars[i])
+            head.checked_sub(1).map(|i| chars[i])
         } else {
-            chars.get(head0).copied()
+            chars.get(head).copied()
         };
         match next {
             Some(ch) if is_line_ending(ch) => {
                 prev_ch = Some(ch);
                 if is_prev {
-                    head0 = head0.saturating_sub(1);
+                    head = head.saturating_sub(1);
                 } else {
-                    head0 += 1;
+                    head += 1;
                 }
             }
             _ => break,
         }
     }
     if prev_ch.map(is_line_ending).unwrap_or(false) {
-        anchor = head0;
+        anchor = head;
     }
     // 目標位置まで歩く
-    let mut head = head0;
     let head_start = head;
     loop {
         let next_ch = if is_prev {
