@@ -37,6 +37,13 @@ pub enum Movement {
     Line,
     /// 単語の先頭（単語 = 英数字 + アンダースコアの連続。カテゴリ境界で判定）。
     Word,
+    /// 単語の末尾（Helix の `e`）。空白・改行を越えて次の単語の末尾まで。
+    /// Backward は前の単語先頭（`b`）と同じ。
+    WordEnd,
+    /// 行頭（列 0）。方向は無視する。
+    LineStart,
+    /// 行末（改行の直前）。方向は無視する。
+    LineEnd,
 }
 
 /// 選択全体を移動する。各 Range は点（カーソル）に潰される。
@@ -80,6 +87,9 @@ fn move_range(text: &str, range: Range, movement: Movement, dir: Direction, exte
         Movement::Char => step_grapheme(text, range.head(), dir),
         Movement::Line => step_line(text, range.head(), dir),
         Movement::Word => step_word(text, range.head(), dir),
+        Movement::WordEnd => step_word_end(text, range.head(), dir),
+        Movement::LineStart => step_line_start(text, range.head()),
+        Movement::LineEnd => step_line_end(text, range.head()),
     };
     put_cursor(text, range, new_pos, extend)
 }
@@ -225,6 +235,16 @@ fn is_word_skip(ch: char) -> bool {
     matches!(categorize(ch), CharCategory::Whitespace | CharCategory::Eol)
 }
 
+/// 前の単語先頭（`b` 相当）。`step_word` の Backward と同じ意味を明示する。
+pub(crate) fn prev_word_start(text: &str, char_pos: usize) -> usize {
+    step_word(text, char_pos, Direction::Backward)
+}
+
+/// 次の単語末尾（`e` 相当）。`step_word_end` の Forward と同じ意味を明示する。
+pub(crate) fn next_word_end(text: &str, char_pos: usize) -> usize {
+    step_word_end(text, char_pos, Direction::Forward)
+}
+
 /// 次/前の「単語の先頭」（カテゴリ境界の直後にある非空白文字）へ移動する。
 /// 文書端ではクランプする。
 fn step_word(text: &str, char_pos: usize, dir: Direction) -> usize {
@@ -261,6 +281,53 @@ fn step_word(text: &str, char_pos: usize, dir: Direction) -> usize {
             0
         }
     }
+}
+
+/// 次/前の「単語の末尾」へ移動する。
+///
+/// Forward: 空白・改行を越えて次の単語に着いたら、その単語の末尾（カテゴリが
+/// 変わる直前、または文書端）まで進む。単語の途中なら現在の単語の末尾へ。
+/// Backward: `step_word` の Backward（前の単語先頭）と同じ。
+fn step_word_end(text: &str, char_pos: usize, dir: Direction) -> usize {
+    if dir == Direction::Backward {
+        return step_word(text, char_pos, dir);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = char_pos;
+    // 空白・改行を越えて次の単語の先頭へ
+    while i < n && is_word_skip(chars[i]) {
+        i += 1;
+    }
+    if i >= n {
+        return n;
+    }
+    // 現在の単語（同じカテゴリの連続）の末尾へ
+    let cat = categorize(chars[i]);
+    i += 1;
+    while i < n && categorize(chars[i]) == cat {
+        i += 1;
+    }
+    i
+}
+
+/// 現在の行頭（列 0）へ。
+fn step_line_start(text: &str, char_pos: usize) -> usize {
+    let byte = char_to_byte(text, char_pos);
+    text[..byte]
+        .rfind('\n')
+        .map(|b| byte_to_char(text, b) + 1)
+        .unwrap_or(0)
+}
+
+/// 現在の行末（改行の直前。最終行は文書末尾）へ。
+fn step_line_end(text: &str, char_pos: usize) -> usize {
+    let len = text.chars().count();
+    let byte = char_to_byte(text, char_pos);
+    text[byte..]
+        .find('\n')
+        .map(|b| char_pos + text[byte..byte + b].chars().count())
+        .unwrap_or(len)
 }
 
 #[cfg(test)]
@@ -626,6 +693,164 @@ mod tests {
                 Direction::Forward
             ),
             Selection::point(0)
+        );
+    }
+
+    #[test]
+    fn move_word_end_forward() {
+        let doc = Document::from("hello world foo");
+        // 単語途中から現在の単語の末尾へ
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(2),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            Selection::point(5)
+        );
+        // 単語先頭からも同じ末尾へ
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(0),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            Selection::point(5)
+        );
+        // 空白からは次の単語の末尾へ
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(5),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            Selection::point(11)
+        );
+        // 文書端では動かない
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(15),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            Selection::point(15)
+        );
+    }
+
+    #[test]
+    fn move_word_end_punctuation_run() {
+        // 記号の連続（foo-bar）は独立した「語」として末尾を持つ
+        let doc = Document::from("foo-bar");
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(3),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            Selection::point(4)
+        );
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(0),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            Selection::point(3)
+        );
+    }
+
+    #[test]
+    fn move_word_end_backward_falls_back_to_word_start() {
+        let doc = Document::from("hello world");
+        // Backward は前の単語先頭（b と同じ）
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(11),
+                Movement::WordEnd,
+                Direction::Backward
+            ),
+            Selection::point(6)
+        );
+    }
+
+    #[test]
+    fn extend_word_end_keeps_anchor() {
+        let doc = Document::from("hello world");
+        // カーソルから単語末尾まで拡張 = 現在の単語を選択
+        assert_eq!(
+            extend_selection(
+                &doc,
+                &Selection::point(2),
+                Movement::WordEnd,
+                Direction::Forward
+            ),
+            sel(vec![(2, 5)], 0)
+        );
+    }
+
+    #[test]
+    fn move_line_start_and_end() {
+        let doc = Document::from("abc\ndef\nghi");
+        // 行頭: 3 行目の途中からその行頭へ
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(9),
+                Movement::LineStart,
+                Direction::Forward
+            ),
+            Selection::point(8)
+        );
+        // 行末: 1 行目の途中からその行末（改行の直前）へ
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(1),
+                Movement::LineEnd,
+                Direction::Forward
+            ),
+            Selection::point(3)
+        );
+        // 最終行の行末は文書末尾
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(9),
+                Movement::LineEnd,
+                Direction::Forward
+            ),
+            Selection::point(11)
+        );
+    }
+
+    #[test]
+    fn move_line_start_end_multibyte() {
+        // 行頭・行末もバイト/char 変換を正しく行う（panic しないこと）
+        let doc = Document::from("あい\nうえ");
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(1),
+                Movement::LineEnd,
+                Direction::Forward
+            ),
+            Selection::point(2)
+        );
+        assert_eq!(
+            move_selection(
+                &doc,
+                &Selection::point(3),
+                Movement::LineStart,
+                Direction::Forward
+            ),
+            Selection::point(3)
         );
     }
 }
