@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 /// 新しいクライアントに拾われるのを防ぐ（古い daemon は古いソケットに残り、
 /// 新クライアントは新しいソケットで新 daemon を自動起動する — クライアントの
 /// `ensure_daemon` と合わせて、バージョン不一致の応答を一切受けない）。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4: `StateSnapshot.highlights` が全文ではなく可視範囲（first_line から
+/// viewport_height 行。ADR-0021）になった。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 編集モード（wire 型。mina-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,8 +294,10 @@ pub struct StateSnapshot {
     /// フォーカス文書の inlay hint（ADR-0020。同じスナップショットのテキストと
     /// 一致する位置。LSP 非対応・未取得の文書は空）。
     pub inlay_hints: Vec<InlayHint>,
-    /// フォーカス文書の構文ハイライト（ADR-0016/0017。同じスナップショットの
-    /// テキストと一致する範囲。grammar 不在の言語は空）。
+    /// フォーカス文書の可視範囲の構文ハイライト（ADR-0021。可視範囲は
+    /// `first_line` から viewport_height 行。窓の上端を跨ぐトークンは範囲が
+    /// 窓より前に始まることもある）。範囲は昇順・重複しない。grammar 不在の
+    /// 言語は空。
     pub highlights: Vec<HighlightRange>,
     /// 開いているファイルのパス（未開なら None）。
     pub path: Option<String>,
