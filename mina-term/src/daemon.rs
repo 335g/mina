@@ -2692,7 +2692,7 @@ mod tests {
 
     #[test]
     fn word_move_bw_then_delete_removes_word() {
-        // Helix 流: 単語の途中で b → w で単語全体+空白を選択 → d で削除
+        // 単語の途中で b → w で単語全体（空白なし）を選択 → d で削除
         let mut d = daemon();
         open(&mut d, "hello world foo");
         // hello の 2 文字目へ
@@ -2715,18 +2715,18 @@ mod tests {
             "b で anchor がカーソル位置（block cursor）に残る"
         );
         assert_eq!(s.selection[0].head, 0);
-        // w: 単語全体+空白まで拡張される
+        // w: 単語全体（末尾まで。空白は含まない）に拡張される
         let s = apply(&mut d, Command::Move {
             movement: Movement::Word,
             direction: Direction::Forward,
         });
         assert_eq!(
             (s.selection[0].anchor, s.selection[0].head),
-            (0, 6)
+            (0, 5)
         );
-        // d: 選択を削除
+        // d: 選択を削除（単語のみ。後続の空白は残る）
         let s = apply(&mut d, Command::DeleteRange);
-        assert_eq!(s.text, "world foo", "hello が削除される");
+        assert_eq!(s.text, " world foo", "hello だけが削除される");
         // undo で戻る
         let s = apply(&mut d, Command::Undo);
         assert_eq!(s.text, "hello world foo");
