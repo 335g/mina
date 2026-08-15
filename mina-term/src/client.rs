@@ -93,6 +93,22 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let mut state = session.request(&first).await?;
     let first_status = state.status.take();
 
+    // 現在の Colorscheme: config.toml の名前から解決（ユーザーファイル優先、次に組み込み、
+    // 不明なら警告 + 組み込み DEFAULT — ADR-0022）。クライアントローカル — daemon 非関与。
+    // 警告は端末セットアップ前に stderr へ出す（raw モード・代替画面中の表示崩れを避ける）。
+    let config = crate::config::load();
+    let schemes_dir = crate::config::schemes_dir();
+    let mut scheme = match config.colorscheme.as_deref() {
+        Some(name) => match colorscheme::resolve(name, &schemes_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!("warning: unknown colorscheme {name:?}, using default");
+                colorscheme::DEFAULT.clone()
+            }
+        },
+        None => colorscheme::DEFAULT.clone(),
+    };
+
     // 端末セットアップ（raw モード + 代替画面 + カーソル非表示）
     let terminal = PlatformTerminal::new()?;
     // M4: 以降はエラー経路（`?`）でも必ずターミナルを復旧する
@@ -122,15 +138,13 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let mut command_line: Option<String> = None;
     // クライアント側の一時メッセージ（未知コマンド等）。次のキーで消える。
     let mut flash: Option<String> = None;
-    // 現在の Colorscheme（`:colorscheme` で切替。クライアントローカル — daemon 非関与）。
-    let mut scheme: &'static Colorscheme = &colorscheme::DEFAULT;
     // 色能力と NO_COLOR（起動時に 1 回検出 — ADR-0019）。
     let (capability, no_color) = colorscheme::detect_from_env();
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
 
     render::draw(
         &mut *terminal,
-        scheme,
+        &scheme,
         capability,
         no_color,
         &state,
@@ -202,9 +216,11 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                                             flash = Some(format!("unknown command: {cmd}"));
                                         }
                                         CommandLineAction::Colorscheme(name) => {
-                                            if let Some(msg) =
-                                                apply_colorscheme(&mut scheme, name.as_deref())
-                                            {
+                                            if let Some(msg) = apply_colorscheme(
+                                                &mut scheme,
+                                                name.as_deref(),
+                                                &schemes_dir,
+                                            ) {
                                                 flash = Some(msg);
                                             }
                                         }
@@ -269,7 +285,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         if redraw {
             render::draw(
                 &mut *terminal,
-                scheme,
+                &scheme,
                 capability,
                 no_color,
                 &state,
@@ -325,9 +341,14 @@ fn parse_command(input: &str) -> CommandLineAction {
 /// `:colorscheme [name]` の適用（純粋関数 — テスト容易性）。
 ///
 /// 既知名は `scheme` を差し替えて None、不明名・引数なしは表示すべき flash を返す。
-fn apply_colorscheme(scheme: &mut &'static Colorscheme, name: Option<&str>) -> Option<String> {
+/// 解決は起動時と同じ規則（ユーザーファイル優先 → 組み込み — ADR-0022）。
+fn apply_colorscheme(
+    scheme: &mut Colorscheme,
+    name: Option<&str>,
+    schemes_dir: &Path,
+) -> Option<String> {
     match name {
-        Some(name) => match colorscheme::scheme_by_name(name) {
+        Some(name) => match colorscheme::resolve(name, schemes_dir) {
             Some(s) => {
                 *scheme = s;
                 None
@@ -596,22 +617,24 @@ mod tests {
 
     #[test]
     fn apply_colorscheme_switches_and_flashes() {
-        let mut scheme: &'static Colorscheme = &colorscheme::DEFAULT;
+        // スキームファイルのない dir → 組み込みのみで解決される
+        let empty_dir = Path::new("/nonexistent/mina-test-colorschemes");
+        let mut scheme = colorscheme::DEFAULT.clone();
         // 既知名: 切替され flash なし
-        assert_eq!(apply_colorscheme(&mut scheme, Some("vivid")), None);
+        assert_eq!(apply_colorscheme(&mut scheme, Some("vivid"), empty_dir), None);
         assert_eq!(scheme.name, "vivid");
         // 戻せる
-        assert_eq!(apply_colorscheme(&mut scheme, Some("default")), None);
+        assert_eq!(apply_colorscheme(&mut scheme, Some("default"), empty_dir), None);
         assert_eq!(scheme.name, "default");
         // 不明名: flash を返し切替しない
         assert_eq!(
-            apply_colorscheme(&mut scheme, Some("nope")),
+            apply_colorscheme(&mut scheme, Some("nope"), empty_dir),
             Some("unknown colorscheme: nope".into())
         );
         assert_eq!(scheme.name, "default");
         // 引数なし: 現在のスキーム名を flash
         assert_eq!(
-            apply_colorscheme(&mut scheme, None),
+            apply_colorscheme(&mut scheme, None, empty_dir),
             Some("colorscheme: default".into())
         );
     }
