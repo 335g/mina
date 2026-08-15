@@ -1256,6 +1256,14 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
+        Command::GetInlayHints { .. } => {
+            // #23: LSP pull + ServerMessage::Hints 応答を実装する。
+            // 今は未対応（headless は許可リストで、TUI はこのコマンドを送らない）。
+            (
+                snapshot(daemon, Some("inlay hints: not implemented yet".into())),
+                false,
+            )
+        }
         Command::Insert { text } => {
             // SEC-1/ADR-0008: Insert による無制限の文書成長を防ぐ。Open と同じ
             // MAX_FILE_SIZE（バイト数）を超える挿入は状態を変えず status で
@@ -1461,6 +1469,8 @@ fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnapshot {
         mode: convert_mode_back(editor.mode()),
         first_line: editor.first_line(),
         diagnostics: daemon.diagnostics.clone(),
+        // #23: フォーカス文書のヒントキャッシュから載せる（今は空）。
+        inlay_hints: Vec::new(),
         // 不変条件: 同じスナップショットのテキストと一致する範囲（ADR-0016）。
         highlights,
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
@@ -2344,6 +2354,7 @@ mod tests {
             match c.recv_message().await {
                 ServerMessage::Response { snapshot } => return snapshot,
                 ServerMessage::Push { .. } => continue,
+                ServerMessage::Hints { .. } => continue,
             }
         }
     }
@@ -2354,6 +2365,7 @@ mod tests {
             match c.recv_message().await {
                 ServerMessage::Push { snapshot } => return snapshot,
                 ServerMessage::Response { .. } => continue,
+                ServerMessage::Hints { .. } => continue,
             }
         }
     }

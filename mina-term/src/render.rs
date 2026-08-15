@@ -535,6 +535,7 @@ mod tests {
             mode: Mode::Normal,
             first_line: 0,
             diagnostics: Vec::new(),
+            inlay_hints: Vec::new(), // #24: 描画テストで設定する
             highlights: Vec::new(),
             path: None,
             dirty: false,
@@ -881,6 +882,7 @@ mod tests {
             mode: Mode::Normal,
             first_line: 0,
             diagnostics: Vec::new(),
+            inlay_hints: Vec::new(), // #24: 描画テストで設定する
             highlights: Vec::new(),
             // OSC シーケンス（ターミナルタイトル変更）と SGR（色変更）の注入を試みる
             path: Some("\x1b]0;evil\x07".into()),
@@ -916,6 +918,7 @@ mod tests {
                 severity: mina_protocol::Severity::Error,
                 message: "oops".into(),
             }],
+            inlay_hints: Vec::new(), // #24: 描画テストで設定する
             highlights: Vec::new(),
             path: None,
             dirty: false,

@@ -365,6 +365,11 @@ pub(crate) async fn request<T: serde::Serialize>(
         Ok(ServerMessage::Response { snapshot }) | Ok(ServerMessage::Push { snapshot }) => {
             Ok(snapshot)
         }
+        // #23: GetInlayHints の応答はヘッドレスクライアントの別経路で扱う
+        Ok(ServerMessage::Hints { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected inlay hints response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -440,6 +445,9 @@ async fn read_loop(
                     return;
                 }
             }
+            // TUI は GetInlayHints を送らない（エージェント専用経路。ADR-0020）。
+            // 万一届いても応答は無視する。
+            Ok(ServerMessage::Hints { .. }) => {}
             Err(e) => {
                 let _ = res_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
