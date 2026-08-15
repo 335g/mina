@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mina_lsp::{Client, PositionEncoding, PublishDiagnostic};
-use mina_protocol::{Diagnostic, Severity};
+use mina_protocol::{Diagnostic, InlayHint, Severity};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -100,7 +101,21 @@ impl LspSession {
                     "processId": null,
                     "rootUri": uri(root),
                     "capabilities": {
-                        "textDocument": { "publishDiagnostics": { "relatedInformation": false } }
+                        "textDocument": {
+                            "publishDiagnostics": { "relatedInformation": false },
+                            // inlay hint は static 登録のみ（resolve は使わない。ADR-0020）。
+                            "inlayHint": { "dynamicRegistration": false },
+                        }
+                    },
+                    // S3: 対応サーバは rust-analyzer のみ。type + parameter ヒントだけを
+                    // 有効にし、他（closure-return 等）はサーバ既定（オフ）のままにする。
+                    "initializationOptions": {
+                        "rust-analyzer": {
+                            "inlayHints": {
+                                "typeHints": { "enable": true },
+                                "parameterHints": { "enable": true },
+                            }
+                        }
                     },
                     "positionEncodings": ["utf-8", "utf-16"],
                 }),
@@ -195,6 +210,34 @@ impl LspSession {
         let items: Vec<PublishDiagnostic> = serde_json::from_value(Value::Array(items.clone())).ok()?;
         Some(convert_diagnostics(text, self.encoding, items))
     }
+
+    /// inlay hint（`textDocument/inlayHint`）を取得し、char インデックスに変換して返す。
+    ///
+    /// 診断の pull と同じ形状: 現在の文書以外には応えない（`None`）。応答は
+    /// 全文範囲のヒント配列。座標はネゴシエート済み encoding で変換する。
+    pub async fn pull_inlay_hints(&mut self, path: &Path, text: &str) -> Option<Vec<InlayHint>> {
+        let doc_uri = uri(path);
+        if self.current_uri.as_deref() != Some(doc_uri.as_str()) {
+            return None;
+        }
+        let result = self
+            .client
+            .request(
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": doc_uri },
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": doc_end_position(text, self.encoding),
+                    },
+                }),
+            )
+            .await
+            .ok()?;
+        let items = result.as_array()?;
+        let items: Vec<LspInlayHint> = serde_json::from_value(Value::Array(items.clone())).ok()?;
+        Some(convert_inlay_hints(text, self.encoding, items))
+    }
 }
 
 /// LSP 診断アイテム（LSP 座標・severity）を char インデックスに変換する。
@@ -238,6 +281,105 @@ fn convert_diagnostics(
             })
         })
         .collect()
+}
+
+/// `textDocument/inlayHint` の1項目（LSP 座標のまま。表示に使わない
+/// kind / tooltip / textEdits / data は読まない）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LspInlayHint {
+    position: mina_lsp::LspPosition,
+    /// `string | InlayHintLabelPart[]`。
+    #[serde(default)]
+    label: InlayLabel,
+    #[serde(default)]
+    padding_left: bool,
+    #[serde(default)]
+    padding_right: bool,
+}
+
+/// `label` の untagged union（プレーン文字列 or parts 配列）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum InlayLabel {
+    Plain(String),
+    Parts(Vec<InlayLabelPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InlayLabelPart {
+    value: String,
+}
+
+impl InlayLabel {
+    /// 表示テキスト: parts 配列は各 part の `value` を連結する
+    /// （tooltip / location / command は表示に使わないため無視）。
+    fn into_text(self) -> String {
+        match self {
+            InlayLabel::Plain(s) => s,
+            InlayLabel::Parts(parts) => parts.into_iter().map(|p| p.value).collect(),
+        }
+    }
+}
+
+// label 欠落時（`#[serde(default)]`）の既定: 空ヒントは convert 側で落とされる。
+impl Default for InlayLabel {
+    fn default() -> Self {
+        InlayLabel::Plain(String::new())
+    }
+}
+
+/// LSP の inlay hint 項目を char インデックスに変換する。
+///
+/// 空 label のヒントは表示・配信の価値がないため落とす（#21 残リスク対策）。
+/// 描画側（#24）は position 昇順のポインタ走査を前提とする（highlights と同じ
+/// 不変条件）ため、サーバが昇順を保証しない場合に備えて stable sort で整える
+/// （同 position は応答順を保持）。
+fn convert_inlay_hints(
+    text: &str,
+    enc: PositionEncoding,
+    items: Vec<LspInlayHint>,
+) -> Vec<InlayHint> {
+    let index = LineIndex::new(text);
+    let mut hints: Vec<InlayHint> = items
+        .into_iter()
+        .filter_map(|h| {
+            let position = lsp_pos_to_char_indexed(
+                &index,
+                text,
+                h.position.line,
+                h.position.character,
+                enc,
+            );
+            let text = h.label.into_text();
+            if text.is_empty() {
+                return None;
+            }
+            Some(InlayHint {
+                position,
+                text,
+                padding_left: h.padding_left,
+                padding_right: h.padding_right,
+            })
+        })
+        .collect();
+    hints.sort_by_key(|h| h.position);
+    hints
+}
+
+/// 文書末尾の LSP 座標（全文範囲要求用）。末尾改行は空行として数える。
+///
+/// utf-8 では `character` がバイト列、utf-16 では UTF-16 単位になる
+/// （position.rs の変換と同じ単位系）。
+fn doc_end_position(text: &str, enc: PositionEncoding) -> Value {
+    let last_line = text.rsplit('\n').next().unwrap_or("");
+    let character = match enc {
+        PositionEncoding::Utf8 => last_line.len() as u32,
+        PositionEncoding::Utf16 => {
+            mina_lsp::position::char_to_utf16_col(last_line, last_line.chars().count())
+        }
+    };
+    json!({ "line": text.matches('\n').count() as u32, "character": character })
 }
 
 /// 行先頭の char インデックス（5c: 診断座標変換を O(N×文書長) にしないための索引）。
@@ -736,5 +878,152 @@ mod tests {
             start.elapsed()
         );
         drop(guard);
+    }
+
+    // ---- inlay hint ----
+
+    /// テスト用の LSP ヒント項目（LSP 座標）。
+    fn hint(
+        line: u32,
+        character: u32,
+        label: &str,
+        padding_left: bool,
+        padding_right: bool,
+    ) -> LspInlayHint {
+        LspInlayHint {
+            position: mina_lsp::LspPosition { line, character },
+            label: InlayLabel::Plain(label.into()),
+            padding_left,
+            padding_right,
+        }
+    }
+
+    #[test]
+    fn inlay_hint_conversion_utf8_multi_line() {
+        // "let x = 5\nfoo(1)": type ヒントは x の直後（char 5）、param ヒントは
+        // ( の直後（"let x = 5\n"=10 + "foo("=4 → char 14）。
+        let text = "let x = 5\nfoo(1)";
+        let items = vec![hint(0, 5, ": i32", false, true), hint(1, 4, "arg: i32", false, false)];
+        let hints = convert_inlay_hints(text, PositionEncoding::Utf8, items);
+        assert_eq!(hints.len(), 2, "{hints:?}");
+        assert_eq!(hints[0].position, 5);
+        assert_eq!(hints[0].text, ": i32");
+        assert!(hints[0].padding_right);
+        assert!(!hints[0].padding_left);
+        assert_eq!(hints[1].position, 14);
+        assert_eq!(hints[1].text, "arg: i32");
+    }
+
+    #[test]
+    fn inlay_hint_conversion_utf16_cjk() {
+        // "あ😀let x = 5": x の直後は UTF-16 で 8（あ=1 + 😀=2 + "let "=4 + x=1）。
+        // バイトなら 12 なので、バイトのまま char に直すと誤って 12 文字目扱いになる。
+        let text = "あ😀let x = 5";
+        let items = vec![hint(0, 8, ": i32", false, true)];
+        let hints = convert_inlay_hints(text, PositionEncoding::Utf16, items);
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert_eq!(hints[0].position, 7, "x の直後の空白（あ=0,😀=1,let=2-5,x=6）: {hints:?}");
+        assert_eq!(hints[0].text, ": i32");
+    }
+
+    #[test]
+    fn inlay_hint_same_position_keeps_order_and_sorts() {
+        // 同 position の複数ヒントは応答順を保ち、全体は position 昇順に整う
+        // （描画側 #24 の昇順ポインタ走査の前提）。入力は順不同で与える。
+        let text = "ab\nfoo(x, y)";
+        let items = vec![
+            hint(1, 4, "second", false, false), // "foo(" の直後 = char 7
+            hint(0, 1, "first", false, false),  // char 1
+            hint(1, 4, "third", false, false),  // 同位置 7（応答順を保つ）
+        ];
+        let hints = convert_inlay_hints(text, PositionEncoding::Utf8, items);
+        let pos: Vec<usize> = hints.iter().map(|h| h.position).collect();
+        assert_eq!(pos, vec![1, 7, 7], "昇順・同位置は応答順: {hints:?}");
+        assert_eq!(hints[1].text, "second");
+        assert_eq!(hints[2].text, "third");
+    }
+
+    #[test]
+    fn inlay_hint_empty_label_is_dropped() {
+        let text = "let x = 5";
+        let items = vec![hint(0, 5, "", false, false), hint(0, 5, ": i32", false, true)];
+        let hints = convert_inlay_hints(text, PositionEncoding::Utf8, items);
+        assert_eq!(hints.len(), 1, "空 label は落とす: {hints:?}");
+        assert_eq!(hints[0].text, ": i32");
+    }
+
+    #[test]
+    fn inlay_hint_label_parts_concatenate() {
+        let text = "let x = 5";
+        let items = vec![LspInlayHint {
+            position: mina_lsp::LspPosition { line: 0, character: 5 },
+            label: InlayLabel::Parts(vec![
+                InlayLabelPart { value: ": ".into() },
+                InlayLabelPart { value: "i32".into() },
+            ]),
+            padding_left: false,
+            padding_right: true,
+        }];
+        let hints = convert_inlay_hints(text, PositionEncoding::Utf8, items);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].text, ": i32", "parts の value が連結される");
+    }
+
+    #[tokio::test]
+    async fn pull_inlay_hints_converts_cjk_utf16_positions() {
+        // 欠陥の E2E 検証: --cjk の mock が返す inlay hint の UTF-16 単位の位置が、
+        // pull_inlay_hints（convert_inlay_hints → position.rs 変換）を経て
+        // char インデックスとして正しく返る。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let path = PathBuf::from("/tmp/x.rs");
+        let text = "あ😀let x = 5";
+        let session = Arc::new(Mutex::new(
+            LspSession::new_with_args(bin, Path::new("/tmp"), &["--cjk"])
+                .await
+                .expect("initialize"),
+        ));
+        session.lock().await.did_open(&path, text).await;
+        let hints = session
+            .lock()
+            .await
+            .pull_inlay_hints(&path, text)
+            .await
+            .expect("pull ヒントが返る");
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        let h = &hints[0];
+        assert_eq!(h.position, 7, "x の直後: {h:?}");
+        assert_eq!(h.text, ": i32");
+        assert!(h.padding_right, "サーバ指定の padding が反映される: {h:?}");
+    }
+
+    #[tokio::test]
+    async fn pull_inlay_hints_type_and_parameter() {
+        // mock の固定パターン: `let NAME` に type、`foo(` に parameter ヒント。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let path = PathBuf::from("/tmp/x.rs");
+        let text = "let x = 5\nfoo(1)";
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        session.lock().await.did_open(&path, text).await;
+        let hints = session
+            .lock()
+            .await
+            .pull_inlay_hints(&path, text)
+            .await
+            .expect("pull ヒントが返る");
+        assert_eq!(hints.len(), 2, "{hints:?}");
+        assert_eq!(hints[0].position, 5);
+        assert_eq!(hints[0].text, ": i32");
+        assert_eq!(hints[1].position, 14, "2行目の ( の直後: {hints:?}");
+        assert_eq!(hints[1].text, "arg: i32");
     }
 }
