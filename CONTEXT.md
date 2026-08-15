@@ -84,6 +84,10 @@ _Avoid_: event, log entry
 A problem reported by the language server for a range of text — error, warning, info, or hint. Carried to Clients in the StateSnapshot.
 _Avoid_: lint, problem
 
+**InlayHint**:
+A read-only annotation rendered inline at a position in the text (inferred types, parameter names), provided by the language server. Display-only: it is never part of the Document text and never participates in Selection, editing, undo, or the checksum. Distinct from `Severity::Hint`, a Diagnostic severity.
+_Avoid_: annotation, ghost text
+
 **Colorscheme**:
 A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes.
 _Avoid_: theme, palette
