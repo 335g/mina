@@ -87,55 +87,126 @@ fn ctrl(c: char) -> KeyEvent {
     key(KeyCode::Char(c), Modifiers::CONTROL)
 }
 
-impl Keymaps {
-    /// S1 のバインディングセットを構築する。
-    pub fn new() -> Self {
-        let mut normal = Node::default();
-        let mv = |m: Movement, d: Direction| Command::Move {
-            movement: m,
-            direction: d,
-        };
-        let ex = |m: Movement, d: Direction| Command::Extend {
-            movement: m,
-            direction: d,
-        };
+fn alt(code: KeyCode) -> KeyEvent {
+    key(code, Modifiers::ALT)
+}
 
-        // Normal: 移動
-        for (key, movement) in [
-            (KeyCode::Char('h'), Movement::Char),
-            (KeyCode::Char('l'), Movement::Char),
-            (KeyCode::Char('j'), Movement::Line),
-            (KeyCode::Char('k'), Movement::Line),
-            (KeyCode::Char('w'), Movement::Word),
-            (KeyCode::Char('b'), Movement::Word),
-        ] {
-            normal.insert(
-                &[plain(key)],
-                mv(movement, if matches!(key, KeyCode::Char('h') | KeyCode::Char('k') | KeyCode::Char('b')) { Direction::Backward } else { Direction::Forward }),
-            );
-        }
-        // 矢印キー
-        normal.insert(&[plain(KeyCode::Left)], mv(Movement::Char, Direction::Backward));
-        normal.insert(&[plain(KeyCode::Right)], mv(Movement::Char, Direction::Forward));
-        normal.insert(&[plain(KeyCode::Up)], mv(Movement::Line, Direction::Backward));
-        normal.insert(&[plain(KeyCode::Down)], mv(Movement::Line, Direction::Forward));
-        // prefix g: g g = 先頭, G = 末尾
-        normal.insert(
-            &[plain(KeyCode::Char('g')), plain(KeyCode::Char('g'))],
+impl Keymaps {
+    /// Normal/Select 共通の移動バインディング（キー列 → コマンド）。
+    /// Normal では Move、Select では Extend になる（Goto/Scroll は両モード共通）。
+    fn movement_bindings(extend: bool) -> Vec<(Vec<KeyEvent>, Command)> {
+        let move_or_extend = |m: Movement, d: Direction| {
+            if extend {
+                Command::Extend {
+                    movement: m,
+                    direction: d,
+                }
+            } else {
+                Command::Move {
+                    movement: m,
+                    direction: d,
+                }
+            }
+        };
+        let mut out = vec![
+            // 1文字・1行・単語（hjkl + 矢印。e は単語末尾）
+            (
+                vec![plain(KeyCode::Char('h'))],
+                move_or_extend(Movement::Char, Direction::Backward),
+            ),
+            (
+                vec![plain(KeyCode::Char('l'))],
+                move_or_extend(Movement::Char, Direction::Forward),
+            ),
+            (
+                vec![plain(KeyCode::Char('j'))],
+                move_or_extend(Movement::Line, Direction::Forward),
+            ),
+            (
+                vec![plain(KeyCode::Char('k'))],
+                move_or_extend(Movement::Line, Direction::Backward),
+            ),
+            (
+                vec![plain(KeyCode::Char('w'))],
+                move_or_extend(Movement::Word, Direction::Forward),
+            ),
+            (
+                vec![plain(KeyCode::Char('b'))],
+                move_or_extend(Movement::Word, Direction::Backward),
+            ),
+            (
+                vec![plain(KeyCode::Char('e'))],
+                move_or_extend(Movement::WordEnd, Direction::Forward),
+            ),
+            (
+                vec![plain(KeyCode::Left)],
+                move_or_extend(Movement::Char, Direction::Backward),
+            ),
+            (
+                vec![plain(KeyCode::Right)],
+                move_or_extend(Movement::Char, Direction::Forward),
+            ),
+            (
+                vec![plain(KeyCode::Up)],
+                move_or_extend(Movement::Line, Direction::Backward),
+            ),
+            (
+                vec![plain(KeyCode::Down)],
+                move_or_extend(Movement::Line, Direction::Forward),
+            ),
+            // Home/End: 行頭/行末（方向は core 側で無視される）
+            (
+                vec![plain(KeyCode::Home)],
+                move_or_extend(Movement::LineStart, Direction::Forward),
+            ),
+            (
+                vec![plain(KeyCode::End)],
+                move_or_extend(Movement::LineEnd, Direction::Forward),
+            ),
+        ];
+        // 文書先頭/末尾（prefix g: g g = 先頭, G = 末尾）
+        out.push((
+            vec![plain(KeyCode::Char('g')), plain(KeyCode::Char('g'))],
             Command::Goto {
                 target: GotoTarget::DocumentStart,
             },
-        );
-        normal.insert(
-            &[plain(KeyCode::Char('G'))],
+        ));
+        out.push((
+            vec![plain(KeyCode::Char('G'))],
             Command::Goto {
                 target: GotoTarget::DocumentEnd,
             },
-        );
-        // スクロール（ページ単位、高さは daemon 側が把握）
-        normal.insert(&[ctrl('d')], Command::Scroll { pages: 1 });
-        normal.insert(&[ctrl('u')], Command::Scroll { pages: -1 });
-        // モード遷移
+        ));
+        // ページスクロール（ページ単位、高さは daemon 側が把握）。C-u/C-d は
+        // 従来どおり1ページ（Helix は半ページだが Scroll は整数ページ単位のため
+        // 差異を許容する — ponytail: 半ページが必要になったら page を分数化）。
+        for (key, pages) in [
+            (ctrl('d'), 1),
+            (ctrl('u'), -1),
+            (ctrl('f'), 1),
+            (ctrl('b'), -1),
+            (plain(KeyCode::PageDown), 1),
+            (plain(KeyCode::PageUp), -1),
+        ] {
+            out.push((vec![key], Command::Scroll { pages }));
+        }
+        out
+    }
+
+    /// 現在のバインディングセットを構築する（Helix default を基準に整理）。
+    pub fn new() -> Self {
+        let mut normal = Node::default();
+        let mut select = Node::default();
+
+        // 移動テーブルは Normal/Select で共有（Normal = Move、Select = Extend）
+        for (keys, command) in Self::movement_bindings(false) {
+            normal.insert(&keys, command);
+        }
+        for (keys, command) in Self::movement_bindings(true) {
+            select.insert(&keys, command);
+        }
+
+        // Normal: モード遷移
         normal.insert(
             &[plain(KeyCode::Char('v'))],
             Command::SetMode { mode: Mode::Select },
@@ -144,44 +215,15 @@ impl Keymaps {
             &[plain(KeyCode::Char('i'))],
             Command::SetMode { mode: Mode::Insert },
         );
-        // 編集
+        // Normal: 編集。x/Backspace は1文字削除（vim 流）、d は選択削除（Helix 流）。
+        // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
         normal.insert(&[plain(KeyCode::Char('x'))], Command::DeleteForward);
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
+        normal.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         normal.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         normal.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
-        // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
 
-        // Select: 拡張移動 + 解除
-        let mut select = Node::default();
-        for (key, movement) in [
-            (KeyCode::Char('h'), Movement::Char),
-            (KeyCode::Char('l'), Movement::Char),
-            (KeyCode::Char('j'), Movement::Line),
-            (KeyCode::Char('k'), Movement::Line),
-            (KeyCode::Char('w'), Movement::Word),
-            (KeyCode::Char('b'), Movement::Word),
-        ] {
-            select.insert(
-                &[plain(key)],
-                ex(movement, if matches!(key, KeyCode::Char('h') | KeyCode::Char('k') | KeyCode::Char('b')) { Direction::Backward } else { Direction::Forward }),
-            );
-        }
-        select.insert(&[plain(KeyCode::Left)], ex(Movement::Char, Direction::Backward));
-        select.insert(&[plain(KeyCode::Right)], ex(Movement::Char, Direction::Forward));
-        select.insert(&[plain(KeyCode::Up)], ex(Movement::Line, Direction::Backward));
-        select.insert(&[plain(KeyCode::Down)], ex(Movement::Line, Direction::Forward));
-        select.insert(
-            &[plain(KeyCode::Char('g')), plain(KeyCode::Char('g'))],
-            Command::Goto {
-                target: GotoTarget::DocumentStart,
-            },
-        );
-        select.insert(
-            &[plain(KeyCode::Char('G'))],
-            Command::Goto {
-                target: GotoTarget::DocumentEnd,
-            },
-        );
+        // Select: モード解除 + 編集
         select.insert(
             &[plain(KeyCode::Char('v'))],
             Command::SetMode { mode: Mode::Normal },
@@ -192,11 +234,12 @@ impl Keymaps {
         );
         select.insert(&[plain(KeyCode::Char('x'))], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Backspace)], Command::DeleteRange);
+        select.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         select.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
         // Insert: 文字入力はクライアント側のフォールバック。ここでは
-        // Esc・Enter（改行）・Tab・Backspace・左右移動のみ
+        // Esc・Enter（改行）・Tab・削除（文字/単語）・左右/行頭/行末移動のみ
         let mut insert = Node::default();
         insert.insert(
             &[plain(KeyCode::Escape)],
@@ -205,12 +248,26 @@ impl Keymaps {
         insert.insert(&[plain(KeyCode::Enter)], Command::Insert { text: "\n".into() });
         insert.insert(&[plain(KeyCode::Tab)], Command::Insert { text: "\t".into() });
         insert.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
+        insert.insert(&[ctrl('h')], Command::DeleteBackward);
+        insert.insert(&[plain(KeyCode::Delete)], Command::DeleteForward);
+        insert.insert(&[ctrl('d')], Command::DeleteForward);
+        insert.insert(&[ctrl('w')], Command::DeleteWordBackward);
+        insert.insert(&[alt(KeyCode::Backspace)], Command::DeleteWordBackward);
+        insert.insert(&[alt(KeyCode::Char('d'))], Command::DeleteWordForward);
         insert.insert(&[plain(KeyCode::Left)], Command::Move {
             movement: Movement::Char,
             direction: Direction::Backward,
         });
         insert.insert(&[plain(KeyCode::Right)], Command::Move {
             movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        insert.insert(&[plain(KeyCode::Home)], Command::Move {
+            movement: Movement::LineStart,
+            direction: Direction::Forward,
+        });
+        insert.insert(&[plain(KeyCode::End)], Command::Move {
+            movement: Movement::LineEnd,
             direction: Direction::Forward,
         });
 
@@ -440,6 +497,11 @@ mod tests {
             km.resolve(Mode::Normal, &mut pending, k('U')),
             Resolution::Command(Command::Redo)
         ));
+        // Helix 流: Normal の d は選択削除（カーソル上では no-op — daemon 側）
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('d')),
+            Resolution::Command(Command::DeleteRange)
+        ));
         // 保存は `:` コマンド（:w）に移行したので s は未定義
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('s')),
@@ -449,10 +511,128 @@ mod tests {
             km.resolve(Mode::Normal, &mut pending, KeyCode::Backspace.into()),
             Resolution::Command(Command::DeleteBackward)
         ));
-        // Select モードでは x が範囲削除
+        // Select モードでは x / d が範囲削除
         assert!(matches!(
             km.resolve(Mode::Select, &mut pending, k('x')),
             Resolution::Command(Command::DeleteRange)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('d')),
+            Resolution::Command(Command::DeleteRange)
+        ));
+    }
+
+    #[test]
+    fn helix_movement_bindings() {
+        // Helix との差分で追加した移動キー: e（単語末尾）・Home/End（行頭/行末）
+        // ・PageUp/PageDown・C-b/C-f（ページスクロール）
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        let mut move_of = |key| match km.resolve(Mode::Normal, &mut pending, key) {
+            Resolution::Command(Command::Move {
+                movement,
+                direction,
+            }) => Some((movement, direction)),
+            _ => None,
+        };
+        assert_eq!(
+            move_of(k('e')),
+            Some((Movement::WordEnd, Direction::Forward))
+        );
+        assert_eq!(
+            move_of(KeyCode::Home.into()),
+            Some((Movement::LineStart, Direction::Forward))
+        );
+        assert_eq!(
+            move_of(KeyCode::End.into()),
+            Some((Movement::LineEnd, Direction::Forward))
+        );
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, KeyCode::PageDown.into()),
+            Resolution::Command(Command::Scroll { pages: 1 })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, KeyCode::PageUp.into()),
+            Resolution::Command(Command::Scroll { pages: -1 })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, ctrl('f')),
+            Resolution::Command(Command::Scroll { pages: 1 })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, ctrl('b')),
+            Resolution::Command(Command::Scroll { pages: -1 })
+        ));
+    }
+
+    #[test]
+    fn select_mode_extends_with_new_movements() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('e')),
+            Resolution::Command(Command::Extend {
+                movement: Movement::WordEnd,
+                direction: Direction::Forward
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, KeyCode::Home.into()),
+            Resolution::Command(Command::Extend {
+                movement: Movement::LineStart,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn insert_mode_word_delete_bindings() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, ctrl('w')),
+            Resolution::Command(Command::DeleteWordBackward)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, alt(KeyCode::Backspace)),
+            Resolution::Command(Command::DeleteWordBackward)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, alt(KeyCode::Char('d'))),
+            Resolution::Command(Command::DeleteWordForward)
+        ));
+        // 文字削除: C-h / C-d も Helix と同じ
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, ctrl('h')),
+            Resolution::Command(Command::DeleteBackward)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, ctrl('d')),
+            Resolution::Command(Command::DeleteForward)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::Delete.into()),
+            Resolution::Command(Command::DeleteForward)
+        ));
+    }
+
+    #[test]
+    fn insert_mode_home_end_move_to_line_bounds() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::Home.into()),
+            Resolution::Command(Command::Move {
+                movement: Movement::LineStart,
+                ..
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::End.into()),
+            Resolution::Command(Command::Move {
+                movement: Movement::LineEnd,
+                ..
+            })
         ));
     }
 
