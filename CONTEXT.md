@@ -76,6 +76,10 @@ _Avoid_: frame, update
 A monotonically increasing counter on the Daemon, bumped on every state-changing operation (edits, undo/redo, mode changes, Open/Save), never on pure reads. Clients compare generations to detect that something changed without re-reading the document. Carried in every StateSnapshot.
 _Avoid_: version, revision
 
+**Gutter**:
+The fixed-width strip at the left of a View showing the absolute LineNumber (1-based) of each visible line, with the line containing the cursor highlighted. Display-only, computed by the Client from the StateSnapshot; never part of the Document text.
+_Avoid_: line number column, margin
+
 **ChangeEvent**:
 A record of one state-changing operation, tagged with its source (Interactive, Headless, or External) and kind. The Daemon keeps a bounded ring of recent ChangeEvents and carries it in every StateSnapshot.
 _Avoid_: event, log entry
