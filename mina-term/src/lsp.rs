@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mina_lsp::{Client, PositionEncoding, PublishDiagnostic};
-use mina_protocol::{Diagnostic, InlayHint, Severity};
+use mina_protocol::{Diagnostic, InlayHint, Severity, StateSnapshot};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 
 use crate::daemon::Daemon;
@@ -586,7 +586,9 @@ pub async fn pull_after_edit(
 }
 
 /// Open 直後の診断追跡タスク: 初期解析が完了するまで pull を繰り返し、
-/// 診断を daemon に反映する。
+/// 診断と inlay hint を daemon に反映する。更新のたびに購読者（TUI）へ
+/// push する — ヒント・診断は generation を進めないため、クライアント側は
+/// 内容比較（`snapshot != state`）で再描画する（#24 のフィードバック）。
 ///
 /// rust-analyzer の初期解析（crate ロード）は数秒かかり、その間の pull は空を
 /// 返す。非空が 2 回連続で返ったら解析完了とみなして終了する（空の連続は
@@ -597,6 +599,7 @@ pub async fn settle_open_diagnostics(
     daemon: &Mutex<Daemon>,
     session: Arc<Mutex<LspSession>>,
     path: PathBuf,
+    push_tx: watch::Sender<StateSnapshot>,
 ) {
     let mut prev: Option<usize> = None;
     for i in 0..120 {
@@ -632,6 +635,12 @@ pub async fn settle_open_diagnostics(
         if let Some(hints) = pulled.1 {
             d.cache_hints(path.clone(), &text, hints);
         }
+        // ヒント・診断の反映は generation を進めないが、見え方を変える。
+        // 購読者へスナップショットを作り直して配る（クライアントは内容比較で
+        // 再描画する。自分の応答と同じ内容なら捨てられる）。
+        let snap = crate::daemon::snapshot(&mut d, None);
+        drop(d);
+        let _ = push_tx.send(snap);
         if n > 0 {
             // 非空が返った = 解析完了の確証。2回連続同じ件数なら安定とみなす
             // （誤検出: 解析未完の空（0,0,0...）を安定と誤認しないため、

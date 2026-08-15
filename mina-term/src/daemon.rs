@@ -954,9 +954,15 @@ async fn process_command(
                         let daemon_task = daemon.clone();
                         let session_task = session.clone();
                         let path_task = path_buf.clone();
+                        let push_task = push_tx.clone();
                         tokio::spawn(async move {
-                            lsp::settle_open_diagnostics(&daemon_task, session_task, path_task)
-                                .await;
+                            lsp::settle_open_diagnostics(
+                                &daemon_task,
+                                session_task,
+                                path_task,
+                                push_task,
+                            )
+                            .await;
                         });
                     }
                     let mut d = daemon.lock().await;
@@ -1021,9 +1027,15 @@ async fn process_command(
                         let daemon_task = daemon.clone();
                         let session_task = session.clone();
                         let path_task = path_buf.clone();
+                        let push_task = push_tx.clone();
                         tokio::spawn(async move {
-                            lsp::settle_open_diagnostics(&daemon_task, session_task, path_task)
-                                .await;
+                            lsp::settle_open_diagnostics(
+                                &daemon_task,
+                                session_task,
+                                path_task,
+                                push_task,
+                            )
+                            .await;
                         });
                     }
                     let mut d = daemon.lock().await;
@@ -1628,7 +1640,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
     }
 }
 
-fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnapshot {
+pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnapshot {
     let text = daemon.editor.current_document().text().to_string();
     let checksum = fnv1a64(text.as_bytes());
     let highlights = daemon.syntax_highlights(&text, checksum);

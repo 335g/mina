@@ -253,11 +253,15 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
             }
             push = session.pushes.recv() => {
                 match push {
-                    Some(snapshot) if snapshot.generation != state.generation => {
+                    // 内容が変わったときだけ再描画する。generation 比較でなく内容
+                    // 比較にする理由: LSP の診断・inlay hint の反映（settle ループ）
+                    // は generation を進めないが画面は変わる（#24 のフィードバック）。
+                    // 自分自身の変更（応答で描画済み）は内容が同一なので捨てられる。
+                    Some(snapshot) if snapshot != state => {
                         state = snapshot;
                         redraw = true;
                     }
-                    Some(_) => {} // 自分自身の変更（応答で描画済み）
+                    Some(_) => {} // 内容が同一（自分自身の変更）: 描画済み
                     None => break, // daemon の切断（EOF）
                 }
             }
