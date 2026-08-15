@@ -547,8 +547,11 @@ pub fn drain_into(daemon: &mut Daemon) {
     };
     // MEDIUM-3: サーバが死んだら古い診断を残さない（下線・カウントが文書と
     // 不整合のまま表示され続ける）。再 spawn は次回 .rs Open 時（ADR-0009）。
+    // ヒントも同様に消す（死んだサーバの解析結果は表示・配信しない。ADR-0020）。
     if session.client.is_dead() {
         daemon.diagnostics.clear();
+        daemon.hints.clear();
+        daemon.hint_order.clear();
     } else if session.current_uri() != Some(doc_uri.as_str()) {
         // フォーカスが LSP 対象外の文書に移ったら診断は残さない
         daemon.diagnostics.clear();
@@ -568,15 +571,18 @@ pub async fn pull_after_edit(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
-) -> Option<Vec<Diagnostic>> {
+) -> (Option<Vec<Diagnostic>>, Option<Vec<InlayHint>>) {
     tokio::time::sleep(PULL_SETTLE).await;
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
-        return None;
+        return (None, None);
     };
     if session.client.is_dead() {
-        return None;
+        return (None, None);
     }
-    session.pull_diagnostics(path, text).await
+    // 診断とヒントを続けて pull する（同じテキスト・同じ解析状態に対して）。
+    let diags = session.pull_diagnostics(path, text).await;
+    let hints = session.pull_inlay_hints(path, text).await;
+    (diags, hints)
 }
 
 /// Open 直後の診断追跡タスク: 初期解析が完了するまで pull を繰り返し、
@@ -610,13 +616,22 @@ pub async fn settle_open_diagnostics(
             if s.client.is_dead() {
                 return;
             }
-            s.pull_diagnostics(&path, &text).await
+            // ヒントも診断と同じループで pull し、キャッシュに載せる（ADR-0020）。
+            // 解析未完の間は空が返るが、次の反復で追いつく。
+            (
+                s.pull_diagnostics(&path, &text).await,
+                s.pull_inlay_hints(&path, &text).await,
+            )
         };
-        let Some(diags) = pulled else {
+        let Some(diags) = pulled.0 else {
             continue; // 解析中のキャンセル等: 次回に持ち越し
         };
         let n = diags.len();
-        daemon.lock().await.diagnostics = diags;
+        let mut d = daemon.lock().await;
+        d.diagnostics = diags;
+        if let Some(hints) = pulled.1 {
+            d.cache_hints(path.clone(), &text, hints);
+        }
         if n > 0 {
             // 非空が返った = 解析完了の確証。2回連続同じ件数なら安定とみなす
             // （誤検出: 解析未完の空（0,0,0...）を安定と誤認しないため、
@@ -631,6 +646,44 @@ pub async fn settle_open_diagnostics(
         }
         prev = Some(n);
     }
+}
+
+/// セッションを掴んで inlay hint を pull する（ロック取得はタイムアウト付き）。
+///
+/// エージェントの GetInlayHints 処理（daemon 側の serve_inlay_hints）用。
+/// サーバ死亡・ロック待ち・エラー応答は `None`（呼び出し側は現状維持）。
+pub async fn pull_hints_timeout(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+) -> Option<Vec<InlayHint>> {
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return None;
+    };
+    if session.client.is_dead() {
+        return None;
+    }
+    session.pull_inlay_hints(path, text).await
+}
+
+/// フォーカス文書へ LSP セッションを復元する（Q10-(c)）: 現在テキストで
+/// didOpen し直し、診断を即時 pull して返す（解析は温かいため settle 待ちなし）。
+///
+/// エージェントの GetInlayHints がセッションを借りた後の自己修復。サーバ死亡・
+/// ロック待ちは `None`（呼び出し側は現状維持）。
+pub async fn restore_focus_with_diagnostics(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+) -> Option<Vec<Diagnostic>> {
+    open_document(session, path, text).await;
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return None;
+    };
+    if session.client.is_dead() {
+        return None;
+    }
+    session.pull_diagnostics(path, text).await
 }
 
 #[cfg(test)]

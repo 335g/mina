@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mina_core::{Range as CoreRange, Selection, Transaction, extend_selection, move_selection};
 use mina_protocol::{
     ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
-    HighlightRange, Range, ServerMessage, StateSnapshot, fnv1a64,
+    HighlightRange, InlayHint, Range, ServerMessage, StateSnapshot, fnv1a64,
 };
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -96,6 +96,11 @@ pub struct Daemon {
     pub(crate) lsp_sessions: HashMap<PathBuf, Arc<Mutex<LspSession>>>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
     pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
+    /// パスごとの inlay hint キャッシュ（ADR-0020）。`HintCache.text_checksum` が
+    /// 現在のテキストと一致すれば新鮮（再取得不要）。一致しなくても表示には使う
+    /// （Q7: stale ヒントは新ヒント到着まで保持）。挿入順は `hint_order` で FIFO evict。
+    pub(crate) hints: HashMap<PathBuf, HintCache>,
+    pub(crate) hint_order: VecDeque<PathBuf>,
     /// 開いている undo グループの所有者（= SetMode(Insert) で開いたクライアント）。
     ///
     /// HIGH-1: グループは接続スコープで所有される。所有者の切断のみがグループを
@@ -125,6 +130,16 @@ struct SyntaxCache {
     text_checksum: u64,
     highlights: Vec<HighlightRange>,
 }
+
+/// 1パス分の inlay hint キャッシュ（ADR-0020）。`text_checksum` は pull 時点の
+/// テキストの FNV-1a 64（一致 = 「このテキストに対して取得済み」）。
+pub(crate) struct HintCache {
+    pub(crate) text_checksum: u64,
+    pub(crate) hints: Vec<InlayHint>,
+}
+
+/// ヒントキャッシュの上限（ADR-0020）。超過は挿入順の最古から除去する。
+const MAX_HINT_CACHE: usize = 64;
 
 /// 外部変更検知のベースライン（mtime+size。ADR-0012/0015 のヒューリスティック）。
 #[derive(Clone, Debug)]
@@ -170,6 +185,26 @@ impl Daemon {
         highlights
     }
 
+    /// パスの inlay hint をキャッシュに書き込む（ADR-0020）。
+    ///
+    /// checksum は pull 時点のテキストから計算する（このテキストに対して取得
+    /// 済みという意味）。上限超過は挿入順の最古から除去する（FIFO）。
+    pub(crate) fn cache_hints(&mut self, path: PathBuf, text: &str, hints: Vec<InlayHint>) {
+        let checksum = fnv1a64(text.as_bytes());
+        if self
+            .hints
+            .insert(path.clone(), HintCache { text_checksum: checksum, hints })
+            .is_none()
+        {
+            self.hint_order.push_back(path.clone());
+        }
+        while self.hints.len() > MAX_HINT_CACHE {
+            if let Some(old) = self.hint_order.pop_front() {
+                self.hints.remove(&old);
+            }
+        }
+    }
+
     /// 状態を変える操作を記録する（世代を増やし、イベントをリングに積む）。
     fn record_event(
         &mut self,
@@ -203,6 +238,8 @@ impl Daemon {
             baselines: HashMap::new(),
             deleted: None,
             syntax: HashMap::new(),
+            hints: HashMap::new(),
+            hint_order: VecDeque::new(),
         }
     }
 
@@ -420,10 +457,15 @@ async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnap
             };
             if let Some(session) = session {
                 lsp::sync(&session, path, text).await;
-                let pulled = lsp::pull_after_edit(&session, path, text).await;
+                // ヒントも編集と同経路で pull してキャッシュに載せる（ADR-0020）
+                let (pulled_diags, pulled_hints) =
+                    lsp::pull_after_edit(&session, path, text).await;
                 let mut d = daemon.lock().await;
-                if let Some(diags) = pulled {
+                if let Some(diags) = pulled_diags {
                     d.diagnostics = diags;
+                }
+                if let Some(hints) = pulled_hints {
+                    d.cache_hints(path.clone(), text, hints);
                 }
                 lsp::drain_into(&mut d);
                 // pull 診断は generation を変えないので、スナップショットを
@@ -561,6 +603,20 @@ async fn handle_connection(
                 if line.len() > MAX_CMD_LINE {
                     break; // 過大なコマンド行: クライアントが壊れているか悪意がある
                 }
+                // ADR-0020: GetInlayHints はスナップショットでなく Hints を返す
+                // 読み取り専用コマンド（世代・push・イベントを進めない）。
+                // process_command の戻り型を汚さないため、ここで専用処理する。
+                // headless のエージェント用途が主だが、読み取り専用かつ自己修復
+                // （セッション復元 + 診断再 pull）するため種別は問わない。
+                if let Ok(Command::GetInlayHints { path }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_inlay_hints(&daemon, &path).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 let snapshot = process_command(&daemon, &push_tx, conn_id, source, &line).await;
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
@@ -610,6 +666,127 @@ async fn write_message(
         return false;
     }
     true
+}
+
+/// `Command::GetInlayHints` の処理（ADR-0020）: 任意パスの inlay hint を全文
+/// テキストなしで返す（エージェントの LLM コスト削減経路）。
+///
+/// LSP セッションは同時に 1 文書しか開けないため、フォーカス文書と異なる
+/// パスの要求は「対象を didOpen → pull → フォーカス文書を現在テキストで
+/// didOpen し直し + 診断の再 pull」で対応する（Q10-(c)。切り替えウィンドウ中に
+/// 入った編集は全文同期の復元で整合する）。LSP の await は daemon ロック外
+/// （ADR-0009）。読み取り専用: 世代・push・イベントは進めない。
+async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let path_str = path_buf.to_string_lossy().into_owned();
+    // 要求パスのテキスト: Editor の開文書を優先し、なければディスク読み
+    // （SEC-1 検証済み。ADR-0008 の read_open_target を再利用）。
+    let text = {
+        let d = daemon.lock().await;
+        d.editor
+            .doc_id_for_path(&path_buf)
+            .map(|id| d.editor.document(id).text().to_string())
+    };
+    let (text, _status) = match text {
+        Some(t) => (Some(t), None),
+        None => read_open_target(&path_str).await,
+    };
+    let Some(text) = text else {
+        // 読み込み不可（存在しない・非正規ファイル等）: 空ヒントで応答する
+        let d = daemon.lock().await;
+        return ServerMessage::Hints {
+            path: path_str,
+            generation: d.generation,
+            hints: Vec::new(),
+        };
+    };
+    // LSP 非対応パス（.rs 以外）: 空ヒントで応答する（サーバを spawn しない）
+    if lsp::server_for(&path_buf).is_none() {
+        let d = daemon.lock().await;
+        return ServerMessage::Hints {
+            path: path_str,
+            generation: d.generation,
+            hints: Vec::new(),
+        };
+    }
+    // キャッシュが現在のテキストに対して新鮮なら LSP に触らず返す
+    // （エージェントの反復要求で rust-analyzer の再解析を起こさない）。
+    let checksum = fnv1a64(text.as_bytes());
+    {
+        let d = daemon.lock().await;
+        if let Some(c) = d.hints.get(&path_buf) {
+            if c.text_checksum == checksum {
+                return ServerMessage::Hints {
+                    path: path_str,
+                    generation: d.generation,
+                    hints: c.hints.clone(),
+                };
+            }
+        }
+    }
+    // フォーカス文書（復元用。テキストは復元時に最新を読む）
+    let focused = {
+        let d = daemon.lock().await;
+        d.editor.focused_path().map(Path::to_path_buf)
+    };
+    let session = match lsp::ensure(daemon, &path_buf).await {
+        Ok(s) => s,
+        Err(_) => {
+            // spawn + initialize 失敗: 空ヒントで応答する
+            let d = daemon.lock().await;
+            return ServerMessage::Hints {
+                path: path_str,
+                generation: d.generation,
+                hints: Vec::new(),
+            };
+        }
+    };
+    let target_is_focused = focused.as_deref() == Some(path_buf.as_path());
+    // フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
+    // ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
+    // いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
+    // 置き換わる）。
+    let borrows_focus_session = !target_is_focused
+        && focused.as_deref().is_some_and(|fp| {
+            lsp::server_for(fp).is_some()
+                && lsp::workspace_root(fp) == lsp::workspace_root(&path_buf)
+        });
+    // 切り替え: 対象文書を didOpen（前の文書は閉じられる）。pull は現在の文書に
+    // しか応えない（current_uri 一致チェック）ため、対象を開くことは必須。
+    lsp::open_document(&session, &path_buf, &text).await;
+    let hints = lsp::pull_hints_timeout(&session, &path_buf, &text)
+        .await
+        .unwrap_or_default();
+    // キャッシュ更新（daemon ロックは短時間のみ）
+    {
+        let mut d = daemon.lock().await;
+        d.cache_hints(path_buf.clone(), &text, hints.clone());
+    }
+    if borrows_focus_session {
+        // 復元（Q10-(c)）: フォーカス文書がこの間に移動していなければ、現在
+        // テキストで didOpen し直し + 診断を再 pull して更新停止を自己修復する。
+        if let Some(fp) = &focused {
+            let focused_text = {
+                let d = daemon.lock().await;
+                (d.editor.focused_path() == Some(fp.as_path()))
+                    .then(|| d.editor.current_document().text().to_string())
+            };
+            if let Some(text) = focused_text {
+                let diags = lsp::restore_focus_with_diagnostics(&session, fp, &text).await;
+                let mut d = daemon.lock().await;
+                if let Some(diags) = diags {
+                    d.diagnostics = diags;
+                }
+                lsp::drain_into(&mut d);
+            }
+        }
+    }
+    let d = daemon.lock().await;
+    ServerMessage::Hints {
+        path: path_str,
+        generation: d.generation,
+        hints,
+    }
 }
 
 /// コマンド行1件を処理して応答スナップショットを返す（ADR-0013 で
@@ -970,10 +1147,15 @@ async fn process_command(
                     // 編集後のライブ診断は push ではなく pull で取る（flycheck は
                     // ディスク基準のため編集内容を反映しない。上流フィードバック
                     // どおり pull を扱う）。解析完了まで短く待ってから打つ。
-                    let pulled = lsp::pull_after_edit(&session, &path, &text).await;
+                    // ヒントも同じ経路で pull する（ADR-0020）。
+                    let (pulled_diags, pulled_hints) =
+                        lsp::pull_after_edit(&session, &path, &text).await;
                     let mut d = daemon.lock().await;
-                    if let Some(diags) = pulled {
+                    if let Some(diags) = pulled_diags {
                         d.diagnostics = diags;
+                    }
+                    if let Some(hints) = pulled_hints {
+                        d.cache_hints(path.clone(), &text, hints);
                     }
                     lsp::drain_into(&mut d);
                     snapshot(&mut d, None)
@@ -1021,10 +1203,14 @@ async fn process_command(
                             rejected
                         } else if let Some((session, path, text)) = sync_target {
                             lsp::sync(&session, &path, &text).await;
-                            let pulled = lsp::pull_after_edit(&session, &path, &text).await;
+                            let (pulled_diags, pulled_hints) =
+                                lsp::pull_after_edit(&session, &path, &text).await;
                             let mut d = daemon.lock().await;
-                            if let Some(diags) = pulled {
+                            if let Some(diags) = pulled_diags {
                                 d.diagnostics = diags;
+                            }
+                            if let Some(hints) = pulled_hints {
+                                d.cache_hints(path.clone(), &text, hints);
                             }
                             lsp::drain_into(&mut d);
                             snapshot(&mut d, None)
@@ -1257,12 +1443,9 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             (snapshot(daemon, None), false)
         }
         Command::GetInlayHints { .. } => {
-            // #23: LSP pull + ServerMessage::Hints 応答を実装する。
-            // 今は未対応（headless は許可リストで、TUI はこのコマンドを送らない）。
-            (
-                snapshot(daemon, Some("inlay hints: not implemented yet".into())),
-                false,
-            )
+            // handle_connection で専用処理される（ServerMessage::Hints 応答。
+            // ADR-0020）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
         }
         Command::Insert { text } => {
             // SEC-1/ADR-0008: Insert による無制限の文書成長を防ぐ。Open と同じ
@@ -1469,8 +1652,14 @@ fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnapshot {
         mode: convert_mode_back(editor.mode()),
         first_line: editor.first_line(),
         diagnostics: daemon.diagnostics.clone(),
-        // #23: フォーカス文書のヒントキャッシュから載せる（今は空）。
-        inlay_hints: Vec::new(),
+        // ADR-0020: フォーカス文書のヒントをキャッシュから載せる。checksum 不一致
+        // （編集中）でも載せる — Q7: stale ヒントは新ヒント到着まで保持する。
+        inlay_hints: daemon
+            .editor
+            .focused_path()
+            .and_then(|p| daemon.hints.get(p))
+            .map(|c| c.hints.clone())
+            .unwrap_or_default(),
         // 不変条件: 同じスナップショットのテキストと一致する範囲（ADR-0016）。
         highlights,
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
@@ -4150,5 +4339,204 @@ mod tests {
         assert!(snap.generation >= 1, "既に超えていれば即応答");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
+    }
+
+    // ---- inlay hint（ADR-0020） ----
+
+    /// GetInlayHints を送り、Hints 応答を受け取る。
+    async fn request_hints(c: &mut TestClient, path: &str) -> (String, u64, Vec<InlayHint>) {
+        let mut line =
+            serde_json::to_string(&Command::GetInlayHints { path: path.into() }).unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        recv_hints(c).await
+    }
+
+    /// Hints 応答1件を読む（途中の応答・push は読み飛ばす）。
+    async fn recv_hints(c: &mut TestClient) -> (String, u64, Vec<InlayHint>) {
+        loop {
+            match c.recv_message().await {
+                ServerMessage::Hints { path, generation, hints } => {
+                    return (path, generation, hints)
+                }
+                ServerMessage::Response { .. } | ServerMessage::Push { .. } => continue,
+            }
+        }
+    }
+
+    fn type_hint(position: usize, text: &str, padding_right: bool) -> InlayHint {
+        InlayHint {
+            position,
+            text: text.into(),
+            padding_left: false,
+            padding_right,
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_stale_hints_until_new_pull() {
+        // Q7: 編集でテキストが変わっても（checksum 不一致）、新ヒントが届くまで
+        // 旧ヒントを表示に載せ続ける（タイプ中のちらつき防止）。
+        let mut d = daemon();
+        open_path(&mut d, "test.rs", "let x = 5");
+        let path = PathBuf::from("test.rs");
+        d.cache_hints(
+            path.clone(),
+            "let x = 5",
+            vec![type_hint(5, ": i32", true)],
+        );
+        // 編集でテキストが変わる（キャッシュは stale になる）
+        apply(&mut d, Command::Insert { text: "aaa".into() });
+        let snap = snapshot(&mut d, None);
+        assert_eq!(snap.inlay_hints.len(), 1, "stale ヒントは保持される: {:?}", snap.inlay_hints);
+        assert_eq!(snap.inlay_hints[0].position, 5);
+        // 新ヒント（空）が届けば置き換わる
+        d.cache_hints(path, &snap.text, Vec::new());
+        let snap = snapshot(&mut d, None);
+        assert!(snap.inlay_hints.is_empty(), "新ヒントで置き換わる");
+    }
+
+    #[test]
+    fn hint_cache_evicts_oldest_over_cap() {
+        // ADR-0020: パスキーキャッシュの上限超過は挿入順の最古から除去する。
+        let mut d = daemon();
+        open_path(&mut d, "test.rs", "let x = 5");
+        for i in 0..(MAX_HINT_CACHE + 5) {
+            let p = format!("/tmp/hint-cache-evict-{i}.rs");
+            d.cache_hints(PathBuf::from(&p), "let x = 5", vec![type_hint(5, ": i32", true)]);
+        }
+        assert_eq!(d.hints.len(), MAX_HINT_CACHE, "上限を超えない");
+        assert!(
+            !d.hints.contains_key(Path::new("/tmp/hint-cache-evict-0.rs")),
+            "最古が除去される"
+        );
+        assert!(
+            d.hints.contains_key(Path::new(&format!(
+                "/tmp/hint-cache-evict-{}.rs",
+                MAX_HINT_CACHE + 4
+            ))),
+            "最新は残る"
+        );
+    }
+
+    #[tokio::test]
+    async fn inlay_hints_follow_edits_and_snapshot() {
+        // Open の settle ループと編集後の pull がヒントをキャッシュに載せ、
+        // snapshot に反映される（ADR-0020）。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-hint-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-hint-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "let x = 5\nTODO\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        // settle ループがヒントを pull する: snapshot に載るまで待つ
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| !s.inlay_hints.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(snap.inlay_hints.len(), 1, "{:?}", snap.inlay_hints);
+        assert_eq!(snap.inlay_hints[0].position, 5, "x の直後");
+        assert_eq!(snap.inlay_hints[0].text, ": i32");
+
+        // 編集 → pull: ヒントの位置が新テキストに追従する（"alet x = 5" の x は char 6）
+        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        assert_eq!(snap.inlay_hints.len(), 1, "{:?}", snap.inlay_hints);
+        assert_eq!(snap.inlay_hints[0].position, 6, "編集後の位置: {:?}", snap.inlay_hints);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn get_inlay_hints_serves_arbitrary_path_and_restores_focus() {
+        // ADR-0020: エージェントの GetInlayHints が、開いていないパスのヒントを
+        // 全文テキストなしで返す。フォーカス文書の LSP セッションを借りるため、
+        // 応答後はフォーカス文書へ復元され（Q10-(c)）、次回の編集が同期される。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-hint2-sock-{}.sock", std::process::id()));
+        let file_a = dir.join(format!("mina-hint2-a-{}.rs", std::process::id()));
+        let file_b = dir.join(format!("mina-hint2-b-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file_a, "let x = 5\nTODO\n").unwrap();
+        std::fs::write(&file_b, "foo(1)\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path_a = file_a.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path_a.clone() }).await;
+        // A の診断・ヒントが settle で載るまで待つ
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| !s.diagnostics.is_empty() && !s.inlay_hints.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(snap.diagnostics[0].message, "mock: TODO found");
+        assert_eq!(snap.inlay_hints[0].position, 5);
+
+        // エージェント（headless）: 未開パス B のヒントを取得
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path_b = file_b.to_string_lossy().into_owned();
+        let (resp_path, _gen, hints) = request_hints(&mut agent, &path_b).await;
+        // normalize_open_path が canonicalize するため /private 等の正規化差がある
+        // （/var → /private/var）。サフィックスで同一ファイルを検証する。
+        assert!(
+            resp_path.ends_with(&file_b.to_string_lossy().into_owned()),
+            "応答パスが要求パスに対応する: {resp_path}"
+        );
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert_eq!(hints[0].position, 4, "foo( の直後: {hints:?}");
+        assert_eq!(hints[0].text, "arg: i32");
+
+        // キャッシュ: 同じ B への再要求は同じヒントを返す（LSP 再解析なし）
+        let (_p, _g, hints2) = request_hints(&mut agent, &path_b).await;
+        assert_eq!(hints, hints2);
+
+        // 復元の実証: A への編集の didChange が mock に届く = セッションが A に
+        // 戻っている（Q10-(c)）。"alet x = 5\nTODO\n" の TODO は byte 10。
+        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        assert_eq!(snap.diagnostics[0].start, 10, "復元後の編集が同期される: {snap:?}");
+        assert_eq!(snap.inlay_hints[0].position, 6, "ヒントも編集後テキストに追従");
+
+        drop(tui);
+        drop(agent);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
     }
 }
