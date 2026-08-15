@@ -44,12 +44,23 @@ pub struct Style {
     pub bg: Option<Color>,
     pub underline: bool,
     pub reverse: bool,
+    /// ディム（SGR 2）。`NO_COLOR` や低色深度でも残る属性で視認できる。
+    pub dim: bool,
+    /// 斜体（SGR 3）。
+    pub italic: bool,
 }
 
 impl Style {
     /// const 構築ヘルパー（`static` テーブル用）。
     pub const fn new() -> Self {
-        Self { fg: None, bg: None, underline: false, reverse: false }
+        Self {
+            fg: None,
+            bg: None,
+            underline: false,
+            reverse: false,
+            dim: false,
+            italic: false,
+        }
     }
     /// 後勝ちマージ（None は base を維持、属性は OR）。レンダラの優先順位合成で使う。
     pub(crate) fn merged(self, other: Style) -> Style {
@@ -58,6 +69,8 @@ impl Style {
             bg: other.bg.or(self.bg),
             underline: self.underline || other.underline,
             reverse: self.reverse || other.reverse,
+            dim: self.dim || other.dim,
+            italic: self.italic || other.italic,
         }
     }
     const fn fg(color: Color) -> Self {
@@ -84,6 +97,8 @@ pub enum UiRole {
     StatusLine,
     CommandLine,
     Popup,
+    /// inlay hint の仮想テキスト（ADR-0020。既定: ディム + 斜体）。
+    InlayHint,
 }
 
 /// 役割 → スタイルの写像。未掲載の役割は既定テキスト (無色)。
@@ -116,6 +131,10 @@ const DEFAULT_UI: &[(UiRole, Style)] = &[
     (UiRole::StatusLine, Style::reverse()),
     (UiRole::CommandLine, Style::reverse()),
     (UiRole::Popup, Style::reverse()),
+    // ディム + 斜体: 属性のみ（NO_COLOR・ANSI16 でも視認できる）。
+    // #24: colorscheme ファイルで上書き可能（ロールの既定はここで持ち、
+    // スキームの ui テーブルで差し替える）。
+    (UiRole::InlayHint, Style { dim: true, italic: true, ..Style::new() }),
 ];
 
 pub static DEFAULT: Colorscheme = Colorscheme {
