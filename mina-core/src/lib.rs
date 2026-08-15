@@ -17,7 +17,9 @@ pub use edit::{
     delete_range, delete_word_backward, delete_word_backward_transaction, delete_word_forward,
     delete_word_forward_transaction, insert_text,
 };
-pub use movement::{Direction, Movement, extend_selection, move_selection};
+pub use movement::{
+    Direction, Movement, WordMoveTarget, extend_selection, move_selection, word_move_selection,
+};
 pub use ropey::Rope;
 pub use search::{CaseSensitivity, find_matches, find_next};
 pub use selection::{Range, Selection};

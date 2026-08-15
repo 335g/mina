@@ -245,6 +245,167 @@ pub(crate) fn next_word_end(text: &str, char_pos: usize) -> usize {
     step_word_end(text, char_pos, Direction::Forward)
 }
 
+// --- 単語移動（Helix 流の選択保持） ---
+
+/// 単語移動の目標。Helix の `WordMotionTarget` のうちデフォルトキーで使う4種。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordMoveTarget {
+    /// `w`: 次の単語の先頭。
+    NextWordStart,
+    /// `e`: 次の単語の末尾。
+    NextWordEnd,
+    /// `b`: 前の単語の先頭。
+    PrevWordStart,
+    /// 前の単語の末尾（デフォルトキーでは未使用）。
+    PrevWordEnd,
+}
+
+/// Helix の単語移動（`word_move` + `range_to_target` の移植）。
+///
+/// [`move_selection`] が選択を点に潰すのに対し、こちらは anchor を保持して
+/// 「移動した分」を選択状態にする。Helix のカーソルは常に1文字の選択（block
+/// cursor）で、w/b/e はその anchor を残すため、単語の途中から `b` を押すと
+/// 現在の単語が選択される。これにより `bw` で単語全体+空白を選択して `d` で
+/// 削除する、という Helix 流の操作が可能になる。
+///
+/// 単語カテゴリは [`categorize`] の4分類（Word/Whitespace/Eol/Other）。改行は
+/// 線結合的に越える（直後の改行を越える移動では anchor が行頭側に置かれる）。
+pub fn word_move_selection(
+    doc: &Document,
+    selection: &Selection,
+    target: WordMoveTarget,
+) -> Selection {
+    let text = doc.text().to_string();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| word_move_range(&text, *r, target))
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
+/// 1つの Range に対する単語移動（Helix の `word_move`）。
+fn word_move_range(text: &str, range: Range, target: WordMoveTarget) -> Range {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let is_prev = matches!(
+        target,
+        WordMoveTarget::PrevWordStart | WordMoveTarget::PrevWordEnd
+    );
+    let head = range.head();
+    // 文書端では動かない（Helix と同じ early-out）
+    if (is_prev && head == 0) || (!is_prev && head == n) {
+        return range;
+    }
+    // block-cursor セマンティクス: 空の選択（カーソル）は anchor を head の次の
+    // 文字に置き、既存の選択は向きに応じて anchor を決める。以降の walk で
+    // anchor は原則動かない（境界上から出発した場合のみ head に畳む）。
+    let (anchor, start_head) = if is_prev {
+        if range.anchor() < head {
+            (head, prev_grapheme_boundary(text, head))
+        } else {
+            (next_grapheme_boundary(text, head), head)
+        }
+    } else if range.anchor() < head {
+        (prev_grapheme_boundary(text, head), head)
+    } else {
+        (head, next_grapheme_boundary(text, head))
+    };
+    range_to_target(&chars, anchor, start_head, target)
+}
+
+/// Helix の `range_to_target` の移植。head を目標位置まで歩かせ、開始位置が
+/// ちょうど境界上なら anchor を head に畳む（それ以外は anchor を保持）。
+fn range_to_target(
+    chars: &[char],
+    mut anchor: usize,
+    mut head: usize,
+    target: WordMoveTarget,
+) -> Range {
+    let is_prev = matches!(
+        target,
+        WordMoveTarget::PrevWordStart | WordMoveTarget::PrevWordEnd
+    );
+    // 先頭の peek（前進は head-1、後退は head の文字）
+    let mut prev_ch = if is_prev {
+        chars.get(head).copied()
+    } else {
+        head.checked_sub(1).and_then(|i| chars.get(i)).copied()
+    };
+    // 直後の改行を越える（Helix と同じ。anchor は越えた後の位置に畳む）
+    let mut head0 = head;
+    loop {
+        let next = if is_prev {
+            head0.checked_sub(1).map(|i| chars[i])
+        } else {
+            chars.get(head0).copied()
+        };
+        match next {
+            Some(ch) if is_line_ending(ch) => {
+                prev_ch = Some(ch);
+                if is_prev {
+                    head0 = head0.saturating_sub(1);
+                } else {
+                    head0 += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    if prev_ch.map(is_line_ending).unwrap_or(false) {
+        anchor = head0;
+    }
+    // 目標位置まで歩く
+    let mut head = head0;
+    let head_start = head;
+    loop {
+        let next_ch = if is_prev {
+            head.checked_sub(1).map(|i| chars[i])
+        } else {
+            chars.get(head).copied()
+        };
+        let next_ch = match next_ch {
+            Some(c) => c,
+            None => break,
+        };
+        if prev_ch.is_none() || reached_target(target, prev_ch.unwrap(), next_ch) {
+            if head == head_start {
+                anchor = head;
+            } else {
+                break;
+            }
+        }
+        prev_ch = Some(next_ch);
+        if is_prev {
+            head = head.saturating_sub(1);
+        } else {
+            head += 1;
+        }
+    }
+    Range::new(anchor, head)
+}
+
+fn is_line_ending(c: char) -> bool {
+    c == '\n' || c == '\r'
+}
+
+fn is_word_boundary(a: char, b: char) -> bool {
+    categorize(a) != categorize(b)
+}
+
+fn reached_target(target: WordMoveTarget, prev_ch: char, next_ch: char) -> bool {
+    match target {
+        WordMoveTarget::NextWordStart | WordMoveTarget::PrevWordEnd => {
+            is_word_boundary(prev_ch, next_ch)
+                && (is_line_ending(next_ch) || !next_ch.is_whitespace())
+        }
+        WordMoveTarget::NextWordEnd | WordMoveTarget::PrevWordStart => {
+            is_word_boundary(prev_ch, next_ch)
+                && (!prev_ch.is_whitespace() || is_line_ending(next_ch))
+        }
+    }
+}
+
 /// 次/前の「単語の先頭」（カテゴリ境界の直後にある非空白文字）へ移動する。
 /// 文書端ではクランプする。
 fn step_word(text: &str, char_pos: usize, dir: Direction) -> usize {
@@ -851,6 +1012,138 @@ mod tests {
                 Direction::Forward
             ),
             Selection::point(3)
+        );
+    }
+
+    // --- Helix 流の単語移動（選択保持） ---
+
+    fn word_sel(text: &str, pos: usize, target: WordMoveTarget) -> Selection {
+        let doc = Document::from(text);
+        word_move_selection(&doc, &Selection::point(pos), target)
+    }
+
+    #[test]
+    fn word_b_from_mid_word_selects_current_word() {
+        // 単語の途中から b → [単語先頭, カーソル+1)。カーソルの文字も含む
+        // （Helix の block-cursor セマンティクス。Helix のテストからの移植）
+        assert_eq!(
+            word_sel("Basic backward motion from the middle of a word", 3, WordMoveTarget::PrevWordStart),
+            sel(vec![(4, 0)], 0),
+            "Basic の途中 → Basi が選択"
+        );
+        // 単語の直後（空白）から b → 単語全体（Helix のテストと同じ入力 {6,7}）
+        let doc = Document::from("Jumping to start of word from the end selects the word");
+        assert_eq!(
+            word_move_selection(&doc, &sel(vec![(6, 7)], 0), WordMoveTarget::PrevWordStart),
+            sel(vec![(7, 0)], 0),
+            "Jumping の直後 → Jumping が選択"
+        );
+        // 文末のカーソルから b → 現在の単語全体
+        assert_eq!(
+            word_sel("hello", 5, WordMoveTarget::PrevWordStart),
+            sel(vec![(5, 0)], 0),
+            "hello の文末 → hello が選択"
+        );
+    }
+
+    #[test]
+    fn word_b_from_word_start_selects_preceding_whitespace() {
+        // 単語先頭のカーソルから b → 直前の空白ランが選択される（Helix と同じ）
+        assert_eq!(
+            word_sel("    Jump to start of line from start of word preceded by whitespace", 4, WordMoveTarget::PrevWordStart),
+            sel(vec![(4, 0)], 0),
+            "J の先頭 → 前の空白が選択"
+        );
+        // 単語途中で空白の直後 → 単語先頭まで
+        assert_eq!(
+            word_sel("    Jump to start of a word preceded by whitespace", 5, WordMoveTarget::PrevWordStart),
+            sel(vec![(6, 4)], 0),
+            "u の途中 → Ju が選択"
+        );
+    }
+
+    #[test]
+    fn word_b_crosses_newline_selecting_whitespace_run() {
+        // 改行をまたぐ b は、直前の空白ランを選択する（Helix のテストからの移植）
+        assert_eq!(
+            word_sel("Jumping\n    \nback", 13, WordMoveTarget::PrevWordStart),
+            sel(vec![(12, 8)], 0),
+            "back の先頭 → 前の空白 4 文字が選択"
+        );
+        // 行頭の改行直後から b → 前の行の単語を選択（anchor は行頭側）
+        assert_eq!(
+            word_sel("foo\nbar", 4, WordMoveTarget::PrevWordStart),
+            sel(vec![(3, 0)], 0),
+            "bar の先頭 → foo が選択"
+        );
+    }
+
+    #[test]
+    fn word_w_from_mid_word_selects_rest_of_word() {
+        assert_eq!(
+            word_sel("Starting from mid-word leaves anchor at start position and moves head", 3, WordMoveTarget::NextWordStart),
+            sel(vec![(3, 9)], 0),
+            "Starting の途中 → rting が選択（Helix のテストからの移植）"
+        );
+        // 単語先頭から w → 単語+空白
+        assert_eq!(
+            word_sel("hello world foo", 0, WordMoveTarget::NextWordStart),
+            sel(vec![(0, 6)], 0),
+            "hello が選択"
+        );
+        // 続けて w → 次の単語（anchor が畳まれて1語ずつ進む）
+        let doc = Document::from("hello world foo");
+        let mut s2 = word_move_selection(&doc, &Selection::point(0), WordMoveTarget::NextWordStart);
+        s2 = word_move_selection(&doc, &s2, WordMoveTarget::NextWordStart);
+        assert_eq!(s2, sel(vec![(6, 12)], 0), "world が選択");
+    }
+
+    #[test]
+    fn word_bw_selects_whole_word_then_delete() {
+        // ユーザーが求めるフロー: 単語途中で b → 現在の単語、続けて w →
+        // 単語全体+空白が選択され、d で削除できる
+        let doc = Document::from("hello world foo");
+        let mut s2 = word_move_selection(&doc, &Selection::point(3), WordMoveTarget::PrevWordStart);
+        assert_eq!(s2, sel(vec![(4, 0)], 0), "b: hell が選択");
+        s2 = word_move_selection(&doc, &s2, WordMoveTarget::NextWordStart);
+        assert_eq!(s2, sel(vec![(0, 6)], 0), "bw: hello が選択");
+        // 削除すると単語が消える（daemon 側の DeleteRange と同義）
+        let tx = crate::Transaction::delete(&doc, &s2);
+        let new_doc = tx.apply(&doc);
+        assert_eq!(new_doc.text().to_string(), "world foo");
+    }
+
+    #[test]
+    fn word_e_selects_word_without_trailing_space() {
+        // e は末尾まで（空白を含まない）
+        assert_eq!(
+            word_sel("hello world", 0, WordMoveTarget::NextWordEnd),
+            sel(vec![(0, 5)], 0),
+            "hello が選択（空白なし）"
+        );
+        assert_eq!(
+            word_sel("hello world", 2, WordMoveTarget::NextWordEnd),
+            sel(vec![(2, 5)], 0),
+            "llo が選択"
+        );
+        // 空白からは次の単語の末尾まで（空白を含む）
+        assert_eq!(
+            word_sel("hello world", 5, WordMoveTarget::NextWordEnd),
+            sel(vec![(5, 11)], 0),
+            " world が選択"
+        );
+    }
+
+    #[test]
+    fn word_move_at_document_edges_is_noop() {
+        // 文書端では動かない（Helix と同じ early-out）
+        assert_eq!(
+            word_sel("hello", 0, WordMoveTarget::PrevWordStart),
+            sel(vec![(0, 0)], 0)
+        );
+        assert_eq!(
+            word_sel("hello", 5, WordMoveTarget::NextWordStart),
+            sel(vec![(5, 5)], 0)
         );
     }
 }
