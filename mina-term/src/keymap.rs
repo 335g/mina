@@ -215,11 +215,13 @@ impl Keymaps {
             &[plain(KeyCode::Char('i'))],
             Command::SetMode { mode: Mode::Insert },
         );
-        // Normal: 編集。x/Backspace は1文字削除（vim 流）、d は選択削除（Helix 流）。
-        // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
+        // Normal: 編集。x/Backspace は1文字削除（vim 流）、d は選択削除・c は
+        // 削除+Insert（Helix 流）。保存は `:` コマンドモードの :w（Helix/vim 流）。
+        // s には割り当てない。
         normal.insert(&[plain(KeyCode::Char('x'))], Command::DeleteForward);
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         normal.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
+        normal.insert(&[plain(KeyCode::Char('c'))], Command::Change);
         normal.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         normal.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
@@ -235,6 +237,7 @@ impl Keymaps {
         select.insert(&[plain(KeyCode::Char('x'))], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Backspace)], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
+        select.insert(&[plain(KeyCode::Char('c'))], Command::Change);
         select.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         select.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
@@ -497,10 +500,15 @@ mod tests {
             km.resolve(Mode::Normal, &mut pending, k('U')),
             Resolution::Command(Command::Redo)
         ));
-        // Helix 流: Normal の d は選択削除（カーソル上では no-op — daemon 側）
+        // Helix 流: Normal の d は選択削除（カーソル上では no-op — daemon 側）、
+        // c は削除+Insert
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('d')),
             Resolution::Command(Command::DeleteRange)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('c')),
+            Resolution::Command(Command::Change)
         ));
         // 保存は `:` コマンド（:w）に移行したので s は未定義
         assert!(matches!(
@@ -519,6 +527,10 @@ mod tests {
         assert!(matches!(
             km.resolve(Mode::Select, &mut pending, k('d')),
             Resolution::Command(Command::DeleteRange)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('c')),
+            Resolution::Command(Command::Change)
         ));
     }
 
