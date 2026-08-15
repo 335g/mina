@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// 新しいクライアントに拾われるのを防ぐ（古い daemon は古いソケットに残り、
 /// 新クライアントは新しいソケットで新 daemon を自動起動する — クライアントの
 /// `ensure_daemon` と合わせて、バージョン不一致の応答を一切受けない）。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 編集モード（wire 型。mina-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +63,9 @@ pub enum Command {
     Save,
     /// フォーカス文書を閉じる。残りの文書があればそこへ移り、無ければ空状態に戻る（ADR-0015）。
     Close,
+    /// 任意パスの inlay hint をテキストなしで取得する（ADR-0020。読み取り専用）。
+    /// 応答は [`ServerMessage::Hints`]。未開パスは daemon がディスクから読む。
+    GetInlayHints { path: String },
 }
 
 /// 移動の種類（wire 型）。
@@ -137,6 +140,14 @@ pub enum ServerMessage {
     /// サーバーが能動的に通知する最新状態（他クライアントの変更など）。
     /// 購読（Interactive クライアント）にのみ届く。
     Push { snapshot: StateSnapshot },
+    /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
+    /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
+    Hints {
+        path: String,
+        /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
+        generation: u64,
+        hints: Vec<InlayHint>,
+    },
 }
 
 /// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
@@ -218,6 +229,21 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// LSP の inlay hint（ADR-0020。CONTEXT.md の InlayHint 定義）。
+///
+/// 読み取り専用の注釈: Document のテキストの一部ではなく、選択・編集・undo・
+/// checksum に一切関与しない。位置は char インデックス。`padding_left` /
+/// `padding_right` はサーバ指定の前後空白（LSP の `paddingLeft` / `paddingRight`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlayHint {
+    /// ヒントを挟み込む char インデックス。
+    pub position: usize,
+    /// 表示するテキスト（label が parts 配列なら連結済み）。
+    pub text: String,
+    pub padding_left: bool,
+    pub padding_right: bool,
+}
+
 /// 構文ハイライトのグループ（ADR-0018: フラットな正規集合）。
 ///
 /// wire 形式は小文字（serde `rename_all`）。tree-sitter のハイライトクエリの
@@ -262,6 +288,9 @@ pub struct StateSnapshot {
     pub mode: Mode,
     pub first_line: usize,
     pub diagnostics: Vec<Diagnostic>,
+    /// フォーカス文書の inlay hint（ADR-0020。同じスナップショットのテキストと
+    /// 一致する位置。LSP 非対応・未取得の文書は空）。
+    pub inlay_hints: Vec<InlayHint>,
     /// フォーカス文書の構文ハイライト（ADR-0016/0017。同じスナップショットの
     /// テキストと一致する範囲。grammar 不在の言語は空）。
     pub highlights: Vec<HighlightRange>,
@@ -291,6 +320,7 @@ impl Default for StateSnapshot {
             mode: Mode::Normal,
             first_line: 0,
             diagnostics: Vec::new(),
+            inlay_hints: Vec::new(),
             highlights: Vec::new(),
             path: None,
             dirty: false,
@@ -340,6 +370,12 @@ mod tests {
                 severity: Severity::Warning,
                 message: "unused".to_string(),
             }],
+            inlay_hints: vec![InlayHint {
+                position: 3,
+                text: ": i32".to_string(),
+                padding_left: false,
+                padding_right: true,
+            }],
             highlights: vec![HighlightRange {
                 start: 0,
                 end: 5,
@@ -381,6 +417,13 @@ mod tests {
         let json = serde_json::to_string(&wait).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, wait);
+
+        let hints = Command::GetInlayHints {
+            path: "src/main.rs".into(),
+        };
+        let json = serde_json::to_string(&hints).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hints);
     }
 
     #[test]
@@ -400,6 +443,34 @@ mod tests {
                 "タグ付きエンベロープ: {json}"
             );
         }
+
+        let hints = ServerMessage::Hints {
+            path: "src/main.rs".into(),
+            generation: 7,
+            hints: vec![InlayHint {
+                position: 1,
+                text: "i32".into(),
+                padding_left: false,
+                padding_right: false,
+            }],
+        };
+        let json = serde_json::to_string(&hints).expect("serialize");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hints);
+        assert!(json.contains("\"type\":\"hints\""), "タグ: {json}");
+    }
+
+    #[test]
+    fn inlay_hint_round_trip() {
+        let hint = InlayHint {
+            position: 10,
+            text: ": Vec<u8>".into(),
+            padding_left: false,
+            padding_right: true,
+        };
+        let json = serde_json::to_string(&hint).expect("serialize");
+        let back: InlayHint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hint);
     }
 
     #[test]
