@@ -783,6 +783,15 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // PeekDefinition も同様に専用処理（LSP の await はロック外で行う）。
+                // 応答はスナップショット（peek フィールド付き）で通常経路と同じ形状。
+                if let Ok(Command::PeekDefinition) = serde_json::from_str::<Command>(line.trim()) {
+                    let message = serve_peek_definition(&daemon).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 let snapshot = process_command(&daemon, &push_tx, conn_id, source, &line).await;
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
@@ -953,6 +962,45 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
         generation: d.generation,
         hints,
     }
+}
+
+/// `Command::PeekDefinition` の処理: カーソル位置のシンボル定義を確認用
+/// スニペットとして返す（読み取り専用。定義にジャンプしない）。
+///
+/// LSP の await は daemon ロック外（ADR-0009）。応答はスナップショットの
+/// `peek` フィールドに載せる（daemon 状態には持たない — 次のコマンドで消える
+/// クライアント側の一時表示。push には載らない）。フォーカス文書を開き直すので
+/// 借用・復元は不要（serve_inlay_hints と違い、対象は常にフォーカス文書）。
+async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
+    let (path, head, text) = {
+        let mut d = daemon.lock().await;
+        match d.editor.focused_path().map(Path::to_path_buf) {
+            Some(path) => {
+                let head = d.editor.selection().primary().head();
+                let text = d.editor.current_document().text().to_string();
+                (path, head, text)
+            }
+            // 開いていない: peek なしのスナップショットで応答
+            None => return ServerMessage::Response { snapshot: snapshot(&mut d, None) },
+        }
+    };
+    let peek = if lsp::server_for(&path).is_some() {
+        match lsp::ensure(daemon, &path).await {
+            Ok(session) => {
+                // セッションを借りた（開き直し）ので現在のテキストで didOpen する。
+                // 既に開いている場合の再 didOpen は無害（idempotent）。
+                lsp::open_document(&session, &path, &text).await;
+                lsp::definition_peek(&session, &path, &text, head).await
+            }
+            Err(_) => None, // サーバ spawn 失敗: peek なし
+        }
+    } else {
+        None // LSP 非対応ファイル（.rs 以外）: peek なし
+    };
+    let mut d = daemon.lock().await;
+    let mut snap = snapshot(&mut d, None);
+    snap.peek = peek;
+    ServerMessage::Response { snapshot: snap }
 }
 
 /// コマンド行1件を処理して応答スナップショットを返す（ADR-0013 で
@@ -1706,6 +1754,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // ADR-0020）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
+        Command::PeekDefinition => {
+            // handle_connection で専用処理される（peek フィールド付き応答）。
+            // ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
         Command::Insert { text } => {
             // SEC-1/ADR-0008: Insert による無制限の文書成長を防ぐ。Open と同じ
             // MAX_FILE_SIZE（バイト数）を超える挿入は状態を変えず status で
@@ -2001,6 +2054,7 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
         generation: daemon.generation,
         events: daemon.events.iter().cloned().collect(),
         deleted: daemon.deleted.clone(),
+        peek: None, // PeekDefinition 応答は serve_peek_definition が上書きする
     }
 }
 
@@ -5249,5 +5303,55 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file_a);
         let _ = std::fs::remove_file(&file_b);
+    }
+
+    #[tokio::test]
+    async fn peek_definition_returns_snippet_in_snapshot() {
+        // Space k（PeekDefinition）: カーソル位置のシンボル定義を確認用スニペット
+        // として応答スナップショットの peek フィールドに載せる（ジャンプしない）。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-peek-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-peek-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "fn peek_target(x: i32) -> i32 {\n    x\n}\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        // PeekDefinition は自前で LSP セッションを ensure + didOpen するため
+        // settle を待つ必要はない。直接 peek を要求する。
+        let snap = request(&mut tui, &Command::PeekDefinition).await;
+        let peek = snap.peek.expect("PeekDefinition は peek を返す: {snap:?}");
+        assert!(peek.path.ends_with(&file.to_string_lossy().into_owned()), "定義元ファイル: {peek:?}");
+        assert_eq!(peek.line, 1, "1 始まりの開始行: {peek:?}");
+        assert!(
+            peek.text.contains("fn peek_target") && peek.text.contains("    x"),
+            "定義行 + 本体: {peek:?}"
+        );
+        // 通常コマンドの応答からは peek が落ちている（一時表示）
+        let snap = request(&mut tui, &Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Backward,
+        })
+        .await;
+        assert!(snap.peek.is_none(), "次のコマンドで peek は落ちる: {snap:?}");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 }
