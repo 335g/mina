@@ -127,9 +127,11 @@ pub struct Daemon {
 /// 保持し、編集ごとに差分ベースのインクリメンタルパースでツリーを更新する。
 ///
 /// `text_checksum` が現在のテキストと一致する間はツリーを再利用し、可視範囲
-/// のハイライトを毎スナップショット再計算する（スクロールで窓が動くため —
-/// 窓付きクエリは ~0.15ms と安価）。テキストが変わったら `old_text` との差分
-/// から InputEdit を求め、`tree.edit` + インクリメンタルパースで更新する
+/// のハイライトをキャッシュから返す（窓キー = text_checksum + first_line +
+/// viewport_height。カーソル移動など窓が動かないコマンドでは再計算しない）。
+/// 窓が動いた（スクロール）かテキストが変わったときだけ窓クエリを走らせる
+/// （窓付きクエリは 1MB で ~0.5-2.5ms）。テキストが変わったら `old_text` との
+/// 差分から InputEdit を求め、`tree.edit` + インクリメンタルパースで更新する
 /// （全文再パースを回避。計測: 214KB で 38ms → 0.5ms）。
 struct SyntaxCache {
     text_checksum: u64,
@@ -139,6 +141,9 @@ struct SyntaxCache {
     tree: tree_sitter::Tree,
     language: tree_sitter::Language,
     query: tree_sitter::Query,
+    /// 可視窓のハイライトキャッシュ（(text_checksum, first_line, viewport_height) キー）。
+    /// 単一エントリ（スクロール位置ごとに持ち続けない）。
+    window: Option<(u64, usize, usize, Vec<HighlightRange>)>,
 }
 
 /// 1パス分の inlay hint キャッシュ（ADR-0020）。`text_checksum` は pull 時点の
@@ -168,8 +173,8 @@ impl Daemon {
     /// ツリー・クエリ・言語は文書ごとにキャッシュし、テキストが変わったとき
     /// だけ差分ベースのインクリメンタルパースでツリーを更新する（全文再パース
     /// とクエリ再コンパイルを回避 — 計測: 214KB で 38ms + 20ms → 0.5ms）。
-    /// テキスト不変（カーソル移動・スクロール等）ならツリーを再利用し、窓の
-    /// byte 範囲を限定したクエリを走らせるだけ（全文走査 19ms → 0.15ms）。
+    /// テキストと可視窓が変わらなければ（カーソル移動等）ハイライトはキャッシュ
+    /// を返すだけ（窓クエリの再計算を回避）。
     fn syntax_highlights(&mut self, text: &str, checksum: u64) -> Vec<HighlightRange> {
         let doc_id = self.editor.focused_doc_id();
         // 破棄された文書（Open の上限 evict）のキャッシュを落とす
@@ -207,6 +212,7 @@ impl Daemon {
                 tree,
                 language,
                 query,
+                window: None,
             });
         }
 
@@ -237,7 +243,27 @@ impl Daemon {
             }
             cached.text_checksum = checksum;
         }
-        mina_loader::highlight_ranges_in_window(&cached.query, text, &cached.tree, window)
+        // 可視窓キャッシュ: (checksum, first_line, viewport_height) が一致する
+        // 間は再計算しない。スクロール・リサイズ・編集で窓かテキストが変わった
+        // ときだけ窓クエリを走らせる（カーソル移動の打鍵コストを O(1) に）。
+        let window_key = (checksum, self.editor.first_line(), self.viewport_height);
+        if let Some((c, fl, h, ranges)) = &cached.window {
+            if (*c, *fl, *h) == window_key {
+                return ranges.clone();
+            }
+        }
+        // 窓先頭 byte の char インデックスを渡す（loader は窓範囲限定の
+        // byte→char 変換を使うため、文書内の絶対位置はここで解決する）。
+        let window_char_start = text[..window.start].chars().count();
+        let ranges = mina_loader::highlight_ranges_in_window(
+            &cached.query,
+            text,
+            &cached.tree,
+            window,
+            window_char_start,
+        );
+        cached.window = Some((window_key.0, window_key.1, window_key.2, ranges.clone()));
+        ranges
     }
 
     /// パスの inlay hint をキャッシュに書き込む（ADR-0020）。
@@ -421,7 +447,7 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
     // 起こさない」ので、no-op 応答で購読者に push が飛ぶことはない
     // （オーバーフローも失われるのは中間世代のみで、フルスナップショット
     // なので最新に収束する）。
-    let (push_tx, _) = watch::channel(StateSnapshot::default());
+    let (push_tx, _) = watch::channel((None, StateSnapshot::default()));
     // ADR-0012/0015: 外部変更監視（全オープン文書の mtime+size をポーリング）
     {
         let daemon_task = daemon.clone();
@@ -456,7 +482,10 @@ pub async fn serve(path: &Path) -> std::io::Result<()> {
 /// ponytail: mtime+size はヒューリスティック（mtime を保存するツールや粗い
 /// mtime 粒度の FS では見逃しうる）。文書ごとのベースラインは Open/Save/
 /// Close で更新される。
-async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnapshot>) {
+async fn watch_disk(
+    daemon: Arc<Mutex<Daemon>>,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         interval.tick().await;
@@ -589,11 +618,12 @@ async fn watch_disk(daemon: Arc<Mutex<Daemon>>, push_tx: watch::Sender<StateSnap
                 snap = Some(snapshot(&mut d, snap.and_then(|s| s.status)));
             }
         }
-        // 世代が進んでいれば全購読者へ配る（ADR-0013 と同条件）
+        // 世代が進んでいれば全購読者へ配る（ADR-0013 と同条件）。発信元は
+        // コマンドでない（外部監視）ため None を包み、全クライアントに届く。
         if let Some(snap) = snap {
-            let changed = push_tx.borrow().generation != snap.generation;
+            let changed = push_tx.borrow().1.generation != snap.generation;
             if changed {
-                let _ = push_tx.send(snap);
+                let _ = push_tx.send((None, snap));
             }
         }
     }
@@ -612,7 +642,7 @@ fn is_peer_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 async fn accept_loop(
     listener: UnixListener,
     daemon: Arc<Mutex<Daemon>>,
-    push_tx: watch::Sender<StateSnapshot>,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
 ) -> std::io::Result<()> {
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     // MEDIUM-3: daemon 自身の uid。共有 /tmp では別ユーザの接続を拒否する。
@@ -658,7 +688,7 @@ async fn handle_connection(
     stream: UnixStream,
     daemon: Arc<Mutex<Daemon>>,
     conn_id: u64,
-    push_tx: watch::Sender<StateSnapshot>,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -709,16 +739,24 @@ async fn handle_connection(
             ReadNext::Command(lines.next_line().await)
         };
         match next {
-            // ADR-0013: 他クライアント（および自分自身）の状態変化を購読者へ配る。
+            // ADR-0013: 他クライアント・daemon 起動の状態変化を購読者へ配る。
             // watch は最新1件を保持するので、中間世代の欠落は許容（フルスナップ
             // ショットなので必ず最新に収束する）。
             ReadNext::Push(Ok(())) => {
-                let snapshot = push_rx
+                let (origin, snapshot) = push_rx
                     .as_mut()
                     .expect("push 分岐は購読時のみ")
                     .borrow_and_update()
                     .clone();
-                if !write_message(&mut write_half, conn_id, ServerMessage::Push { snapshot }).await
+                // ADR-0013: 発信元自身へは push しない — 応答で同じ状態を既に
+                // 持っている（自分宛 push の JSON 直列化・転送を節約）。
+                // daemon 起動の push（外部リロード・LSP settle）は None で
+                // 届き、全購読者が受ける。
+                if origin == Some(conn_id) {
+                    continue;
+                }
+                if !write_message(&mut write_half, conn_id, ServerMessage::Push { snapshot })
+                    .await
                 {
                     break; // 切断 or 書き込みタイムアウト
                 }
@@ -746,11 +784,11 @@ async fn handle_connection(
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
                 // 応答（GetState・拒否・no-op など）で送ると無駄な push が飛ぶ。
-                // 発信元も購読者なので自分にも届く — クライアント側で generation
-                // 重複を捨てて再描画しない（#10 の決定）。
-                let changed = push_tx.borrow().generation != snapshot.generation;
+                // 発信元には届かない（応答で持っているため）— 他クライアント
+                // と daemon 起動の購読者だけが受ける。
+                let changed = push_tx.borrow().1.generation != snapshot.generation;
                 if changed {
-                    let _ = push_tx.send(snapshot.clone());
+                    let _ = push_tx.send((Some(conn_id), snapshot.clone()));
                 }
                 if !write_message(&mut write_half, conn_id, ServerMessage::Response { snapshot })
                     .await
@@ -919,7 +957,7 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
 /// ブロックしないよう接続ハンドラ側で async 実行する）。
 async fn process_command(
     daemon: &Arc<Mutex<Daemon>>,
-    push_tx: &watch::Sender<StateSnapshot>,
+    push_tx: &watch::Sender<(Option<u64>, StateSnapshot)>,
     conn_id: u64,
     source: EventSource,
     line: &str,
@@ -4517,8 +4555,7 @@ mod tests {
         let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path }).await;
-        // Open の自分の push（空文書）を先に消費しておく
-        let _ = recv_push(&mut tui).await;
+        // Open の自分の push は届かない（発信元スキップ — 応答で状態を持つ）
 
         // agent の位置指定編集 → TUI へ push が届く
         let resp = request_edit(
@@ -4547,9 +4584,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn self_edit_push_reaches_originator_with_same_generation() {
-        // ADR-0013: 発信元（自分自身）にも push が届く。generation は応答と
-        // 同じなので、TUI 側で重複を捨てられる（#10 の決定）。
+    async fn own_push_is_skipped_for_originator_but_reaches_other_clients() {
+        // ADR-0013: 発信元自身には push が届かない（応答で同じ状態を持つ —
+        // 自分宛 push の JSON 往復を節約）。他の Interactive クライアントに
+        // は届く。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-13b-sock-{}.sock", std::process::id()));
         let file = dir.join(format!("mina-13b-file-{}.txt", std::process::id()));
@@ -4557,15 +4595,25 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         start_server(&sock).await;
 
-        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let mut a = connect_client(&sock, ClientKind::Interactive).await;
+        let mut b = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
-        let _ = request(&mut c, &Command::Open { path }).await;
+        let _ = request(&mut a, &Command::Open { path }).await;
+        let _ = recv_push(&mut b).await; // a の Open は b へ届く（b 側で消費）
 
-        let resp = request(&mut c, &Command::Insert { text: "x".into() }).await;
-        let pushed = recv_push(&mut c).await;
+        let resp = request(&mut a, &Command::Insert { text: "x".into() }).await;
+        // 発信元 a には自分の push が届かない（タイムアウトで確認）
+        let own_push = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            a.recv_message(),
+        )
+        .await;
+        assert!(own_push.is_err(), "発信元に自分の push は届かない");
+        // 他クライアント b には届く（応答と同じ世代）
+        let pushed = recv_push(&mut b).await;
         assert_eq!(
             pushed.generation, resp.generation,
-            "自分の編集の push は応答と同じ世代"
+            "他クライアントの push は応答と同じ世代"
         );
         assert_eq!(pushed.text, "x");
         let _ = std::fs::remove_file(&sock);
@@ -4622,8 +4670,7 @@ mod tests {
         let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path }).await;
-        // Open の自分の push を消費しておく
-        let _ = recv_push(&mut tui).await;
+        // Open の自分の push は届かない（発信元スキップ）
 
         // agent の読み取り（GetState）は状態を変えない
         let _ = request(&mut agent, &Command::GetState).await;
@@ -4652,7 +4699,7 @@ mod tests {
         let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
-        let _ = recv_push(&mut tui).await; // Open の自己 push を消費
+        // Open の自分の push は届かない（発信元スキップ）
 
         // 拒否されるコマンド: 状態・世代・モードは不変
         for cmd in [

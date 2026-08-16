@@ -599,7 +599,7 @@ pub async fn settle_open_diagnostics(
     daemon: &Mutex<Daemon>,
     session: Arc<Mutex<LspSession>>,
     path: PathBuf,
-    push_tx: watch::Sender<StateSnapshot>,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
 ) {
     let mut prev: Option<usize> = None;
     for i in 0..120 {
@@ -640,7 +640,8 @@ pub async fn settle_open_diagnostics(
         // 再描画する。自分の応答と同じ内容なら捨てられる）。
         let snap = crate::daemon::snapshot(&mut d, None);
         drop(d);
-        let _ = push_tx.send(snap);
+        // 発信元はコマンドでない（LSP settle）ため None を包み、全クライアントに届く。
+        let _ = push_tx.send((None, snap));
         if n > 0 {
             // 非空が返った = 解析完了の確証。2回連続同じ件数なら安定とみなす
             // （誤検出: 解析未完の空（0,0,0...）を安定と誤認しないため、
