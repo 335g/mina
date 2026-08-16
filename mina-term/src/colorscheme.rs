@@ -143,6 +143,10 @@ pub enum UiRole {
     StatusLine,
     CommandLine,
     Popup,
+    /// ステータス行先頭のモードマーカー（Normal / Insert / Select で色分け）。
+    ModeNormal,
+    ModeInsert,
+    ModeSelect,
     /// 非カーソル行の行番号（ガター）。既定: 灰。
     LineNumber,
     /// カーソル行の行番号（ガター）。既定: 白。
@@ -185,6 +189,10 @@ const DEFAULT_UI: &[(UiRole, Style)] = &[
     (UiRole::StatusLine, Style::reverse()),
     (UiRole::CommandLine, Style::reverse()),
     (UiRole::Popup, Style::reverse()),
+    // モードマーカー: 黒文字 + 明るい背景（反転チップの見た目を維持しつつ色分け）
+    (UiRole::ModeNormal, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(12)), ..Style::new() }), // 30;104
+    (UiRole::ModeInsert, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(10)), ..Style::new() }), // 30;102
+    (UiRole::ModeSelect, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(13)), ..Style::new() }), // 30;105
     (UiRole::LineNumber, Style::fg(Color::Ansi(8))), // 90 灰
     (UiRole::LineNumberActive, Style::fg(Color::Ansi(15))), // 97 白
     // ディム + 斜体: 属性のみ（NO_COLOR・ANSI16 でも視認できる）。
