@@ -256,11 +256,15 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                                 key,
                             ) {
                                 Resolution::Command(command) => {
+                                    let is_peek = matches!(&command, Command::PeekDefinition);
                                     state = session.request(&command).await?;
                                     // PeekDefinition の応答: ポップアップ内容を
                                     // ローカルに移す（スナップショットには残さない）
                                     if let Some(p) = state.peek.take() {
                                         peek = Some(p);
+                                    } else if is_peek {
+                                        // 定義なし（LSP 非対応・未解析・解決不能など）
+                                        flash = Some("no definition".into());
                                     }
                                 }
                                 _ => {} // pending 変化の描画は共通ループ末尾で行う
