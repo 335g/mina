@@ -188,7 +188,10 @@ const DEFAULT_UI: &[(UiRole, Style)] = &[
     (UiRole::DiagnosticWarning, Style::fg_underline(Color::Ansi(11))), // 4;93
     (UiRole::StatusLine, Style::reverse()),
     (UiRole::CommandLine, Style::reverse()),
-    (UiRole::Popup, Style::reverse()),
+    // ポップアップ（peek 定義表示・外部削除通知）。reverse（白反転）だと背景が
+    // 白く浮くため、暗い端末上で「ウィンドウ」として際立つ明示的な bg+fg にする
+    // （ADR-0024）。ユーザーはスキームの `[ui] popup` で上書きできる。
+    (UiRole::Popup, Style { fg: Some(Color::Ansi(15)), bg: Some(Color::Ansi(8)), ..Style::new() }),
     // モードマーカー: 黒文字 + 明るい背景（反転チップの見た目を維持しつつ色分け）
     (UiRole::ModeNormal, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(12)), ..Style::new() }), // 30;104
     (UiRole::ModeInsert, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(10)), ..Style::new() }), // 30;102
