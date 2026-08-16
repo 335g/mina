@@ -734,13 +734,6 @@ dependencies = [
 [[package]]
 name = "tmp"
 version = "0.1.0"
-dependencies = [
- "mina-loader",
- "mina-protocol",
- "serde_json",
- "tree-sitter",
- "tree-sitter-rust",
-]
 
 [[package]]
 name = "tokio"
