@@ -90,6 +90,9 @@ pub enum Command {
     /// 任意パスの inlay hint をテキストなしで取得する（ADR-0020。読み取り専用）。
     /// 応答は [`ServerMessage::Hints`]。未開パスは daemon がディスクから読む。
     GetInlayHints { path: String },
+    /// カーソル位置のシンボル定義を確認用スニペットとして返す（読み取り専用）。
+    /// 定義にジャンプせず、応答スナップショットの `peek` フィールドに載る。
+    PeekDefinition,
 }
 
 /// 移動の種類（wire 型）。
@@ -340,6 +343,19 @@ pub struct StateSnapshot {
     /// フォーカス文書が外部で削除され、Close を待っている状態（ADR-0015）。
     /// 値は削除されたパス。
     pub deleted: Option<String>,
+    /// 定義の確認表示（[`Command::PeekDefinition`] の応答にのみ載る。それ以外は None）。
+    pub peek: Option<Peek>,
+}
+
+/// 定義の確認表示（[`Command::PeekDefinition`] の結果。ジャンプしない簡易確認用）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peek {
+    /// 定義元ファイルのパス。
+    pub path: String,
+    /// 定義の開始行（1 始まり）。
+    pub line: u32,
+    /// 定義のスニペット（数行。改行区切り）。
+    pub text: String,
 }
 
 impl Default for StateSnapshot {
@@ -361,6 +377,7 @@ impl Default for StateSnapshot {
             generation: 0,
             events: Vec::new(),
             deleted: None,
+            peek: None,
         }
     }
 }
@@ -426,6 +443,11 @@ mod tests {
                 text: Some("x".to_string()),
             }],
             deleted: Some("test.rs".to_string()),
+            peek: Some(Peek {
+                path: "lib.rs".to_string(),
+                line: 42,
+                text: "fn frobnicate() {}".to_string(),
+            }),
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
