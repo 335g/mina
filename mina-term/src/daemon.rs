@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mina_core::{Range as CoreRange, Selection, Transaction, extend_selection, move_selection};
+use mina_core::{
+    Range as CoreRange, Selection, Transaction, extend_selection, move_selection,
+    move_selection_lines, move_selection_to_line_first_non_whitespace,
+};
 use mina_protocol::{
     ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
     HighlightRange, InlayHint, Range, ServerMessage, StateSnapshot, fnv1a64,
@@ -1301,6 +1304,13 @@ async fn process_command(
                             ))
                         }
                     }
+                    // A/I はテキストを変えない — モードが実際に変わる場合だけ
+                    // SetMode イベント（選択移動は Move 同様スナップショットに載る）
+                    Command::InsertAtLineEnd | Command::InsertAtLineStart
+                        if d.editor.mode() != mina_view::Mode::Insert =>
+                    {
+                        Some((EventKind::SetMode, None, None))
+                    }
                     Command::Undo if d.editor.can_undo() => Some((EventKind::Undo, None, None)),
                     Command::Redo if d.editor.can_redo() => Some((EventKind::Redo, None, None)),
                     Command::Close => Some((EventKind::Close, None, None)),
@@ -1628,6 +1638,57 @@ fn preempt(daemon: &mut Daemon, conn_id: u64) {
     }
 }
 
+/// A/I（`InsertAtLineEnd` / `InsertAtLineStart`）の移動先。
+enum LinePos {
+    /// 行末（改行の直前）。
+    End,
+    /// 最初の非空白文字（空白のみの行は列 0）。
+    FirstNonWhitespace,
+}
+
+/// Insert モードへ入る（ADR-0007 のグループ管理込み）。SetMode(Insert) と
+/// 同一の経路 — 既に Insert で別クライアントが所有している場合は後勝ちで
+/// 奪取する（HIGH-1）。
+fn enter_insert(daemon: &mut Daemon, conn_id: u64) {
+    let current = daemon.editor.mode();
+    if current != mina_view::Mode::Insert {
+        daemon.editor.begin_group();
+        daemon.insert_owner = Some(conn_id);
+    } else if daemon.insert_owner != Some(conn_id) {
+        daemon.editor.end_group();
+        daemon.editor.begin_group();
+        daemon.insert_owner = Some(conn_id);
+    }
+    daemon.editor.set_mode(mina_view::Mode::Insert);
+}
+
+/// `A`/`I` 共通処理: 選択を目標位置へ点に潰して Insert モードへ入る
+/// （ADR-0023）。テキストは変えないので preempt 不要。Select でも折りたたむ —
+/// mina の `Transaction::insert` は選択範囲を置換するため、拡張したまま Insert
+/// に入るとタイプ文字が選択範囲を置換し、Helix の「行末に追加」という観測挙動と
+/// 一致しない（ADR-0023）。
+fn insert_at_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateSnapshot, bool) {
+    let selection = daemon.editor.selection();
+    let moved = match target {
+        LinePos::End => move_selection(
+            daemon.editor.current_document(),
+            &selection,
+            mina_core::Movement::LineEnd,
+            mina_core::Direction::Forward,
+        ),
+        LinePos::FirstNonWhitespace => {
+            move_selection_to_line_first_non_whitespace(daemon.editor.current_document(), &selection)
+        }
+    };
+    daemon.editor.set_selection(moved);
+    // 既に Insert ならモードは変わらない（changed = false → 世代もイベントも
+    // 進まない。選択位置の移動だけがスナップショットに載る）。
+    let changed = daemon.editor.mode() != mina_view::Mode::Insert;
+    enter_insert(daemon, conn_id);
+    daemon.editor.scroll_to_cursor(daemon.viewport_height);
+    (snapshot(daemon, None), changed)
+}
+
 /// 接続 ID 付きでコマンドを状態に適用する（接続ハンドラから呼ばれる）。
 /// `conn_id` は undo グループの所有者判定に使う。
 ///
@@ -1759,6 +1820,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), deleted || !was_insert)
         }
+        Command::InsertAtLineEnd => insert_at_line(daemon, conn_id, LinePos::End),
+        Command::InsertAtLineStart => {
+            insert_at_line(daemon, conn_id, LinePos::FirstNonWhitespace)
+        }
         Command::Undo => {
             // Undo/Redo も書き込みとして扱う（単一の共有履歴・グローバル undo）
             preempt(daemon, conn_id);
@@ -1826,9 +1891,25 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // 壊れた/悪意あるページ数でスクロール計算が overflow しないよう
             // clamp する（SetViewport と同様、daemon 側で防御する）
             let pages = pages.clamp(-MAX_SCROLL_PAGES, MAX_SCROLL_PAGES);
-            daemon
-                .editor
-                .scroll_pages(pages, daemon.viewport_height);
+            let height = daemon.viewport_height;
+            daemon.editor.scroll_pages(pages, height);
+            // ADR-0023: カーソルもスクロールした行数と同じだけ動かす。Normal
+            // では点に潰して移動、Select では head だけ拡張（h/j/k/l と同じ
+            // モード分岐）。移動量 = スクロール量なので画面内の相対位置が保たれ、
+            // カーソルは画面外に出ない（文書端では両者ともクランプされる）。
+            let delta = pages.saturating_mul(height as isize);
+            if delta != 0 {
+                let selection = daemon.editor.selection();
+                let extend = daemon.editor.mode() == mina_view::Mode::Select;
+                let moved = move_selection_lines(
+                    daemon.editor.current_document(),
+                    &selection,
+                    delta,
+                    extend,
+                );
+                daemon.editor.set_selection(moved);
+            }
+            daemon.editor.scroll_to_cursor(height);
             (snapshot(daemon, None), false)
         }
         Command::SetMode { mode } => {
@@ -1846,20 +1927,16 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // 閉じる（agent の SetMode は通常送られない — ponytail 参照）。
             // ponytail: ネストしたグループは考慮しない（v1 にその経路はない）。
             if new_mode == mina_view::Mode::Insert {
-                if current != mina_view::Mode::Insert {
-                    daemon.editor.begin_group();
-                    daemon.insert_owner = Some(conn_id);
-                } else if daemon.insert_owner != Some(conn_id) {
-                    // 別クライアントのセッションが開いている: 後勝ちで奪取
+                // グループの開閉・所有者・奪取は enter_insert に集約
+                // （InsertAtLineEnd / InsertAtLineStart と共通）。
+                enter_insert(daemon, conn_id);
+            } else {
+                if current == mina_view::Mode::Insert {
                     daemon.editor.end_group();
-                    daemon.editor.begin_group();
-                    daemon.insert_owner = Some(conn_id);
+                    daemon.insert_owner = None;
                 }
-            } else if current == mina_view::Mode::Insert {
-                daemon.editor.end_group();
-                daemon.insert_owner = None;
+                daemon.editor.set_mode(new_mode);
             }
-            daemon.editor.set_mode(new_mode);
             (snapshot(daemon, None), new_mode != current)
         }
         Command::SetViewport { height } => {
@@ -2803,6 +2880,159 @@ mod tests {
         assert_eq!(s.mode, Mode::Insert);
         let s = apply(&mut d, Command::Insert { text: "X".into() });
         assert_eq!(s.text, "Xhello");
+    }
+
+    #[test]
+    fn scroll_moves_cursor_keeping_relative_position() {
+        // ADR-0023: C-f/C-b 等のスクロールでカーソルも同じ行数だけ動き、
+        // 画面内の相対位置が保たれる（Normal = 点に潰す）
+        let mut d = daemon();
+        let mut src = String::new();
+        for i in 0..80 {
+            src.push_str(&format!("line{i:02}\n"));
+        }
+        open(&mut d, &src);
+        // カーソルを行20の列2へ（"lineXX\n" は7文字）
+        for _ in 0..20 {
+            apply(&mut d, Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            });
+        }
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        // 1ページ（既定 viewport 高 = 24）下へ → カーソルは行44の列2
+        let s = apply(&mut d, Command::Scroll { pages: 1 });
+        assert_eq!(s.first_line, 24, "viewport が1ページ進む");
+        assert_eq!(
+            s.selection[0],
+            Range { anchor: 310, head: 310 },
+            "カーソルも24行下（44*7+2）へ: {:?}",
+            s.selection
+        );
+        // 戻る: カーソルは行20の列2へ
+        let s = apply(&mut d, Command::Scroll { pages: -1 });
+        assert_eq!(s.first_line, 0);
+        assert_eq!(s.selection[0], Range { anchor: 142, head: 142 });
+    }
+
+    #[test]
+    fn scroll_in_select_mode_extends_selection() {
+        // ADR-0023: Select モードでは head だけが動き選択が拡張される
+        let mut d = daemon();
+        let mut src = String::new();
+        for i in 0..80 {
+            src.push_str(&format!("line{i:02}\n"));
+        }
+        open(&mut d, &src);
+        // 行5の列2で Select モードへ
+        for _ in 0..5 {
+            apply(&mut d, Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            });
+        }
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        // 1ページ下へ: anchor（行5・列2 = 37）を保って head が24行下（行29・列2 = 205）へ
+        let s = apply(&mut d, Command::Scroll { pages: 1 });
+        assert_eq!(s.first_line, 24);
+        assert_eq!(
+            s.selection[0],
+            Range { anchor: 37, head: 205 },
+            "anchor を保って head だけが24行下へ: {:?}",
+            s.selection
+        );
+    }
+
+    #[test]
+    fn insert_at_line_end_enters_insert_at_eol() {
+        // ADR-0023: A = 行末（改行の直前）へ移動して Insert（Helix の A）
+        let mut d = daemon();
+        open(&mut d, "hello\nworld");
+        apply(&mut d, Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::InsertAtLineEnd);
+        assert_eq!(s.mode, Mode::Insert, "Insert モードへ入る");
+        assert_eq!(
+            s.selection[0],
+            Range { anchor: 11, head: 11 },
+            "行1（'world'）の行末へ"
+        );
+        // 入力は行末に追加され、1つの undo グループになる
+        let s = apply(&mut d, Command::Insert { text: "!".into() });
+        assert_eq!(s.text, "hello\nworld!");
+        apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "hello\nworld");
+    }
+
+    #[test]
+    fn insert_at_line_start_moves_to_first_non_whitespace() {
+        // ADR-0023: I = 行頭（最初の非空白文字）へ移動して Insert（Helix の I）
+        let mut d = daemon();
+        open(&mut d, "  hello\n   \nworld");
+        let s = apply(&mut d, Command::InsertAtLineStart);
+        assert_eq!(s.mode, Mode::Insert);
+        assert_eq!(
+            s.selection[0],
+            Range { anchor: 2, head: 2 },
+            "行0の最初の非空白へ"
+        );
+        // 空白のみの行は列 0 へ
+        apply(&mut d, Command::SetMode { mode: Mode::Normal });
+        apply(&mut d, Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::InsertAtLineStart);
+        assert_eq!(s.mode, Mode::Insert);
+        assert_eq!(
+            s.selection[0],
+            Range { anchor: 8, head: 8 },
+            "空白のみの行1は列 0 へ"
+        );
+    }
+
+    #[test]
+    fn insert_at_line_end_in_select_collapses_to_line_end() {
+        // ADR-0023: Select でも選択を折りたたんで行末で Insert（mina の Insert は
+        // 選択を置換するため、拡張のままだと Helix の「行末に追加」と一致しない）
+        let mut d = daemon();
+        open(&mut d, "abc\ndef");
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        apply(&mut d, Command::Extend {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::InsertAtLineEnd);
+        assert_eq!(s.mode, Mode::Insert);
+        assert_eq!(
+            s.selection[0],
+            Range { anchor: 3, head: 3 },
+            "選択は折りたたまれ行0の行末へ"
+        );
+        let s = apply(&mut d, Command::Insert { text: "!".into() });
+        assert_eq!(s.text, "abc!\ndef", "選択は置換されず行末に追加される");
     }
 
     #[test]
