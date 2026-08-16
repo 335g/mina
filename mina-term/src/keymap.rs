@@ -222,6 +222,9 @@ impl Keymaps {
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         normal.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         normal.insert(&[plain(KeyCode::Char('c'))], Command::Change);
+        // A/I: 行末/行頭（最初の非空白）へ移動して Insert（Helix の A/I。ADR-0023）
+        normal.insert(&[plain(KeyCode::Char('A'))], Command::InsertAtLineEnd);
+        normal.insert(&[plain(KeyCode::Char('I'))], Command::InsertAtLineStart);
         normal.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         normal.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
@@ -238,6 +241,9 @@ impl Keymaps {
         select.insert(&[plain(KeyCode::Backspace)], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Char('c'))], Command::Change);
+        // A/I: Select でも折りたたんで行末/行頭で Insert（ADR-0023）
+        select.insert(&[plain(KeyCode::Char('A'))], Command::InsertAtLineEnd);
+        select.insert(&[plain(KeyCode::Char('I'))], Command::InsertAtLineStart);
         select.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         select.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
 
@@ -449,6 +455,30 @@ mod tests {
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, ctrl('d')),
             Resolution::Command(Command::Scroll { pages: 1 })
+        ));
+    }
+
+    #[test]
+    fn shift_a_and_i_resolve_to_line_insert() {
+        // ADR-0023: Shift+a → Char('A')（修飾子なし）→ InsertAtLineEnd。
+        // Normal/Select の両方で、Insert では文字 'A' として入力される。
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        let shift_a = KeyEvent::new(KeyCode::Char('a'), Modifiers::SHIFT);
+        for mode in [Mode::Normal, Mode::Select] {
+            assert!(matches!(
+                km.resolve(mode, &mut pending, shift_a),
+                Resolution::Command(Command::InsertAtLineEnd)
+            ));
+            assert!(matches!(
+                km.resolve(mode, &mut pending, k('I')),
+                Resolution::Command(Command::InsertAtLineStart)
+            ));
+        }
+        // Insert モードでは fallback で 'A' が入力される
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, shift_a),
+            Resolution::Command(Command::Insert { text }) if text == "A"
         ));
     }
 
