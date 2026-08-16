@@ -92,6 +92,10 @@ _Avoid_: lint, problem
 A read-only annotation rendered inline at a position in the text (inferred types, parameter names), provided by the language server. Display-only: it is never part of the Document text and never participates in Selection, editing, undo, or the checksum. Distinct from `Severity::Hint`, a Diagnostic severity.
 _Avoid_: annotation, ghost text
 
+**Peek**:
+A transient preview of a symbol's definition shown in a popup, without changing the Selection or jumping to the definition. Triggered by `Space k` (`Command::PeekDefinition`); its result rides in a `StateSnapshot`'s `peek` field and is dismissed by the next key press. Read-only — it never edits or moves.
+_Avoid_: definition popup, go-to preview
+
 **Colorscheme**:
 A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes. Built-in schemes ship with mina; user schemes are TOML files in the colorschemes directory and take precedence over built-ins of the same name. A scheme is selected by name from the config file or the `:colorscheme` command.
 _Avoid_: theme, palette
