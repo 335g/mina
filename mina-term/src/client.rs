@@ -15,7 +15,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use mina_protocol::{ClientKind, Command, Hello, InlayHint, Mode, ServerMessage, StateSnapshot};
+use mina_protocol::{ClientKind, Command, Hello, InlayHint, Mode, Peek, ServerMessage, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent, KeyEventKind};
 use termina::{Event, EventStream, PlatformTerminal, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -138,6 +138,11 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let mut command_line: Option<String> = None;
     // クライアント側の一時メッセージ（未知コマンド等）。次のキーで消える。
     let mut flash: Option<String> = None;
+    // 定義ポップアップ（Space k / PeekDefinition）の内容。次のキーで消える
+    // クライアントローカルな一時表示。応答スナップショットの `peek` フィールド
+    // から移し替える — スナップショット自体には残さない（push との内容比較を
+    // 汚さず、`state != state` の再描画判定を壊さないため）。
+    let mut peek: Option<Peek> = None;
     // 色能力と NO_COLOR（起動時に 1 回検出 — ADR-0019）。
     let (capability, no_color) = colorscheme::detect_from_env();
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
@@ -176,6 +181,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                         // ADR-0015: 外部削除ポップアップ表示中は入力をブロックし、
                         // 任意キーで Close（空画面へ戻る）
                         flash = None; // 一時メッセージは次のキーで消える
+                        peek = None; // 定義ポップアップも次のキーで消える
                         if state.deleted.is_some() {
                             command_line = None;
                             state = session.request(&Command::Close).await?;
@@ -251,6 +257,11 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                             ) {
                                 Resolution::Command(command) => {
                                     state = session.request(&command).await?;
+                                    // PeekDefinition の応答: ポップアップ内容を
+                                    // ローカルに移す（スナップショットには残さない）
+                                    if let Some(p) = state.peek.take() {
+                                        peek = Some(p);
+                                    }
                                 }
                                 _ => {} // pending 変化の描画は共通ループ末尾で行う
                             }
@@ -299,6 +310,19 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 height,
                 &mut li_cache,
             )?;
+            // 定義ポップアップはメイン描画の後に重ねる（クライアントローカルな
+            // 一時表示 — render_text に載せると全テストのシグネチャを汚す）。
+            if let Some(p) = &peek {
+                render::draw_peek_popup(
+                    &mut *terminal,
+                    &scheme,
+                    capability,
+                    no_color,
+                    p,
+                    width,
+                    height,
+                )?;
+            }
             terminal.flush()?;
         }
     }
