@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthChar;
 ///
 /// 行 `i` の描画対象は `[byte_starts[i], byte_starts[i+1])` から行末の `\n` を
 /// 除いた範囲。行の先頭 char 位置は `char_starts[i]`。
-struct LineIndex {
+pub(crate) struct LineIndex {
     byte_starts: Vec<usize>,
     char_starts: Vec<usize>,
     text_len: usize,
@@ -88,8 +88,9 @@ impl Default for LineIndexCache {
 
 /// 画面全体の描画エスケープ列を生成する。`width`×`height` はターミナルのセル数。
 ///
-/// 毎フレーム新しい [`LineIndexCache`] を使う（単発描画用）。ループ内で
-/// キャッシュを再利用するには [`render_text_with_cache`] を使う。
+/// テスト・単発描画用（毎フレーム新しい [`LineIndexCache`] を使う）。
+/// TUI ループは [`render_text_with_cache`] で LineIndex をフレーム間再利用する。
+#[cfg(test)]
 pub fn render_text(
     scheme: &Colorscheme,
     capability: ColorCapability,
@@ -267,36 +268,9 @@ pub(crate) fn render_text_with_cache(
 }
 
 /// 画面を描画する（`out` への書き込み）。テストではバッファへ書き出せる。
-#[allow(clippy::too_many_arguments)]
-pub fn draw(
-    out: &mut impl Write,
-    scheme: &Colorscheme,
-    capability: ColorCapability,
-    no_color: bool,
-    state: &StateSnapshot,
-    pending: &[KeyEvent],
-    command_line: Option<&str>,
-    flash: Option<&str>,
-    width: u16,
-    height: u16,
-) -> std::io::Result<()> {
-    let mut cache = LineIndexCache::default();
-    draw_with_cache(
-        out,
-        scheme,
-        capability,
-        no_color,
-        state,
-        pending,
-        command_line,
-        flash,
-        width,
-        height,
-        &mut cache,
-    )
-}
-
-/// [`draw`] のキャッシュ付き版（TUI ループで LineIndex を再利用する）。
+///
+/// [`draw_with_cache`] の単発版（キャッシュは毎回新規 — テスト・1回描画用）。
+/// TUI ループでは [`draw_with_cache`] で LineIndex をフレーム間再利用する。
 pub(crate) fn draw_with_cache(
     out: &mut impl Write,
     scheme: &Colorscheme,
@@ -733,8 +707,10 @@ fn truncate_wide(s: &mut String, width: usize) {
 /// position 昇順（#22 の不変条件）。
 /// カーソル位置（行・列・表示列幅）を計算する。`head` は char インデックス。
 ///
-/// [`LineIndex`] ベースの [`cursor_pos_at`] への委譲（小さなテキスト・テスト用。
-/// 内部で LineIndex を構築する）。
+/// [`LineIndex`] ベースの [`cursor_pos_at`] への委譲（テスト用。内部で
+/// LineIndex を構築する）。TUI は [`cursor_pos_at`] をキャッシュ済み
+/// LineIndex で呼ぶ。
+#[cfg(test)]
 fn cursor_pos(text: &str, head: usize, hints: &[InlayHint]) -> (usize, usize, usize) {
     cursor_pos_at(&LineIndex::new(text), text, head, hints)
 }
