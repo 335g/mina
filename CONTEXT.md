@@ -93,7 +93,7 @@ A read-only annotation rendered inline at a position in the text (inferred types
 _Avoid_: annotation, ghost text
 
 **Peek**:
-A transient preview of a symbol's definition shown in a popup, without changing the Selection or jumping to the definition. Triggered by `Space k` (`Command::PeekDefinition`); its result rides in a `StateSnapshot`'s `peek` field and is dismissed by the next key press. Read-only — it never edits or moves.
+A transient preview of a symbol's definition shown in a popup, without changing the Selection or jumping to the definition. Triggered by `Space k` (`Command::PeekDefinition`); its result rides in a `StateSnapshot`'s `peek` field and is dismissed by the next key press. Read-only — it never edits or moves. The headless counterpart is `Command::PeekDefinitionAt` (position-addressed, ADR-0025), whose lightweight `ServerMessage::Peek` response carries only the definition snippet, never the full text.
 _Avoid_: definition popup, go-to preview
 
 **Colorscheme**:

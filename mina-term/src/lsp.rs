@@ -34,10 +34,11 @@ const PULL_SETTLE: Duration = Duration::from_millis(250);
 /// ロックを握り続け、待ち側の `open_document` / `sync` が無制限に待つ。ロックを
 /// 取れないときは諦める — didOpen の欠落は次回 .rs Open、didChange の欠落は
 /// 全文同期の次の編集で補われる（スキップしても整合が壊れない）。
+/// daemon 側（serve_peek_definition）もセッションの encoding を読むため共用する。
 #[cfg(not(test))]
-const LSP_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
-const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// LSP セッションの状態（1セッション = 1サーバ。S3 は rust-analyzer のみ）。
 pub struct LspSession {
@@ -185,6 +186,13 @@ impl LspSession {
     /// 現在の文書の URI。
     pub fn current_uri(&self) -> Option<&str> {
         self.current_uri.as_deref()
+    }
+
+    /// 文字インデックス → LSP 座標（ネゴシエート済み encoding 込み）。
+    /// カーソル基準の TUI 要求（[`Command::PeekDefinition`]）が、位置指定の
+    /// [`definition_peek_at`] に渡す座標を作るために使う。
+    pub fn char_to_lsp_pos(&self, text: &str, char_idx: usize) -> (u32, u32) {
+        char_to_lsp_pos(text, char_idx, self.encoding)
     }
 
     /// pull 診断（`textDocument/diagnostic`）を取得し、char インデックスに変換して返す。
@@ -542,11 +550,36 @@ const MAX_PEEK_FILE: u64 = 4 * 1024 * 1024;
 /// `textDocument/definition` の応答（Location | Location[] | LocationLink[] | null）
 /// の最初の定義を対象ファイルから数行抜き出す。サーバ死亡・ロック待ち・
 /// エラー応答・定義なし・対象が読めない場合は `None`。
-pub async fn definition_peek(
+/// 行内の文字位置（0-origin）→ LSP の `character`（encoding の単位）。
+/// 行末を超える文字位置は行末に clamp。TUI（文字インデックス基準）と
+/// エージェント（1-origin 行:列基準）の両方が行内の文字位置を LSP 座標へ
+/// 直すために使う。
+fn char_col_to_lsp_character(line: &str, char_col: usize, enc: PositionEncoding) -> u32 {
+    let char_col = char_col.min(line.chars().count());
+    let byte_end = line.char_indices().nth(char_col).map_or(line.len(), |(b, _)| b);
+    match enc {
+        PositionEncoding::Utf8 => byte_end as u32,
+        PositionEncoding::Utf16 => {
+            let prefix = &line[..byte_end];
+            mina_lsp::position::char_to_utf16_col(prefix, prefix.chars().count())
+        }
+    }
+}
+
+/// LSP 座標（0-origin 行・列）のシンボル定義を確認用スニペットとして返す
+/// （読み取り専用。ADR-0025）。
+///
+/// `textDocument/definition` の応答（Location | Location[] | LocationLink[] | null）
+/// の最初の定義を対象ファイルから数行抜き出す。サーバ死亡・ロック待ち・
+/// エラー応答・定義なし・対象が読めない場合は `None`。
+/// TUI（カーソル基準）もエージェント（指定位置基準）も、ここに LSP 座標を
+/// 渡して呼ぶ。
+pub async fn definition_peek_at(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
-    head: usize,
+    line: u32,
+    character: u32,
 ) -> Option<mina_protocol::Peek> {
     let (target_uri, range) = {
         let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
@@ -555,7 +588,6 @@ pub async fn definition_peek(
         if session.client.is_dead() {
             return None;
         }
-        let (line, character) = char_to_lsp_pos(text, head, session.encoding);
         let result = session
             .client
             .request(
@@ -582,6 +614,49 @@ pub async fn definition_peek(
         line,
         text,
     })
+}
+
+/// カーソル基準の TUI 要求用: 文字インデックス → LSP 座標に変換してから
+/// [`definition_peek_at`] を呼ぶ（ロックは座標変換の瞬間だけ別途握る）。
+pub async fn definition_peek_at_char(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    head: usize,
+) -> Option<mina_protocol::Peek> {
+    let (line, character) = {
+        let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return None;
+        };
+        s.char_to_lsp_pos(text, head)
+    };
+    definition_peek_at(session, path, text, line, character).await
+}
+
+/// エージェント向け（ADR-0025）: 1-origin 行:列を指定して定義を引く。
+/// `col` は文字数単位。行・列が範囲外なら定義なし（`None`）になる。
+pub async fn definition_peek_at_line_col(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    line: u32,
+    col: u32,
+) -> Option<mina_protocol::Peek> {
+    let (lsp_line, lsp_character) = {
+        let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return None;
+        };
+        let line_idx = line.saturating_sub(1); // 1-origin → 0-origin
+        let Some(line_text) = text.lines().nth(line_idx as usize) else {
+            return None; // 行が範囲外: 定義なし
+        };
+        let char_col = col.saturating_sub(1) as usize;
+        (
+            line_idx,
+            char_col_to_lsp_character(line_text, char_col, s.encoding),
+        )
+    };
+    definition_peek_at(session, path, text, lsp_line, lsp_character).await
 }
 
 // ---- daemon 統合 ----
@@ -919,6 +994,19 @@ mod tests {
         assert_eq!(char_to_lsp_pos(text, 5, PositionEncoding::Utf16), (1, 1)); // 'd'
         // 範囲外は clamp
         assert_eq!(char_to_lsp_pos("ab", 99, PositionEncoding::Utf8), (0, 2));
+    }
+
+    #[test]
+    fn char_col_to_lsp_character_converts_with_encoding() {
+        // UTF-8: 列は行先頭からのバイト列
+        assert_eq!(char_col_to_lsp_character("abc", 1, PositionEncoding::Utf8), 1);
+        // マルチバイトはバイト数で数える
+        assert_eq!(char_col_to_lsp_character("あいう", 1, PositionEncoding::Utf8), 3);
+        // UTF-16: サロゲートペアは2単位
+        assert_eq!(char_col_to_lsp_character("a😀b", 2, PositionEncoding::Utf16), 3);
+        // 行末を超える列は行末に clamp
+        assert_eq!(char_col_to_lsp_character("abc", 99, PositionEncoding::Utf8), 3);
+        assert_eq!(char_col_to_lsp_character("", 0, PositionEncoding::Utf8), 0);
     }
 
     #[test]

@@ -5,11 +5,13 @@
 //! - `mina session edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
 //! - `mina session wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
 //! - `mina session hints <path>` — 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
+//! - `mina session peek <path> <line>:<col>` — 指定位置（1-origin）の定義を全文なしで取得する（ADR-0025）
 //!
 //! 例: `mina session exec '{"Insert": {"text": "hello"}}'`
 //! 例: `mina session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
 //! 例: `mina session wait 42`
 //! 例: `mina session hints src/main.rs`
+//! 例: `mina session peek src/main.rs 12:5`
 //!
 //! daemon が動いていなければ自動起動される（TUI と同じ挙動）。終了コード:
 //! 0 = 成功（適用・no-op 含む）、1 = トランスポート/JSON エラー、
@@ -52,6 +54,13 @@ pub enum SessionCmd {
         /// Path
         path: PathBuf,
     },
+    /// Peek the definition at `<line>:<col>` (1-origin) without fetching full text (ADR-0025)
+    Peek {
+        /// Path
+        path: PathBuf,
+        /// Position as `line:col` (1-origin, col is a char count)
+        pos: String,
+    },
 }
 
 /// `mina session <subcommand>` を処理する。
@@ -89,8 +98,45 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
             // （エージェントがそのまま読める形）。
             println!("{}", serde_json::to_string_pretty(&hints.2)?);
         }
+        SessionCmd::Peek { path, pos } => {
+            let (line, col) = parse_position(&pos)?;
+            let peek = execute_peek(&path.to_string_lossy(), line, col).await?;
+            // 応答は (path, line, text)。全文スナップショットではなく定義だけを
+            // JSON で出力する（トークン削減 — ADR-0025）。
+            println!("{}", serde_json::to_string_pretty(&peek)?);
+        }
     }
     Ok(())
+}
+
+/// `<line>:<col>`（1-origin）を解釈する。不正ならエラー。
+fn parse_position(pos: &str) -> io::Result<(u32, u32)> {
+    let Some((line, col)) = pos.split_once(':') else {
+        return Err(invalid(format!("位置は <行>:<列> 形式で指定してください: {pos:?}")));
+    };
+    let line = line
+        .parse::<u32>()
+        .map_err(|_| invalid(format!("行番号が不正です: {line:?}")))?;
+    let col = col
+        .parse::<u32>()
+        .map_err(|_| invalid(format!("列番号が不正です: {col:?}")))?;
+    if line == 0 || col == 0 {
+        return Err(invalid("行・列は 1 始まりです（0 は指定できません）"));
+    }
+    Ok((line, col))
+}
+
+/// daemon に接続し、指定位置の定義を軽量応答（[`ServerMessage::Peek`]）で受け取る。
+async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protocol::Peek> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
+    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る
+    client::request_peek(&mut write_half, &mut reader, &client::absolutize(path), line, col).await
 }
 
 /// daemon に接続し、コマンドを実行してスナップショットを受け取る。
@@ -187,6 +233,17 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("expected"));
+    }
+
+    #[test]
+    fn parse_position_parses_line_col() {
+        // ADR-0025: `<行>:<列>`（1-origin）。0 と不正形式は拒否。
+        assert_eq!(parse_position("12:5").unwrap(), (12, 5));
+        assert_eq!(parse_position("1:1").unwrap(), (1, 1));
+        assert!(parse_position("12").is_err(), "コロン無しは拒否");
+        assert!(parse_position("0:5").is_err(), "行 0 は拒否");
+        assert!(parse_position("12:0").is_err(), "列 0 は拒否");
+        assert!(parse_position("a:b").is_err(), "数値以外は拒否");
     }
 
     #[test]

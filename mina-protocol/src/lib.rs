@@ -93,6 +93,16 @@ pub enum Command {
     /// カーソル位置のシンボル定義を確認用スニペットとして返す（読み取り専用）。
     /// 定義にジャンプせず、応答スナップショットの `peek` フィールドに載る。
     PeekDefinition,
+    /// 指定位置（1-origin 行:列）のシンボル定義を、全文を読まずに確認する
+    /// （読み取り専用。ADR-0025）。応答は [`ServerMessage::Peek`]（軽量 —
+    /// スナップショット＝全文は返さない）。エージェントのトークン削減経路。
+    PeekDefinitionAt {
+        path: String,
+        /// 1-origin 行番号。
+        line: u32,
+        /// 1-origin 列番号（文字数単位）。
+        col: u32,
+    },
 }
 
 /// 移動の種類（wire 型）。
@@ -181,6 +191,17 @@ pub enum ServerMessage {
         /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
         generation: u64,
         hints: Vec<InlayHint>,
+    },
+    /// [`Command::PeekDefinitionAt`] の応答（ADR-0025）。エージェントが全文
+    /// テキストを読まずに定義を参照するための軽量経路 — スナップショット
+    /// （全文）を運ばない。`text` が空なら定義なし・LSP 非対応。
+    Peek {
+        /// 定義元ファイルのパス。
+        path: String,
+        /// 定義の開始行（1 始まり）。
+        line: u32,
+        /// 定義のスニペット（数行。改行区切り）。空なら定義が見つからなかった。
+        text: String,
     },
 }
 
@@ -459,6 +480,16 @@ mod tests {
         let json = serde_json::to_string(&Command::GetState).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, Command::GetState);
+
+        // ADR-0025: 位置指定の定義確認も round-trip する
+        let peek = Command::PeekDefinitionAt {
+            path: "src/main.rs".into(),
+            line: 12,
+            col: 5,
+        };
+        let json = serde_json::to_string(&peek).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, peek);
 
         let cmd = Command::Move {
             movement: Movement::Line,

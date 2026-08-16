@@ -2,7 +2,7 @@
 //!
 //! モード:
 //! - `mina daemon serve` — 常駐デーモン（クライアントから自動起動されることもある）
-//! - `mina session <get|exec|edit|wait|hints>` — agent 用ヘッドレス CLI
+//! - `mina session <get|exec|edit|wait|hints|peek>` — agent 用ヘッドレス CLI
 //! - `mina config <show|path|edit|set|get|init>` — ユーザー設定の確認・編集
 //! - `mina open [file]` — ファイル編集 TUI（省略時は新規バッファ）
 

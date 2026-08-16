@@ -792,6 +792,18 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // PeekDefinitionAt（ADR-0025）: 任意パスの指定位置の定義を全文なしの
+                // 軽量応答（ServerMessage::Peek）で返す。GetInlayHints と同じく
+                // 読み取り専用コマンドなので専用処理する。
+                if let Ok(Command::PeekDefinitionAt { path, line, col }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_peek_definition_at(&daemon, &path, line, col).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 let snapshot = process_command(&daemon, &push_tx, conn_id, source, &line).await;
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
@@ -921,11 +933,7 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
     // ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
     // いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
     // 置き換わる）。
-    let borrows_focus_session = !target_is_focused
-        && focused.as_deref().is_some_and(|fp| {
-            lsp::server_for(fp).is_some()
-                && lsp::workspace_root(fp) == lsp::workspace_root(&path_buf)
-        });
+    let borrows_focus_session = !target_is_focused && borrows_focus_session(&focused, &path_buf);
     // 切り替え: 対象文書を didOpen（前の文書は閉じられる）。pull は現在の文書に
     // しか応えない（current_uri 一致チェック）ため、対象を開くことは必須。
     lsp::open_document(&session, &path_buf, &text).await;
@@ -938,23 +946,8 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
         d.cache_hints(path_buf.clone(), &text, hints.clone());
     }
     if borrows_focus_session {
-        // 復元（Q10-(c)）: フォーカス文書がこの間に移動していなければ、現在
-        // テキストで didOpen し直し + 診断を再 pull して更新停止を自己修復する。
-        if let Some(fp) = &focused {
-            let focused_text = {
-                let d = daemon.lock().await;
-                (d.editor.focused_path() == Some(fp.as_path()))
-                    .then(|| d.editor.current_document().text().to_string())
-            };
-            if let Some(text) = focused_text {
-                let diags = lsp::restore_focus_with_diagnostics(&session, fp, &text).await;
-                let mut d = daemon.lock().await;
-                if let Some(diags) = diags {
-                    d.diagnostics = diags;
-                }
-                lsp::drain_into(&mut d);
-            }
-        }
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &session, &focused).await;
     }
     let d = daemon.lock().await;
     ServerMessage::Hints {
@@ -970,7 +963,7 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
 /// LSP の await は daemon ロック外（ADR-0009）。応答はスナップショットの
 /// `peek` フィールドに載せる（daemon 状態には持たない — 次のコマンドで消える
 /// クライアント側の一時表示。push には載らない）。フォーカス文書を開き直すので
-/// 借用・復元は不要（serve_inlay_hints と違い、対象は常にフォーカス文書）。
+/// 借用・復元は不要（serve_peek_definition_at と違い、対象は常にフォーカス文書）。
 async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
     let (path, head, text) = {
         let mut d = daemon.lock().await;
@@ -990,7 +983,7 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
                 // セッションを借りた（開き直し）ので現在のテキストで didOpen する。
                 // 既に開いている場合の再 didOpen は無害（idempotent）。
                 lsp::open_document(&session, &path, &text).await;
-                lsp::definition_peek(&session, &path, &text, head).await
+                lsp::definition_peek_at_char(&session, &path, &text, head).await
             }
             Err(_) => None, // サーバ spawn 失敗: peek なし
         }
@@ -1001,6 +994,112 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
     let mut snap = snapshot(&mut d, None);
     snap.peek = peek;
     ServerMessage::Response { snapshot: snap }
+}
+
+/// `Command::PeekDefinitionAt` の処理（ADR-0025）: 任意パスの指定位置
+/// （1-origin 行:列）のシンボル定義を、全文テキストを返さず軽量応答
+/// （[`ServerMessage::Peek`]）で返す（エージェントのトークン削減経路）。
+///
+/// LSP セッションは同時に 1 文書しか開けないため、フォーカス文書と異なる
+/// パスの要求は serve_inlay_hints と同じく「対象を didOpen → 取得 →
+/// フォーカス文書を復元 + 診断の再 pull」で対応する（Q10-(c)）。LSP の await は
+/// daemon ロック外（ADR-0009）。読み取り専用: 世代・push・イベントは進めない。
+/// 定義なし・LSP 非対応・読み込み不可は `text` 空で応答する。
+async fn serve_peek_definition_at(
+    daemon: &Mutex<Daemon>,
+    path: &str,
+    line: u32,
+    col: u32,
+) -> ServerMessage {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let path_str = path_buf.to_string_lossy().into_owned();
+    let empty = || ServerMessage::Peek {
+        path: path_str.clone(),
+        line: 0,
+        text: String::new(),
+    };
+    // 要求パスのテキスト: Editor の開文書を優先し、なければディスク読み
+    // （SEC-1 検証済み。ADR-0008 の read_open_target を再利用）。
+    let text = {
+        let d = daemon.lock().await;
+        d.editor
+            .doc_id_for_path(&path_buf)
+            .map(|id| d.editor.document(id).text().to_string())
+    };
+    let (text, _status) = match text {
+        Some(t) => (Some(t), None),
+        None => read_open_target(&path_str).await,
+    };
+    let Some(text) = text else {
+        return empty(); // 読み込み不可: 定義なし
+    };
+    // LSP 非対応パス（.rs 以外）: 定義なしで応答する（サーバを spawn しない）
+    if lsp::server_for(&path_buf).is_none() {
+        return empty();
+    }
+    // フォーカス文書（復元用。テキストは復元時に最新を読む）
+    let focused = {
+        let d = daemon.lock().await;
+        d.editor.focused_path().map(Path::to_path_buf)
+    };
+    let session = match lsp::ensure(daemon, &path_buf).await {
+        Ok(s) => s,
+        Err(_) => return empty(), // spawn + initialize 失敗: 定義なし
+    };
+    let borrows = borrows_focus_session(&focused, &path_buf);
+    // 切り替え: 対象文書を didOpen（現在の文書にしか応えないため、対象を開く
+    // ことは必須）。既に開いている場合の再 didOpen は無害。
+    lsp::open_document(&session, &path_buf, &text).await;
+    let peek = lsp::definition_peek_at_line_col(&session, &path_buf, &text, line, col).await;
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &session, &focused).await;
+    }
+    match peek {
+        Some(p) => ServerMessage::Peek {
+            path: p.path,
+            line: p.line,
+            text: p.text,
+        },
+        None => empty(),
+    }
+}
+
+/// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
+/// ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
+/// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
+/// 置き換わる）。
+fn borrows_focus_session(focused: &Option<PathBuf>, target: &Path) -> bool {
+    focused.as_deref().is_some_and(|fp| {
+        fp != target
+            && lsp::server_for(fp).is_some()
+            && lsp::workspace_root(fp) == lsp::workspace_root(target)
+    })
+}
+
+/// LSP セッションを借りた場合の復元（Q10-(c)）: フォーカス文書がこの間に
+/// 移動していなければ、現在テキストで didOpen し直し + 診断を再 pull して
+/// 更新停止を自己修復する。serve_inlay_hints と serve_peek_definition_at で共用。
+async fn restore_focus_session(
+    daemon: &Mutex<Daemon>,
+    session: &Mutex<lsp::LspSession>,
+    focused: &Option<PathBuf>,
+) {
+    let focused_text = {
+        let d = daemon.lock().await;
+        (d.editor.focused_path() == focused.as_deref())
+            .then(|| d.editor.current_document().text().to_string())
+    };
+    if let Some(text) = focused_text {
+        if let Some(fp) = focused {
+            let diags = lsp::restore_focus_with_diagnostics(session, fp, &text).await;
+            let mut d = daemon.lock().await;
+            if let Some(diags) = diags {
+                d.diagnostics = diags;
+            }
+            lsp::drain_into(&mut d);
+        }
+    }
 }
 
 /// コマンド行1件を処理して応答スナップショットを返す（ADR-0013 で
@@ -1757,6 +1856,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::PeekDefinition => {
             // handle_connection で専用処理される（peek フィールド付き応答）。
             // ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::PeekDefinitionAt { .. } => {
+            // handle_connection で専用処理される（ServerMessage::Peek 応答。
+            // ADR-0025）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::Insert { text } => {
@@ -3300,6 +3404,7 @@ mod tests {
                 ServerMessage::Response { snapshot } => return snapshot,
                 ServerMessage::Push { .. } => continue,
                 ServerMessage::Hints { .. } => continue,
+                ServerMessage::Peek { .. } => continue,
             }
         }
     }
@@ -3311,6 +3416,7 @@ mod tests {
                 ServerMessage::Push { snapshot } => return snapshot,
                 ServerMessage::Response { .. } => continue,
                 ServerMessage::Hints { .. } => continue,
+                ServerMessage::Peek { .. } => continue,
             }
         }
     }
@@ -5125,6 +5231,7 @@ mod tests {
                     return (path, generation, hints)
                 }
                 ServerMessage::Response { .. } | ServerMessage::Push { .. } => continue,
+                ServerMessage::Peek { .. } => continue,
             }
         }
     }
@@ -5351,6 +5458,59 @@ mod tests {
         })
         .await;
         assert!(snap.peek.is_none(), "次のコマンドで peek は落ちる: {snap:?}");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn peek_definition_at_returns_lightweight_peek_for_headless() {
+        // ADR-0025: エージェントの PeekDefinitionAt は全文スナップショットではなく
+        // 軽量な ServerMessage::Peek（定義だけ）で応答する — トークン削減経路。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-peekat-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-peekat-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "fn peek_target(x: i32) -> i32 {\n    x\n}\n").unwrap();
+        start_server(&sock).await;
+
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let cmd = Command::PeekDefinitionAt { path, line: 1, col: 5 };
+        let mut line = serde_json::to_string(&cmd).unwrap();
+        line.push('\n');
+        agent.send(line.as_bytes()).await;
+        // 応答は ServerMessage::Peek（途中の push は読み飛ばす）
+        let peek = loop {
+            match agent.recv_message().await {
+                ServerMessage::Peek { path, line, text } => {
+                    break (path, line, text);
+                }
+                ServerMessage::Response { .. } | ServerMessage::Push { .. } | ServerMessage::Hints { .. } => {
+                    continue;
+                }
+            }
+        };
+        assert!(peek.0.ends_with(&file.to_string_lossy().into_owned()), "定義元: {peek:?}");
+        assert_eq!(peek.1, 1, "1 始まりの開始行: {peek:?}");
+        assert!(
+            peek.2.contains("fn peek_target") && peek.2.contains("    x"),
+            "定義スニペット: {peek:?}"
+        );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }

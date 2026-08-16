@@ -230,6 +230,11 @@ impl Conn {
                 ErrorKind::InvalidData,
                 "unexpected inlay hints response".to_string(),
             )),
+            // ADR-0025: Peek 応答もこの CLI では使わない
+            Ok(ServerMessage::Peek { .. }) => Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "unexpected peek response".to_string(),
+            )),
             Err(e) => Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!("不正な応答: {e}"),

@@ -428,6 +428,53 @@ pub(crate) async fn request_hints(
                 "unexpected snapshot response",
             ))
         }
+        // #23 と同様: Peek 応答はここでは期待しない
+        Ok(ServerMessage::Peek { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected peek response",
+        )),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("不正な応答: {e}"),
+        )),
+    }
+}
+
+/// 指定位置（1-origin 行:列）のシンボル定義を取得する（ADR-0025）。
+/// `Command::PeekDefinitionAt` の応答はスナップショットでなく軽量な
+/// `ServerMessage::Peek`（全文なし）なので専用経路。
+/// エージェント（session CLI）が全文を読まずに定義を参照するためのもの。
+pub(crate) async fn request_peek(
+    write_half: &mut OwnedWriteHalf,
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    path: &str,
+    line: u32,
+    col: u32,
+) -> std::io::Result<mina_protocol::Peek> {
+    let message = Command::PeekDefinitionAt {
+        path: path.to_string(),
+        line,
+        col,
+    };
+    let mut line = serde_json::to_string(&message).expect("メッセージはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::Peek { path, line, text }) => Ok(mina_protocol::Peek { path, line, text }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected snapshot response",
+            ))
+        }
+        // この経路は Peek 専用: hints 応答は期待しない
+        Ok(ServerMessage::Hints { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected inlay hints response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -458,6 +505,11 @@ pub(crate) async fn request<T: serde::Serialize>(
         Ok(ServerMessage::Hints { .. }) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unexpected inlay hints response",
+        )),
+        // ADR-0025: Peek 応答も別経路（request_peek）で扱う
+        Ok(ServerMessage::Peek { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected peek response",
         )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -534,9 +586,9 @@ async fn read_loop(
                     return;
                 }
             }
-            // TUI は GetInlayHints を送らない（エージェント専用経路。ADR-0020）。
+            // TUI は GetInlayHints / PeekDefinitionAt を送らない（エージェント専用経路）。
             // 万一届いても応答は無視する。
-            Ok(ServerMessage::Hints { .. }) => {}
+            Ok(ServerMessage::Hints { .. }) | Ok(ServerMessage::Peek { .. }) => {}
             Err(e) => {
                 let _ = res_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
