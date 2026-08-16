@@ -543,13 +543,14 @@ fn draw_status(
         status.push('_');
         status.push_str("\x1b[0m");
     } else {
-        // テキストを SGR なしで組み立ててから幅で切り詰め、最後に mode を反転で
+        // テキストを SGR なしで組み立ててから幅で切り詰め、最後に mode をマーカー色で
         // 包む — エスケープを幅に数えると truncate がエスケープ途中で切れて
         // 壊れた CSI を出力する（敵対的検証で発見）。
-        let mode = match state.mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
-            Mode::Select => "SELECT",
+        // mode はマーカーチップ（前後に余白込み）として色分けし、残りは無地で描く。
+        let (mode, mode_role) = match state.mode {
+            Mode::Normal => (" NORMAL ", UiRole::ModeNormal),
+            Mode::Insert => (" INSERT ", UiRole::ModeInsert),
+            Mode::Select => (" SELECT ", UiRole::ModeSelect),
         };
         let mut text = String::new();
         text.push_str(mode);
@@ -596,14 +597,15 @@ fn draw_status(
             text.push_str(&format!("  {}", sanitize_status_data(msg)));
         }
         truncate_wide(&mut text, width);
-        status.push_str(&ui_sgr(scheme, capability, no_color, UiRole::StatusLine));
         if let Some(rest) = text.strip_prefix(mode) {
-            // mode が丸ごと残った: mode だけ反転で包み、残りは無地
+            // mode が丸ごと残った: mode だけマーカー色で包み、残りは無地
+            status.push_str(&ui_sgr(scheme, capability, no_color, mode_role));
             status.push_str(mode);
             status.push_str("\x1b[0m");
             status.push_str(rest);
         } else {
-            // 切り詰めが mode の途中に入った: 残り全部を反転で包む
+            // 切り詰めが mode の途中に入った: 残り全部をマーカー色で包む
+            status.push_str(&ui_sgr(scheme, capability, no_color, mode_role));
             status.push_str(&text);
             status.push_str("\x1b[0m");
         }
@@ -895,17 +897,39 @@ mod tests {
     fn narrow_status_line_does_not_emit_broken_csi() {
         // レビュー指摘: エスケープを幅に数えて truncate すると中途半端な CSI を
         // 出力する。テキスト先行切り詰めに変えたので mode のラップとリセットが
-        // 壊れない（幅 10 < NORMAL 6 + 残りの幅）
+        // 壊れない（幅 10 < " NORMAL " 8 + 残りの幅）
         let state = state_with("x", vec![Range { anchor: 0, head: 0 }], 0);
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 10, 10);
         assert!(
-            out.contains("\x1b[7mNORMAL\x1b[0m"),
-            "mode の反転ラップとリセットが壊れない: {out:?}"
+            out.contains("\x1b[30;104m NORMAL \x1b[0m"),
+            "mode のマーカー色ラップとリセットが壊れない: {out:?}"
         );
         assert!(
-            !out.contains("\x1b[7mNORMAL\x1b[K"),
+            !out.contains("\x1b[30;104m NORMAL \x1b[K"),
             "エスケープが \x1b[K に飲み込まれない: {out:?}"
         );
+    }
+
+    #[test]
+    fn mode_marker_has_per_mode_color_and_padding() {
+        // モードごとにマーカーチップの色が変わり、前後に余白（空白 1 セル）が入る
+        let cases = [
+            (Mode::Normal, "\x1b[30;104m NORMAL "),
+            (Mode::Insert, "\x1b[30;102m INSERT "),
+            (Mode::Select, "\x1b[30;105m SELECT "),
+        ];
+        for (mode, chip) in cases {
+            let mut state = state_with("x", vec![Range { anchor: 0, head: 0 }], 0);
+            state.mode = mode;
+            let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
+            assert!(out.contains(chip), "{:?}: {out:?}", mode);
+            assert!(out.contains("\x1b[0m"), "{:?} の後にリセット: {out:?}", mode);
+        }
+        // マーカーは無地の残り（パス等）と区別される — 反転の StatusLine は使わない
+        let mut state = state_with("x", vec![Range { anchor: 0, head: 0 }], 0);
+        state.mode = Mode::Insert;
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
+        assert!(!out.contains("\x1b[7mINSERT"), "反転チップは使わない: {out:?}");
     }
 
     #[test]
