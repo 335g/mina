@@ -3,7 +3,7 @@
 //! モード:
 //! - `mina daemon serve` — 常駐デーモン（クライアントから自動起動されることもある）
 //! - `mina session <get|exec|edit|wait|hints>` — agent 用ヘッドレス CLI
-//! - `mina [file]` — クライアント（S0 では GetState の表示のみ。TUI は S1）
+//! - `mina open [file]` — ファイル編集 TUI（省略時は新規バッファ）
 
 mod client;
 mod colorscheme;
@@ -22,10 +22,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "mina", version, about = "daemon/client 分割のターミナルエディタ")]
 struct Cli {
-    /// ファイルパス（TUI で開く。サブコマンド名と重なる場合はサブコマンドが優先）
-    path: Option<PathBuf>,
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -40,6 +38,11 @@ enum Command {
         #[command(subcommand)]
         cmd: session::SessionCmd,
     },
+    /// ファイル編集 TUI を開く
+    Open {
+        /// 開くファイル（省略時は新規バッファ）
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -52,11 +55,10 @@ enum DaemonCmd {
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Daemon { cmd: DaemonCmd::Serve }) => daemon::run().await,
-        Some(Command::Session { cmd }) => session::run(cmd).await,
-        None => {
-            let path = cli
-                .path
+        Command::Daemon { cmd: DaemonCmd::Serve } => daemon::run().await,
+        Command::Session { cmd } => session::run(cmd).await,
+        Command::Open { path } => {
+            let path = path
                 .map(|p| p.into_os_string().into_string())
                 .transpose()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "パスが UTF-8 ではありません"))?;
