@@ -74,15 +74,21 @@ pub fn compute_highlights(def: &LanguageDef, text: &str) -> Vec<HighlightRange> 
     let Ok(query) = Query::new(&(def.grammar)(), def.highlights) else {
         return Vec::new();
     };
-    collect(&query, text, &tree, None)
+    collect(&query, text, &tree, None, 0)
 }
 
 /// 既存ツリー + コンパイル済みクエリで、`range`（byte 範囲）内のハイライト
 /// 範囲を計算する。パースもクエリコンパイルも行わない。
 ///
+/// `window_char_start` は `range.start` の char インデックス。byte→char 変換は
+/// 窓範囲内のローカルテーブルのみを使い、全文の char テーブル構築（O(n)）を
+/// 避ける（窓付きクエリの打鍵ごとの主コスト — 計測: 1MB で 2.5ms）。窓を跨ぐ
+/// トークン（上端より前・下端より後ろに広がる複数行コメント等）は境界からの
+/// オーバーハング走査で正確に変換する。
+///
 /// daemon はツリーとクエリを文書ごとにキャッシュし、編集のたびに差分ベースの
 /// インクリメンタルパースでツリーを更新してこの関数に渡す（ADR-0021: 全文再
-/// パースとクエリ再コンパイルを回避 — 計測: 214KB で 38ms + 20ms → 0.5ms）。
+/// パースとクエリ再コンパイルを回避）。
 ///
 /// `range` は可視行の byte 範囲。窓の上端を跨ぐトークン（複数行コメント・
 /// 文字列等）は、範囲に交差するノードとして捕捉される（set_byte_range は
@@ -92,8 +98,9 @@ pub fn highlight_ranges_in_window(
     text: &str,
     tree: &Tree,
     range: Range<usize>,
+    window_char_start: usize,
 ) -> Vec<HighlightRange> {
-    collect(query, text, tree, Some(range))
+    collect(query, text, tree, Some(range), window_char_start)
 }
 
 /// クエリ走査 → 重複確定 → byte→char 変換の共通実装。`range` が `None` なら全文。
@@ -102,6 +109,7 @@ fn collect(
     text: &str,
     tree: &Tree,
     range: Option<Range<usize>>,
+    window_char_start: usize,
 ) -> Vec<HighlightRange> {
     let mut items: Vec<(usize, usize, HighlightGroup)> = Vec::new();
     {
@@ -145,10 +153,38 @@ fn collect(
     }
 
     // byte → char インデックス変換（コードベースの慣習: char インデックス）。
-    // char_starts[c] = 文字 c の開始 byte（c = n_chars は text.len()）。
-    let mut char_starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
-    char_starts.push(text.len());
-    let char_at = |byte: usize| char_starts.partition_point(|&b| b <= byte) - 1;
+    // 窓付き: 窓範囲 [range.start, range.end] のローカルテーブルのみ構築する
+    // （全文の char_starts は O(n) — 窓が小さくても毎回全文を走査する主因）。
+    // 窓外に広がるトークン（窓を跨ぐ複数行コメント等）は境界からの
+    // オーバーハング走査で正確な char 位置を得る。
+    // 全文: 従来どおり全文テーブル。
+    let char_at: Box<dyn Fn(usize) -> usize> = match &range {
+        Some(r) => {
+            let window = &text[r.start..r.end];
+            let window_chars = window.chars().count();
+            // 窓内の各文字の開始 byte（グローバル絶対値）
+            let starts: Vec<usize> =
+                window.char_indices().map(|(b, _)| b + r.start).collect();
+            let (ws, re) = (window_char_start, r.end);
+            Box::new(move |byte: usize| {
+                if byte < r.start {
+                    // 窓上端より前（トークンが窓の上を跨ぐ）: 上端から巻き戻す
+                    ws.saturating_sub(text[byte..r.start].chars().count())
+                } else if byte > re {
+                    // 窓下端より後ろ（トークンが窓の下を跨ぐ）: 下端から進める
+                    ws + window_chars + text[re..byte].chars().count()
+                } else {
+                    // 窓内: ローカルテーブルで二分探索
+                    ws + starts.partition_point(|&b| b < byte)
+                }
+            })
+        }
+        None => {
+            let mut char_starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+            char_starts.push(text.len());
+            Box::new(move |byte: usize| char_starts.partition_point(|&b| b <= byte) - 1)
+        }
+    };
     deduped
         .into_iter()
         .map(|(start, end, group)| HighlightRange {
@@ -411,7 +447,13 @@ fn add(a: i32, b: i32) -> i32 {
 
         // 窓 = 行1〜2（"// c1" と fn b）
         let window = window_bytes(src, 1, 2);
-        let windowed = highlight_ranges_in_window(&query, src, &tree, window.clone());
+        let windowed = highlight_ranges_in_window(
+            &query,
+            src,
+            &tree,
+            window.clone(),
+            src[..window.start].chars().count(),
+        );
         assert_valid_ranges(src, &windowed);
         assert!(!windowed.is_empty(), "窓内にハイライトがある: {windowed:?}");
         // 窓と交差する全文範囲だけが残る（start < 窓end かつ end > 窓start）
@@ -434,7 +476,8 @@ fn add(a: i32, b: i32) -> i32 {
         let (query, tree) = window_fixture(def, src);
         // 窓 = 行2〜3（ブロックコメントの途中）
         let window = window_bytes(src, 2, 2);
-        let windowed = highlight_ranges_in_window(&query, src, &tree, window);
+        let window_char_start = src[..window.start].chars().count();
+        let windowed = highlight_ranges_in_window(&query, src, &tree, window, window_char_start);
         assert_valid_ranges(src, &windowed);
         let comment = windowed
             .iter()
