@@ -227,29 +227,15 @@ pub(crate) fn render_text_with_cache(
             lines.push("unsaved changes will be lost".to_string());
         }
         lines.push("(press any key to close)".to_string());
-        let line_width = |l: &str| l.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
-        let box_w = lines
-            .iter()
-            .map(|l| line_width(l))
-            .max()
-            .unwrap_or(0)
-            .min(width.saturating_sub(2));
-        let box_h = lines.len().min(body_rows);
-        let top = body_rows.saturating_sub(box_h) / 2;
-        let left = width.saturating_sub(box_w) / 2;
-        for (i, line) in lines.iter().take(box_h).enumerate() {
-            s.push_str(&format!("\x1b[{};{}H", top + i + 1, left + 1));
-            s.push_str(&ui_sgr(scheme, capability, no_color, UiRole::Popup));
-            let mut padded = line.clone();
-            let mut w = line_width(&padded);
-            while w < box_w {
-                padded.push(' ');
-                w += 1;
-            }
-            truncate_wide(&mut padded, box_w);
-            s.push_str(&padded);
-            s.push_str("\x1b[0m\x1b[K");
-        }
+        push_popup_box(
+            &mut s,
+            &lines,
+            width,
+            body_rows,
+            scheme,
+            capability,
+            no_color,
+        );
     }
 
     // ターミナルカーソルを primary head へ（Q4: ヒントは仮想テキストなので
@@ -299,6 +285,79 @@ pub(crate) fn draw_with_cache(
         )
         .as_bytes(),
     )
+}
+
+/// 中央ポップアップの描画（deleted ポップアップと peek ポップアップで共用）。
+/// 内容は呼び出し側でサニタイズ済み。幅・高さに合わせて切り詰める。
+fn push_popup_box(
+    s: &mut String,
+    lines: &[String],
+    width: usize,
+    body_rows: usize,
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+) {
+    let line_width = |l: &str| l.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+    let box_w = lines
+        .iter()
+        .map(|l| line_width(l))
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(2));
+    let box_h = lines.len().min(body_rows);
+    let top = body_rows.saturating_sub(box_h) / 2;
+    let left = width.saturating_sub(box_w) / 2;
+    for (i, line) in lines.iter().take(box_h).enumerate() {
+        s.push_str(&format!("\x1b[{};{}H", top + i + 1, left + 1));
+        s.push_str(&ui_sgr(scheme, capability, no_color, UiRole::Popup));
+        let mut padded = line.clone();
+        let mut w = line_width(&padded);
+        while w < box_w {
+            padded.push(' ');
+            w += 1;
+        }
+        truncate_wide(&mut padded, box_w);
+        s.push_str(&padded);
+        s.push_str("\x1b[0m\x1b[K");
+    }
+}
+
+/// 定義ポップアップ（[`Command::PeekDefinition`] の結果）を画面中央に描画する。
+///
+/// クライアントローカルな一時表示（次のキーで消える）のため、メイン描画の後に
+/// 呼ばれる。内容は SEC-2 に従い制御文字をサニタイズしてから描画する。
+pub(crate) fn draw_peek_popup(
+    out: &mut impl Write,
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+    peek: &mina_protocol::Peek,
+    width: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    let mut lines = vec![format!(
+        "definition: {}:{}",
+        sanitize_status_data(&peek.path),
+        peek.line
+    )];
+    lines.extend(
+        peek.text
+            .split('\n')
+            .map(|l| format!("  {}", sanitize_status_data(l))),
+    );
+    lines.push("(any key closes)".to_string());
+    let mut s = String::new();
+    push_popup_box(
+        &mut s,
+        &lines,
+        width as usize,
+        height.saturating_sub(1) as usize,
+        scheme,
+        capability,
+        no_color,
+    );
+    out.write_all(s.as_bytes())
 }
 
 /// 1行分を描画する。選択範囲は反転、診断範囲は下線、ハイライトグループは前景色、
@@ -783,6 +842,7 @@ mod tests {
             generation: 0,
             events: Vec::new(),
             deleted: None,
+            peek: None,
         }
     }
 
@@ -1435,6 +1495,7 @@ mod tests {
             generation: 0,
             events: Vec::new(),
             deleted: None,
+            peek: None,
         };
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
         assert!(!out.contains("\x1b]0;evil"), "OSC を生出力しない: {out:?}");
@@ -1470,6 +1531,7 @@ mod tests {
             generation: 0,
             events: Vec::new(),
             deleted: None,
+            peek: None,
         };
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[4;91mworld\x1b[0m"), "診断範囲に下線 + エラー色: {out:?}");
@@ -1490,6 +1552,54 @@ mod tests {
         state.dirty = true;
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
         assert!(out.contains("unsaved changes will be lost"), "{out:?}");
+    }
+
+    #[test]
+    fn peek_popup_renders_definition_and_closes_on_any_key() {
+        // Space k（PeekDefinition）の結果: 中央に定義スニペットが描画される。
+        let mut out = Vec::new();
+        draw_peek_popup(
+            &mut out,
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            &mina_protocol::Peek {
+                path: "/src/lib.rs".into(),
+                line: 42,
+                text: "pub fn frobnicate(x: i32) -> i32 {\n    x * 2\n}".into(),
+            },
+            40,
+            10,
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("definition: /src/lib.rs:42"), "ヘッダー: {out:?}");
+        assert!(out.contains("pub fn frobnicate(x: i32) -> i32 {"), "定義行: {out:?}");
+        assert!(out.contains("x * 2"), "本体: {out:?}");
+        assert!(out.contains("any key closes"), "閉じ方のヒント: {out:?}");
+    }
+
+    #[test]
+    fn peek_popup_sanitizes_content_and_truncates_to_terminal() {
+        // SEC-2: 定義テキストの制御文字は � に置換される。幅超過は切り詰める。
+        let mut out = Vec::new();
+        draw_peek_popup(
+            &mut out,
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            &mina_protocol::Peek {
+                path: "/x.rs".into(),
+                line: 1,
+                text: "bad\x1b[31m ESC + あいうえおかきくけこ".into(),
+            },
+            20,
+            10,
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("\x1b[31m"), "ESC を生出力しない: {out:?}");
+        assert!(out.contains("bad\u{FFFD}"), "制御文字は置換: {out:?}");
     }
 
     #[test]
