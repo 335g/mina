@@ -18,76 +18,79 @@
 //! `status` フィールドに載る。
 
 use std::io;
+use std::path::PathBuf;
 
+use clap::Subcommand;
 use mina_protocol::{ClientKind, Command, DocumentEdit, InlayHint, StateSnapshot};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 use crate::client;
 
-/// `mina session <get|exec|edit ...>` を処理する。`args` はサブコマンド以降。
-pub async fn run(args: &[String]) -> io::Result<()> {
-    if args.first().map(String::as_str) == Some("hints") {
-        let path = args.get(1).ok_or_else(|| {
-            invalid("hints にはパスが必要です: mina session hints <path>")
-        })?;
-        let hints = execute_hints(path).await?;
-        // 応答は (path, generation, hints)。hints だけを JSON で出力する
-        // （エージェントがそのまま読める形）。
-        println!("{}", serde_json::to_string_pretty(&hints.2)?);
-        return Ok(());
-    }
-    if args.first().map(String::as_str) == Some("edit") {
-        let json = args.get(1).ok_or_else(|| {
-            invalid("edit には DocumentEdit JSON が必要です: mina session edit '<json>'")
-        })?;
-        let edit: DocumentEdit = serde_json::from_str(json)
-            .map_err(|e| invalid(format!("DocumentEdit JSON を解釈できません: {e}")))?;
-        let snapshot = execute_edit(&edit).await?;
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
-        // #11: daemon の拒否（status 付き応答）を exit code 2 で明示する。
-        // エージェントは $? だけで失敗を検知し、再読み込み→再試行できる。
-        if edit_exit_code(&snapshot) != 0 {
-            std::process::exit(edit_exit_code(&snapshot));
+/// `mina session` のサブコマンド。引数・型は clap が検証する。
+#[derive(Subcommand)]
+pub enum SessionCmd {
+    /// 現在の状態を取得する（JSON で出力）
+    Get,
+    /// `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
+    Exec {
+        /// コマンド JSON
+        json: String,
+    },
+    /// [`DocumentEdit`]（位置指定編集）を1つ実行する
+    Edit {
+        /// DocumentEdit JSON
+        json: String,
+    },
+    /// 世代が `<generation>` を超えるまでブロックして状態を返す
+    Wait {
+        /// 世代
+        generation: u64,
+    },
+    /// 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
+    Hints {
+        /// パス
+        path: PathBuf,
+    },
+}
+
+/// `mina session <subcommand>` を処理する。
+pub async fn run(cmd: SessionCmd) -> io::Result<()> {
+    match cmd {
+        SessionCmd::Get => {
+            let snapshot = execute(&Command::GetState).await?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        return Ok(());
+        SessionCmd::Exec { json } => {
+            let command: Command = serde_json::from_str(&json)
+                .map_err(|e| invalid(format!("コマンド JSON を解釈できません: {e}")))?;
+            let snapshot = execute(&command).await?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        SessionCmd::Edit { json } => {
+            let edit: DocumentEdit = serde_json::from_str(&json)
+                .map_err(|e| invalid(format!("DocumentEdit JSON を解釈できません: {e}")))?;
+            let snapshot = execute_edit(&edit).await?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            // #11: daemon の拒否（status 付き応答）を exit code 2 で明示する。
+            // エージェントは $? だけで失敗を検知し、再読み込み→再試行できる。
+            let code = edit_exit_code(&snapshot);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        SessionCmd::Wait { generation } => {
+            let snapshot = execute(&Command::WaitFor { generation }).await?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        SessionCmd::Hints { path } => {
+            let hints = execute_hints(&path.to_string_lossy()).await?;
+            // 応答は (path, generation, hints)。hints だけを JSON で出力する
+            // （エージェントがそのまま読める形）。
+            println!("{}", serde_json::to_string_pretty(&hints.2)?);
+        }
     }
-    if args.first().map(String::as_str) == Some("wait") {
-        let command = parse_wait(args)?;
-        let snapshot = execute(&command).await?;
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
-        return Ok(());
-    }
-    let command = parse_command(args)?;
-    let snapshot = execute(&command).await?;
-    println!("{}", serde_json::to_string_pretty(&snapshot)?);
     Ok(())
-}
-
-/// サブコマンドを [`Command`] に変換する。
-fn parse_command(args: &[String]) -> io::Result<Command> {
-    match args.first().map(String::as_str) {
-        Some("get") => Ok(Command::GetState),
-        Some("exec") => {
-            let json = args.get(1).ok_or_else(|| {
-                invalid("exec にはコマンド JSON が必要です: mina session exec '<command>'")
-            })?;
-            serde_json::from_str(json).map_err(|e| invalid(format!("コマンド JSON を解釈できません: {e}")))
-        }
-        Some(other) => Err(invalid(format!("未知の session サブコマンド: {other}（get / exec）"))),
-        None => Err(invalid("session サブコマンドが必要です: get / exec")),
-    }
-}
-
-/// `session wait <generation>` を [`Command::WaitFor`] に変換する。
-fn parse_wait(args: &[String]) -> io::Result<Command> {
-    let gen_str = args
-        .get(1)
-        .ok_or_else(|| invalid("wait には世代が必要です: mina session wait <generation>"))?;
-    let generation: u64 = gen_str
-        .parse()
-        .map_err(|e| invalid(format!("世代は数値で指定してください: {e}")))?;
-    Ok(Command::WaitFor { generation })
 }
 
 /// daemon に接続し、コマンドを実行してスナップショットを受け取る。
@@ -166,10 +169,6 @@ fn edit_exit_code(snapshot: &StateSnapshot) -> i32 {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
     fn rejected_edit_status_yields_exit_code_2() {
         // #11: 拒否（status 付き応答）は exit 2、成功・no-op（status なし）は 0。
@@ -182,35 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn wait_parses_generation() {
-        assert_eq!(
-            parse_wait(&args(&["wait", "42"])).unwrap(),
-            Command::WaitFor { generation: 42 }
-        );
-        assert!(parse_wait(&args(&["wait"])).is_err(), "世代なしはエラー");
-        assert!(parse_wait(&args(&["wait", "abc"])).is_err(), "非数値はエラー");
-    }
-
-    #[test]
-    fn get_parses() {
-        assert_eq!(parse_command(&args(&["get"])).unwrap(), Command::GetState);
-    }
-
-    #[test]
-    fn exec_parses_json() {
-        let cmd = parse_command(&args(&["exec", r#"{"Insert": {"text": "x"}}"#])).unwrap();
-        assert_eq!(cmd, Command::Insert { text: "x".into() });
-    }
-
-    #[test]
     fn bad_json_is_rejected() {
-        assert!(parse_command(&args(&["exec", "not json"])).is_err());
-    }
-
-    #[test]
-    fn unknown_subcommand_is_rejected() {
-        assert!(parse_command(&args(&["frobnicate"])).is_err());
-        assert!(parse_command(&args(&[])).is_err());
+        // サブコマンドの JSON 解釈（clap は引数構造のみ検証し、JSON はここで検証する）
+        let err = serde_json::from_str::<Command>("not json")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("expected"));
     }
 
     #[test]
