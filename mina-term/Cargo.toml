@@ -24,3 +24,4 @@ libc.workspace = true
 termina.workspace = true
 futures-lite.workspace = true
 unicode-width.workspace = true
+clap.workspace = true

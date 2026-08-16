@@ -19,5 +19,6 @@ libc = "0.2"
 termina = { version = "0.3", features = ["event-stream"] }
 futures-lite = "2"
 unicode-width = "0.2"
+clap = { version = "4", features = ["derive"] }
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
