@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 /// `DeleteWordBackward`/`DeleteWordForward`（単語削除）、`Movement::WordEnd` /
 /// `LineStart`/`LineEnd`（単語末尾・行頭/行末）。追加のみで後方互換だが、
 /// 古い daemon に新コマンドを送っても動作しないため version を上げる。
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: `Command::InsertAtLineEnd` / `InsertAtLineStart`（Helix の `A`/`I`。
+/// ADR-0023）。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 編集モード（wire 型。mina-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +73,12 @@ pub enum Command {
     /// 選択（またはカーソル位置）を削除して Insert モードへ入る（Helix の `c`）。
     /// カーソル上では削除なしで Insert モードに入るだけ。削除は undo グループの外。
     Change,
+    /// 各 Range を head の行の行末（改行の直前）へ点に潰して Insert モードへ
+    /// 入る（Helix の `A`。ADR-0023）。Select でも折りたたむ。
+    InsertAtLineEnd,
+    /// 各 Range を head の行の最初の非空白文字（空白のみの行は列 0）へ点に潰して
+    /// Insert モードへ入る（Helix の `I`。ADR-0023）。Select でも折りたたむ。
+    InsertAtLineStart,
     /// 直近の変更グループを元に戻す。
     Undo,
     /// 直近に undo された変更グループをやり直す。
@@ -452,6 +460,12 @@ mod tests {
         let json = serde_json::to_string(&change).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, change);
+
+        for cmd in [Command::InsertAtLineEnd, Command::InsertAtLineStart] {
+            let json = serde_json::to_string(&cmd).expect("serialize");
+            let back: Command = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, cmd);
+        }
 
         let end = Command::Move {
             movement: Movement::LineEnd,
