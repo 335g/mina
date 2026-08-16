@@ -341,12 +341,16 @@ pub(crate) fn draw_peek_popup(
         sanitize_status_data(&peek.path),
         peek.line
     )];
+    // ヘッダ行（定義元リンク）の直下に空行を設け、見出しと本体を分ける
+    lines.push(String::new());
     lines.extend(
         peek.text
             .split('\n')
             .map(|l| format!("  {}", sanitize_status_data(l))),
     );
     lines.push("(any key closes)".to_string());
+    // 最下の余白行: ポップアップ下端が画面端に張り付かないよう縦方向に余白を取る
+    lines.push(String::new());
     let mut s = String::new();
     push_popup_box(
         &mut s,
@@ -1577,6 +1581,8 @@ mod tests {
         assert!(out.contains("pub fn frobnicate(x: i32) -> i32 {"), "定義行: {out:?}");
         assert!(out.contains("x * 2"), "本体: {out:?}");
         assert!(out.contains("any key closes"), "閉じ方のヒント: {out:?}");
+        assert!(out.contains("\x1b[97;100m"), "ポップアップは明示 bg+fg（白反転でない）: {out:?}");
+        assert!(!out.contains("\x1b[7m"), "反転（白背景）になっていない: {out:?}");
     }
 
     #[test]
