@@ -227,6 +227,12 @@ impl Keymaps {
         normal.insert(&[plain(KeyCode::Char('I'))], Command::InsertAtLineStart);
         normal.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         normal.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
+        // Space リーダー + k: カーソル位置のシンボル定義をポップアップ表示する
+        // （ジャンプしない簡易確認。Helix の space リーダーに合わせた配置）。
+        normal.insert(
+            &[plain(KeyCode::Char(' ')), plain(KeyCode::Char('k'))],
+            Command::PeekDefinition,
+        );
 
         // Select: モード解除 + 編集
         select.insert(
@@ -246,6 +252,10 @@ impl Keymaps {
         select.insert(&[plain(KeyCode::Char('I'))], Command::InsertAtLineStart);
         select.insert(&[plain(KeyCode::Char('u'))], Command::Undo);
         select.insert(&[plain(KeyCode::Char('U'))], Command::Redo);
+        select.insert(
+            &[plain(KeyCode::Char(' ')), plain(KeyCode::Char('k'))],
+            Command::PeekDefinition,
+        );
 
         // Insert: 文字入力はクライアント側のフォールバック。ここでは
         // Esc・Enter（改行）・Tab・削除（文字/単語）・左右/行頭/行末移動のみ
@@ -703,6 +713,37 @@ mod tests {
         assert!(matches!(
             km.resolve_with_insert_fallback(Mode::Normal, &mut pending, k('a')),
             Resolution::NoMatch
+        ));
+    }
+
+    #[test]
+    fn space_k_peeks_definition_in_normal_and_select() {
+        // Space はリーダー（prefix）で、k で定義ポップアップを要求する。
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k(' ')),
+            Resolution::Pending
+        ));
+        assert_eq!(pending, vec![k(' ')]);
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('k')),
+            Resolution::Command(Command::PeekDefinition)
+        ));
+        assert!(pending.is_empty(), "確定後に pending が残らない");
+        // Select でも同じ
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k(' ')),
+            Resolution::Pending
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('k')),
+            Resolution::Command(Command::PeekDefinition)
+        ));
+        // Insert では Space は入力（fallback）になる
+        assert!(matches!(
+            km.resolve_with_insert_fallback(Mode::Insert, &mut pending, k(' ')),
+            Resolution::Command(Command::Insert { text }) if text == " "
         ));
     }
 }
