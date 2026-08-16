@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mina", version, about = "daemon/client 分割のターミナルエディタ")]
+#[command(name = "mina", version, about = "Terminal editor with a daemon/client split")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -29,31 +29,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 常駐デーモン
+    /// Resident daemon
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// agent 用ヘッドレス CLI（daemon に接続してコマンドを実行）
+    /// Headless CLI for agents (connect to the daemon and run commands)
     Session {
         #[command(subcommand)]
         cmd: session::SessionCmd,
     },
-    /// ユーザー設定（config.toml）の確認・編集
+    /// View and edit user settings (config.toml)
     Config {
         #[command(subcommand)]
         cmd: config::ConfigCmd,
     },
-    /// ファイル編集 TUI を開く
+    /// Open the file-editing TUI
     Open {
-        /// 開くファイル（省略時は新規バッファ）
+        /// File to open (empty buffer when omitted)
         path: Option<PathBuf>,
     },
 }
 
 #[derive(Subcommand)]
 enum DaemonCmd {
-    /// 常駐デーモンを起動する
+    /// Start the resident daemon
     Serve,
 }
 

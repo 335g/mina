@@ -23,31 +23,31 @@ pub struct Config {
 /// `mina config` のサブコマンド。
 #[derive(Subcommand)]
 pub enum ConfigCmd {
-    /// 設定ファイルの内容を表示する
+    /// Print the contents of the config file
     Show {
-        /// デフォルト補完済みの実効設定を TOML 形式で表示する
+        /// Print the effective config (defaults filled in) as TOML
         #[arg(long)]
         effective: bool,
     },
-    /// 設定ファイルのパスを表示する
+    /// Print the path to the config file
     Path,
-    /// 対話形式でキーと値を編集する
+    /// Edit keys and values interactively
     Edit,
-    /// キーに値を書き込む（値は TOML リテラル、解釈不能なら文字列）
+    /// Write a value to a key (value is a TOML literal; falls back to a string)
     Set {
-        /// キー名（既知のもののみ）
+        /// Key name (known keys only)
         key: String,
-        /// 値（TOML リテラル。解釈できなければ文字列として扱う）
+        /// Value (TOML literal; treated as a string when it cannot be parsed)
         value: String,
     },
-    /// キーの値を TOML 形式で表示する（未設定・未知キーは exit 1）
+    /// Print a key's value as TOML (exit 1 when unset or unknown)
     Get {
-        /// キー名（既知のもののみ）
+        /// Key name (known keys only)
         key: String,
     },
-    /// 雛形設定ファイルを作成する（既存は `--force` でのみ上書き）
+    /// Create a template config file (existing files are only overwritten with `--force`)
     Init {
-        /// 既存ファイルを上書きする
+        /// Overwrite the existing file
         #[arg(long)]
         force: bool,
     },

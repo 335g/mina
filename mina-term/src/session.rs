@@ -30,26 +30,26 @@ use crate::client;
 /// `mina session` のサブコマンド。引数・型は clap が検証する。
 #[derive(Subcommand)]
 pub enum SessionCmd {
-    /// 現在の状態を取得する（JSON で出力）
+    /// Fetch the current state (printed as JSON)
     Get,
-    /// `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
+    /// Run one `Command` (JSON is the wire [`Command`] as-is)
     Exec {
-        /// コマンド JSON
+        /// Command JSON
         json: String,
     },
-    /// [`DocumentEdit`]（位置指定編集）を1つ実行する
+    /// Run one [`DocumentEdit`] (position-addressed edit)
     Edit {
         /// DocumentEdit JSON
         json: String,
     },
-    /// 世代が `<generation>` を超えるまでブロックして状態を返す
+    /// Block until the generation exceeds `<generation>` and return the state
     Wait {
-        /// 世代
+        /// Generation
         generation: u64,
     },
-    /// 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
+    /// Fetch inlay hints for any path without full text (ADR-0020)
     Hints {
-        /// パス
+        /// Path
         path: PathBuf,
     },
 }
