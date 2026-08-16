@@ -56,11 +56,40 @@ impl LineIndex {
     }
 }
 
+/// フレーム間で再利用する [`LineIndex`] キャッシュ。`checksum` が同じテキスト
+/// なら再構築しない（打鍵ごとの全文 char 走査を回避 — 1MB で ~1.2ms）。
+///
+/// 前提: `checksum` はスナップショットの `text` と同源（daemon の `snapshot()`
+/// が同じ `text` から算出する）。partial snapshot（ADR-0006 延期）で checksum
+/// だけ新しくなる運用にしたら、この前提は崩れるため再訪が必要。
+pub(crate) struct LineIndexCache {
+    checksum: Option<u64>,
+    index: LineIndex,
+}
+
+impl LineIndexCache {
+    pub(crate) fn get(&mut self, checksum: u64, text: &str) -> &LineIndex {
+        if self.checksum != Some(checksum) {
+            self.index = LineIndex::new(text);
+            self.checksum = Some(checksum);
+        }
+        &self.index
+    }
+}
+
+impl Default for LineIndexCache {
+    fn default() -> Self {
+        Self {
+            checksum: None,
+            index: LineIndex::new(""),
+        }
+    }
+}
+
 /// 画面全体の描画エスケープ列を生成する。`width`×`height` はターミナルのセル数。
 ///
-/// `command_line`: コマンドモードの入力バッファ（`Some` ならステータス行を `:` プロンプトに置き換える）。
-/// `flash`: クライアント側の一時メッセージ（未知コマンド等。次のキーで消える）。
-#[allow(clippy::too_many_arguments)] // 純粋関数: 全描画状態を引数で受ける（scheme 追加で上限超え）
+/// 毎フレーム新しい [`LineIndexCache`] を使う（単発描画用）。ループ内で
+/// キャッシュを再利用するには [`render_text_with_cache`] を使う。
 pub fn render_text(
     scheme: &Colorscheme,
     capability: ColorCapability,
@@ -72,17 +101,42 @@ pub fn render_text(
     width: u16,
     height: u16,
 ) -> String {
+    let mut cache = LineIndexCache::default();
+    render_text_with_cache(
+        scheme, capability, no_color, state, pending, command_line, flash, width, height, &mut cache,
+    )
+}
+
+/// [`render_text`] のキャッシュ付き版。`cache` はフレーム間で使い回す
+/// （checksum が同じテキストなら LineIndex の再構築を省く）。
+#[allow(clippy::too_many_arguments)] // 純粋関数: 全描画状態を引数で受ける
+pub(crate) fn render_text_with_cache(
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+    state: &StateSnapshot,
+    pending: &[KeyEvent],
+    command_line: Option<&str>,
+    flash: Option<&str>,
+    width: u16,
+    height: u16,
+    cache: &mut LineIndexCache,
+) -> String {
     let width = width as usize;
     let height = height as usize;
-    let lines = LineIndex::new(&state.text);
+    let lines = cache.get(state.checksum, &state.text);
     let primary = state
         .selection
         .get(state.primary_index)
         .copied()
         .unwrap_or(Range { anchor: 0, head: 0 });
     let head = primary.head;
-    // カーソル行（ガターの LineNumberActive 判定と端末カーソル列で使う。O(head) は 1 回）
-    let (cursor_row, _, cursor_colw) = cursor_pos(&state.text, head, &state.inlay_hints);
+    // カーソル行（ガターの LineNumberActive 判定と端末カーソル列で使う。
+    // LineIndex ベースで O(log n + 行長)）。
+    let (cursor_row, _, cursor_colw) = cursor_pos_at(lines, &state.text, head, &state.inlay_hints);
+    // ステータス行の "row:col" はヒント幅を含めない（従来の cursor_pos(&[])
+    // と同じ意味論）。
+    let (_, cursor_col, _) = cursor_pos_at(lines, &state.text, head, &[]);
 
     let mut s = String::new();
     s.push_str("\x1b[?2026h"); // synchronized output ON（未対応端末では無視される）
@@ -157,6 +211,8 @@ pub fn render_text(
         command_line,
         flash,
         width,
+        cursor_row,
+        cursor_col,
     );
 
     // 外部削除ポップアップ（ADR-0015）: 中央にモーダル表示。入力をブロックする
@@ -224,9 +280,50 @@ pub fn draw(
     width: u16,
     height: u16,
 ) -> std::io::Result<()> {
+    let mut cache = LineIndexCache::default();
+    draw_with_cache(
+        out,
+        scheme,
+        capability,
+        no_color,
+        state,
+        pending,
+        command_line,
+        flash,
+        width,
+        height,
+        &mut cache,
+    )
+}
+
+/// [`draw`] のキャッシュ付き版（TUI ループで LineIndex を再利用する）。
+pub(crate) fn draw_with_cache(
+    out: &mut impl Write,
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+    state: &StateSnapshot,
+    pending: &[KeyEvent],
+    command_line: Option<&str>,
+    flash: Option<&str>,
+    width: u16,
+    height: u16,
+    cache: &mut LineIndexCache,
+) -> std::io::Result<()> {
     out.write_all(
-        render_text(scheme, capability, no_color, state, pending, command_line, flash, width, height)
-            .as_bytes(),
+        render_text_with_cache(
+            scheme,
+            capability,
+            no_color,
+            state,
+            pending,
+            command_line,
+            flash,
+            width,
+            height,
+            cache,
+        )
+        .as_bytes(),
     )
 }
 
@@ -528,6 +625,8 @@ fn draw_status(
     command_line: Option<&str>,
     flash: Option<&str>,
     width: usize,
+    cursor_row: usize,
+    cursor_col: usize,
 ) {
     // ステータス文字列は別バッファで組み立ててから切り詰める
     // （出力全体の `s` を truncate すると画面が途中で消える）
@@ -572,12 +671,7 @@ fn draw_status(
         }
         let path = sanitize_status_data(state.path.as_deref().unwrap_or("[no name]"));
         let dirty = if state.dirty { "*" } else { "" };
-        let primary = state
-            .selection
-            .get(state.primary_index)
-            .copied()
-            .unwrap_or(Range { anchor: 0, head: 0 });
-        let (row, col, _) = cursor_pos(&state.text, primary.head, &[]);
+        let (row, col) = (cursor_row, cursor_col); // 呼び出し側で LineIndex から算出済み
         // 行・列は 1 始まり（ガターの行番号と揃える — vim/helix と同じ表示規約）
         text.push_str(&format!(" {path}{dirty}  {}:{}", row + 1, col + 1));
         if !pending.is_empty() {
@@ -637,41 +731,55 @@ fn truncate_wide(s: &mut String, width: usize) {
 /// 表示幅には、head と同じ行内で head より前に挟み込まれる inlay hint の幅が
 /// 含まれる（Q4: 端末カーソル列は仮想テキスト分も右へずれる）。`hints` は
 /// position 昇順（#22 の不変条件）。
+/// カーソル位置（行・列・表示列幅）を計算する。`head` は char インデックス。
+///
+/// [`LineIndex`] ベースの [`cursor_pos_at`] への委譲（小さなテキスト・テスト用。
+/// 内部で LineIndex を構築する）。
 fn cursor_pos(text: &str, head: usize, hints: &[InlayHint]) -> (usize, usize, usize) {
-    let mut row = 0usize;
+    cursor_pos_at(&LineIndex::new(text), text, head, hints)
+}
+
+/// カーソル位置（行・列・表示列幅）を [`LineIndex`] から計算する。
+/// O(log n + 行長) — 全文を head まで歩かない（1MB の末尾で ~1ms の走査を回避）。
+///
+/// 意味論は従来の全文走査版と同一:
+/// - `\r` は非表示（CRLF）なので行・列に数えない（H2）
+/// - 行頭より前のヒントは列に影響しない（ADR-0020。1行目のヒントが2行目の列に漏れない）
+/// - `position == head` のヒント（行末カーソル直前）も表示列に加算する
+/// - 行末の `\n` の位置にカーソルがあるときは前行末扱い（列 0 の次行ではない）
+fn cursor_pos_at(
+    lines: &LineIndex,
+    text: &str,
+    head: usize,
+    hints: &[InlayHint],
+) -> (usize, usize, usize) {
+    // 行 = head が属する行（char_starts は行先頭 char 位置の昇順）。
+    // head が行末の `\n` の位置ならその行のまま（前行末 = 列 0 の次行ではない）。
+    let row = lines
+        .char_starts
+        .partition_point(|&cs| cs <= head)
+        .saturating_sub(1);
+    let line_char_start = lines.char_starts[row];
+    let (bs, be) = lines.byte_range(row).expect("row は常に有効");
+    // 行内の head までの文字を走査（`\r` は列・幅に数えない）。
+    let target = head - line_char_start;
     let mut col = 0usize;
     let mut colw = 0usize;
-    let mut row_start = 0usize; // 現在行の先頭 char インデックス
-    let mut hint_i = 0usize;
-    for (i, ch) in text.chars().enumerate() {
-        if i >= head {
-            break;
-        }
-        if ch == '\n' {
-            row += 1;
-            col = 0;
-            colw = 0;
-            row_start = i + 1;
-        } else if ch != '\r' {
-            // \r は非表示（CRLF）なので行・列に数えない（H2）
+    for (_, ch) in text[bs..be].char_indices().take(target) {
+        if ch != '\r' {
             col += 1;
             colw += ch.width().unwrap_or(0);
         }
-        // 位置 i のキャラの直前に挟まれるヒント（position == i）はそのキャラ以降の
-        // 表示位置を右へ押す。前行のヒントは行リセットで消えるため足さない。
-        while let Some(h) = hints.get(hint_i).filter(|h| h.position == i) {
-            if h.position >= row_start {
-                colw += hint_display_width(h);
-            }
-            hint_i += 1;
-        }
     }
-    // head の位置のキャラ（または行末カーソル）の直前に挟まれるヒント
-    // （position == head）も端末カーソル列に影響する。
-    while let Some(h) = hints.get(hint_i).filter(|h| h.position == head) {
-        if h.position >= row_start {
-            colw += hint_display_width(h);
+    // この行の head までの位置に挟まるヒント（position ∈ [行頭, head]）が
+    // 表示列を右へ押す。前行のヒントは行頭より前なので除外される。
+    // position 昇順（#22 の stable sort の不変条件）なので二分探索で先頭を引く。
+    let mut hint_i = hints.partition_point(|h| h.position < line_char_start);
+    while let Some(h) = hints.get(hint_i) {
+        if h.position > head {
+            break;
         }
+        colw += hint_display_width(h);
         hint_i += 1;
     }
     (row, col, colw)

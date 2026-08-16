@@ -141,8 +141,10 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     // 色能力と NO_COLOR（起動時に 1 回検出 — ADR-0019）。
     let (capability, no_color) = colorscheme::detect_from_env();
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
+    // フレーム間で再利用する LineIndex（テキストが同じ間は再構築しない）。
+    let mut li_cache = render::LineIndexCache::default();
 
-    render::draw(
+    render::draw_with_cache(
         &mut *terminal,
         &scheme,
         capability,
@@ -153,6 +155,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         flash.as_deref(),
         width,
         height,
+        &mut li_cache,
     )?;
     terminal.flush()?;
 
@@ -283,7 +286,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
             }
         }
         if redraw {
-            render::draw(
+            render::draw_with_cache(
                 &mut *terminal,
                 &scheme,
                 capability,
@@ -294,6 +297,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 flash.as_deref(),
                 width,
                 height,
+                &mut li_cache,
             )?;
             terminal.flush()?;
         }
