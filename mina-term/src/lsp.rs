@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mina_lsp::{Client, PositionEncoding, PublishDiagnostic};
+use mina_lsp::{Client, LspRange, PositionEncoding, PublishDiagnostic};
 use mina_protocol::{Diagnostic, InlayHint, Severity, StateSnapshot};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 
@@ -435,6 +436,154 @@ fn lsp_pos_to_char(text: &str, line: u32, col: u32, enc: PositionEncoding) -> us
     lsp_pos_to_char_indexed(&LineIndex::new(text), text, line, col, enc)
 }
 
+/// char インデックス → LSP 座標（行・列）。encoding に応じて列の単位が変わる
+/// （utf-8 = バイト列、utf-16 = UTF-16 単位）。
+fn char_to_lsp_pos(text: &str, char_idx: usize, enc: PositionEncoding) -> (u32, u32) {
+    // char 数 → バイト位置（マルチバイト対応。char 境界で必ず切れる）
+    let byte_idx = text
+        .char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(b, _)| b);
+    let line = text[..byte_idx].chars().filter(|&c| c == '\n').count() as u32;
+    let line_start = text[..byte_idx].rfind('\n').map_or(0, |i| i + 1);
+    let col = match enc {
+        PositionEncoding::Utf8 => (byte_idx - line_start) as u32,
+        PositionEncoding::Utf16 => {
+            let line_col = text[line_start..byte_idx].chars().count();
+            mina_lsp::position::char_to_utf16_col(&text[line_start..byte_idx], line_col)
+        }
+    };
+    (line, col)
+}
+
+/// `textDocument/definition` の応答から最初の定義位置を取り出す。
+/// 応答形状は `Location | Location[] | LocationLink[] | null` を扱う
+/// （LocationLink は `targetUri` / `targetRange`）。
+fn first_definition_target(value: &Value) -> Option<(String, LspRange)> {
+    match value {
+        Value::Null => None,
+        Value::Array(items) => items.iter().find_map(first_definition_target),
+        Value::Object(_) => {
+            let uri = value
+                .get("uri")
+                .or_else(|| value.get("targetUri"))?
+                .as_str()?;
+            let range = value
+                .get("range")
+                .or_else(|| value.get("targetRange"))?;
+            let range: LspRange = serde_json::from_value(range.clone()).ok()?;
+            Some((uri.to_string(), range))
+        }
+        _ => None,
+    }
+}
+
+/// 定義スニペットの上限（行数・1行の文字数）。ポップアップ表示のため大きくない。
+const MAX_PEEK_LINES: usize = 12;
+const MAX_PEEK_LINE_LEN: usize = 200;
+
+/// 定義範囲を包む行 + 続きを数行（本体の入口まで見えるように）切り出す。
+/// 戻り値は (開始行番号 1 始まり, スニペット)。
+fn definition_snippet(text: &str, range: &LspRange) -> Option<(u32, String)> {
+    // 行ごとのバイト範囲を1回の走査で集める（LineIndex は char 位置なので
+    // スライスには使えない — ここのみバイト列で持つ）。
+    let mut byte_starts = vec![0usize];
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            byte_starts.push(i + 1);
+        }
+    }
+    let last_line = byte_starts.len() - 1;
+    let line_end = |line: usize| -> usize {
+        byte_starts.get(line + 1).map_or(text.len(), |&s| s - 1)
+    };
+    let first = (range.start.line as usize).min(last_line);
+    let last = (range.end.line as usize + 2)
+        .min(first + MAX_PEEK_LINES - 1)
+        .min(last_line);
+    let lines = (first..=last)
+        .map(|line| {
+            text[byte_starts[line]..line_end(line)]
+                .chars()
+                .take(MAX_PEEK_LINE_LEN)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((first as u32 + 1, lines))
+}
+
+/// 対象ファイルを読む（サイズ上限付き）。ディレクトリ等は None。
+/// ponytail: 開文書の未保存編集は反映されない（フォーカス文書内の定義は
+/// `text` 引数が使われる）。必要になったら editor の文書からも引けるようにする。
+async fn read_peek_target(path: &Path) -> Option<String> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let meta = file.metadata().await.ok()?;
+    if !meta.is_file() || meta.len() > MAX_PEEK_FILE {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(MAX_PEEK_FILE + 1)
+        .read_to_string(&mut s)
+        .await
+        .ok()?;
+    if s.len() as u64 > MAX_PEEK_FILE {
+        return None;
+    }
+    Some(s)
+}
+
+/// 定義対象ファイルの読み取り上限。
+/// ponytail: 固定 4MiB。巨大ファイル内の定義は読めず peek なしになる。
+const MAX_PEEK_FILE: u64 = 4 * 1024 * 1024;
+
+/// カーソル位置のシンボル定義を確認用スニペットとして返す（読み取り専用）。
+///
+/// `textDocument/definition` の応答（Location | Location[] | LocationLink[] | null）
+/// の最初の定義を対象ファイルから数行抜き出す。サーバ死亡・ロック待ち・
+/// エラー応答・定義なし・対象が読めない場合は `None`。
+pub async fn definition_peek(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    head: usize,
+) -> Option<mina_protocol::Peek> {
+    let (target_uri, range) = {
+        let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return None;
+        };
+        if session.client.is_dead() {
+            return None;
+        }
+        let (line, character) = char_to_lsp_pos(text, head, session.encoding);
+        let result = session
+            .client
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": uri(path) },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await
+            .ok()?;
+        first_definition_target(&result)?
+    };
+    let target_path = PathBuf::from(target_uri.strip_prefix("file://").unwrap_or(&target_uri));
+    // フォーカス文書なら渡されたテキスト（未保存編集込み）、それ以外はディスクから読む
+    let target_text = if target_path == path {
+        text.to_string()
+    } else {
+        read_peek_target(&target_path).await?
+    };
+    let (line, text) = definition_snippet(&target_text, &range)?;
+    Some(mina_protocol::Peek {
+        path: target_path.to_string_lossy().into_owned(),
+        line,
+        text,
+    })
+}
+
 // ---- daemon 統合 ----
 
 /// 必要なら LSP セッションを spawn + initialize する（初回 .rs オープン時）。
@@ -754,6 +903,93 @@ mod tests {
         assert_eq!(lsp_pos_to_char(text, 1, 1, PositionEncoding::Utf8), 4);
         // 3行目のバイト6 = こんにちは の 2文字目（ん）。行開始は "ab\ncd\n" の6
         assert_eq!(lsp_pos_to_char(text, 2, 6, PositionEncoding::Utf8), 8);
+    }
+
+    #[test]
+    fn char_to_lsp_pos_converts_with_encoding() {
+        // UTF-8: 列はバイト列
+        assert_eq!(char_to_lsp_pos("ab\ncd", 4, PositionEncoding::Utf8), (1, 1));
+        // 先頭
+        assert_eq!(char_to_lsp_pos("ab\ncd", 0, PositionEncoding::Utf8), (0, 0));
+        // 末尾（改行直後の空行）
+        assert_eq!(char_to_lsp_pos("ab\n", 3, PositionEncoding::Utf8), (1, 0));
+        // UTF-16: サロゲートペアは2単位
+        let text = "a😀b\ncd";
+        assert_eq!(char_to_lsp_pos(text, 3, PositionEncoding::Utf16), (0, 4)); // 改行（😀 の2単位込み）
+        assert_eq!(char_to_lsp_pos(text, 5, PositionEncoding::Utf16), (1, 1)); // 'd'
+        // 範囲外は clamp
+        assert_eq!(char_to_lsp_pos("ab", 99, PositionEncoding::Utf8), (0, 2));
+    }
+
+    #[test]
+    fn first_definition_target_handles_all_shapes() {
+        use serde_json::json;
+        let pos = |l: u32, c: u32| json!({ "line": l, "character": c });
+        // Location 単体
+        let loc = json!({"uri": "file:///a.rs", "range": {"start": pos(1, 2), "end": pos(1, 5)}});
+        let (uri, range) = first_definition_target(&loc).unwrap();
+        assert_eq!(uri, "file:///a.rs");
+        assert_eq!(range.start.line, 1);
+        assert_eq!(range.start.character, 2);
+        // Location[] — 最初の要素を取る
+        let arr = json!([null, loc]);
+        let (uri, _) = first_definition_target(&arr).unwrap();
+        assert_eq!(uri, "file:///a.rs");
+        // LocationLink（targetUri / targetRange）
+        let link = json!({"originSelectionRange": {"start": pos(0, 0), "end": pos(0, 1)}, "targetUri": "file:///b.rs", "targetRange": {"start": pos(3, 0), "end": pos(3, 4)}, "targetSelectionRange": {"start": pos(3, 0), "end": pos(3, 4)}});
+        let (uri, range) = first_definition_target(&link).unwrap();
+        assert_eq!(uri, "file:///b.rs");
+        assert_eq!(range.start.line, 3);
+        // LocationLink[]
+        let (uri, _) = first_definition_target(&json!([link])).unwrap();
+        assert_eq!(uri, "file:///b.rs");
+        // null / 空配列 / 無関係なオブジェクト
+        assert!(first_definition_target(&Value::Null).is_none());
+        assert!(first_definition_target(&json!([])).is_none());
+        assert!(first_definition_target(&json!([null, null])).is_none());
+        assert!(first_definition_target(&json!({ "foo": 1 })).is_none());
+    }
+
+    #[test]
+    fn definition_snippet_covers_range_plus_following_lines() {
+        let text = "a\npub fn f(x: i32) -> i32 {\n    x * 2\n}\nnext";
+        let range = LspRange {
+            start: mina_lsp::LspPosition { line: 1, character: 0 },
+            end: mina_lsp::LspPosition { line: 1, character: 9 },
+        };
+        let (line, snippet) = definition_snippet(text, &range).unwrap();
+        assert_eq!(line, 2, "1 始まり");
+        assert_eq!(snippet, "pub fn f(x: i32) -> i32 {\n    x * 2\n}", "定義行 + 本体 2 行");
+        // 範囲が複数行に跨る場合はその行まで
+        let range = LspRange {
+            start: mina_lsp::LspPosition { line: 1, character: 0 },
+            end: mina_lsp::LspPosition { line: 2, character: 4 },
+        };
+        let (_, snippet) = definition_snippet(text, &range).unwrap();
+        assert!(snippet.starts_with("pub fn f"));
+        // 範囲外行は最後の行に clamp
+        let range = LspRange {
+            start: mina_lsp::LspPosition { line: 99, character: 0 },
+            end: mina_lsp::LspPosition { line: 99, character: 1 },
+        };
+        assert_eq!(definition_snippet(text, &range).unwrap().0, 5);
+        // 1行の長い行は切り詰める
+        let long = "x".repeat(500);
+        let range = LspRange {
+            start: mina_lsp::LspPosition { line: 0, character: 0 },
+            end: mina_lsp::LspPosition { line: 0, character: 1 },
+        };
+        let (_, snippet) = definition_snippet(&long, &range).unwrap();
+        assert_eq!(snippet.chars().count(), MAX_PEEK_LINE_LEN);
+    }
+
+    #[test]
+    fn definition_snippet_empty_text() {
+        let range = LspRange {
+            start: mina_lsp::LspPosition { line: 0, character: 0 },
+            end: mina_lsp::LspPosition { line: 0, character: 0 },
+        };
+        assert_eq!(definition_snippet("", &range).unwrap().0, 1);
     }
 
     #[test]
