@@ -107,3 +107,11 @@ _Avoid_: scope, token type
 **ColorCapability**:
 The color depth a terminal supports — truecolor, a 256-color palette, or ANSI16 — detected once from the environment at Client startup. The renderer converts Colorscheme colors to this depth; `NO_COLOR` suppresses color output entirely while keeping attributes (underline, reverse).
 _Avoid_: color depth, terminal colors
+
+**Config**:
+The user's set of settings, stored as TOML in the `config.toml` file under the XDG config directory and read once at Client startup. Client-local: the Daemon never reads it and changes apply from the next startup, never live. Unknown keys are rejected (typo detection), and a broken file falls back to defaults with a warning rather than blocking startup.
+_Avoid_: settings, preferences
+
+**Config file**:
+The `config.toml` file that stores the Config — `$XDG_CONFIG_HOME/mina/config.toml`, falling back to `~/.config/mina/config.toml`. Manipulated by the user directly or through the `mina config` subcommand.
+_Avoid_: config (as a file), rc file
