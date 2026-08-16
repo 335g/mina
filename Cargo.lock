@@ -380,6 +380,7 @@ name = "mina-term"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cliclack",
  "futures-lite",
  "libc",
  "mina-core",
