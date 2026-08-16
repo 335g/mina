@@ -143,6 +143,9 @@ pub enum UiRole {
     StatusLine,
     CommandLine,
     Popup,
+    /// ポップアップの枠（box 罫線 ┌─┐│└┘）。前景色だけ境界色、背景は Popup に
+    /// 揃える（ADR-0024）。ポップアップ背景が端末背景と同化して見切れるのを防ぐ。
+    PopupBorder,
     /// ステータス行先頭のモードマーカー（Normal / Insert / Select で色分け）。
     ModeNormal,
     ModeInsert,
@@ -192,6 +195,8 @@ const DEFAULT_UI: &[(UiRole, Style)] = &[
     // 白く浮くため、暗い端末上で「ウィンドウ」として際立つ明示的な bg+fg にする
     // （ADR-0024）。ユーザーはスキームの `[ui] popup` で上書きできる。
     (UiRole::Popup, Style { fg: Some(Color::Ansi(15)), bg: Some(Color::Ansi(8)), ..Style::new() }),
+    // ポップアップの枠線。暗い背景でも見えるシアン（浅い色深度でも視認可）。
+    (UiRole::PopupBorder, Style::fg(Color::Ansi(6))),
     // モードマーカー: 黒文字 + 明るい背景（反転チップの見た目を維持しつつ色分け）
     (UiRole::ModeNormal, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(12)), ..Style::new() }), // 30;104
     (UiRole::ModeInsert, Style { fg: Some(Color::Ansi(0)), bg: Some(Color::Ansi(10)), ..Style::new() }), // 30;102

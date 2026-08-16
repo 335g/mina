@@ -289,6 +289,26 @@ pub(crate) fn draw_with_cache(
 
 /// 中央ポップアップの描画（deleted ポップアップと peek ポップアップで共用）。
 /// 内容は呼び出し側でサニタイズ済み。幅・高さに合わせて切り詰める。
+/// ポップアップ境界の SGR: 中身（[`UiRole::Popup`]）と同じ背景 + [`UiRole::PopupBorder`]
+/// の前景色。背景を Popup に揃えるので、ユーザースキームが Popup の背景色を変えても
+/// 境界が追従する。
+fn popup_border_sgr(
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+) -> String {
+    let popup_bg = scheme.ui_style(UiRole::Popup).and_then(|s| s.bg);
+    let border_fg = scheme.ui_style(UiRole::PopupBorder).and_then(|s| s.fg);
+    emit_sgr(
+        Style { fg: border_fg, bg: popup_bg, ..Style::new() },
+        capability,
+        no_color,
+    )
+}
+
+/// 中央ポップアップの描画（deleted ポップアップと peek ポップアップで共用）。
+/// 内容は呼び出し側でサニタイズ済み。box 罫線（┌─┐│└┘）で囲み、幅・高さに合わせて
+/// 切り詰める。内容は両端の │ の 1 セル内側に入る。
 fn push_popup_box(
     s: &mut String,
     lines: &[String],
@@ -299,28 +319,57 @@ fn push_popup_box(
     no_color: bool,
 ) {
     let line_width = |l: &str| l.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
-    let box_w = lines
+    // 内容の幅（両端の │ を 2 セル除く）
+    let content_w = lines
         .iter()
         .map(|l| line_width(l))
         .max()
         .unwrap_or(0)
-        .min(width.saturating_sub(2));
-    let box_h = lines.len().min(body_rows);
-    let top = body_rows.saturating_sub(box_h) / 2;
-    let left = width.saturating_sub(box_w) / 2;
-    for (i, line) in lines.iter().take(box_h).enumerate() {
-        s.push_str(&format!("\x1b[{};{}H", top + i + 1, left + 1));
-        s.push_str(&ui_sgr(scheme, capability, no_color, UiRole::Popup));
+        .min(width.saturating_sub(3));
+    let box_w = content_w + 2; // + 左右の境界 │
+    let total_h = lines.len().saturating_add(2); // + 上下の境界 ┌─┐ / └─┘
+    let box_h = total_h.min(body_rows);
+    let top = body_rows.saturating_sub(box_h) / 2; // 0 始まり（カーソル行は +1）
+    let left = width.saturating_sub(box_w) / 2; // 0 始まり（カーソル列は +1）
+    let content_sgr = ui_sgr(scheme, capability, no_color, UiRole::Popup);
+    let border_sgr = popup_border_sgr(scheme, capability, no_color);
+    // 上辺
+    s.push_str(&format!("\x1b[{};{}H", top + 1, left + 1));
+    s.push_str(&border_sgr);
+    s.push('┌');
+    for _ in 0..content_w {
+        s.push('─');
+    }
+    s.push('┐');
+    s.push_str("\x1b[0m\x1b[K");
+    // 中身（箱に入りきらない行は表示しない）
+    let inner_rows = box_h.saturating_sub(2);
+    for (i, line) in lines.iter().take(inner_rows).enumerate() {
+        s.push_str(&format!("\x1b[{};{}H", top + i + 2, left + 1));
+        s.push_str(&border_sgr);
+        s.push('│');
+        s.push_str(&content_sgr);
         let mut padded = line.clone();
         let mut w = line_width(&padded);
-        while w < box_w {
+        while w < content_w {
             padded.push(' ');
             w += 1;
         }
-        truncate_wide(&mut padded, box_w);
+        truncate_wide(&mut padded, content_w);
         s.push_str(&padded);
+        s.push_str(&border_sgr);
+        s.push('│');
         s.push_str("\x1b[0m\x1b[K");
     }
+    // 下辺
+    s.push_str(&format!("\x1b[{};{}H", top + box_h, left + 1));
+    s.push_str(&border_sgr);
+    s.push('└');
+    for _ in 0..content_w {
+        s.push('─');
+    }
+    s.push('┘');
+    s.push_str("\x1b[0m\x1b[K");
 }
 
 /// 定義ポップアップ（[`Command::PeekDefinition`] の結果）を画面中央に描画する。
@@ -1583,6 +1632,8 @@ mod tests {
         assert!(out.contains("any key closes"), "閉じ方のヒント: {out:?}");
         assert!(out.contains("\x1b[97;100m"), "ポップアップは明示 bg+fg（白反転でない）: {out:?}");
         assert!(!out.contains("\x1b[7m"), "反転（白背景）になっていない: {out:?}");
+        assert!(out.contains('┌') && out.contains('┐') && out.contains('│') && out.contains('└') && out.contains('┘'),
+               "box 罫線で囲まれる: {out:?}");
     }
 
     #[test]
