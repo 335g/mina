@@ -93,6 +93,33 @@ fn main() {
                     });
                     write_frame(&mut stdout, &resp);
                 }
+                "textDocument/definition" => {
+                    // 定義: 現在の文書内の最初の "fn " の位置を Location で返す
+                    // （PeekDefinition の確認用。カーソル位置は解析しない）。
+                    let loc = current.as_ref().map(|(uri, text)| {
+                        let start = text.find("fn ").unwrap_or(0);
+                        let line = text[..start].matches('\n').count() as u32;
+                        let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+                        let char = if utf16 {
+                            text[line_start..start].encode_utf16().count() as u32
+                        } else {
+                            (start - line_start) as u32
+                        };
+                        json!({
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": line, "character": char },
+                                "end": { "line": line, "character": char + 5 },
+                            },
+                        })
+                    });
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": loc,
+                    });
+                    write_frame(&mut stdout, &resp);
+                }
                 _ => {}
             }
         } else if let Some(method) = msg.get("method").and_then(Value::as_str) {
