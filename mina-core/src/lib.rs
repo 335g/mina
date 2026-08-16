@@ -18,7 +18,8 @@ pub use edit::{
     delete_word_forward_transaction, insert_text,
 };
 pub use movement::{
-    Direction, Movement, WordMoveTarget, extend_selection, move_selection, word_move_selection,
+    Direction, Movement, WordMoveTarget, extend_selection, move_selection,
+    move_selection_lines, move_selection_to_line_first_non_whitespace, word_move_selection,
 };
 pub use ropey::Rope;
 pub use search::{CaseSensitivity, find_matches, find_next};

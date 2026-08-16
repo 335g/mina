@@ -82,6 +82,43 @@ fn transform(
     Selection::new(ranges, selection.primary_index())
 }
 
+/// 選択を `lines` 行分まとめて移動する（スクロール連動用。ADR-0023）。
+///
+/// [`Movement::Line`] の繰り返しと違い1回で済ませる（本モジュールのパフォーマンス
+/// 注記どおり、繰り返すと毎回文書全体のマテリアライズが走る）。列は維持し、行の
+/// 長さと文書端でクランプする。`extend` なら anchor を保って head だけ動かす
+/// （Select モードのスクロール拡張用）、そうでなければ点に潰す。
+pub fn move_selection_lines(
+    doc: &Document,
+    selection: &Selection,
+    lines: isize,
+    extend: bool,
+) -> Selection {
+    let text = doc.text().to_string();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| put_cursor(&text, *r, step_lines(&text, r.head(), lines), extend))
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
+/// 各 Range を head の行の「最初の非空白文字」（空白のみの行は列 0）へ点に潰して
+/// 移動する（Helix の `I` = insert_at_line_start と同じ位置。空行の自動インデント
+/// は行わない — ADR-0023）。
+pub fn move_selection_to_line_first_non_whitespace(
+    doc: &Document,
+    selection: &Selection,
+) -> Selection {
+    let text = doc.text().to_string();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| Range::point(step_line_first_non_whitespace(&text, r.head())))
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
 fn move_range(text: &str, range: Range, movement: Movement, dir: Direction, extend: bool) -> Range {
     let new_pos = match movement {
         Movement::Char => step_grapheme(text, range.head(), dir),
@@ -502,6 +539,50 @@ fn step_line_end(text: &str, char_pos: usize) -> usize {
         .unwrap_or(len)
 }
 
+/// `char_pos` から `lines` 行分（正で下、負で上）移動した位置。現在の列を維持し、
+/// 行の長さと文書端でクランプする。端に達していれば動かない。
+fn step_lines(text: &str, char_pos: usize, lines: isize) -> usize {
+    let len = text.chars().count();
+    if len == 0 || lines == 0 {
+        return char_pos;
+    }
+    // 行開始位置（char インデックス）の一覧。行 k は [starts[k], starts[k+1]) で、
+    // 末尾行（改行なし）の終端は文書末尾。
+    let mut starts = vec![0usize];
+    let mut chars = 0usize;
+    for ch in text.chars() {
+        chars += 1;
+        if ch == '\n' {
+            starts.push(chars);
+        }
+    }
+    let cur_line = starts.partition_point(|&s| s <= char_pos) - 1;
+    let last_line = starts.len() - 1;
+    let target = (cur_line as isize + lines).clamp(0, last_line as isize) as usize;
+    if target == cur_line {
+        return char_pos;
+    }
+    let line_end = starts
+        .get(target + 1)
+        .map(|&s| s - 1) // 改行の直前
+        .unwrap_or(len);
+    let col = char_pos - starts[cur_line];
+    starts[target] + col.min(line_end - starts[target])
+}
+
+/// 現在の行の最初の非空白文字の位置。空白のみの行は行頭（列 0）へ（Helix の
+/// insert_at_line_start と同じ位置。`\r\n` 行末の `\r` も空白として飛ばす）。
+fn step_line_first_non_whitespace(text: &str, char_pos: usize) -> usize {
+    let start = step_line_start(text, char_pos);
+    let end = step_line_end(text, start);
+    let start_byte = char_to_byte(text, start);
+    let end_byte = char_to_byte(text, end);
+    match text[start_byte..end_byte].find(|c: char| !c.is_whitespace()) {
+        Some(rel) => start + text[start_byte..start_byte + rel].chars().count(),
+        None => start,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +789,89 @@ mod tests {
                 Direction::Forward
             ),
             Selection::point(8)
+        );
+    }
+
+    #[test]
+    fn move_selection_lines_moves_by_delta_keeping_column() {
+        // "abc\ndef\nghi\njkl\nmno": 行0[0,3] 1[4,6] 2[8,10] 3[12,14] 4[16,18]
+        let doc = Document::from("abc\ndef\nghi\njkl\nmno");
+        // 行1（"def" の列1 = 'e'）から3行下 → 行4（"mno"）の列1
+        assert_eq!(
+            move_selection_lines(&doc, &Selection::point(5), 3, false),
+            Selection::point(17)
+        );
+        // 戻る
+        assert_eq!(
+            move_selection_lines(&doc, &Selection::point(17), -3, false),
+            Selection::point(5)
+        );
+        // 文書端ではクランプして動かない
+        assert_eq!(
+            move_selection_lines(&doc, &Selection::point(17), 3, false),
+            Selection::point(17)
+        );
+        // 短い行へは列がクランプされる（"de" の列2 → "g" の列1）
+        let short = Document::from("abc\nde\ng");
+        assert_eq!(
+            move_selection_lines(&short, &Selection::point(6), 1, false),
+            Selection::point(8)
+        );
+        // 末尾に改行がある文書の最終行（空行）へ
+        let trailing = Document::from("a\nb\n");
+        assert_eq!(
+            move_selection_lines(&trailing, &Selection::point(0), 2, false),
+            Selection::point(4)
+        );
+        // 空文書では動かない
+        let empty = Document::from("");
+        assert_eq!(
+            move_selection_lines(&empty, &Selection::point(0), 5, false),
+            Selection::point(0)
+        );
+    }
+
+    #[test]
+    fn move_selection_lines_extend_keeps_anchor() {
+        // Select モードのスクロール拡張: anchor を保って head だけ動かす
+        let doc = Document::from("abc\ndef\nghi");
+        let selection = sel(vec![(2, 5)], 0); // "cde"
+        assert_eq!(
+            move_selection_lines(&doc, &selection, 1, true),
+            sel(vec![(2, 9)], 0) // head は行2の列1へ、anchor 2 のまま
+        );
+        // extend で head が anchor を越えたら、anchor 側の文字を選択に残すため
+        // anchor が1書記素ずれる（put_cursor の規則）
+        let up = sel(vec![(2, 5)], 0); // [2,5) = "cde"
+        assert_eq!(
+            move_selection_lines(&doc, &up, -2, true),
+            sel(vec![(3, 1)], 0) // head は行0の列1へ、anchor は 2→3（'c' を残す）
+        );
+    }
+
+    #[test]
+    fn line_first_non_whitespace_moves_and_falls_back() {
+        let doc = Document::from("  ab\ncd");
+        // 空白の上から → 行の最初の非空白へ
+        assert_eq!(
+            move_selection_to_line_first_non_whitespace(&doc, &Selection::point(1)),
+            Selection::point(2)
+        );
+        // 既に非空白の上なら動かない
+        assert_eq!(
+            move_selection_to_line_first_non_whitespace(&doc, &Selection::point(2)),
+            Selection::point(2)
+        );
+        // 空白のみの行は列 0 へ
+        let ws = Document::from("   \ncd");
+        assert_eq!(
+            move_selection_to_line_first_non_whitespace(&ws, &Selection::point(1)),
+            Selection::point(0)
+        );
+        // マルチカーソル: 各 Range は head の行の位置へ
+        assert_eq!(
+            move_selection_to_line_first_non_whitespace(&doc, &sel(vec![(1, 1), (5, 5)], 0)),
+            sel(vec![(2, 2), (5, 5)], 0)
         );
     }
 
