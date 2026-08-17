@@ -149,12 +149,21 @@ pub struct Range {
 /// `checksum` はクライアントが最後に読んだ文書全文（UTF-8 バイト列）の
 /// FNV-1a 64。不一致（読み取り後に文書が変化）なら daemon は状態を変えず
 /// status で拒否する。
+///
+/// `expected_text` は局所検証用（B2）: `Some` なら checksum に加えて対象
+/// 範囲（start..end）の現テキストがこれと一致することも検証される。位置の
+/// ずれは checksum（全文）では検出できず expected_text（局所）で検出する
+/// ため、両者は相補的。`None` なら checksum のみ（従来どおり）。オプショナル
+/// 追加なのでプロトコル破壊的変更なし（欠落フィールドは None として扱う）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentEdit {
     pub start: usize,
     pub end: usize,
     pub text: String,
     pub checksum: u64,
+    /// 対象範囲に期待する現テキスト（局所検証）。None でチェックなし。
+    #[serde(default)]
+    pub expected_text: Option<String>,
 }
 
 /// FNV-1a 64 ハッシュ（[`DocumentEdit`] のチェックサム検証用）。
@@ -590,10 +599,31 @@ mod tests {
             end: 5,
             text: "x".into(),
             checksum: 42,
+            expected_text: Some("hello".into()),
         };
         let json = serde_json::to_string(&edit).expect("serialize");
         let back: DocumentEdit = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, edit);
+    }
+
+    #[test]
+    fn document_edit_expected_text_is_optional() {
+        // None は null で通る
+        let edit = DocumentEdit {
+            start: 0,
+            end: 0,
+            text: "".into(),
+            checksum: 0,
+            expected_text: None,
+        };
+        let back: DocumentEdit =
+            serde_json::from_str(&serde_json::to_string(&edit).unwrap()).unwrap();
+        assert_eq!(back.expected_text, None);
+        // フィールドなしの旧クライアント JSON も None として受信できる（非破壊）
+        let legacy = r#"{"start":1,"end":2,"text":"x","checksum":9}"#;
+        let back: DocumentEdit = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.expected_text, None);
+        assert_eq!(back.start, 1);
     }
 
     #[test]
