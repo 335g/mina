@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mina_core::{
-    Range as CoreRange, Selection, Transaction, extend_selection, move_selection,
+    Range as CoreRange, Selection, Transaction, extend_selection, insert_at, move_selection,
     move_selection_lines, move_selection_to_line_first_non_whitespace,
 };
 use mina_protocol::{
@@ -1524,7 +1524,7 @@ async fn process_command(
                 match serde_json::from_str(line.trim()) {
                     Ok(edit) => {
                         let mut d = daemon.lock().await;
-                        // 拒否（checksum 不一致・範囲外）なら状態を変えず status を返す
+                        // 拒否（checksum 不一致）なら状態を変えず status を返す
                         let rejected = apply_edit(&mut d, &edit, conn_id);
                         if rejected.is_none() {
                             // ADR-0012: 適用された DocumentEdit を記録（成功時のみ）
@@ -1718,28 +1718,27 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
 }
 
 /// 位置指定編集（ADR-0011）を適用する。拒否・無変化時はスナップショットを返し、
-/// 状態は一切変えない（checksum 不一致・範囲外・空置換の no-op）。成功時は
-/// `None` を返す。
+/// 状態は一切変えない（checksum 不一致・空置換の no-op）。成功時は `None` を返す。
 ///
 /// 選択は読まず・変えない（履歴には before == after として記録されるので
 /// undo でも選択は動かない）。挿入 = `start == end`、削除 = `text` が空。
+/// 範囲クランプと Transaction 構築は mina-core の `insert_at` に委譲する（#25）。
 fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<StateSnapshot> {
     let text = daemon.editor.current_document().text().to_string();
-    let len = text.chars().count();
     if fnv1a64(text.as_bytes()) != edit.checksum {
         return Some(snapshot(
             daemon,
             Some("document changed since read".into()),
         ));
     }
-    if !(edit.start <= edit.end && edit.end <= len) {
-        return Some(snapshot(daemon, Some("range out of bounds".into())));
-    }
     // ADR-0007: 他クライアントの書き込みとして、開いた Insert グループを閉じる
     preempt(daemon, conn_id);
-    let range = CoreRange::new(edit.start, edit.end);
-    let selection = Selection::new(vec![range], 0);
-    let tx = Transaction::insert(daemon.editor.current_document(), &selection, &edit.text);
+    let (new_doc, tx) = insert_at(
+        daemon.editor.current_document(),
+        edit.start,
+        edit.end,
+        &edit.text,
+    );
     if tx.is_noop() {
         // ADR-0012: 空範囲への空文字置換など状態を変えない編集は、拒否と同じ
         // 扱いでイベント・世代・undo 履歴を進めない（M1）。
@@ -1753,7 +1752,7 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
     // 文書長へクランプして状態を有効に保つ。範囲内の選択は一切変わらない
     // ので、通常時は ADR-0011 どおり不変。apply に渡すため履歴の
     // selection_after もクランプされ、redo でも範囲外に戻らない。
-    let new_len = len - (edit.end - edit.start) + edit.text.chars().count();
+    let new_len = new_doc.len_chars();
     let clamp = |pos: usize| pos.min(new_len);
     let selection_after = Selection::new(
         selection_after
@@ -3873,8 +3872,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_edit_rejects_out_of_bounds_without_state_change() {
-        // 範囲外は status で拒否し、状態を変えず undo エントリも作らない
+    async fn document_edit_clamps_out_of_bounds() {
+        // 範囲外（start > end、end > 文書長）は拒否せず文書長へクランプされる
+        // （#25: クランプはコアの insert_at が一括処理。tmp の
+        // out_of_range_clamped と同じ仕様）。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-8c-sock-{}.sock", std::process::id()));
         let file = dir.join(format!("mina-8c-file-{}.txt", std::process::id()));
@@ -3887,7 +3888,8 @@ mod tests {
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
         let cs = fnv1a64(b"abc");
 
-        // start > end
+        // start > end → クランプ後も start > end なので Range が正規化され
+        // min..max が置換対象になる
         let snap = request_edit(
             &mut c,
             &DocumentEdit {
@@ -3898,22 +3900,24 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(snap.status.as_deref(), Some("range out of bounds"));
-        assert_eq!(snap.text, "abc", "文書は不変");
-        // end > 文書長
+        assert_eq!(snap.status, None, "クランプなので拒否されない");
+        assert_eq!(snap.text, "aXc");
+        // end > 文書長 → end が文書末尾にクランプされ置換される
         let snap = request_edit(
             &mut c,
             &DocumentEdit {
                 start: 0,
-                end: 4,
+                end: 100,
                 text: "X".into(),
-                checksum: cs,
+                checksum: fnv1a64(b"aXc"),
             },
         )
         .await;
-        assert_eq!(snap.status.as_deref(), Some("range out of bounds"));
-        assert_eq!(snap.text, "abc", "文書は不変");
-        // undo しても変化しない（拒否は undo エントリを作らない）
+        assert_eq!(snap.status, None, "クランプなので拒否されない");
+        assert_eq!(snap.text, "X");
+        // undo で1回で元に戻る（クランプ編集も単一トランザクション）
+        let snap = request(&mut c, &Command::Undo).await;
+        assert_eq!(snap.text, "aXc");
         let snap = request(&mut c, &Command::Undo).await;
         assert_eq!(snap.text, "abc");
         let _ = std::fs::remove_file(&sock);
