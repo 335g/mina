@@ -15,7 +15,7 @@ pub use document::Document;
 pub use edit::{
     delete_backward, delete_backward_transaction, delete_forward, delete_forward_transaction,
     delete_range, delete_word_backward, delete_word_backward_transaction, delete_word_forward,
-    delete_word_forward_transaction, insert_text,
+    delete_word_forward_transaction, insert_at, insert_text,
 };
 pub use movement::{
     Direction, Movement, WordMoveTarget, extend_selection, move_selection,

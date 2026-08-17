@@ -9,6 +9,32 @@ use crate::movement::{
 };
 use crate::{Document, Range, Selection, Transaction};
 
+/// char 位置 `start..end` を `text` で置き換える位置指定編集ファサード
+/// （headless エージェントと daemon が共有する「1本の道」。issue #25）。
+///
+/// - `start == end`: 挿入
+/// - `text` が空: 削除
+/// - それ以外: 置換
+///
+/// 3 種すべてが**1つのトランザクション**で処理される（`Transaction::insert` は
+/// Range を text で置き換える仕様。replace を delete→insert の2段階で書くと
+/// undo が2段階になり原子性が壊れるため）。
+///
+/// 範囲外（`start > end`、`end > 文書長`）は文書長へクランプする — 呼び出し側で
+/// 分岐せずコア側で一括処理する。位置は char インデックス。
+///
+/// 返り値は「適用後の文書 + 適用に使ったトランザクション」なので、呼び出し側は
+/// `tx.invert()` で undo 履歴を自然に支えられる。
+pub fn insert_at(doc: &Document, start: usize, end: usize, text: &str) -> (Document, Transaction) {
+    let len = doc.len_chars();
+    let start = start.min(len);
+    let end = end.min(len);
+    let selection = Selection::new(vec![Range::new(start, end)], 0);
+    let tx = Transaction::insert(doc, &selection, text);
+    let new_doc = tx.apply(doc);
+    (new_doc, tx)
+}
+
 /// `selection` の各 Range を `text` で置き換える。
 /// カーソル（空の Range）はその位置への挿入。挿入後、各カーソルは挿入された
 /// テキストの直後に置かれる。
@@ -149,6 +175,79 @@ mod tests {
             ranges.into_iter().map(|(a, h)| Range::new(a, h)).collect(),
             primary,
         )
+    }
+
+    #[test]
+    fn insert_at_inserts_when_start_eq_end() {
+        let doc = Document::from("hello");
+        let (new_doc, _) = insert_at(&doc, 2, 2, "XY");
+        assert_eq!(new_doc.text().to_string(), "heXYllo");
+    }
+
+    #[test]
+    fn insert_at_deletes_when_text_empty() {
+        let doc = Document::from("hello");
+        let (new_doc, _) = insert_at(&doc, 1, 4, "");
+        assert_eq!(new_doc.text().to_string(), "ho");
+    }
+
+    #[test]
+    fn insert_at_replaces_range() {
+        let doc = Document::from("hello world");
+        let (new_doc, _) = insert_at(&doc, 6, 11, "mina");
+        assert_eq!(new_doc.text().to_string(), "hello mina");
+    }
+
+    #[test]
+    fn insert_at_clamps_out_of_range_to_doc_len() {
+        let doc = Document::from("abc");
+        // end は文書末尾にクランプされ start==end=3 なので挿入になる
+        let (new_doc, _) = insert_at(&doc, 10, 20, "!");
+        assert_eq!(new_doc.text().to_string(), "abc!");
+        // start > end もクランプされ、min..max が削除対象になる
+        let doc = Document::from("abcd");
+        let (new_doc, _) = insert_at(&doc, 10, 1, "");
+        assert_eq!(new_doc.text().to_string(), "a");
+    }
+
+    #[test]
+    fn insert_at_undo_restores_original() {
+        // 挿入・削除・置換のすべてが1トランザクションなので、invert 1回で元に戻る
+        for (start, end, text, expected) in [
+            (2, 2, "XY", "heXYllo"),
+            (1, 4, "", "ho"),
+            (1, 4, "mina", "hminao"),
+        ] {
+            let doc = Document::from("hello");
+            let (mid, tx) = insert_at(&doc, start, end, text);
+            assert_eq!(mid.text().to_string(), expected, "適用結果");
+            let restored = tx.invert().apply(&mid);
+            assert_eq!(restored.text().to_string(), "hello", "undo で原文に戻る");
+        }
+    }
+
+    #[test]
+    fn insert_at_uses_char_indices() {
+        let doc = Document::from("日本語");
+        let (new_doc, _) = insert_at(&doc, 1, 1, "X");
+        assert_eq!(new_doc.text().to_string(), "日X本語");
+        let (new_doc, _) = insert_at(&doc, 0, 1, "");
+        assert_eq!(new_doc.text().to_string(), "本語");
+    }
+
+    #[test]
+    fn insert_at_multi_line_replace() {
+        let doc = Document::from("a\nb\nc");
+        let (new_doc, _) = insert_at(&doc, 2, 3, "X");
+        assert_eq!(new_doc.text().to_string(), "a\nX\nc");
+    }
+
+    #[test]
+    fn insert_at_empty_text_at_cursor_is_noop() {
+        let doc = Document::from("hello");
+        let (new_doc, tx) = insert_at(&doc, 2, 2, "");
+        assert_eq!(new_doc.text().to_string(), "hello");
+        assert!(tx.is_noop());
     }
 
     #[test]
