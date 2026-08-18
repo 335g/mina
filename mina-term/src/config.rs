@@ -260,51 +260,71 @@ async fn edit() -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let current_scheme = current.as_ref().and_then(|c| c.colorscheme.clone());
+    let current_reset = current
+        .as_ref()
+        .map(|c| c.reset_cursor_on_disconnect)
+        .unwrap_or(true);
 
     let key = select::<&str>("編集するキー")
         .item("colorscheme", "colorscheme", "起動時に適用する Colorscheme 名")
-        .interact()?;
-
-    // 値: 利用可能スキーム（組み込み + ユーザーファイル）+ カスタム入力。
-    // 現在値が選択肢に含まれていれば initial_value でマークする。
-    let custom = "custom";
-    let schemes = available_schemes();
-    let mut selector = select::<String>("Colorscheme を選択");
-    for name in &schemes {
-        let mark = if Some(name.as_str()) == current_scheme.as_deref() {
-            "（現在）"
-        } else {
-            ""
-        };
-        selector = selector.item(name.clone(), format!("{name} {mark}"), "");
-    }
-    let selected = selector
         .item(
-            custom.to_string(),
-            "カスタム入力…",
-            "組み込みや colorschemes/ のファイル名を直接指定",
-        )
-        .initial_value(
-            current_scheme
-                .as_deref()
-                .filter(|n| schemes.iter().any(|s| s == n))
-                .unwrap_or(custom)
-                .to_string(),
+            "reset_cursor_on_disconnect",
+            "reset_cursor_on_disconnect",
+            "最後の TUI 切断時にカーソルを先頭へ戻すか",
         )
         .interact()?;
 
-    let value = if selected == custom {
-        let entered = input("Colorscheme 名（カスタム）")
-            .placeholder("例: DEFAULT や colorschemes/ のファイル名")
-            .default_input(current_scheme.as_deref().unwrap_or("DEFAULT"))
-            .interact::<String>()?;
-        if entered.trim().is_empty() {
-            outro_cancel("空のためキャンセルしました")?;
-            return Ok(());
-        }
-        entered.trim().to_string()
+    let (value, display) = if key == "reset_cursor_on_disconnect" {
+        // bool: true/false を選択（現在値が初期選択になる）
+        let chosen = select::<bool>("TUI 切断時にカーソルを先頭へ戻しますか")
+            .item(true, "true（リセットする・デフォルト）", "")
+            .item(false, "false（カーソル位置を保持）", "")
+            .initial_value(current_reset)
+            .interact()?;
+        (toml::Value::Boolean(chosen), chosen.to_string())
     } else {
-        selected
+        // 値: 利用可能スキーム（組み込み + ユーザーファイル）+ カスタム入力。
+        // 現在値が選択肢に含まれていれば initial_value でマークする。
+        let custom = "custom";
+        let schemes = available_schemes();
+        let mut selector = select::<String>("Colorscheme を選択");
+        for name in &schemes {
+            let mark = if Some(name.as_str()) == current_scheme.as_deref() {
+                "（現在）"
+            } else {
+                ""
+            };
+            selector = selector.item(name.clone(), format!("{name} {mark}"), "");
+        }
+        let selected = selector
+            .item(
+                custom.to_string(),
+                "カスタム入力…",
+                "組み込みや colorschemes/ のファイル名を直接指定",
+            )
+            .initial_value(
+                current_scheme
+                    .as_deref()
+                    .filter(|n| schemes.iter().any(|s| s == n))
+                    .unwrap_or(custom)
+                    .to_string(),
+            )
+            .interact()?;
+
+        let value = if selected == custom {
+            let entered = input("Colorscheme 名（カスタム）")
+                .placeholder("例: DEFAULT や colorschemes/ のファイル名")
+                .default_input(current_scheme.as_deref().unwrap_or("DEFAULT"))
+                .interact::<String>()?;
+            if entered.trim().is_empty() {
+                outro_cancel("空のためキャンセルしました")?;
+                return Ok(());
+            }
+            entered.trim().to_string()
+        } else {
+            selected
+        };
+        (toml::Value::String(value.clone()), format!("\"{value}\""))
     };
 
     let text = match std::fs::read_to_string(&path) {
@@ -312,10 +332,10 @@ async fn edit() -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    let updated = apply(&text, key, toml::Value::String(value.clone()))?;
+    let updated = apply(&text, key, value)?;
     ensure_config_dir(&path)?;
     std::fs::write(&path, updated)?;
-    outro(format!("{key} を \"{value}\" に設定しました"))?;
+    outro(format!("{key} を {display} に設定しました"))?;
     Ok(())
 }
 
