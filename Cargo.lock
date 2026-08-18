@@ -168,6 +168,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev01"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -728,17 +737,6 @@ checksum = "c13547615a44dc9c452a8a534638acdf07120d4b6847c8178705da06306a3057"
 dependencies = [
  "smawk",
  "unicode-linebreak",
- "unicode-width",
-]
-
-[[package]]
-name = "tmp"
-version = "0.1.0"
-dependencies = [
- "mina-core",
- "mina-protocol",
- "serde",
- "serde_json",
  "unicode-width",
 ]
 
