@@ -6,8 +6,7 @@
 //! `<temp_dir>/mina.sock`（単一ユーザ前提）。0600 で作成し、接続時に
 //! peer uid を検証して別ユーザの接続を拒否する（MEDIUM-3）。
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,6 +109,11 @@ pub struct Daemon {
     /// 閉じモードを戻し、非所有者の書き込みは後勝ちで奪取する（preempt）。
     /// 不変条件: mode == Insert ⟺ insert_owner == Some(_)。
     pub(crate) insert_owner: Option<u64>,
+    /// 接続中の Interactive クライアントの conn_id（ADR-0027）。
+    ///
+    /// 最後の Interactive の切断判定に使う。リセットの要不要は切断した
+    /// クライアントの Hello 宣言（`reset_cursor_on_disconnect`）で決まる。
+    pub(crate) interactive_clients: HashSet<u64>,
     /// 状態を変える操作ごとに増加する世代（ADR-0012）。
     generation: u64,
     /// 直近の状態変化イベントの bounded リング（ADR-0012）。
@@ -320,6 +324,7 @@ impl Daemon {
             lsp_sessions: HashMap::new(),
             diagnostics: Vec::new(),
             insert_owner: None,
+            interactive_clients: HashSet::new(),
             generation: 0,
             events: VecDeque::new(),
             baselines: HashMap::new(),
@@ -340,11 +345,22 @@ impl Daemon {
     /// 非所有者（ワンショットの agent コマンド等）の切断は編集状態を触らない —
     /// 修正前は読み取り専用の agent コマンドが終わるたびに人間の Insert
     /// セッションが閉じられていた。
-    fn on_client_disconnect(&mut self, conn_id: u64) {
+    fn on_client_disconnect(&mut self, conn_id: u64, kind: ClientKind, reset_cursor: bool) {
+        if kind == ClientKind::Interactive {
+            self.interactive_clients.remove(&conn_id);
+        }
         if self.insert_owner == Some(conn_id) && self.editor.mode() == mina_view::Mode::Insert {
             self.editor.end_group();
             self.editor.set_mode(mina_view::Mode::Normal);
             self.insert_owner = None;
+        }
+        // ADR-0027: 最後の Interactive クライアント切断時、そのクライアントが
+        // Hello でリセットを宣言していれば全 View のカーソルを先頭へ戻す。
+        // 状態変化なので世代とイベントを進める（WaitFor 待ちエージェントが起床）。
+        // 文書・undo 履歴・LSP セッションは不変（Q1: 保持するのは Selection のみ）。
+        if kind == ClientKind::Interactive && reset_cursor && self.interactive_clients.is_empty() {
+            self.editor.reset_views_to_start();
+            self.record_event(EventSource::External, EventKind::SelectionReset, None, None);
         }
     }
 }
@@ -708,10 +724,10 @@ async fn handle_connection(
         let mut bounded = (&mut reader).take(MAX_CMD_LINE as u64 + 1);
         timeout(FIRST_COMMAND_TIMEOUT, bounded.read_line(&mut hello_line)).await
     };
-    let kind = match read {
+    let (kind, reset_cursor) = match read {
         Ok(Ok(0)) => return,
         Ok(Ok(_)) => match serde_json::from_str::<Hello>(hello_line.trim()) {
-            Ok(hello) => hello.kind,
+            Ok(hello) => (hello.kind, hello.reset_cursor_on_disconnect),
             Err(_) => return, // Hello でない・不正な kind: 切断
         },
         Ok(Err(_)) => return,
@@ -721,6 +737,11 @@ async fn handle_connection(
         ClientKind::Interactive => EventSource::Interactive,
         ClientKind::Headless => EventSource::Headless,
     };
+
+    // ADR-0027: 最後の Interactive 切断判定用に登録しておく。
+    if kind == ClientKind::Interactive {
+        daemon.lock().await.interactive_clients.insert(conn_id);
+    }
 
     // ADR-0013: Interactive クライアントだけが push を購読する。Headless の
     // ワンショット CLI は応答1行を読んで切断するので、push が混ざると壊れる。
@@ -838,8 +859,12 @@ async fn handle_connection(
         }
     }
     // 切断の後始末: 所有者（グループを開いたクライアント）ならグループを閉じ
-    // モードを Normal に戻す（ADR-0007 / HIGH-1）。
-    daemon.lock().await.on_client_disconnect(conn_id);
+    // モードを Normal に戻す（ADR-0007 / HIGH-1）。最後の Interactive なら
+    // Hello 宣言どおりカーソルを先頭へ戻す（ADR-0027）。
+    daemon
+        .lock()
+        .await
+        .on_client_disconnect(conn_id, kind, reset_cursor);
 }
 
 /// コマンドループの1周で読み取るもの（コマンド行 or push 通知）。
@@ -3417,8 +3442,16 @@ mod tests {
         open(&mut d, "");
         apply(&mut d, Command::SetMode { mode: Mode::Insert });
         apply(&mut d, Command::Insert { text: "a".into() });
-        d.on_client_disconnect(0); // 所有者の切断（修正前はグループが開いたまま漏れた）
+        d.on_client_disconnect(0, ClientKind::Interactive, true); // 所有者の切断（修正前はグループが開いたまま漏れた）
         assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "切断で Normal に戻る");
+        // ADR-0027: 切断でカーソルも先頭へ戻る。このテストは undo グループ境界の
+        // 検証が目的なので、明示的に末尾（位置 1）へ戻してから続ける。
+        assert_eq!(
+            d.editor.selection().ranges()[0].anchor(),
+            0,
+            "切断でカーソルは先頭に戻る"
+        );
+        d.editor.set_selection(mina_core::Selection::point(1));
 
         // 次のクライアント: 再び Insert で入力しても別グループになる
         apply(&mut d, Command::SetMode { mode: Mode::Insert });
@@ -3432,12 +3465,22 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_in_normal_mode_is_noop() {
+    fn disconnect_in_normal_mode_keeps_document_but_resets_cursor() {
+        // ADR-0027: Normal モード切断は文書・モードを保ちつつ、カーソルを
+        // 先頭へ戻し世代とイベントを進める（修正前は完全な no-op だった）。
         let mut d = daemon();
         open(&mut d, "hello");
-        d.on_client_disconnect(0);
+        d.editor.set_selection(mina_core::Selection::point(3));
+        let gen_before = d.generation;
+        d.on_client_disconnect(0, ClientKind::Interactive, true);
         assert_eq!(d.editor.mode(), mina_view::Mode::Normal);
         assert_eq!(d.editor.current_document().text().to_string(), "hello");
+        assert_eq!(d.editor.selection().ranges()[0].anchor(), 0, "カーソルは先頭に戻る");
+        assert_eq!(d.editor.first_line(), 0, "ビューポートも先頭に戻る");
+        assert!(d.generation > gen_before, "状態変化として世代が進む");
+        let snap = snapshot(&mut d, None);
+        assert_eq!(snap.events.last().unwrap().kind, EventKind::SelectionReset);
+        assert_eq!(snap.events.last().unwrap().source, EventSource::External);
     }
 
     #[test]
@@ -3448,7 +3491,7 @@ mod tests {
         open(&mut d, "");
         apply(&mut d, Command::SetMode { mode: Mode::Insert }); // TUI（接続 0）が所有者
         apply(&mut d, Command::Insert { text: "a".into() });
-        d.on_client_disconnect(9); // 非所有者（agent ワンショット）の切断
+        d.on_client_disconnect(9, ClientKind::Headless, true); // 非所有者（agent ワンショット）の切断
         assert_eq!(
             d.editor.mode(),
             mina_view::Mode::Insert,
@@ -3459,6 +3502,100 @@ mod tests {
         apply(&mut d, Command::SetMode { mode: Mode::Normal });
         let s = apply(&mut d, Command::Undo);
         assert_eq!(s.text, "", "1 undo でセッション全体が戻る（グループが無傷）");
+    }
+
+    #[tokio::test]
+    async fn last_interactive_disconnect_resets_cursor_by_default() {
+        // ADR-0027: 最後の TUI 切断でカーソルは先頭へ戻る（デフォルト true）。
+        // 文書・undo 履歴は保持され、世代が進み SelectionReset が積まれる。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-27-reset-sock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        // TUI: テキストを入れ、Normal に戻る（カーソルは末尾に残る）
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui, &Command::SetMode { mode: Mode::Insert }).await;
+        let snap = request(&mut tui, &Command::Insert { text: "hello".into() }).await;
+        assert_eq!(snap.text, "hello");
+        let snap = request(&mut tui, &Command::SetMode { mode: Mode::Normal }).await;
+        assert_eq!(snap.selection[0].anchor, 5, "切断前はカーソルが末尾にある");
+        let gen_before = snap.generation;
+        drop(tui); // 最後の Interactive の切断
+
+        // 新しい TUI: カーソルは先頭・世代が進み・SelectionReset が積まれている
+        let mut tui2 = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui2, &Command::GetState).await;
+        assert_eq!(snap.text, "hello", "文書は保持される");
+        assert_eq!(snap.selection[0].anchor, 0, "カーソルは先頭に戻っている");
+        assert!(snap.generation > gen_before, "世代が進む");
+        assert_eq!(snap.events.last().unwrap().kind, EventKind::SelectionReset);
+        assert_eq!(snap.events.last().unwrap().source, EventSource::External);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn disconnect_keeps_cursor_when_flag_disabled() {
+        // ADR-0027: Hello で reset_cursor_on_disconnect=false を宣言した
+        // TUI の切断ではカーソルが保持される。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-27-nosock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        let stream = UnixStream::connect(&sock).await.expect("接続できる");
+        let mut c = TestClient::new(stream);
+        let mut hello = serde_json::to_string(&Hello {
+            kind: ClientKind::Interactive,
+            reset_cursor_on_disconnect: false,
+        })
+        .unwrap();
+        hello.push('\n');
+        c.send(hello.as_bytes()).await;
+        let snap = request(&mut c, &Command::SetMode { mode: Mode::Insert }).await;
+        let snap = request(&mut c, &Command::Insert { text: "hello".into() }).await;
+        assert_eq!(snap.selection[0].anchor, 5);
+        let _ = request(&mut c, &Command::SetMode { mode: Mode::Normal }).await;
+        drop(c);
+
+        let mut tui2 = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui2, &Command::GetState).await;
+        assert_eq!(snap.selection[0].anchor, 5, "false 宣言ではカーソルが残る");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn disconnect_does_not_reset_while_another_interactive_remains() {
+        // ADR-0027: 最後の Interactive ではない切断は他クライアントのカーソルを
+        // 踏まない（複数 TUI 構成）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-27-two-sock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        let mut tui_a = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui_a, &Command::SetMode { mode: Mode::Insert }).await;
+        let snap = request(&mut tui_a, &Command::Insert { text: "hello".into() }).await;
+        let _ = request(&mut tui_a, &Command::SetMode { mode: Mode::Normal }).await;
+
+        let mut tui_b = connect_client(&sock, ClientKind::Interactive).await;
+        // tui_b の Hello 登録が daemon に着弾してから切る（登録と切断の競合を避ける）
+        let _ = request(&mut tui_b, &Command::GetState).await;
+        drop(tui_a); // まだ tui_b が残っている → リセットしない
+
+        let mut tui_c = connect_client(&sock, ClientKind::Interactive).await;
+        let _ = request(&mut tui_c, &Command::GetState).await;
+        let snap = request(&mut tui_c, &Command::GetState).await;
+        assert_eq!(snap.selection[0].anchor, 5, "他クライアントが残る間はリセットされない");
+        drop(tui_b); // tui_c が残っている → リセットしない
+        let snap = request(&mut tui_c, &Command::GetState).await;
+        assert_eq!(snap.selection[0].anchor, 5, "tui_b の切断だけでは変わらない");
+        drop(tui_c); // 最後の切断 → リセット
+
+        let mut tui_d = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui_d, &Command::GetState).await;
+        assert_eq!(snap.selection[0].anchor, 0, "最後の切断でリセットされる");
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[test]
@@ -3609,7 +3746,11 @@ mod tests {
     async fn connect_client(sock: &std::path::Path, kind: ClientKind) -> TestClient {
         let stream = UnixStream::connect(sock).await.expect("接続できる");
         let mut c = TestClient::new(stream);
-        let mut hello = serde_json::to_string(&Hello { kind }).unwrap();
+        let mut hello = serde_json::to_string(&Hello {
+            kind,
+            reset_cursor_on_disconnect: true,
+        })
+        .unwrap();
         hello.push('\n');
         c.send(hello.as_bytes()).await;
         c
