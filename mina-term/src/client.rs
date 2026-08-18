@@ -433,6 +433,11 @@ pub(crate) async fn request_hints(
             std::io::ErrorKind::InvalidData,
             "unexpected peek response",
         )),
+        // #27: GetServerInfo の応答（ServerInfo）はこの経路では期待しない
+        Ok(ServerMessage::ServerInfo { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected server info response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -475,6 +480,11 @@ pub(crate) async fn request_peek(
             std::io::ErrorKind::InvalidData,
             "unexpected inlay hints response",
         )),
+        // #27: ServerInfo 応答はこの経路では期待しない
+        Ok(ServerMessage::ServerInfo { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected server info response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -510,6 +520,12 @@ pub(crate) async fn request<T: serde::Serialize>(
         Ok(ServerMessage::Peek { .. }) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unexpected peek response",
+        )),
+        // #27: GetServerInfo の応答（ServerInfo）はこの経路では期待しない
+        //（専用経路: session info）
+        Ok(ServerMessage::ServerInfo { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected server info response",
         )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -586,9 +602,11 @@ async fn read_loop(
                     return;
                 }
             }
-            // TUI は GetInlayHints / PeekDefinitionAt を送らない（エージェント専用経路）。
-            // 万一届いても応答は無視する。
-            Ok(ServerMessage::Hints { .. }) | Ok(ServerMessage::Peek { .. }) => {}
+            // TUI は GetInlayHints / PeekDefinitionAt / GetServerInfo を送らない
+            // （エージェント専用経路）。万一届いても応答は無視する。
+            Ok(ServerMessage::Hints { .. })
+            | Ok(ServerMessage::Peek { .. })
+            | Ok(ServerMessage::ServerInfo { .. }) => {}
             Err(e) => {
                 let _ = res_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
