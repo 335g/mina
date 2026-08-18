@@ -87,6 +87,10 @@ pub enum Command {
     Save,
     /// フォーカス文書を閉じる。残りの文書があればそこへ移り、無ければ空状態に戻る（ADR-0015）。
     Close,
+    /// サーバ（daemon）のビルド世代・累積メトリクスを開示する（読み取り専用。
+    /// issue #27/D1）。応答は [`ServerMessage::ServerInfo`]。スナップショットを
+    /// 運ばず、世代・イベント・push を進めない。
+    GetServerInfo,
     /// 任意パスの inlay hint をテキストなしで取得する（ADR-0020。読み取り専用）。
     /// 応答は [`ServerMessage::Hints`]。未開パスは daemon がディスクから読む。
     GetInlayHints { path: String },
@@ -193,6 +197,19 @@ pub enum ServerMessage {
     /// サーバーが能動的に通知する最新状態（他クライアントの変更など）。
     /// 購読（Interactive クライアント）にのみ届く。
     Push { snapshot: StateSnapshot },
+    /// サーバ情報（[`Command::GetServerInfo`] の応答、issue #27）。スナップショット
+    /// を運ばない軽量応答 — 古いビルドの daemon が新プロトコル項目を黙殺して
+    /// いないか（silent ignore）を検知可能にするための開示。`generation` は
+    /// daemon のビルド世代（Git commit hash）、`daemon_build_ts` はビルド日時
+    /// （Unix 秒）。`metrics` は daemon 起動からの累積カウント。
+    ServerInfo {
+        /// daemon のビルド世代（Git commit hash。取得不可なら "unknown"）。
+        generation: String,
+        /// daemon のビルド日時（Unix 秒。注入不可なら 0）。
+        daemon_build_ts: u64,
+        /// daemon 起動からの累積メトリクス（効果検証用）。
+        metrics: ServerMetrics,
+    },
     /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
     /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
     Hints {
@@ -212,6 +229,33 @@ pub enum ServerMessage {
         /// 定義のスニペット（数行。改行区切り）。空なら定義が見つからなかった。
         text: String,
     },
+}
+
+/// daemon 起動からの累積メトリクス（[`ServerMessage::ServerInfo`] に載る。
+/// issue #27 の効果検証用 — headless エージェントの「編集までの手順数・全文再読・
+/// リトライ」を daemon 側の近似指標で観測する）。
+///
+/// セマンティクス: 成功数は `edits_total - edits_rejected_checksum -
+/// edits_rejected_expected_text - edits_noop` で導出できる。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerMetrics {
+    /// 受理した DocumentEdit の総数（拒否・no-op を含む）。
+    pub edits_total: u64,
+    /// checksum 不一致で拒否した数。
+    pub edits_rejected_checksum: u64,
+    /// expected_text 不一致で拒否した数。
+    pub edits_rejected_expected_text: u64,
+    /// 状態を変えなかった no-op 編集の数。
+    pub edits_noop: u64,
+    /// expected_text を使った編集の数（Some で届いた数。一致・不一致は問わない）。
+    pub edits_expected_text_used: u64,
+    /// GetState 実行回数（スナップショットは全文を返すため、
+    /// headless の全文再読回数の近似になる）。
+    pub get_state_total: u64,
+    /// WaitFor 実行回数。
+    pub wait_total: u64,
+    /// Save 実行回数。
+    pub save_total: u64,
 }
 
 /// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
@@ -590,6 +634,32 @@ mod tests {
         let json = serde_json::to_string(&hint).expect("serialize");
         let back: InlayHint = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, hint);
+    }
+
+    #[test]
+    fn server_info_round_trip() {
+        // ServerInfo 応答（issue #27）の wire 形状が安定していること
+        let msg = ServerMessage::ServerInfo {
+            generation: "abc1234".into(),
+            daemon_build_ts: 1699999999,
+            metrics: ServerMetrics {
+                edits_total: 10,
+                edits_rejected_checksum: 1,
+                edits_rejected_expected_text: 2,
+                edits_noop: 3,
+                edits_expected_text_used: 4,
+                get_state_total: 5,
+                wait_total: 6,
+                save_total: 7,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+        // GetServerInfo コマンドも外部タグ付きで通る
+        let back: Command =
+            serde_json::from_str(&serde_json::to_string(&Command::GetServerInfo).unwrap()).unwrap();
+        assert_eq!(back, Command::GetServerInfo);
     }
 
     #[test]
