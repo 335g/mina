@@ -204,8 +204,11 @@ impl Conn {
         let stream = UnixStream::connect(&path)?;
         let reader = BufReader::new(stream.try_clone()?);
         let mut conn = Conn { stream, reader };
-        let mut line = serde_json::to_string(&Hello { kind: ClientKind::Headless })
-            .expect("Hello はシリアライズ可能");
+        let mut line = serde_json::to_string(&Hello {
+            kind: ClientKind::Headless,
+            reset_cursor_on_disconnect: true, // Headless には無意味（切断でリセットしない）
+        })
+        .expect("Hello はシリアライズ可能");
         line.push('\n');
         conn.stream.write_all(line.as_bytes())?;
         conn.stream.flush()?;

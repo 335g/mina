@@ -79,7 +79,10 @@ impl Drop for TerminalGuard {
 pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     let socket = crate::daemon::socket_path();
     ensure_daemon(&socket).await?;
-    let mut session = Session::connect(&socket).await?;
+    // ADR-0027: 切断時カーソルリセットの宣言を Hello に載せるため、config は
+    // 接続前に読む（colorscheme 解決でも同じ値を使い回す）。
+    let config = crate::config::load();
+    let mut session = Session::connect(&socket, config.reset_cursor_on_disconnect).await?;
 
     // 初回コマンド: ファイル指定があれば Open、なければ GetState。
     // Open のパスは絶対化して送る — daemon は常駐で cwd が起動時のディレクトリの
@@ -96,7 +99,6 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     // 現在の Colorscheme: config.toml の名前から解決（ユーザーファイル優先、次に組み込み、
     // 不明なら警告 + 組み込み DEFAULT — ADR-0022）。クライアントローカル — daemon 非関与。
     // 警告は端末セットアップ前に stderr へ出す（raw モード・代替画面中の表示崩れを避ける）。
-    let config = crate::config::load();
     let schemes_dir = crate::config::schemes_dir();
     let mut scheme = match config.colorscheme.as_deref() {
         Some(name) => match colorscheme::resolve(name, &schemes_dir) {
@@ -396,8 +398,13 @@ fn apply_colorscheme(
 pub(crate) async fn send_hello(
     write_half: &mut OwnedWriteHalf,
     kind: ClientKind,
+    reset_cursor_on_disconnect: bool,
 ) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(&Hello { kind }).expect("Hello はシリアライズ可能");
+    let mut line = serde_json::to_string(&Hello {
+        kind,
+        reset_cursor_on_disconnect,
+    })
+    .expect("Hello はシリアライズ可能");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await
@@ -544,12 +551,16 @@ struct Session {
 }
 
 impl Session {
-    /// 接続し、Hello（Interactive 宣言）を送り、読み取りタスクを起動する。
-    async fn connect(path: &std::path::Path) -> std::io::Result<Session> {
+    /// 接続し、Hello（Interactive 宣言 + 切断時カーソルリセットの宣言）を送り、
+    /// 読み取りタスクを起動する。
+    async fn connect(
+        path: &std::path::Path,
+        reset_cursor_on_disconnect: bool,
+    ) -> std::io::Result<Session> {
         let stream = UnixStream::connect(path).await?;
         let (read_half, mut write) = stream.into_split();
         // ADR-0012: 接続直後に Hello（対話型宣言）を送る
-        send_hello(&mut write, ClientKind::Interactive).await?;
+        send_hello(&mut write, ClientKind::Interactive, reset_cursor_on_disconnect).await?;
         let (res_tx, responses) = mpsc::unbounded_channel();
         let (push_tx, pushes) = mpsc::unbounded_channel();
         tokio::spawn(read_loop(read_half, res_tx, push_tx));

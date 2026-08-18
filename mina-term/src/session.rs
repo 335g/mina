@@ -187,7 +187,7 @@ async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protoc
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
     // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る
     client::request_peek(&mut write_half, &mut reader, &client::absolutize(path), line, col).await
 }
@@ -202,7 +202,7 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
     let mut line = serde_json::to_string(&Command::GetServerInfo).expect("コマンドはシリアライズ可能");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
@@ -235,7 +235,7 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
     // CRITICAL C2: Open のパスは agent の cwd 基準で絶対化してから送る（TUI と
     // 同一の契約）。そのまま送ると daemon の spawn cwd 基準で解決され、意図しない
     // ファイルを開く恐れがある。
@@ -267,7 +267,7 @@ async fn execute_edit(edit: &DocumentEdit) -> io::Result<StateSnapshot> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
     client::request(&mut write_half, &mut reader, edit).await
 }
 
@@ -302,7 +302,7 @@ async fn apply(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
 
     let abs = client::absolutize(&path.to_string_lossy());
     let mut snapshot = client::request(&mut write_half, &mut reader, &Command::Open { path: abs.clone() }).await?;
@@ -436,7 +436,7 @@ async fn execute_hints(path: &str) -> io::Result<(String, u64, Vec<InlayHint>)> 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    client::send_hello(&mut write_half, ClientKind::Headless).await?;
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
     // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る（Open と同一の契約）
     client::request_hints(&mut write_half, &mut reader, &client::absolutize(path)).await
 }
