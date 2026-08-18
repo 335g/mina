@@ -12,12 +12,31 @@ use serde::Deserialize;
 
 /// `config.toml` の内容。未知キーはエラーにする（タイポ検出）— キーを増やす
 /// ときはフィールドを足すだけで既存の設定ファイルはそのまま動く。
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// 起動時に適用する Colorscheme の名前（組み込み名 or `colorschemes/` のファイル名）。
     #[serde(default)]
     pub colorscheme: Option<String>,
+    /// 最後の Interactive クライアント切断時にカーソルを先頭へ戻すか（ADR-0027）。
+    /// デフォルト true。false にすると TUI を閉じてもカーソル位置が保持される。
+    /// クライアントローカルのまま、接続時の Hello でデーモンに宣言される。
+    #[serde(default = "default_reset_cursor")]
+    pub reset_cursor_on_disconnect: bool,
+}
+
+/// [`Config::reset_cursor_on_disconnect`] のデフォルト（true）。
+fn default_reset_cursor() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            colorscheme: None,
+            reset_cursor_on_disconnect: default_reset_cursor(),
+        }
+    }
 }
 
 /// `mina config` のサブコマンド。
@@ -74,7 +93,7 @@ pub fn config_path() -> std::path::PathBuf {
 
 /// 既知のキー一覧（`deny_unknown_fields` と同じタイポ検出の思想）。
 pub fn known_keys() -> &'static [&'static str] {
-    &["colorscheme"]
+    &["colorscheme", "reset_cursor_on_disconnect"]
 }
 
 /// `set` の値の解釈: TOML リテラルとして解釈できればその値、
@@ -137,6 +156,10 @@ fn effective_toml(config: &Config) -> String {
         Some(name) => out.push_str(&format!("colorscheme = \"{name}\"\n")),
         None => out.push_str("# colorscheme = <未設定>\n"),
     }
+    out.push_str(&format!(
+        "reset_cursor_on_disconnect = {}\n",
+        config.reset_cursor_on_disconnect
+    ));
     out
 }
 
@@ -202,7 +225,10 @@ pub const TEMPLATE: &str = "# mina 設定ファイル\n\n\
 # 既知のキーのみ指定できます（未知キーはタイポとしてエラーになります）。\n\n\
 # 起動時に適用する Colorscheme の名前。\n\
 # 組み込み名（DEFAULT）または colorschemes/ ディレクトリのファイル名（拡張子なし）。\n\
-# colorscheme = \"DEFAULT\"\n";
+# colorscheme = \"DEFAULT\"\n\n\
+# 最後の TUI クライアント切断時にカーソルを先頭へ戻すか（デフォルト true）。\n\
+# false にすると、TUI を閉じてもカーソル位置がデーモンに保持されます。\n\
+# reset_cursor_on_disconnect = true\n";
 
 /// 選択肢として提示できるスキーム名: 組み込み DEFAULT + ユーザーファイル名。
 fn available_schemes() -> Vec<String> {
@@ -340,9 +366,13 @@ mod tests {
     fn empty_and_missing_config_are_default() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.colorscheme, None);
-        // キー未記入も同じ（Option は None のまま）
+        assert!(config.reset_cursor_on_disconnect, "デフォルトは true");
+        // キー未記入も同じ（Option は None のまま、bool はデフォルト）
         let config: Config = toml::from_str("colorscheme = \"vivid\"").unwrap();
         assert_eq!(config.colorscheme.as_deref(), Some("vivid"));
+        assert!(config.reset_cursor_on_disconnect);
+        // Config::default() も同じ
+        assert!(Config::default().reset_cursor_on_disconnect);
     }
 
     #[test]
@@ -356,6 +386,7 @@ mod tests {
         // 雛形はコメントのみなので Config::default() と同値でパースできる
         let config: Config = toml::from_str(TEMPLATE).unwrap();
         assert_eq!(config.colorscheme, None);
+        assert!(config.reset_cursor_on_disconnect);
     }
 
     #[test]
@@ -390,11 +421,14 @@ mod tests {
     fn effective_toml_notes_unset_keys() {
         let unset = effective_toml(&Config::default());
         assert!(unset.contains("# colorscheme = <未設定>"), "{unset}");
+        assert!(unset.contains("reset_cursor_on_disconnect = true"), "{unset}");
         let set = effective_toml(&Config {
             colorscheme: Some("vivid".into()),
+            reset_cursor_on_disconnect: false,
         });
         assert!(set.contains("colorscheme = \"vivid\""), "{set}");
         assert!(!set.contains("<未設定>"), "{set}");
+        assert!(set.contains("reset_cursor_on_disconnect = false"), "{set}");
     }
 
     #[test]
@@ -408,7 +442,12 @@ mod tests {
     fn known_keys_matches_config_fields() {
         // known_keys の各キーが Config としてパース可能なことを保証（網羅性の目安）
         for key in known_keys() {
-            let text = format!("{key} = \"dummy\"");
+            let value = if *key == "reset_cursor_on_disconnect" {
+                "true"
+            } else {
+                "\"dummy\""
+            };
+            let text = format!("{key} = {value}");
             assert!(toml::from_str::<Config>(&text).is_ok(), "{key}");
         }
     }
