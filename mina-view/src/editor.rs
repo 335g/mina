@@ -267,6 +267,15 @@ impl Editor {
         true
     }
 
+    /// 全 View のカーソルとビューポートを初期位置（文書先頭・1行目）へ戻す。
+    /// ADR-0027: 最後の Interactive クライアント切断時の後始末。
+    pub fn reset_views_to_start(&mut self) {
+        for view in self.views.iter_mut().flatten() {
+            view.selection = Selection::point(0);
+            view.first_line = 0;
+        }
+    }
+
     /// フォーカス中の View が表示する文書が保存済み状態から編集されているか。
     ///
     /// ponytail: undo で保存時点まで戻っても dirty は残る（履歴に保存時点の
