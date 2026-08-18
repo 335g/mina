@@ -37,7 +37,7 @@ dev01 開発で minae ヘルパー（get → expected_text 検証 → edit → s
 
 ## 制約（#28 の範囲外判断を維持）
 
-- headless は `Open` に加え GetState / Save / WaitFor / DocumentEdit のみ（#13 の許可リストに Open を追加。選択・モード・undo/redo は従来どおり拒否）
+- headless は `Open` / `Close` に加え GetState / Save / WaitFor / DocumentEdit のみ（#13 の許可リストに Open → #28、Close → #30 を追加。選択・モード・undo/redo は従来どおり拒否）
 - DocumentEdit への `path` フィールド追加（未オープン自動オープン）は引き続き範囲外 — 同期 I/O のため handle 層の段組変更が必要
 - TUI 接続中のフォーカス政策（バックグラウンドオープン等）は別途判断。フォーカス変更は世代と push で他クライアントに伝播する（既存の仕組み）
 
