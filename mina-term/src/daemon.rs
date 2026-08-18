@@ -19,7 +19,7 @@ use mina_core::{
 };
 use mina_protocol::{
     ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
-    HighlightRange, InlayHint, Range, ServerMessage, StateSnapshot, fnv1a64,
+    HighlightRange, InlayHint, Range, ServerMessage, ServerMetrics, StateSnapshot, fnv1a64,
 };
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -124,6 +124,9 @@ pub struct Daemon {
     /// （mina-loader のクエリ経由）。破棄された文書（Open の上限 evict）の
     /// エントリは参照時に掃除する。
     syntax: HashMap<mina_view::DocumentId, SyntaxCache>,
+    /// 起動からの累積メトリクス（issue #27。GetServerInfo で開示し、headless
+    /// エージェントの検証失敗率・全文再読回数などを効果検証する）。
+    metrics: ServerMetrics,
 }
 
 /// 1文書分の Syntax キャッシュ（ADR-0021）: tree-sitter ツリー・クエリ・言語を
@@ -324,6 +327,7 @@ impl Daemon {
             syntax: HashMap::new(),
             hints: HashMap::new(),
             hint_order: VecDeque::new(),
+            metrics: ServerMetrics::default(),
         }
     }
 
@@ -804,6 +808,16 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // GetServerInfo（issue #27/D1）: daemon のビルド世代と累積メトリクスを
+                // 軽量応答（ServerMessage::ServerInfo）で返す読み取り専用コマンド。
+                // GetInlayHints と同じく専用処理する。
+                if let Ok(Command::GetServerInfo) = serde_json::from_str::<Command>(line.trim()) {
+                    let message = serve_server_info(&daemon).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 let snapshot = process_command(&daemon, &push_tx, conn_id, source, &line).await;
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
@@ -832,6 +846,25 @@ async fn handle_connection(
 enum ReadNext {
     Command(io::Result<Option<String>>),
     Push(Result<(), watch::error::RecvError>),
+}
+
+/// `Command::GetServerInfo` の処理（issue #27/D1）: daemon のビルド世代と
+/// 起動からの累積メトリクスを軽量応答（[`ServerMessage::ServerInfo`]）で返す。
+///
+/// 目的は「古いビルドの daemon が新プロトコル項目を黙殺していないか」を
+/// クライアント側で検知可能にすること（silent ignore の防止）。読み取り専用:
+/// 世代・push・イベントは進めない。ビルド世代は build.rs が注入した
+/// `MINA_GIT_HASH` / `MINA_BUILD_TS`（`option_env!`。取り込まれない環境向けに
+/// フォールバックを持つ）。
+async fn serve_server_info(daemon: &Mutex<Daemon>) -> ServerMessage {
+    let d = daemon.lock().await;
+    ServerMessage::ServerInfo {
+        generation: option_env!("MINA_GIT_HASH").unwrap_or("unknown").to_string(),
+        daemon_build_ts: option_env!("MINA_BUILD_TS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        metrics: d.metrics,
+    }
 }
 
 /// メッセージ1件を NDJSON で書き込む。成功なら true、切断・書き込み
@@ -1148,6 +1181,10 @@ async fn process_command(
         // 「agent 1 + TUI 1」の現実的な構成では起きないと判断。必要になったら
         // タイムアウトを追加する。
         Ok(Command::WaitFor { generation }) => {
+            {
+                let mut d = daemon.lock().await;
+                d.metrics.wait_total += 1;
+            }
             let mut rx = push_tx.subscribe();
             rx.borrow_and_update();
             loop {
@@ -1358,6 +1395,10 @@ async fn process_command(
             }
             Ok(Command::Save) => {
                 // 保存対象（テキスト・パス・文書 ID）を取り出してから、ロック外で書き込む
+                {
+                    let mut d = daemon.lock().await;
+                    d.metrics.save_total += 1;
+                }
                 let (text, path, doc_id) = {
                     let d = daemon.lock().await;
                     let text = d.editor.current_document().text().to_string();
@@ -1717,19 +1758,59 @@ fn apply(daemon: &mut Daemon, command: Command) -> StateSnapshot {
     apply_from(daemon, command, 0).0
 }
 
+/// expected_text 不一致エラーに含める期待値・実値スニペットの最大 char 数
+/// （C1: 全文を返すと長文ドキュメントで応答が肥大するため先頭N文字）。
+const MAX_MISMATCH_SNIPPET_CHARS: usize = 40;
+
+/// エラー応答用に文字列を先頭N文字に短縮し、切れたら `…` を付す。
+fn mismatch_snippet(s: &str) -> String {
+    let mut out: String = s.chars().take(MAX_MISMATCH_SNIPPET_CHARS).collect();
+    if s.chars().count() > MAX_MISMATCH_SNIPPET_CHARS {
+        out.push('…');
+    }
+    out
+}
+
 /// 位置指定編集（ADR-0011）を適用する。拒否・無変化時はスナップショットを返し、
-/// 状態は一切変えない（checksum 不一致・空置換の no-op）。成功時は `None` を返す。
+/// 状態は一切変えない（checksum 不一致・expected_text 不一致・空置換の no-op）。
+/// 成功時は `None` を返す。
 ///
 /// 選択は読まず・変えない（履歴には before == after として記録されるので
 /// undo でも選択は動かない）。挿入 = `start == end`、削除 = `text` が空。
 /// 範囲クランプと Transaction 構築は mina-core の `insert_at` に委譲する（#25）。
+/// `expected_text` が `Some` なら2段検証（#26/B2）: checksum に加えて対象範囲の
+/// 現テキストと一致することも検証し、不一致ならチェックサム不一致とは別の
+/// status（期待値・実値のスニペット付き）で拒否する（C1）。
 fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<StateSnapshot> {
+    daemon.metrics.edits_total += 1;
     let text = daemon.editor.current_document().text().to_string();
     if fnv1a64(text.as_bytes()) != edit.checksum {
+        daemon.metrics.edits_rejected_checksum += 1;
         return Some(snapshot(
             daemon,
             Some("document changed since read".into()),
         ));
+    }
+    // 局所検証: insert_at と同じクランプ・正規化で対象範囲を特定する。
+    // 位置のずれは checksum（全文）では検出できず expected_text（局所）で検出する。
+    if let Some(expected) = &edit.expected_text {
+        daemon.metrics.edits_expected_text_used += 1;
+        let len = daemon.editor.current_document().len_chars();
+        let start = edit.start.min(len);
+        let end = edit.end.min(len);
+        let (lo, hi) = (start.min(end), start.max(end));
+        let actual = daemon.editor.current_document().text().slice(lo..hi).to_string();
+        if actual != *expected {
+            daemon.metrics.edits_rejected_expected_text += 1;
+            return Some(snapshot(
+                daemon,
+                Some(format!(
+                    "expected text mismatch: expected {:?}, found {:?} at [{lo}, {hi})",
+                    mismatch_snippet(expected),
+                    mismatch_snippet(&actual),
+                )),
+            ));
+        }
     }
     // ADR-0007: 他クライアントの書き込みとして、開いた Insert グループを閉じる
     preempt(daemon, conn_id);
@@ -1742,6 +1823,7 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
     if tx.is_noop() {
         // ADR-0012: 空範囲への空文字置換など状態を変えない編集は、拒否と同じ
         // 扱いでイベント・世代・undo 履歴を進めない（M1）。
+        daemon.metrics.edits_noop += 1;
         return Some(snapshot(daemon, None));
     }
     let selection_after = daemon.editor.selection();
@@ -1860,6 +1942,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::PeekDefinitionAt { .. } => {
             // handle_connection で専用処理される（ServerMessage::Peek 応答。
             // ADR-0025）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::GetServerInfo => {
+            // handle_connection で専用処理される（ServerMessage::ServerInfo 応答。
+            // issue #27）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::Insert { text } => {
@@ -2110,7 +2197,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             }
             (snapshot(daemon, None), closed)
         }
-        Command::GetState => (snapshot(daemon, None), false),
+        Command::GetState => {
+            daemon.metrics.get_state_total += 1;
+            (snapshot(daemon, None), false)
+        }
         Command::Open { .. } | Command::Save => {
             unreachable!("I/O コマンドは接続ハンドラで処理される")
         }
@@ -2335,6 +2425,7 @@ mod tests {
             end: 0,
             text: "// agent note\n".into(),
             checksum: before.checksum,
+            expected_text: None,
         };
         assert!(apply_edit(&mut d, &edit, 0).is_none(), "適用に成功する");
         let s = apply(&mut d, Command::GetState);
@@ -2344,6 +2435,86 @@ mod tests {
             "DocumentEdit 後にコメントがハイライトされる: {:?}",
             s.highlights
         );
+    }
+
+    #[test]
+    fn expected_text_match_applies() {
+        // B2: expected_text が範囲の現テキストと一致すれば適用される
+        let mut d = daemon();
+        open(&mut d, "hello world");
+        let edit = DocumentEdit {
+            start: 6,
+            end: 11,
+            text: "mina".into(),
+            checksum: fnv1a64(b"hello world"),
+            expected_text: Some("world".into()),
+        };
+        assert!(apply_edit(&mut d, &edit, 0).is_none(), "一致なら適用される");
+        let s = apply(&mut d, Command::GetState);
+        assert_eq!(s.text, "hello mina");
+    }
+
+    #[test]
+    fn expected_text_mismatch_rejected_but_checksum_passed() {
+        // B2 の実証: 位置を1文字ずらす（world のつもりが worl）。checksum は
+        // 一致するのに expected_text（局所）が引っかかる — 位置のずれを
+        // checksum（全文）は検出できず expected_text が検出する（相補関係）。
+        let mut d = daemon();
+        open(&mut d, "hello world");
+        let edit = DocumentEdit {
+            start: 6,
+            end: 11,
+            text: "X".into(),
+            checksum: fnv1a64(b"hello world"),
+            expected_text: Some("worl".into()),
+        };
+        let snap = apply_edit(&mut d, &edit, 0).expect("不一致は拒否のスナップショットを返す");
+        let status = snap.status.as_deref().expect("status に拒否理由");
+        // C1: checksum 不一致とは区別されるメッセージ
+        assert!(
+            status.starts_with("expected text mismatch"),
+            "checksum 不一致と区別される: {status}"
+        );
+        assert!(status.contains("\"worl\""), "期待値のスニペットを含む: {status}");
+        assert!(status.contains("\"world\""), "実値のスニペットを含む: {status}");
+        assert_eq!(snap.text, "hello world", "状態は変わらない");
+        assert!(!d.editor.can_undo(), "拒否で undo 履歴が増えない");
+    }
+
+    #[test]
+    fn expected_text_none_behaves_like_before() {
+        // None: checksum のみ（従来どおり）— 範囲内の別テキストでも適用される
+        let mut d = daemon();
+        open(&mut d, "hello world");
+        let edit = DocumentEdit {
+            start: 6,
+            end: 11,
+            text: "mina".into(),
+            checksum: fnv1a64(b"hello world"),
+            expected_text: None,
+        };
+        assert!(apply_edit(&mut d, &edit, 0).is_none(), "None なら適用される");
+        let s = apply(&mut d, Command::GetState);
+        assert_eq!(s.text, "hello mina");
+    }
+
+    #[test]
+    fn expected_text_mismatch_snippet_is_truncated() {
+        // C1 の粒度: 長い一致期待文字列は先頭N文字 + … に短縮され応答が肥大しない
+        let mut d = daemon();
+        open(&mut d, "a");
+        let long = "x".repeat(200);
+        let edit = DocumentEdit {
+            start: 0,
+            end: 1,
+            text: "".into(),
+            checksum: fnv1a64(b"a"),
+            expected_text: Some(long.clone()),
+        };
+        let snap = apply_edit(&mut d, &edit, 0).expect("不一致で拒否");
+        let status = snap.status.as_deref().unwrap();
+        assert!(!status.contains(&long), "全文は含まれない");
+        assert!(status.contains('…'), "切れたことを示す: {status}");
     }
 
     #[test]
@@ -2793,6 +2964,7 @@ mod tests {
                 end: 2,
                 text: "".into(),
                 checksum: fnv1a64(b"hello"),
+                expected_text: None,
             },
             0,
         )
@@ -2870,6 +3042,7 @@ mod tests {
                 end: 1,
                 text: "Y".into(),
                 checksum: fnv1a64(b"wrong"),
+                expected_text: None,
             },
         )
         .await;
@@ -3404,6 +3577,7 @@ mod tests {
                 ServerMessage::Push { .. } => continue,
                 ServerMessage::Hints { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
+                ServerMessage::ServerInfo { .. } => continue,
             }
         }
     }
@@ -3416,6 +3590,7 @@ mod tests {
                 ServerMessage::Response { .. } => continue,
                 ServerMessage::Hints { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
+                ServerMessage::ServerInfo { .. } => continue,
             }
         }
     }
@@ -3756,6 +3931,7 @@ mod tests {
                 end: 11,
                 text: "W".into(),
                 checksum: fnv1a64(b"hello world"),
+                expected_text: None,
             },
         )
         .await;
@@ -3795,6 +3971,7 @@ mod tests {
                 end: 11,
                 text: "hi".into(),
                 checksum: fnv1a64(b"hello world"),
+                expected_text: None,
             },
         )
         .await;
@@ -3851,6 +4028,7 @@ mod tests {
                 end: 1,
                 text: "X".into(),
                 checksum: fnv1a64(b"abc"),
+                expected_text: None,
             },
         )
         .await;
@@ -3863,6 +4041,7 @@ mod tests {
                 end: 2,
                 text: String::new(),
                 checksum: fnv1a64(b"aXbc"),
+                expected_text: None,
             },
         )
         .await;
@@ -3897,6 +4076,7 @@ mod tests {
                 end: 1,
                 text: "X".into(),
                 checksum: cs,
+                expected_text: None,
             },
         )
         .await;
@@ -3910,6 +4090,7 @@ mod tests {
                 end: 100,
                 text: "X".into(),
                 checksum: fnv1a64(b"aXc"),
+                expected_text: None,
             },
         )
         .await;
@@ -3946,6 +4127,7 @@ mod tests {
                 end: 1,
                 text: "X".into(),
                 checksum: 12345,
+                expected_text: None,
             },
         )
         .await;
@@ -3959,6 +4141,7 @@ mod tests {
                 end: 1,
                 text: "X".into(),
                 checksum: fnv1a64(b"abc"),
+                expected_text: None,
             },
         )
         .await;
@@ -3987,6 +4170,7 @@ mod tests {
                 end: 0,
                 text: "X".into(),
                 checksum: fnv1a64(b"abc"),
+                expected_text: None,
             },
         )
         .await;
@@ -4028,6 +4212,7 @@ mod tests {
                 end: 3,
                 text: "Z".into(),
                 checksum: fnv1a64(b"aabc"),
+                expected_text: None,
             },
         )
         .await;
@@ -4091,6 +4276,7 @@ mod tests {
                 end: 1,
                 text: "Z".into(),
                 checksum: fnv1a64(snap.text.as_bytes()),
+                expected_text: None,
             },
         )
         .await;
@@ -4159,6 +4345,7 @@ mod tests {
                 end: 1,
                 text: "Z".into(),
                 checksum: fnv1a64(snap.text.as_bytes()),
+                expected_text: None,
             },
         )
         .await;
@@ -4220,6 +4407,7 @@ mod tests {
                 end: 0,
                 text: "aaaa".into(),
                 checksum: fnv1a64(b"fn f() { TODO }\n"),
+                expected_text: None,
             },
         )
         .await;
@@ -4298,6 +4486,7 @@ mod tests {
                 end: 1,
                 text: "Y".into(),
                 checksum: fnv1a64(b"Xabc"),
+                expected_text: None,
             },
         )
         .await;
@@ -4959,6 +5148,7 @@ mod tests {
                 end: 0,
                 text: "hi".into(),
                 checksum: fnv1a64(b""),
+                expected_text: None,
             },
         )
         .await;
@@ -5035,6 +5225,7 @@ mod tests {
                 end: 0,
                 text: "hi".into(),
                 checksum: fnv1a64(b""),
+                expected_text: None,
             },
         )
         .await;
@@ -5129,6 +5320,7 @@ mod tests {
                 end: 4,
                 text: "Z".into(),
                 checksum: fnv1a64(b"base\n"),
+                expected_text: None,
             },
         )
         .await;
@@ -5236,6 +5428,7 @@ mod tests {
                 }
                 ServerMessage::Response { .. } | ServerMessage::Push { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
+                ServerMessage::ServerInfo { .. } => continue,
             }
         }
     }
