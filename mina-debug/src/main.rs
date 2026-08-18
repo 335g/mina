@@ -106,6 +106,7 @@ fn apply(conn: &mut Conn, start: usize, end: usize, text: &str) -> std::io::Resu
         end,
         text: text.to_string(),
         checksum: fnv1a64(before.text.as_bytes()),
+        expected_text: None,
     };
     let after = conn.request(&edit)?;
     report(&after, start, end, text)
@@ -234,6 +235,11 @@ impl Conn {
             Ok(ServerMessage::Peek { .. }) => Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "unexpected peek response".to_string(),
+            )),
+            // GET サーバ情報応答を普通の状態要求として受け取った場合は応答不一致
+            Ok(ServerMessage::ServerInfo { .. }) => Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "unexpected server info response".to_string(),
             )),
             Err(e) => Err(std::io::Error::new(
                 ErrorKind::InvalidData,
