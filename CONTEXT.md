@@ -61,7 +61,7 @@ A mapping from key sequences to Commands, scoped per Mode and structured as a pr
 _Avoid_: keybindings, keymap table
 
 **Daemon**:
-The persistent mina process that owns the editor state — documents, histories, selections, and LSP clients — and serves Clients over a local channel. Clients may come and go; the Daemon and its state remain.
+The persistent mina process that owns the editor state — documents, histories, selections, and LSP clients — and serves Clients over a local channel. Clients may come and go; the Daemon and its state remain. The Selection and viewport position are connection-scoped: while an Interactive client is connected they follow that client's navigation, and when the last Interactive client disconnects every View returns to the idle default (a single cursor at the start of the Document, viewport at the first line) unless that client declared `reset_cursor_on_disconnect = false` in its Hello (ADR-0027). Documents, undo histories, and LSP sessions are unaffected by Client disconnects.
 _Avoid_: server, backend
 
 **Client**:
@@ -113,7 +113,7 @@ The color depth a terminal supports — truecolor, a 256-color palette, or ANSI1
 _Avoid_: color depth, terminal colors
 
 **Config**:
-The user's set of settings, stored as TOML in the `config.toml` file under the XDG config directory and read once at Client startup. Client-local: the Daemon never reads it and changes apply from the next startup, never live. Unknown keys are rejected (typo detection), and a broken file falls back to defaults with a warning rather than blocking startup.
+The user's set of settings, stored as TOML in the `config.toml` file under the XDG config directory and read once at Client startup. Client-local: the Daemon never reads it and changes apply from the next startup, never live. Unknown keys are rejected (typo detection), and a broken file falls back to defaults with a warning rather than blocking startup. Settings that affect the Daemon (e.g. `reset_cursor_on_disconnect`) are declared by the Client at connect time via the Hello message — the Daemon still never reads the config file itself.
 _Avoid_: settings, preferences
 
 **Config file**:
