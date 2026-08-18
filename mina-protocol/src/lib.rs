@@ -272,6 +272,16 @@ pub enum ClientKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub kind: ClientKind,
+    /// 最後の Interactive クライアント切断時に全 View のカーソルを先頭へ戻すか
+    /// （ADR-0027）。デフォルト true — 旧クライアントの無指定 Hello も
+    /// 「リセットする」として扱う。Headless には無意味（切断でリセットしない）。
+    #[serde(default = "default_true")]
+    pub reset_cursor_on_disconnect: bool,
+}
+
+/// [`Hello::reset_cursor_on_disconnect`] のデフォルト（true）。
+fn default_true() -> bool {
+    true
 }
 
 /// イベントの発生源（ADR-0012）。
@@ -303,6 +313,8 @@ pub enum EventKind {
     SetMode,
     /// フォーカス文書が外部ツールによって変更された。
     ExternalChange,
+    /// 最後の Interactive クライアント切断時のカーソルリセット（ADR-0027）。
+    SelectionReset,
 }
 
 /// 状態を変える操作1件の記録（ADR-0012）。bounded リングで保持され、
