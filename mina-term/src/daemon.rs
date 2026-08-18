@@ -1147,26 +1147,32 @@ async fn process_command(
 ) -> StateSnapshot {
     let parsed = serde_json::from_str::<Command>(line.trim());
     // #13: headless クライアントは DocumentEdit 系に制限する（GetState / Save /
-    // WaitFor / DocumentEdit / Open のみ）。選択移動・モード変更・コマンドベース
-    // 編集・undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否し、
-    // 状態と世代を変えない（M1 と同じ扱い — 拒否で push も飛ばない）。
+    // WaitFor / DocumentEdit / Open / Close のみ）。選択移動・モード変更・コマンド
+    // ベース編集・undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否
+    // し、状態と世代を変えない（M1 と同じ扱い — 拒否で push も飛ばない）。
     // CONTEXT.md のドメインモデルどおり「TUI は Command のみ、agent は
     // DocumentEdit のみ」をプロトコル層で強制する。
     // #28（E1）: headless に素の Open を許可する（issue #28）。フォーカス変更は
     // 世代と push で他クライアント（TUI 含む）に伝播する — TUI は DocumentEdit
     // 由来の編集と同様に追従する。代替の「パス指定 DocumentEdit の自動オープン」
     // は将来拡張（同期 I/O のため handle 層の段組変更が必要）として範囲外。
+    // #30: headless に Close も許可する（issue #30）。Open で開いた文書を
+    // 外部削除された deleted 状態からでも閉じられ、空画面に戻せる。
     if source == EventSource::Headless {
         if let Ok(command) = &parsed {
             if !matches!(
                 command,
-                Command::GetState | Command::Save | Command::WaitFor { .. } | Command::Open { .. }
+                Command::GetState
+                    | Command::Save
+                    | Command::WaitFor { .. }
+                    | Command::Open { .. }
+                    | Command::Close
             ) {
                 let mut d = daemon.lock().await;
                 return snapshot(
                     &mut d,
                     Some(
-                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, and Open"
+                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, and Close"
                             .into(),
                     ),
                 );
@@ -5349,6 +5355,12 @@ mod tests {
             "Save は許可: {:?}",
             snap.status
         );
+
+        // #30: headless の Close は許可される（フォーカス文書を閉じて空画面へ）
+        let snap = request(&mut agent, &Command::Close).await;
+        assert!(snap.status.is_none(), "Close は許可: {:?}", snap.status);
+        assert_eq!(snap.path, None, "Close で空画面（ファイル未オープン）に戻る");
+        assert!(snap.text.is_empty(), "Close 後の文書は空");
 
         // Interactive は従来どおり全コマンドを使える
         let snap = request(&mut tui, &Command::Insert { text: "Y".into() }).await;
