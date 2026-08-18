@@ -1147,22 +1147,26 @@ async fn process_command(
 ) -> StateSnapshot {
     let parsed = serde_json::from_str::<Command>(line.trim());
     // #13: headless クライアントは DocumentEdit 系に制限する（GetState / Save /
-    // WaitFor / DocumentEdit のみ）。Open・選択移動・モード変更・コマンドベース
+    // WaitFor / DocumentEdit / Open のみ）。選択移動・モード変更・コマンドベース
     // 編集・undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否し、
     // 状態と世代を変えない（M1 と同じ扱い — 拒否で push も飛ばない）。
     // CONTEXT.md のドメインモデルどおり「TUI は Command のみ、agent は
     // DocumentEdit のみ」をプロトコル層で強制する。
+    // #28（E1）: headless に素の Open を許可する（issue #28）。フォーカス変更は
+    // 世代と push で他クライアント（TUI 含む）に伝播する — TUI は DocumentEdit
+    // 由来の編集と同様に追従する。代替の「パス指定 DocumentEdit の自動オープン」
+    // は将来拡張（同期 I/O のため handle 層の段組変更が必要）として範囲外。
     if source == EventSource::Headless {
         if let Ok(command) = &parsed {
             if !matches!(
                 command,
-                Command::GetState | Command::Save | Command::WaitFor { .. }
+                Command::GetState | Command::Save | Command::WaitFor { .. } | Command::Open { .. }
             ) {
                 let mut d = daemon.lock().await;
                 return snapshot(
                     &mut d,
                     Some(
-                        "headless clients can only use GetState, Save, WaitFor, and DocumentEdit"
+                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, and Open"
                             .into(),
                     ),
                 );
@@ -2591,7 +2595,7 @@ mod tests {
         let def = mina_loader::language_by_name("rust").unwrap();
         open_path(&mut d, "test.rs", "fn a() {}\n// note\nfn b(x: i32) -> i32 { x + 1 }\n");
 
-        let mut assert_matches = |d: &mut Daemon| {
+        let assert_matches = |d: &mut Daemon| {
             let s = apply(d, Command::GetState);
             assert_highlights_valid(&s.text, &s.highlights);
             assert_eq!(
@@ -4255,8 +4259,9 @@ mod tests {
         assert_eq!(snap.text, "a");
 
         // agent: Y を Open → フォーカスは Y へ（X のグループは開いたまま）
-        // （#13: headless は Open できないため、2 番目のクライアントを
-        // Interactive で演じる。undo グループ境界は conn_id 基準で不変）
+        // （#28 で headless Open は許可されたが、このテストは undo グループ境界の
+        // 検証が目的で agent が Undo を使う必要があるため Interactive で演じる —
+        // Undo は #13 の制限で headless には拒否される）
         let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut agent, &Command::Open { path: path_y }).await;
         assert_eq!(snap.text, "");
@@ -4320,7 +4325,8 @@ mod tests {
         assert_eq!(snap.text, "a");
 
         // agent: Y を Open（フォーカスを X から Y へ移す）
-        // （#13: headless は Open できないため Interactive で演じる）
+        // （#28 で headless Open は許可されたが、このテストは切断後の Undo を
+        // 確認するため Interactive で演じる — Undo は headless には拒否される）
         let mut agent = connect_client(&sock, ClientKind::Interactive).await;
         let _ = request(&mut agent, &Command::Open { path: path_y }).await;
 
@@ -5270,9 +5276,9 @@ mod tests {
 
     #[tokio::test]
     async fn headless_client_is_restricted_to_document_edit_family() {
-        // #13: headless は GetState / Save / DocumentEdit のみ。それ以外の
-        // Command（Open・選択移動・モード変更・コマンドベース編集・undo/redo）
-        // は拒否され、状態・世代が変わらない。Interactive は従来どおり。
+        // #13: headless は GetState / Save / DocumentEdit / Open のみ（#28 で Open
+        // を追加）。それ以外の Command（選択移動・モード変更・コマンドベース編集・
+        // undo/redo）は拒否され、状態・世代が変わらない。Interactive は従来どおり。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("mina-13e-sock-{}.sock", std::process::id()));
         let file = dir.join(format!("mina-13e-file-{}.txt", std::process::id()));
@@ -5286,9 +5292,8 @@ mod tests {
         let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
         // Open の自分の push は届かない（発信元スキップ）
 
-        // 拒否されるコマンド: 状態・世代・モードは不変
+        // 拒否されるコマンド: 状態・世代・モードは不変（Open は #28 で許可済み）
         for cmd in [
-            Command::Open { path: path.clone() },
             Command::SetMode { mode: Mode::Insert },
             Command::Move {
                 movement: Movement::Char,
@@ -5309,6 +5314,19 @@ mod tests {
             assert_eq!(snap.generation, 1, "{cmd:?} で世代が進まない");
             assert_eq!(snap.mode, Mode::Normal, "{cmd:?} でモードが変わらない");
         }
+
+        // #28: headless の Open は許可される（フォーカスを切り替えられる）
+        let snap = request(&mut agent, &Command::Open { path: path.clone() }).await;
+        assert!(snap.status.is_none(), "Open は許可: {:?}", snap.status);
+        assert_eq!(snap.text, "base\n", "Open で内容が読める");
+        // 絶対化は /private/var 等の symlink 解決で表記が変わり得るため末尾比較
+        assert!(
+            snap.path
+                .as_deref()
+                .is_some_and(|p| p.ends_with(&file.file_name().unwrap().to_string_lossy().into_owned())),
+            "Open でパスが載る: {:?}",
+            snap.path
+        );
 
         // 許可される操作は従来どおり
         let snap = request(&mut agent, &Command::GetState).await;
@@ -5697,7 +5715,10 @@ mod tests {
                 ServerMessage::Peek { path, line, text } => {
                     break (path, line, text);
                 }
-                ServerMessage::Response { .. } | ServerMessage::Push { .. } | ServerMessage::Hints { .. } => {
+                ServerMessage::Response { .. }
+                | ServerMessage::Push { .. }
+                | ServerMessage::Hints { .. }
+                | ServerMessage::ServerInfo { .. } => {
                     continue;
                 }
             }
