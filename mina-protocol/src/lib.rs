@@ -396,6 +396,29 @@ pub struct HighlightRange {
     pub group: HighlightGroup,
 }
 
+/// 進行中の非同期処理の種別（ADR-0028）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    /// LSP セッションの spawn + initialize。
+    LspInit,
+    /// 診断・inlay hint の settle（Open 後 or 編集後）。
+    DiagnosticsSettle,
+    /// 外部変更 Reload 後の LSP 同期 + pull。
+    ReloadSync,
+    /// 保存（write）。
+    Save,
+}
+
+/// 進行中の非同期処理の単位（ADR-0028）。開始で追加・終了で除去され、
+/// 結果の成否は語らない。空の集合 = 処理中なし。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// 表示用の短いラベル（"LSP 初期化中" など）。クライアントはそのまま表示する。
+    pub label: String,
+}
+
 /// daemon が返す編集状態の全体像（ADR-0006: 毎コマンドに全量を返す）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
@@ -422,6 +445,9 @@ pub struct StateSnapshot {
     pub dirty: bool,
     /// 一時的なメッセージ（Open の失敗など）。ステータス行に表示される。
     pub status: Option<String>,
+    /// 進行中の非同期処理の集合（ADR-0028。空 = 処理中なし）。増減は
+    /// generation を進める（診断・ヒントの反映は進めない）。
+    pub activities: Vec<Activity>,
     /// 状態を変える操作ごとに増加する世代（ADR-0012）。
     pub generation: u64,
     /// 直近の状態変化イベント（bounded リング。古いものから破棄）。
@@ -460,6 +486,7 @@ impl Default for StateSnapshot {
             path: None,
             dirty: false,
             status: None,
+            activities: Vec::new(),
             generation: 0,
             events: Vec::new(),
             deleted: None,
@@ -520,6 +547,7 @@ mod tests {
             path: Some("test.rs".to_string()),
             dirty: true,
             status: Some("ok".to_string()),
+            activities: Vec::new(),
             generation: 7,
             events: vec![ChangeEvent {
                 generation: 7,
@@ -529,6 +557,10 @@ mod tests {
                 text: Some("x".to_string()),
             }],
             deleted: Some("test.rs".to_string()),
+            activities: vec![Activity {
+                kind: ActivityKind::LspInit,
+                label: "LSP 初期化中".to_string(),
+            }],
             peek: Some(Peek {
                 path: "lib.rs".to_string(),
                 line: 42,
