@@ -80,6 +80,10 @@ _Avoid_: version, revision
 The fixed-width strip at the left of a View showing the absolute LineNumber (1-based) of each visible line, with the line containing the cursor highlighted. Display-only, computed by the Client from the StateSnapshot; never part of the Document text.
 _Avoid_: line number column, margin
 
+**Activity**:
+A unit of in-progress asynchronous work known to the Daemon — added when the work begins and removed when it ends. Activities ride in the StateSnapshot as a set, so Clients can tell the user that processing is ongoing and headless Clients can detect that it has cleared. An Activity says nothing about its outcome: it ends without reporting success or failure. The animated indicator (spinner) is a Client-side rendering concern; the Activity itself carries only the fact of the work.
+_Avoid_: busy flag, loading, progress
+
 **ChangeEvent**:
 A record of one state-changing operation, tagged with its source (Interactive, Headless, or External) and kind. The Daemon keeps a bounded ring of recent ChangeEvents and carries it in every StateSnapshot.
 _Avoid_: event, log entry
