@@ -2279,6 +2279,8 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
         dirty: editor.is_dirty(),
         status,
+        // ADR-0028: wire 形状のみ先行。daemon の Activity 追跡（生成・除去）は未実装。
+        activities: Vec::new(),
         generation: daemon.generation,
         events: daemon.events.iter().cloned().collect(),
         deleted: daemon.deleted.clone(),
