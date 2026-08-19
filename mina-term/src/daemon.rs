@@ -4063,7 +4063,15 @@ mod tests {
 
         let mut tui = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
-        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        // ADR-0028: Open の応答に診断取得中の活動が載る（settle の spawn 前に確定される）
+        assert!(
+            snap.activities
+                .iter()
+                .any(|a| a.kind == ActivityKind::DiagnosticsSettle),
+            "Open 直後の活動: {:?}",
+            snap.activities
+        );
         // 初回解析: TODO（byte 9）の診断が反映されるまで待つ
         let snap = poll_snapshot(
             &mut tui,
@@ -4073,6 +4081,20 @@ mod tests {
         .await;
         assert_eq!(snap.diagnostics[0].start, 9, "TODO は byte 9 から");
         assert_eq!(snap.diagnostics[0].message, "mock: TODO found");
+        // ADR-0028: 診断が届いても settle は終了直前のため、活動はまだ active
+        assert!(
+            snap.activities.iter().any(|a| a.kind == ActivityKind::DiagnosticsSettle),
+            "診断到着時はまだ解析中: {:?}",
+            snap.activities
+        );
+        // 活動の除去は settle の終了後（次の push で届く）
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| s.activities.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert!(!snap.diagnostics.is_empty(), "診断は残っている: {:?}", snap.diagnostics);
 
         // 先頭に挿入して TODO を byte 13 へ移動（didChange で同期される）
         let snap = request(&mut tui, &Command::Insert { text: "aaaa".into() }).await;
