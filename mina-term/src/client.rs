@@ -169,6 +169,12 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     // ADR-0013: キーイベントと daemon からの push を並列に待つ。push は
     // 他クライアント（agent 等）の変更を即時反映する。generation が最後に
     // 描画したものと同じなら捨てる（自分自身の変更は応答で描画済み）。
+    // ADR-0028: スピナー用のタイマー（~15Hz）を第3分岐に足す。Activity が
+    // active な間だけ再描画を駆動する（アニメーションはローカル描画の問題で
+    // daemon に一切触れない）。コマンド応答待ち中はループ自体がブロックする
+    // ため回らない — Open 応答待ちの静止は設計で許容済み（ADR-0028）。
+    let mut tick = tokio::time::interval(Duration::from_millis(66));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let mut redraw = false;
         tokio::select! {
@@ -299,6 +305,11 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                     }
                     Some(_) => {} // 内容が同一（自分自身の変更）: 描画済み
                     None => break, // daemon の切断（EOF）
+                }
+            }
+            _ = tick.tick() => {
+                if !state.activities.is_empty() {
+                    redraw = true; // スピナーを回す
                 }
             }
         }

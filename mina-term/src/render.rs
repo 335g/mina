@@ -776,7 +776,29 @@ fn draw_status(
         if let Some(msg) = msg {
             text.push_str(&format!("  {}", sanitize_status_data(msg)));
         }
-        truncate_wide(&mut text, width);
+        // ADR-0028: 進行中の処理（スピナー + ラベル）を右端に表示する。幅を先に
+        // 予約してから本文を切り詰め、最後に追記する（右端が切れないように）。
+        // スピナーのフレームは壁時計で回す（再描画のたびに進む。クライアントの
+        // タイマーか push が再描画を駆動する）。ラベルは sanitize を透過する。
+        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let mut suffix = String::new();
+        if let Some((first, rest)) = state.activities.split_first() {
+            let frame = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as usize
+                / 66; // ~15Hz の 1 フレーム
+            suffix.push(' ');
+            suffix.push(SPINNER[frame % SPINNER.len()]);
+            suffix.push(' ');
+            suffix.push_str(&sanitize_status_data(&first.label));
+            if !rest.is_empty() {
+                suffix.push_str(&format!(" (+{})", rest.len() + 1));
+            }
+        }
+        let suffix_w = suffix.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+        truncate_wide(&mut text, width.saturating_sub(suffix_w));
+        text.push_str(&suffix);
         if let Some(rest) = text.strip_prefix(mode) {
             // mode が丸ごと残った: mode だけマーカー色で包み、残りは無地
             status.push_str(&ui_sgr(scheme, capability, no_color, mode_role));
@@ -1591,6 +1613,57 @@ mod tests {
         };
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, None, 40, 10);
         assert!(out.contains("\x1b[4;91mworld\x1b[0m"), "診断範囲に下線 + エラー色: {out:?}");
+    #[test]
+    fn status_line_shows_activity_spinner_and_label() {
+        // ADR-0028: 活動があると右端にスピナー + ラベルが表示される
+        let mut state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
+        state.activities = vec![mina_protocol::Activity {
+            kind: mina_protocol::ActivityKind::DiagnosticsSettle,
+            label: "診断取得中".into(),
+        }];
+        let out = render_text(
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            &state,
+            &[],
+            None,
+            None,
+            40,
+            10,
+        );
+        assert!(out.contains("診断取得中"), "ラベルが表示される: {out:?}");
+        let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        assert!(
+            spinner_chars.iter().any(|c| out.contains(*c)),
+            "スピナーが表示される: {out:?}"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn status_line_reserves_width_for_spinner() {
+        // ADR-0028: 狭い幅でも右端のスピナー + ラベルが切れない
+        let mut state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
+        state.activities = vec![mina_protocol::Activity {
+            kind: mina_protocol::ActivityKind::Save,
+            label: "保存中".into(),
+        }];
+        let out = render_text(
+            &crate::colorscheme::DEFAULT,
+            ColorCapability::Ansi16,
+            false,
+            &state,
+            &[],
+            None,
+            None,
+            20,
+            10,
+        );
+        assert!(out.contains("保存中"), "狭い幅でもラベルが残る: {out:?}");
+    }
+
+
         assert!(out.contains("[1E 0W]"), "ステータスにカウント: {out:?}");
     }
 
