@@ -547,7 +547,6 @@ mod tests {
             path: Some("test.rs".to_string()),
             dirty: true,
             status: Some("ok".to_string()),
-            activities: Vec::new(),
             generation: 7,
             events: vec![ChangeEvent {
                 generation: 7,
