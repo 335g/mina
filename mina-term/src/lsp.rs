@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mina_lsp::{Client, LspRange, PositionEncoding, PublishDiagnostic};
-use mina_protocol::{Diagnostic, InlayHint, Severity, StateSnapshot};
+use mina_protocol::{ActivityKind, Diagnostic, InlayHint, Severity, StateSnapshot};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -820,6 +820,19 @@ pub async fn pull_after_edit(
 /// ファイルとみなして停止）。フォーカスが別文書に移ったら中断する。
 /// 上限 120 回 = 60 秒。
 pub async fn settle_open_diagnostics(
+    daemon: &Mutex<Daemon>,
+    session: Arc<Mutex<LspSession>>,
+    path: PathBuf,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
+) {
+    settle_open_diagnostics_loop(daemon, session, path.clone(), push_tx).await;
+    // ADR-0028: ループの全出口（安定・タイムアウト・フォーカス移動・サーバ死）で
+    // 活動を除去する（追加は Open 側が spawn 前に行う。idempotent なので安全）。
+    let mut d = daemon.lock().await;
+    d.remove_activity(&path, ActivityKind::DiagnosticsSettle);
+}
+
+async fn settle_open_diagnostics_loop(
     daemon: &Mutex<Daemon>,
     session: Arc<Mutex<LspSession>>,
     path: PathBuf,

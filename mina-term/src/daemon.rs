@@ -17,8 +17,9 @@ use mina_core::{
     move_selection_lines, move_selection_to_line_first_non_whitespace,
 };
 use mina_protocol::{
-    ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource, GotoTarget, Hello,
-    HighlightRange, InlayHint, Range, ServerMessage, ServerMetrics, StateSnapshot, fnv1a64,
+    Activity, ActivityKind, ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource,
+    GotoTarget, Hello, HighlightRange, InlayHint, Range, ServerMessage, ServerMetrics, StateSnapshot,
+    fnv1a64,
 };
 use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -118,6 +119,9 @@ pub struct Daemon {
     generation: u64,
     /// 直近の状態変化イベントの bounded リング（ADR-0012）。
     events: VecDeque<ChangeEvent>,
+    /// パスごとの進行中の非同期処理（ADR-0028）。スナップショットにはフォーカス
+    /// 文書の分だけが載る。増減で generation を進める（診断・ヒントの反映は進めない）。
+    activities: HashMap<PathBuf, Vec<Activity>>,
     /// 外部変更検知のベースライン（全オープン文書。Open/Save/Close で更新）。
     baselines: HashMap<PathBuf, DiskBaseline>,
     /// フォーカス文書が外部で削除され、Close を待っているパス（ADR-0015）。
@@ -296,6 +300,35 @@ impl Daemon {
         }
     }
 
+    /// 進行中の処理を追加する（ADR-0028）。追加で generation を進める
+    /// （診断・ヒントの反映は進めない — 増減だけが待ち合わせの対象）。
+    /// 同一 kind の重複追加は無視（idempotent）。
+    pub(crate) fn add_activity(&mut self, path: &Path, kind: ActivityKind, label: &str) {
+        let activities = self.activities.entry(path.to_path_buf()).or_default();
+        if !activities.iter().any(|a| a.kind == kind) {
+            activities.push(Activity {
+                kind,
+                label: label.to_string(),
+            });
+            self.generation += 1;
+        }
+    }
+
+    /// 進行中の処理を除去する（ADR-0028）。除去で generation を進める。
+    pub(crate) fn remove_activity(&mut self, path: &Path, kind: ActivityKind) {
+        let Some(activities) = self.activities.get_mut(path) else {
+            return;
+        };
+        let before = activities.len();
+        activities.retain(|a| a.kind != kind);
+        if activities.len() != before {
+            self.generation += 1;
+            if activities.is_empty() {
+                self.activities.remove(path);
+            }
+        }
+    }
+
     /// 状態を変える操作を記録する（世代を増やし、イベントをリングに積む）。
     fn record_event(
         &mut self,
@@ -332,6 +365,7 @@ impl Daemon {
             syntax: HashMap::new(),
             hints: HashMap::new(),
             hint_order: VecDeque::new(),
+            activities: HashMap::new(),
             metrics: ServerMetrics::default(),
         }
     }
@@ -624,11 +658,17 @@ async fn watch_disk(
                 d.lsp_sessions.get(&lsp::workspace_root(path)).cloned()
             };
             if let Some(session) = session {
+                // ADR-0028: 外部変更リロードの LSP 同期中もActivity として公開する（フォーカス
+                // 文書のみ。lsp_sync はフォーカス文書の場合にだけ設定される）。
+                let mut d = daemon.lock().await;
+                d.add_activity(path, ActivityKind::ReloadSync, "再読込同期中");
+                drop(d);
                 lsp::sync(&session, path, text).await;
                 // ヒントも編集と同経路で pull してキャッシュに載せる（ADR-0020）
                 let (pulled_diags, pulled_hints) =
                     lsp::pull_after_edit(&session, path, text).await;
                 let mut d = daemon.lock().await;
+                d.remove_activity(path, ActivityKind::ReloadSync);
                 if let Some(diags) = pulled_diags {
                     d.diagnostics = diags;
                 }
@@ -1336,6 +1376,11 @@ async fn process_command(
                     };
                     if let Some(session) = &session {
                         lsp::open_document(session, &path_buf, &text).await;
+                        // ADR-0028: 診断取得の活動を確定してから spawn する（スナップショットに
+                        // 確実に乗るため。settle 側は出口で除去する）。
+                        let mut d = daemon.lock().await;
+                        d.add_activity(&path_buf, ActivityKind::DiagnosticsSettle, "診断取得中");
+                        drop(d);
                         let daemon_task = daemon.clone();
                         let session_task = session.clone();
                         let path_task = path_buf.clone();
@@ -1409,6 +1454,10 @@ async fn process_command(
                     // 初期解析（crate ロード・数秒）が完了するまで pull で診断を追う。
                     // 解析未完の間の pull は空を返すため、バックグラウンドで poll する。
                     if let Some(session) = &session {
+                        // ADR-0028: 診断取得の活動を確定してから spawn する（settle 側は出口で除去）。
+                        let mut d = daemon.lock().await;
+                        d.add_activity(&path_buf, ActivityKind::DiagnosticsSettle, "診断取得中");
+                        drop(d);
                         let daemon_task = daemon.clone();
                         let session_task = session.clone();
                         let path_task = path_buf.clone();
@@ -1440,11 +1489,21 @@ async fn process_command(
                     let doc_id = d.editor.focused_doc_id();
                     (text, d.editor.focused_path().map(Path::to_path_buf), doc_id)
                 };
+                // ADR-0028: write 前に保存の活動を追加（スナップショットに載るのは次以降）。
+                if let Some(p) = &path {
+                    let mut d = daemon.lock().await;
+                    d.add_activity(p, ActivityKind::Save, "保存中");
+                    drop(d);
+                }
                 let write_result = match &path {
                     Some(p) => tokio::fs::write(p, text.as_bytes()).await,
                     None => Err(io::Error::new(io::ErrorKind::NotFound, "no file name")),
                 };
                 let mut d = daemon.lock().await;
+                // ADR-0028: 保存の活動を除去（write の前で追加済み。成功/失敗どちらも除去）。
+                if let Some(p) = &path {
+                    d.remove_activity(p, ActivityKind::Save);
+                }
                 match write_result {
                     Ok(()) => {
                         // 保存した文書そのものの dirty を消す。ただし書き込んだ
@@ -2279,8 +2338,12 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
         path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
         dirty: editor.is_dirty(),
         status,
-        // ADR-0028: wire 形状のみ先行。daemon の Activity 追跡（生成・除去）は未実装。
-        activities: Vec::new(),
+        // ADR-0028: フォーカス文書の活動だけが載る（増減で generation を進める）。
+        activities: editor
+            .focused_path()
+            .and_then(|p| daemon.activities.get(p))
+            .cloned()
+            .unwrap_or_default(),
         generation: daemon.generation,
         events: daemon.events.iter().cloned().collect(),
         deleted: daemon.deleted.clone(),
@@ -2425,6 +2488,61 @@ mod tests {
             .find(|r| r.group == HighlightGroup::Comment)
             .expect("コメントがハイライトされる");
         assert_eq!(&s.text[comment.start..comment.end], "// comment");
+    }
+
+    #[test]
+    fn activity_add_remove_bumps_generation() {
+        // ADR-0028: 増減のたび generation が進む。重複追加は無視、存在しない除去は無視。
+        let mut d = daemon();
+        let g = d.generation;
+        let a = std::path::Path::new("a.rs");
+        d.add_activity(a, ActivityKind::LspInit, "LSP 初期化中");
+        assert_eq!(d.generation, g + 1, "追加で世代が進む");
+        d.add_activity(a, ActivityKind::Save, "保存中");
+        assert_eq!(d.generation, g + 2);
+        d.add_activity(a, ActivityKind::LspInit, "LSP 初期化中");
+        assert_eq!(d.generation, g + 2, "同一 kind の重複追加は無視");
+        d.remove_activity(a, ActivityKind::Save);
+        assert_eq!(d.generation, g + 3, "除去で世代が進む");
+        d.remove_activity(a, ActivityKind::Save);
+        assert_eq!(d.generation, g + 3, "存在しない除去は世代を動かさない");
+        d.remove_activity(a, ActivityKind::LspInit);
+        assert_eq!(d.generation, g + 4);
+        assert!(d.activities.is_empty(), "空になったエントリは map から消える");
+    }
+
+    #[test]
+    fn snapshot_carries_focused_activities() {
+        // ADR-0028: フォーカス文書の活動だけがスナップショットに載る。
+        let mut d = daemon();
+        let a = open_path(&mut d, "a.rs", "fn a() {}\n");
+        assert!(a.activities.is_empty(), "LSP を使わないテスト経路は空: {a:?}");
+
+        d.add_activity(
+            std::path::Path::new("a.rs"),
+            ActivityKind::DiagnosticsSettle,
+            "診断取得中",
+        );
+        let s = apply(&mut d, Command::GetState);
+        assert_eq!(
+            s.activities.len(),
+            1,
+            "フォーカス文書の活動が載る: {:?}",
+            s.activities
+        );
+        assert_eq!(s.activities[0].kind, ActivityKind::DiagnosticsSettle);
+
+        // フォーカスが他文書へ移ると、その文書の活動だけになる
+        let _ = open_path(&mut d, "b.txt", "plain text\n");
+        let s = apply(&mut d, Command::GetState);
+        assert!(s.activities.is_empty(), "b.txt の活動は空: {:?}", s.activities);
+
+        d.remove_activity(
+            std::path::Path::new("a.rs"),
+            ActivityKind::DiagnosticsSettle,
+        );
+        let s = apply(&mut d, Command::GetState);
+        assert!(s.activities.is_empty(), "除去後は空: {:?}", s.activities);
     }
 
     #[test]
