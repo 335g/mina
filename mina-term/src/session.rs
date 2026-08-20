@@ -8,6 +8,7 @@
 //! - `mina session exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
 //! - `mina session edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
 //! - `mina session wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
+//!   （90 秒で時間切れ: 現状を返し exit code 2 = 再試行可能）
 //! - `mina session hints <path>` — 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
 //! - `mina session peek <path> <line>:<col>` — 指定位置（1-origin）の定義を全文なしで取得する（ADR-0025）
 //!
@@ -21,9 +22,9 @@
 //!
 //! daemon が動いていなければ自動起動される（TUI と同じ挙動）。終了コード:
 //! 0 = 成功（適用・no-op 含む）、1 = トランスポート/JSON エラー、
-//! 2 = `edit` が daemon に拒否された（checksum 不一致・範囲外。
-//! 再読み込みして再試行可能）。拒否理由の詳細はスナップショットの
-//! `status` フィールドに載る。
+//! 2 = 再試行可能な失敗 — `edit` が daemon に拒否された（checksum 不一致・
+//! 範囲外）か、`wait` が時間内（90 秒）に世代超過を観測できなかった。
+//! 拒否/待機失敗の詳細はスナップショットの `status` フィールドに載る。
 
 use std::io::Read;
 use std::io;
@@ -33,6 +34,7 @@ use clap::Subcommand;
 use mina_protocol::{ClientKind, Command, DocumentEdit, InlayHint, StateSnapshot};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::time::{timeout, Duration};
 
 use crate::client;
 
@@ -97,6 +99,35 @@ pub enum SessionCmd {
     },
 }
 
+/// `session wait` のタイムアウト。診断 settle の正常終了上限（~30–60 秒、
+/// ADR-0028）にマージンを足した値。時間切れは exit code 2（再試行可能）で
+/// 表す（e2e-01: settle の進まない wait が永久ブロックした欠陥の修正）。
+const WAIT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// [`wait_with_timeout`] の結果。タイムアウト時も現状スナップショットを返す。
+#[derive(Debug, PartialEq)]
+enum WaitOutcome {
+    /// 時間内に世代が target を超えた時点のスナップショット。
+    Completed(StateSnapshot),
+    /// 時間内に世代が進まなかった。`fallback`（= 現状スナップショット）を返す。
+    TimedOut(StateSnapshot),
+}
+
+/// `fut` を `timeout_dur` まで待つ。時間切れなら `fallback` の結果を
+/// `TimedOut` として返す。待機中の接続は daemon 側でブロックされたまま
+/// （per-connection 直列処理）なので、現状の取得は別接続で行う —
+/// 呼び出し側は `GetState` を `fallback` に渡す。
+async fn wait_with_timeout(
+    timeout_dur: Duration,
+    fut: impl std::future::Future<Output = io::Result<StateSnapshot>>,
+    fallback: impl std::future::Future<Output = io::Result<StateSnapshot>>,
+) -> io::Result<WaitOutcome> {
+    match timeout(timeout_dur, fut).await {
+        Ok(result) => Ok(WaitOutcome::Completed(result?)),
+        Err(_elapsed) => Ok(WaitOutcome::TimedOut(fallback.await?)),
+    }
+}
+
 /// `mina session <subcommand>` を処理する。
 pub async fn run(cmd: SessionCmd) -> io::Result<()> {
     match cmd {
@@ -142,8 +173,28 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
             apply(&path, old, new, whole, whole_stdin, old_file, new_file).await?;
         }
         SessionCmd::Wait { generation } => {
-            let snapshot = execute(&Command::WaitFor { generation }).await?;
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            // WAIT_TIMEOUT 以内に世代が進まなければ、現状を返して再試行可能な
+            // exit code 2 で終了する（settle が進まない編集等で永久ブロック
+            // しないため — e2e-01 の中タスクで再現した欠陥）。
+            match wait_with_timeout(
+                WAIT_TIMEOUT,
+                execute(&Command::WaitFor { generation }),
+                execute(&Command::GetState),
+            )
+            .await?
+            {
+                WaitOutcome::Completed(snapshot) => {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                }
+                WaitOutcome::TimedOut(snapshot) => {
+                    eprintln!(
+                        "wait timed out after {}s: generation {generation} が観測されなかった（再試行可能）",
+                        WAIT_TIMEOUT.as_secs()
+                    );
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    std::process::exit(2);
+                }
+            }
         }
         SessionCmd::Hints { path } => {
             let hints = execute_hints(&path.to_string_lossy()).await?;
@@ -458,6 +509,44 @@ fn edit_exit_code(snapshot: &StateSnapshot) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wait_with_timeout_returns_current_state_on_timeout() {
+        // e2e-01 で再現した欠陥（世代が進まない wait の永久ブロック）の回帰
+        // テスト。ヘルパーは分離済みなので短時間の timeout で検証でき、実 CLI
+        // の 90 秒定数に依存しない。完了パスは daemon 側の
+        // `wait_for_generation_blocks_until_change` が実接続で検証済み。
+        let current = StateSnapshot {
+            text: "current".into(),
+            generation: 5,
+            ..Default::default()
+        };
+
+        // 完了パス: 未来が瞬時に完了すればその結果を返し、fallback は呼ばれない
+        let done = wait_with_timeout(
+            Duration::from_millis(200),
+            async { Ok(current.clone()) },
+            async { unreachable!("完了時は fallback を呼ばない") },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(done, WaitOutcome::Completed(s) if s.generation == 5));
+
+        // タイムアウトパス: 完了しない未来は time out し、fallback（現状取得）
+        // の結果を TimedOut として返す
+        let pending = std::future::pending::<io::Result<StateSnapshot>>();
+        let timed_out = wait_with_timeout(
+            Duration::from_millis(50),
+            pending,
+            async { Ok(current.clone()) },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&timed_out, WaitOutcome::TimedOut(s) if s.generation == 5),
+            "タイムアウト時は現状スナップショットを返す: {timed_out:?}"
+        );
+    }
 
     #[test]
     fn rejected_edit_status_yields_exit_code_2() {
