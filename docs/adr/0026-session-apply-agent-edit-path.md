@@ -32,6 +32,20 @@ dev01 開発で minae ヘルパー（get → expected_text 検証 → edit → s
 | 全文置換 | `session apply <path> --whole <new>` |
 | 全文置換（stdin） | `session apply <path> --whole-stdin < new.rs` |
 | ファイル入力 | `session apply <path> --old-file f --new-file g` |
+| 複数編集 | `session apply <path> --hunks-stdin` — JSON 配列 `[{"old","new"},…]` を stdin から |
+
+### 複数編集 `--hunks-stdin`（ラウンドトリップ削減, e2e-01 対応）
+
+エージェントが複数行・多数箇所を編集する際、単発 apply を N 回呼ぶと N プロセス ×（接続 + Open/Edit/Save）を消費する（e2e では 370 行を 40 回の apply で書いた）。`--hunks-stdin` は N 個の編集を **1 プロセス・1 接続で順次適用**し、**Save は最後に一度だけ**行う:
+
+1. 接続・Hello → `Open` → 2 以降を 1 接続で実行
+2. 各 hunk を順に: 直前までの適用後の現在テキストに対し `old` を検索（char 単位）→ `DocumentEdit`（checksum + `expected_text` の2段検証、チェックサムは前の編集結果で連鎖）
+3. 全 hunk 成功後に一度だけ `Save`
+4. 成功時は `{"applied","edits","generation","checksum"}` を JSON 出力（generation を返すことで、続く `wait <generation>` を別の `session get` なしで直接呼べる — state 呼び出し 1 回分を削減）
+
+**失敗契約は単発 apply の一般化**: 途中の hunk で `old` 未発見・拒否があれば必ず exit 2 で終了する。Save は最後に一度だけなので **直前に適用済みの hunk もディスクへは書き込まれない**（ディスク無変更・再試行可能）。daemon のメモリ内文書は部分的に編集済みだが、次の apply の Open（ディスク再読込）で上書きされ自己修復する。未存在パス・終了コード・再試行の契約は単発 apply と同一。
+
+プロトコルは変更しない（DocumentEdit / Save のループは既存の headless 許可リスト内で完結。generation の同梱も CLI 側の出力整形であり wire 変更なし）。
 
 終了コード: 0 = 成功、1 = トランスポート/引数/Open 失敗、2 = 再試行可能な失敗（old 未発見・checksum/expected_text 不一致による拒否・Save 失敗）。エージェントは `$?` だけで判定し、再読み込み→再試行できる（`session edit` と同じ契約、#11）。
 
