@@ -3712,18 +3712,25 @@ mod tests {
         assert_eq!(snap.selection[0].anchor, 5, "tui_b の切断だけでは変わらない");
         drop(tui_c); // 最後の切断 → リセット
 
-        // リセットは daemon が切断の EOF を処理してから起きる。直後の GetState は
-        // 切断処理との競合で間欠失敗するため（既存のフレーキー）、伝播を待ってから
-        // 検証する（settle/wait 系テストと同じ待ちパターン）。
-        let mut tui_d = connect_client(&sock, ClientKind::Interactive).await;
-        let mut snap = request(&mut tui_d, &Command::GetState).await;
-        for _ in 0..40 {
-            if snap.selection[0].anchor == 0 {
-                break;
+        // リセットは daemon が切断の EOF を処理してから起きる（非同期）。ここで
+        // Interactive を先に接続すると「残存する Interactive」としてリセット自体を
+        // 抑止してしまうので、リセットを抑止しない Headless オブザーバで伝播を待つ
+        // （ADR-0027 の Interactive 判定には Headless は数えない）。
+        let mut obs = connect_client(&sock, ClientKind::Headless).await;
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let s = request(&mut obs, &Command::GetState).await;
+                if s.selection[0].anchor == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            snap = request(&mut tui_d, &Command::GetState).await;
-        }
+        })
+        .await;
+        assert!(observed.is_ok(), "最後の切断でリセットされる（2 秒以内に伝播しない）");
+
+        let mut tui_d = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui_d, &Command::GetState).await;
         assert_eq!(snap.selection[0].anchor, 0, "最後の切断でリセットされる");
         let _ = std::fs::remove_file(&sock);
     }
