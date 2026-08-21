@@ -4,7 +4,8 @@
 //! - `mina session info` — daemon のビルド世代・累積メトリクスを取得する（issue #27）
 //! - `mina session apply <path> <old> <new>` — 1コマンドで「Open→検証置換→Save」
 //!   （issue #29 F1。minae ヘルパーの製品化。`--whole` / `--whole-stdin` /
-//!   `--old-file` / `--new-file` で argv 制限やシェル引用を回避できる）
+//!   `--old-file` / `--new-file` で argv 制限やシェル引用を回避できる。
+//!   複数編集は `--hunks-stdin`（JSON 配列を stdin から、1 接続で Save は最後に一度））
 //! - `mina session exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
 //! - `mina session edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
 //! - `mina session wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
@@ -32,6 +33,7 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 use mina_protocol::{ClientKind, Command, DocumentEdit, InlayHint, StateSnapshot};
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
@@ -73,6 +75,12 @@ pub enum SessionCmd {
         /// Replace the whole file with the text read from stdin (no argv limit)
         #[arg(long)]
         whole_stdin: bool,
+        /// Apply multiple verified edits: stdin carries a JSON array
+        /// [{"old": "...", "new": "..."}, ...] applied in order on one connection,
+        /// saving once at the end (round-trip reduction). Exit 2 (nothing saved)
+        /// if any old is not found or an edit is rejected.
+        #[arg(long)]
+        hunks_stdin: bool,
         /// Read the sought text from a file (avoids shell quoting)
         #[arg(long)]
         old_file: Option<PathBuf>,
@@ -167,10 +175,21 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
             new,
             whole,
             whole_stdin,
+            hunks_stdin,
             old_file,
             new_file,
         } => {
-            apply(&path, old, new, whole, whole_stdin, old_file, new_file).await?;
+            apply(
+                &path,
+                old,
+                new,
+                whole,
+                whole_stdin,
+                hunks_stdin,
+                old_file,
+                new_file,
+            )
+            .await?;
         }
         SessionCmd::Wait { generation } => {
             // WAIT_TIMEOUT 以内に世代が進まなければ、現状を返して再試行可能な
@@ -331,6 +350,7 @@ async fn execute_edit(edit: &DocumentEdit) -> io::Result<StateSnapshot> {
 ///
 /// - old あり: 先頭から最初の出現位置を置換（見つからなければ exit 2）
 /// - `--whole` / `--whole-stdin`: 全文置換（old 不要）
+/// - `--hunks-stdin`: 複数編集を 1 接続で適用（Open → Edit×N → Save×1）
 /// - ファイルが存在しない場合: 空文書として扱い、Save で新規作成する
 ///   （report 3-1 の touch→open 2段階ハックの解消）
 ///
@@ -342,9 +362,22 @@ async fn apply(
     new: Option<String>,
     whole: Option<String>,
     whole_stdin: bool,
+    hunks_stdin: bool,
     old_file: Option<PathBuf>,
     new_file: Option<PathBuf>,
 ) -> io::Result<()> {
+    // --hunks-stdin: 複数編集を 1 プロセス・1 接続で適用（ラウンドトリップ削減）。
+    // 他入力指定と排他。
+    if hunks_stdin {
+        if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() {
+            return Err(invalid("--hunks-stdin は他の入力指定と併用できません"));
+        }
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        let hunks = parse_hunks(&buf)?;
+        return apply_hunks(path, &hunks).await;
+    }
+
     let (old_text, new_text) = resolve_apply_args(old, new, whole, whole_stdin, old_file, new_file)?;
 
     let socket = crate::daemon::socket_path();
@@ -469,6 +502,109 @@ fn resolve_apply_args(
     Ok((Some(old), new))
 }
 
+/// `--hunks-stdin` の編集 1 つ分。`old` を現在テキストに検索し `new` で置換する。
+#[derive(Debug, Deserialize)]
+struct Hunk {
+    #[serde(default)]
+    old: String,
+    #[serde(default)]
+    new: String,
+}
+
+/// `--hunks-stdin` の入力を解釈する。少なくとも 1 つ、かつ `old` が空でないこと。
+fn parse_hunks(input: &str) -> io::Result<Vec<Hunk>> {
+    let hunks: Vec<Hunk> = serde_json::from_str(input)
+        .map_err(|e| invalid(format!("--hunks-stdin の JSON を解釈できません: {e}")))?;
+    if hunks.is_empty() {
+        return Err(invalid("--hunks-stdin は少なくとも 1 つの hunk が必要です"));
+    }
+    if let Some(h) = hunks.iter().find(|h| h.old.is_empty()) {
+        return Err(invalid("hunk.old は空にできません (置換対象が必要)"));
+    }
+    Ok(hunks)
+}
+
+/// `--hunks-stdin` の実体: 複数編集を 1 接続で順次適用し、最後に一度だけ Save する。
+/// 途中で `old` 未発見や daemon 拒否なら exit 2（Save 前なのでディスクは無変更
+/// — 単発 apply の失敗契約を複数に一般化したもの。エージェントは state で再確認
+/// →修正→再試行）。成功時は generation を JSON で返し、続く `wait <generation>`
+/// を別プロセスなしで直接呼べるようにする（ラウンドトリップ削減 — e2e-01）。
+async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+
+    let abs = client::absolutize(&path.to_string_lossy());
+    let mut snapshot = client::request(
+        &mut write_half,
+        &mut reader,
+        &Command::Open { path: abs.clone() },
+    )
+    .await?;
+    // 既存 apply と同じ: 未存在パスは空ファイルを touch して再 Open（Save で新規作成）
+    if snapshot.status.is_some() && std::fs::metadata(&abs).is_err() {
+        std::fs::write(&abs, "")
+            .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
+        snapshot = client::request(
+            &mut write_half,
+            &mut reader,
+            &Command::Open { path: abs.clone() },
+        )
+        .await?;
+    }
+    if let Some(status) = &snapshot.status {
+        return Err(invalid(format!("Open 失敗: {status}")));
+    }
+
+    let mut applied = 0usize;
+    for hunk in hunks {
+        // 直前の編集適用後の現在テキストに対し位置を再計算する（行揺れを踏む。char 単位）
+        let text = snapshot.text.clone();
+        let Some((start, end)) = find_range(&text, &hunk.old) else {
+            eprintln!("NOT FOUND: {:?}", short(&hunk.old));
+            std::process::exit(2); // Save 前なのでディスク無変更
+        };
+        let edit = DocumentEdit {
+            start,
+            end,
+            text: hunk.new.clone(),
+            checksum: snapshot.checksum,
+            expected_text: Some(hunk.old.clone()),
+        };
+        snapshot = client::request(&mut write_half, &mut reader, &edit).await?;
+        if let Some(status) = &snapshot.status {
+            eprintln!("EDIT REJECTED: {status}");
+            std::process::exit(2);
+        }
+        applied += 1;
+    }
+
+    let snapshot = client::request(&mut write_half, &mut reader, &Command::Save).await?;
+    let saved = snapshot
+        .status
+        .as_deref()
+        .is_some_and(|s| s.starts_with("saved"));
+    if !saved {
+        eprintln!("SAVE FAILED: {:?}", snapshot.status);
+        std::process::exit(2);
+    }
+    // Q3: 成功時に generation を返す（エージェントは wait <generation> を直接呼べる）
+    println!(
+        "{}",
+        serde_json::json!({
+            "applied": abs,
+            "edits": applied,
+            "generation": snapshot.generation,
+            "checksum": snapshot.checksum,
+        })
+    );
+    Ok(())
+}
+
 /// エラーメッセージ用に文字列を先頭40文字に短縮する。
 fn short(s: &str) -> String {
     let mut out: String = s.chars().take(40).collect();
@@ -546,6 +682,21 @@ mod tests {
             matches!(&timed_out, WaitOutcome::TimedOut(s) if s.generation == 5),
             "タイムアウト時は現状スナップショットを返す: {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn parse_hunks_rejects_bad_input() {
+        // 不正 JSON・空・空 old は拒否。有効な配列はそのまま解釈する。
+        assert!(parse_hunks("not json").is_err());
+        assert!(parse_hunks("[]").is_err(), "空配列は拒否");
+        assert!(parse_hunks("[{\"old\":\"\",\"new\":\"b\"}]").is_err(), "空 old は拒否");
+
+        let hunks = parse_hunks("[{\"old\":\"a\",\"new\":\"b\"},{\"old\":\"c\",\"new\":\"\"}]").unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].old, "a");
+        assert_eq!(hunks[0].new, "b");
+        assert_eq!(hunks[1].old, "c");
+        assert_eq!(hunks[1].new, "", "空 new は削除を意味し許容");
     }
 
     #[test]
