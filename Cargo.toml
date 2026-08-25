@@ -1,5 +1,5 @@
 [workspace]
-members = ["mina-core", "mina-view", "mina-protocol", "mina-lsp", "mina-term", "mina-debug", "mina-loader", "tmp/dev01"]
+members = ["mina-core", "mina-view", "mina-protocol", "mina-lsp", "mina-term", "mina-debug", "mina-loader", "tmp/dev01", "tmp/dev02"]
 resolver = "3"
 
 [workspace.package]
