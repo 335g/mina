@@ -2,6 +2,8 @@
 
 エージェントがファイルを編集する正規手順を、1コマンドの `mina session apply <path> <old> <new>` に集約する（issue #29 / F1、docs/dev-feedback.md 第2ラウンド 報告#3 の minae ヘルパーの製品化）。`session edit` は生の [`DocumentEdit`] JSON 実行のまま残し、`session apply` がその上に正規の利用手順を載せる。
 
+> **補足（R2/2026-08-26）**: エージェント向けの契約を1か所にまとめた表を本ADR末尾「エージェント向け契約表」に追加（dev02 README の契約表を mina 本体に移植）。`session get --lines`（トークン削減, P1）と `session info` の CLI 世代（I4）も新設。
+
 ## 動機
 
 dev01 開発で minae ヘルパー（get → expected_text 検証 → edit → save の1コマンド化）が「無いと実質開発不能」だった（報告#3）。その摩擦を CLI 側で直接除去する:
@@ -59,3 +61,47 @@ dev01 開発で minae ヘルパー（get → expected_text 検証 → edit → s
 
 - **minae の同梱（Python スクリプトの追跡）**: 摩擦が残ったままラッパーだけ増殖する。保守対象が増え、製品の動作がラッパー依存になる。→ 摩擦を直接除去する
 - **search/replace への全面移行（B1）**: 業界標準ではあるが、既存の checksum + expected_text の2段検証（B2）で局所検証は実現済み。`session apply` は old テキストを位置の代わりに使うため、実質「位置指定を隠した内容解決型」。位置指定 API の公開は `session edit` として残す
+
+## エージェント向け契約表（R2/2026-08-26 追記）
+
+dev02 README（tools.rs）で整備された契約を、mina 本体の `session` サブコマンドにも適用。エージェントはこの表だけで分岐できる（exit code の三値分類・失敗の意味・再試行可否を JSON パースなしで判定）。
+
+### 終了コード（三値分類）
+
+| code | 意味 | 再試行 | 対応コマンド |
+|---|---|---|---|
+| 0 | 成功・適用・no-op | — | get / apply / edit / info / wait（完了） |
+| 1 | 入力・引数・トランスポート・Open・JSON 解釈エラー | 不要（修正してやり直す） | apply / edit / wait（CLI層エラー） |
+| 2 | 再試行可能な失敗: old 未発見・checksum / expected_text 不一致・Save 失敗・wait タイムアウト | 必要（fresh read から） | apply / edit / wait |
+
+エラー内容は stderr に英語（メッセージ冒頭）で、具体的な理由・値を添える（C1）。成功時 stdout は機械可読 JSON。
+
+### read / edit 契約（`session get --lines` + `session apply`）
+
+`session get --lines start:end` は全文の代わりに指定行を番号付きで返す（P1 トークン削減）。
+
+| 入力 | 標準出力 | 備考 |
+|---|---|---|
+| `--lines` 省略 | 全文スナップショット（従来どおり、checksum 含む） | edit の checksum 取得に使用 |
+| `--lines 10:20` | 10〜20行の番号付き JSON `{"n":N,"text":…}` | read の結果がそのまま `apply` の `old` に使える（P2） |
+| `start` > 行数 | `note: "no lines in {start}..{end}: file has {line_count} lines"` + 空 `lines` | 説明付きゼロ結果（Q3）。無駄な再試行を防ぐ |
+| `end` > 行数 | 最終行へクランプ + `note: "clamped to last line …"` | — |
+| `end` 省略（`10:`） | 10行目から最終行まで | — |
+
+`session apply <path> <old> <new>` は `old` の最初の出現を置換・検証・Save する。
+
+### 複数編集 `--hunks-stdin`
+
+stdin に JSON 配列 `[{"old":"…","new":"…"},…]`。
+
+| 契約 | 内容 |
+|---|---|
+| 適用順序 | 配列順に順次適用（直前の適用結果にマッチ） |
+| 原子性 | 途中で old 未発見・拒否なら全体を未保存・exit 2（ディスク無変更） |
+| noop | `new == old` はエラーでなく正常完了（冪等リトライ可能） |
+| 出力 | 成功時 `{"applied","edits","generation","checksum"}`（新 checksum を返すので続く編集に再利用可） |
+| 空配列 / 不正 JSON | CLI層エラー・exit 1 |
+
+### 永続化（H1）
+
+`session edit` は保存しない（dirty のまま）。成功時 dirty なら stderr に1行 `note: buffer is dirty (not saved); persist with: session exec '"Save"'`。`session apply` / `--hunks-stdin` は Save まで行い dirty を解消する。
