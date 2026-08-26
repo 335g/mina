@@ -44,7 +44,15 @@ use crate::client;
 #[derive(Subcommand)]
 pub enum SessionCmd {
     /// Fetch the current state (printed as JSON)
-    Get,
+    Get {
+        /// Restrict output to a line range `start:end` (1-origin, inclusive; `end`
+        /// may be empty = last line). Prints only those numbered lines instead of
+        /// the whole snapshot — cuts the token cost of reading a large file to
+        /// the region needed (P1). Out-of-range `start` yields an explained zero
+        /// result (Q3), `end` past EOF is clamped with a note.
+        #[arg(long)]
+        lines: Option<String>,
+    },
     /// Fetch the daemon build generation and metrics (printed as JSON, issue #27)
     Info,
     /// Run one `Command` (JSON is the wire [`Command`] as-is)
@@ -139,9 +147,15 @@ async fn wait_with_timeout(
 /// `mina session <subcommand>` を処理する。
 pub async fn run(cmd: SessionCmd) -> io::Result<()> {
     match cmd {
-        SessionCmd::Get => {
+        SessionCmd::Get { lines } => {
             let snapshot = execute(&Command::GetState).await?;
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            match lines {
+                // --lines: 全文スナップショットを渡す代わりに、対象行だけを番号付きで
+                // 返す（トークン削減 — P1）。daemon へのソケット転送はローカルで無料
+                // なので、節約は CLI 出力側（= LLM が読む量）で成立する。
+                Some(range) => print_line_range(&snapshot, &range)?,
+                None => println!("{}", serde_json::to_string_pretty(&snapshot)?),
+            }
         }
         SessionCmd::Info => {
             // #27: ワンショット CLI にも GetServerInfo 経路を用意する。daemon の
@@ -167,6 +181,13 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
             let code = edit_exit_code(&snapshot);
             if code != 0 {
                 std::process::exit(code);
+            }
+            // H1: `session edit` は保存しない（apply だけが保存まで行う）。daemon 上は
+            // 変わったのにディスクが古いまま＝エージェントが旧ファイルを参照し続ける
+            // 事故クラスを防ぐため、dirty のままなら永続化導線を stderr に1行だけ
+            // 明示する（auto-save は不採用 — 非保存が正しいユースケースが存在する）。
+            if snapshot.dirty {
+                eprintln!("note: buffer is dirty (not saved); persist with: session exec '\"Save\"'");
             }
         }
         SessionCmd::Apply {
@@ -249,6 +270,121 @@ fn parse_position(pos: &str) -> io::Result<(u32, u32)> {
     Ok((line, col))
 }
 
+/// `session get --lines start:end` の出力。全文スナップショットの代わりに、対象行
+/// だけを番号付き JSON で返す（トークン削減 — P1）。`start` が行数を超えれば
+/// 説明付きゼロ結果（Q3/R1）、`end` が行数を超えれば最終行へクランプしてその旨を
+/// 載せる。read の結果（番号付き行）がそのまま `session apply` の `old` 指定に
+/// 使える（read/edit 契約統一 — P2）。
+fn print_line_range(snapshot: &StateSnapshot, range: &str) -> io::Result<()> {
+    let (start, end) = parse_line_range(range)?;
+    let r = slice_lines(&snapshot.text, start, end);
+    let end_str = end.map_or(String::new(), |e| e.to_string());
+    let mut obj = serde_json::Map::new();
+    obj.insert("path".into(), snapshot.path.clone().unwrap_or_default().into());
+    obj.insert("generation".into(), snapshot.generation.into());
+    obj.insert("line_count".into(), (r.line_count as u64).into());
+    if r.out_of_range {
+        // Q3: 「空の成功」ではなく理由付きのゼロ結果。エージェントは次の範囲指定を
+        // 根拠を持って決められる（無駄な再試行をしない）。
+        obj.insert(
+            "note".into(),
+            format!("no lines in {start}..{end_str}: file has {} lines", r.line_count).into(),
+        );
+        obj.insert("lines".into(), serde_json::Value::Array(vec![]));
+    } else {
+        obj.insert(
+            "lines".into(),
+            r.lines
+                .iter()
+                .map(|(n, t)| serde_json::json!({ "n": n, "text": t }))
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        if r.clamped {
+            obj.insert(
+                "note".into(),
+                format!("clamped to last line {} (requested end {end_str})", r.line_count).into(),
+            );
+        }
+    }
+    println!("{}", serde_json::Value::Object(obj));
+    Ok(())
+}
+
+/// `start:end`（1-origin・両端含む）を解釈する。`end` 省略可（最終行まで）。
+fn parse_line_range(range: &str) -> io::Result<(usize, Option<usize>)> {
+    let (s, e) = range
+        .split_once(':')
+        .ok_or_else(|| invalid("行範囲は start:end 形式です (1-origin)"))?;
+    let start: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| invalid(format!("行番号が不正です: {s:?}")))?;
+    if start == 0 {
+        return Err(invalid("行は 1 始まりです（0 は指定できません）"));
+    }
+    let end = if e.trim().is_empty() {
+        None
+    } else {
+        let v: usize = e
+            .trim()
+            .parse()
+            .map_err(|_| invalid(format!("行番号が不正です: {e:?}")))?;
+        if v == 0 {
+            return Err(invalid("行は 1 始まりです（0 は指定できません）"));
+        }
+        if v < start {
+            return Err(invalid("end は start 以上にしてください"));
+        }
+        Some(v)
+    };
+    Ok((start, end))
+}
+
+struct LineSlice {
+    lines: Vec<(usize, String)>,
+    line_count: usize,
+    out_of_range: bool,
+    clamped: bool,
+}
+
+/// `text` から 1-origin・両端含む `start..=end` 行を取り出す。trailing newline は
+/// 行として数えない。`end` が `None`（開いた範囲）は最終行まで。
+fn slice_lines(text: &str, start: usize, end: Option<usize>) -> LineSlice {
+    let line_count = if text.is_empty() {
+        0
+    } else {
+        let n = text.split('\n').count();
+        if text.ends_with('\n') { n - 1 } else { n }
+    };
+    let out_of_range = start > line_count;
+    let concrete_end = if out_of_range {
+        0
+    } else {
+        end.unwrap_or(line_count).min(line_count)
+    };
+    let clamped = end.is_some() && end.unwrap() > line_count;
+    let mut lines = Vec::new();
+    if !out_of_range {
+        for (i, line) in text.split('\n').enumerate() {
+            let no = i + 1;
+            if no < start {
+                continue;
+            }
+            if no > concrete_end {
+                break;
+            }
+            lines.push((no, line.to_string()));
+        }
+    }
+    LineSlice {
+        lines,
+        line_count,
+        out_of_range,
+        clamped,
+    }
+}
+
 /// daemon に接続し、指定位置の定義を軽量応答（[`ServerMessage::Peek`]）で受け取る。
 async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protocol::Peek> {
     let socket = crate::daemon::socket_path();
@@ -284,7 +420,18 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
             generation,
             daemon_build_ts,
             metrics,
-        }) => Ok(serde_json::json!({ "generation": generation, "daemon_build_ts": daemon_build_ts, "metrics": metrics })),
+        }) => Ok(serde_json::json!({
+            "generation": generation,
+            "daemon_build_ts": daemon_build_ts,
+            // I4: CLI 側のビルド世代も開示する（D1 のクライアント側バリアント —
+            // 再ビルド後に release バイナリが古いまま、という事故の検知）。build.rs が
+            // 注入した MINA_GIT_HASH / MINA_BUILD_TS を読む。
+            "cli_generation": option_env!("MINA_GIT_HASH").unwrap_or("unknown"),
+            "cli_build_ts": option_env!("MINA_BUILD_TS")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
+            "metrics": metrics,
+        })),
         Ok(mina_protocol::ServerMessage::Response { .. })
         | Ok(mina_protocol::ServerMessage::Push { .. }) => {
             Err(invalid("GetServerInfo にスナップショット応答が返った（旧 daemon: 再ビルドしてください）"))
@@ -728,6 +875,60 @@ mod tests {
         assert!(parse_position("0:5").is_err(), "行 0 は拒否");
         assert!(parse_position("12:0").is_err(), "列 0 は拒否");
         assert!(parse_position("a:b").is_err(), "数値以外は拒否");
+    }
+
+    #[test]
+    fn parse_line_range_parses_start_end() {
+        // start:end（1-origin・両端含む）。end 省略可。0・逆順・不正は拒否。
+        assert_eq!(parse_line_range("10:20").unwrap(), (10, Some(20)));
+        assert_eq!(parse_line_range("1:1").unwrap(), (1, Some(1)));
+        assert_eq!(parse_line_range("5:").unwrap(), (5, None), "end 省略=最終行");
+        assert!(parse_line_range("0:5").is_err(), "行 0 は拒否");
+        assert!(parse_line_range("5:0").is_err(), "end=0 は拒否");
+        assert!(parse_line_range("20:10").is_err(), "end < start は拒否");
+        assert!(parse_line_range("a:b").is_err(), "数値以外は拒否");
+        assert!(parse_line_range("5").is_err(), "コロンなしは拒否");
+    }
+
+    #[test]
+    fn slice_lines_selects_range_and_detects_edges() {
+        // 通常範囲（trailing newline を 1 行に数えない）
+        let r = slice_lines("a\nb\nc\nd\n", 2, Some(3));
+        assert_eq!(r.line_count, 4);
+        assert!(!r.out_of_range);
+        assert!(!r.clamped);
+        assert_eq!(r.lines, vec![(2, "b".into()), (3, "c".into())]);
+
+        // end 省略 = 最終行まで
+        let r = slice_lines("a\nb\nc", 2, None);
+        assert_eq!(r.line_count, 3);
+        assert_eq!(r.lines, vec![(2, "b".into()), (3, "c".into())]);
+
+        // end 超過は最終行へクランプされ clamped フラグが立つ
+        let r = slice_lines("a\nb", 1, Some(99));
+        assert_eq!(r.line_count, 2);
+        assert!(r.clamped);
+        assert!(!r.out_of_range);
+        assert_eq!(r.lines, vec![(1, "a".into()), (2, "b".into())]);
+
+        // start 超過は説明付きゼロ結果（Q3）
+        let r = slice_lines("a\nb\nc", 50, Some(60));
+        assert!(r.out_of_range);
+        assert_eq!(r.line_count, 3);
+        assert!(r.lines.is_empty());
+
+        // 空文字列は 0 行
+        let r = slice_lines("", 1, None);
+        assert_eq!(r.line_count, 0);
+        assert!(r.out_of_range);
+    }
+
+    #[test]
+    fn slice_lines_handles_empty_interior_lines() {
+        // 文書内部の空行は正しく数え・返す
+        let r = slice_lines("a\n\nb\n", 1, Some(3));
+        assert_eq!(r.line_count, 3);
+        assert_eq!(r.lines, vec![(1, "a".into()), (2, "".into()), (3, "b".into())]);
     }
 
     #[test]
