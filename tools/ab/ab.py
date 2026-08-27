@@ -110,6 +110,36 @@ function main() {
 """)
 
 
+def fixture_t5():
+    """T5: 3-file TS project, many occurrences (USD x12, price x9) — the
+    regime where LSP semantic rename should beat an apply loop."""
+    (WORK / "ws" / "utils.ts").write_text(
+        """export const USD = 100;
+
+export function price(x: number): number {
+  return x * USD;
+}
+""")
+    (WORK / "ws" / "data.ts").write_text(
+        """import { USD, price } from './utils';
+
+export const items = [USD * 1, USD * 2, USD * 3, USD * 4, USD * 5, USD * 10];
+
+export function total(a: number, b: number): number {
+  return price(a) + price(b) + price(a * b) + price(a + b);
+}
+""")
+    (WORK / "ws" / "main.ts").write_text(
+        """import { USD, price } from './utils';
+import { items, total } from './data';
+
+const first = items[0] + USD;
+const second = price(USD) + USD * 2;
+const third = total(USD, price(USD));
+console.log(first, second, third);
+""")
+
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -135,7 +165,30 @@ Work in small steps: mread a range (e.g. mread cfg.rs 1:20), then medit the exac
 text you saw. When both changes are in place, verify with a final mread and reply
 with exactly: DONE
 Do not modify anything else.""",
-    # Test4: LSP semantic rename (mrename) vs content-resolved apply loop
+    # Test5: LSP rename vs apply — many occurrences across 3 files
+    "t5-A": """Refactor the TypeScript project in the current directory
+(utils.ts, data.ts, main.ts):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+Work file by file, occurrence by occurrence. When done, verify that no
+occurrence of "USD" or "price" remains in ANY of the .ts files and reply with
+exactly: DONE""",
+    "t5-B": """Refactor the TypeScript project in the current directory
+(utils.ts, data.ts, main.ts):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  mrename <path> <old> <new> perform a LANGUAGE-AWARE RENAME of the symbol
+     whose first whole-word occurrence is <old> in <path> — it renames the
+     definition AND all references across all files in one call.
+One mrename per symbol is enough. Then verify with a final mread that no
+"USD" or "price" remains in ANY .ts file, and reply with exactly: DONE""",
     "t4-A": """Refactor the file rename.ts (TypeScript) in the current directory:
   - rename the constant USD to JPY (every occurrence)
   - rename the function price to amount (its definition and every call)
@@ -212,6 +265,8 @@ def build_workdir(test, arm):
     lsp_env = ""
     if test == "t4" and arm == "B":
         lsp_env = f"export MAB_LSP_BIN=typescript-language-server; export MAB_LSP_ARGS='--stdio'; export MAB_LSP_SETTLE=5;"
+    elif test == "t5" and arm == "B":
+        lsp_env = f"export MAB_LSP_BIN=typescript-language-server; export MAB_LSP_ARGS='--stdio'; export MAB_LSP_SETTLE=6;"
     # shim wrappers — names must avoid zsh builtins ('r'/'e' collide: `r` is the
     # history-rerun builtin in zsh, which opencode's bash tool uses)
     env = f"export MAB_MINABIN={MINA}; export MAB_AUDIT={wd}/audit.log;"
@@ -232,6 +287,11 @@ def build_workdir(test, arm):
         p.write_text(
             f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
         p.chmod(0o755)
+    if test == "t5" and arm == "B":
+        p = wd / "bin" / "mrename"
+        p.write_text(
+            f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
+        p.chmod(0o755)
     if test == "t2":
         fixture_t2()
         # drift: both arms get it; only rejection verbosity differs (apply vs apply-generic)
@@ -244,6 +304,8 @@ def build_workdir(test, arm):
         fixture_t3()
     elif test == "t4":
         fixture_t4()
+    elif test == "t5":
+        fixture_t5()
     (wd / "task.txt").write_text(PROMPTS[f"{test}-{arm}"])
     return wd
 
@@ -350,13 +412,17 @@ def success(test):
         s = read("rename.ts")
         ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
         return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
+    if test == "t5":
+        s = read("utils.ts") + read("data.ts") + read("main.ts")
+        ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
+        return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
     return "NA", ""
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
