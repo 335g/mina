@@ -14,6 +14,7 @@ mod keymap;
 mod lsp;
 mod render;
 mod session;
+mod skill;
 
 use std::io;
 use std::path::PathBuf;
@@ -44,6 +45,11 @@ enum Command {
         #[command(subcommand)]
         cmd: config::ConfigCmd,
     },
+    /// Agent skill guides: `mina skill` lists topics, `mina skill <topic>` prints one
+    Skill {
+        /// Topic to print (omit for the index)
+        topic: Option<String>,
+    },
     /// Open the file-editing TUI
     Open {
         /// File to open (empty buffer when omitted)
@@ -72,6 +78,7 @@ async fn run() -> std::io::Result<()> {
         Command::Daemon { cmd: DaemonCmd::Serve } => daemon::run().await,
         Command::Session { cmd } => session::run(cmd).await,
         Command::Config { cmd } => config::run(cmd).await,
+        Command::Skill { topic } => skill::run(topic),
         Command::Open { path } => {
             let path = path
                 .map(|p| p.into_os_string().into_string())
