@@ -95,6 +95,21 @@ fn report() -> i64 {
     (WORK / "ws" / "f2.rs").write_text(f2)
 
 
+def fixture_t4():
+    """T4: single real TypeScript file for LSP semantic rename vs apply."""
+    (WORK / "ws" / "rename.ts").write_text(
+        """const USD = 100;
+
+export function price(x: number): number {
+  return x + USD;
+}
+
+function main() {
+  console.log(price(USD));
+}
+""")
+
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -120,7 +135,29 @@ Work in small steps: mread a range (e.g. mread cfg.rs 1:20), then medit the exac
 text you saw. When both changes are in place, verify with a final mread and reply
 with exactly: DONE
 Do not modify anything else.""",
-    # Test3: content-resolved (apply) vs positional (edit)
+    # Test4: LSP semantic rename (mrename) vs content-resolved apply loop
+    "t4-A": """Refactor the file rename.ts (TypeScript) in the current directory:
+  - rename the constant USD to JPY (every occurrence)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+When done, verify that no occurrence of "USD" or "price" remains in the file
+and reply with exactly: DONE""",
+    "t4-B": """Refactor the file rename.ts (TypeScript) in the current directory:
+  - rename the constant USD to JPY (every occurrence)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  mrename <path> <old> <new> perform a LANGUAGE-AWARE RENAME of the symbol whose
+     first whole-word occurrence is <old> in <path> — the editor finds and
+     updates every reference (definition, calls, uses) itself. One call per
+     rename is enough; do not loop over occurrences.
+First mread rename.ts to see the file, then use mrename for USD->JPY and for
+price->amount, then verify with a final mread that no "USD" or "price"
+remains, and reply with exactly: DONE""",
     "t3-A": """Refactor the project in the current directory (files f1.rs and f2.rs):
   - rename the constant USD to JPY (all occurrences)
   - rename the method price() to amount() (its definition and all calls)
@@ -172,6 +209,9 @@ def build_workdir(test, arm):
         edit_mode = "edit" if arm == "B" else "apply"
     if arm == "B" and test == "t1":
         read_mode = "full"
+    lsp_env = ""
+    if test == "t4" and arm == "B":
+        lsp_env = f"export MAB_LSP_BIN=typescript-language-server; export MAB_LSP_ARGS='--stdio'; export MAB_LSP_SETTLE=5;"
     # shim wrappers — names must avoid zsh builtins ('r'/'e' collide: `r` is the
     # history-rerun builtin in zsh, which opencode's bash tool uses)
     env = f"export MAB_MINABIN={MINA}; export MAB_AUDIT={wd}/audit.log;"
@@ -186,6 +226,12 @@ def build_workdir(test, arm):
     wr("mread", "read_shim.py", read_mode)
     wr("medit", "edit_shim.py", edit_mode)
     wr("mcheck", "check_shim.py", "x")
+    if test == "t4" and arm == "B":
+        p = wd / "bin" / "mrename"
+        # NOTE: no mode placeholder arg — rename_shim takes <path> <old> <new>
+        p.write_text(
+            f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
+        p.chmod(0o755)
     if test == "t2":
         fixture_t2()
         # drift: both arms get it; only rejection verbosity differs (apply vs apply-generic)
@@ -196,6 +242,8 @@ def build_workdir(test, arm):
         p.chmod(0o755)
     elif test == "t3":
         fixture_t3()
+    elif test == "t4":
+        fixture_t4()
     (wd / "task.txt").write_text(PROMPTS[f"{test}-{arm}"])
     return wd
 
@@ -227,9 +275,10 @@ def run_once(test, arm, idx):
     audit_summary = summarize_audit(audit.read_text()) if audit.exists() else ""
     edits = audit.read_text().count("edit_ok") if audit.exists() else 0
     rejects = audit.read_text().count("edit_reject") if audit.exists() else 0
+    renames = audit.read_text().count("rename\t") if audit.exists() else 0
     bypass = int(m.split("bypass=")[-1]) if "bypass=" in m else -1
-    comp = "C" if ((edits + rejects) > 0 and bypass == 0) else "NC"
-    print(f"{title} wall={wall}s ok={ok} comp={comp} {m} {audit_summary} {detail}")
+    comp = "C" if ((edits + rejects + renames) > 0 and bypass == 0) else "NC"
+    print(f"{title} wall={wall}s ok={ok} comp={comp} {m} {audit_summary} renames={renames} {detail}")
     return title, ok, comp
 
 
@@ -260,13 +309,17 @@ def measure(sid):
             inp += t.get("input", 0)
             outp += t.get("output", 0)
             cost += d.get("cost", 0)
-        # bypass: direct mina edit calls outside the shims (compliance check).
-        # Command text lives in state.input.command (top-level input is null).
+        # bypass: direct edits outside the shims (compliance check). Command text
+        # lives in state.input.command (top-level input is null). Common direct-edit
+        # patterns (sed -i, perl -pi, python replace/re.sub) are also flagged.
         if d.get("type") == "tool" and str(d.get("tool", "")).lower() == "bash":
             st = d.get("state") or {}
             st_in = st.get("input") or {}
             cmd = str(st_in.get("command", "")) if isinstance(st_in, dict) else ""
-            if "session apply" in cmd or "session edit" in cmd:
+            bypass_words = ("session apply", "session edit",
+                            "sed -i", "perl -pi", "re.sub", "python3 - <<",
+                            "python3 -c", "python3 -f", ".replace(")
+            if any(w in cmd for w in bypass_words):
                 bypass += 1
     return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={bypass}"
 
@@ -293,13 +346,17 @@ def success(test):
         s = read("f1.rs") + read("f2.rs")
         ok = "USD" not in s and "price(" not in s and "JPY" in s and "amount(" in s
         return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price(' in s} amount={'amount(' in s}"
+    if test == "t4":
+        s = read("rename.ts")
+        ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
+        return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
     return "NA", ""
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
