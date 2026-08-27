@@ -165,7 +165,39 @@ Work in small steps: mread a range (e.g. mread cfg.rs 1:20), then medit the exac
 text you saw. When both changes are in place, verify with a final mread and reply
 with exactly: DONE
 Do not modify anything else.""",
-    # Test5: LSP rename vs apply — many occurrences across 3 files
+    # Test6: does consulting `mina skill` change the tool decision?
+    # Same task and FULL toolset (mread/medit/mrename/mcheck) for both arms.
+    # Arm A is told the skill index/guides exist; Arm B is not.
+    "t6-A": """Refactor the TypeScript project in the current directory
+(utils.ts, data.ts, main.ts):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+Available file commands (in $PATH):
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+  mrename <path> <old> <new> language-aware rename (all references, one call)
+  mcheck <path>              print a file checksum
+
+mina also provides skill guides for how to use these editing tools:
+run `mina skill` to list the topics, and `mina skill <topic>` to read one
+(topics: read, edit, rename, persist, errors). Consult the relevant guide
+BEFORE deciding how you will perform the renames.
+When done, verify that no occurrence of "USD" or "price" remains in ANY of
+the .ts files and reply with exactly: DONE""",
+    "t6-B": """Refactor the TypeScript project in the current directory
+(utils.ts, data.ts, main.ts):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+Available file commands (in $PATH):
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+  mrename <path> <old> <new> language-aware rename (all references, one call)
+  mcheck <path>              print a file checksum
+
+When done, verify that no occurrence of "USD" or "price" remains in ANY of
+the .ts files and reply with exactly: DONE""",
     "t5-A": """Refactor the TypeScript project in the current directory
 (utils.ts, data.ts, main.ts):
   - rename the constant USD to JPY (every occurrence in every file)
@@ -263,10 +295,10 @@ def build_workdir(test, arm):
     if arm == "B" and test == "t1":
         read_mode = "full"
     lsp_env = ""
-    if test == "t4" and arm == "B":
-        lsp_env = f"export MAB_LSP_BIN=typescript-language-server; export MAB_LSP_ARGS='--stdio'; export MAB_LSP_SETTLE=5;"
-    elif test == "t5" and arm == "B":
+    if test == "t6":
         lsp_env = f"export MAB_LSP_BIN=typescript-language-server; export MAB_LSP_ARGS='--stdio'; export MAB_LSP_SETTLE=6;"
+    elif test in ("t4", "t5") and arm == "B":
+        lsp_env = f"export MAB_LSP_BIN=typescript-language-server; export MAB_LSP_ARGS='--stdio'; export MAB_LSP_SETTLE=5;"
     # shim wrappers — names must avoid zsh builtins ('r'/'e' collide: `r` is the
     # history-rerun builtin in zsh, which opencode's bash tool uses)
     env = f"export MAB_MINABIN={MINA}; export MAB_AUDIT={wd}/audit.log;"
@@ -281,16 +313,15 @@ def build_workdir(test, arm):
     wr("mread", "read_shim.py", read_mode)
     wr("medit", "edit_shim.py", edit_mode)
     wr("mcheck", "check_shim.py", "x")
-    if test == "t4" and arm == "B":
+    if (test == "t6") or (test in ("t4", "t5") and arm == "B"):
         p = wd / "bin" / "mrename"
-        # NOTE: no mode placeholder arg — rename_shim takes <path> <old> <new>
         p.write_text(
             f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
         p.chmod(0o755)
-    if test == "t5" and arm == "B":
-        p = wd / "bin" / "mrename"
-        p.write_text(
-            f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
+    if test == "t6":
+        # provide the real `mina` binary so `mina skill` works inside the sandbox
+        p = wd / "bin" / "mina"
+        p.write_text(f"#!/usr/bin/env bash\nexec {MINA} \"$@\"\n")
         p.chmod(0o755)
     if test == "t2":
         fixture_t2()
@@ -305,6 +336,8 @@ def build_workdir(test, arm):
     elif test == "t4":
         fixture_t4()
     elif test == "t5":
+        fixture_t5()
+    elif test == "t6":
         fixture_t5()
     (wd / "task.txt").write_text(PROMPTS[f"{test}-{arm}"])
     return wd
@@ -338,9 +371,10 @@ def run_once(test, arm, idx):
     edits = audit.read_text().count("edit_ok") if audit.exists() else 0
     rejects = audit.read_text().count("edit_reject") if audit.exists() else 0
     renames = audit.read_text().count("rename\t") if audit.exists() else 0
-    bypass = int(m.split("bypass=")[-1]) if "bypass=" in m else -1
+    bypass = int(m.split("bypass=")[-1].split()[0]) if "bypass=" in m else -1
+    skills = int(m.split("skills=")[-1]) if "skills=" in m else 0
     comp = "C" if ((edits + rejects + renames) > 0 and bypass == 0) else "NC"
-    print(f"{title} wall={wall}s ok={ok} comp={comp} {m} {audit_summary} renames={renames} {detail}")
+    print(f"{title} wall={wall}s ok={ok} comp={comp} {m} {audit_summary} renames={renames} skills={skills} {detail}")
     return title, ok, comp
 
 
@@ -361,6 +395,7 @@ def measure(sid):
     con.close()
     inp = outp = cost = 0
     bypass = 0
+    skills = 0
     for (r,) in rows:
         try:
             d = json.loads(r)
@@ -383,7 +418,9 @@ def measure(sid):
                             "python3 -c", "python3 -f", ".replace(")
             if any(w in cmd for w in bypass_words):
                 bypass += 1
-    return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={bypass}"
+            if "mina skill" in cmd:
+                skills += 1
+    return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={bypass} skills={skills}"
 
 
 def summarize_audit(text):
@@ -416,13 +453,17 @@ def success(test):
         s = read("utils.ts") + read("data.ts") + read("main.ts")
         ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
         return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
+    if test == "t6":
+        s = read("utils.ts") + read("data.ts") + read("main.ts")
+        ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
+        return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
     return "NA", ""
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
