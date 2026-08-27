@@ -155,6 +155,22 @@ def fixture_t7():
     (WORK / "ws" / "cfg.rs").write_text("".join(lines))
 
 
+def fixture_t8():
+    """T8: 200-line file, 5 targets at KNOWN lines (task gives line hints —
+    the positional trap), values TARGET_k = 100+k. Task: increment each by 1."""
+    targets = {1: 31, 2: 71, 3: 111, 4: 151, 5: 191}
+    lines = []   # no header line: line N in the file == loop index N, so the
+                 # line numbers advertised in the task match the file exactly
+    for i in range(1, 201):
+        if i in targets.values():
+            k = [n for n, ln in targets.items() if ln == i][0]
+            lines.append(f"let TARGET_{k} = {100 + k};\n")
+        else:
+            v = (i * 13 + 7) % 251
+            lines.append(f"let filler_{i} = {v}; // noise\n")
+    (WORK / "ws" / "cfg.rs").write_text("".join(lines))
+
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -180,7 +196,45 @@ Work in small steps: mread a range (e.g. mread cfg.rs 1:20), then medit the exac
 text you saw. When both changes are in place, verify with a final mread and reply
 with exactly: DONE
 Do not modify anything else.""",
-    # Test7: rejection recovery at scale (600 lines, drift, 8 edits).
+    # Test8: does `mina skill` steer AWAY from the positional trap when both
+    # a positional tool (medit) and a content-resolved tool (mapply) exist?
+    # Task gives explicit line numbers -> positional pull. Tools neutral.
+    "t8-A": """Audit constants in cfg.rs. The five target lines are exactly:
+  line 31:  let TARGET_1 = 101;
+  line 71:  let TARGET_2 = 102;
+  line 111: let TARGET_3 = 103;
+  line 151: let TARGET_4 = 104;
+  line 191: let TARGET_5 = 105;
+Increment each value by 1 (TARGET_1 -> 102, ..., TARGET_5 -> 106). All five
+updates are required.
+
+Available file commands:
+  mread <path> [start:end]             read lines (numbered)
+  medit <path> <documentedit-json>     edit by exact character offsets
+  mapply <path> <old> <new>            replacement of the first occurrence of <old>
+  mcheck <path>                        print the file checksum
+
+mina also provides skill guides: run `mina skill` for the index and
+`mina skill <topic>` to read one (read/edit/errors). Consult the edit guide
+BEFORE choosing how you will perform the updates.
+When all 5 values are updated, verify with mread and reply with exactly: DONE""",
+    "t8-B": """Audit constants in cfg.rs. The five target lines are exactly:
+  line 31:  let TARGET_1 = 101;
+  line 71:  let TARGET_2 = 102;
+  line 111: let TARGET_3 = 103;
+  line 151: let TARGET_4 = 104;
+  line 191: let TARGET_5 = 105;
+Increment each value by 1 (TARGET_1 -> 102, ..., TARGET_5 -> 106). All five
+updates are required.
+
+Available file commands:
+  mread <path> [start:end]             read lines (numbered)
+  medit <path> <documentedit-json>     edit by exact character offsets
+  mapply <path> <old> <new>            replacement of the first occurrence of <old>
+  mcheck <path>                        print the file checksum
+
+When all 5 values are updated, verify with mread and reply with exactly: DONE""",
+
     # Same real rejection messages in both arms; only the `mina skill` reference
     # differs (both may use mread/medit/mcheck).
     "t7-A": """Edit cfg.rs (a large generated file) in the current directory.
@@ -356,15 +410,15 @@ def build_workdir(test, arm):
     wr("mread", "read_shim.py", read_mode)
     wr("medit", "edit_shim.py", edit_mode)
     wr("mcheck", "check_shim.py", "x")
+    if test == "t8":
+        # both edit tools present: medit (positional) and mapply (content-resolved)
+        wr("mapply", "edit_shim.py", "apply")
     if (test == "t6") or (test in ("t4", "t5") and arm == "B"):
         p = wd / "bin" / "mrename"
         p.write_text(
             f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
         p.chmod(0o755)
-    if test in ("t6", "t7") and arm == "A":
-        # expose ONLY `mina skill` (real binary would let the model shortcut edits
-        # via `mina session apply` directly and defeat the shim capture — observed
-        # in a t7 smoke). File ops must go through medit/mread.
+    if test in ("t6", "t7", "t8") and arm == "A":
         p = wd / "bin" / "mina"
         p.write_text(
             f"#!/usr/bin/env bash\n"
@@ -398,6 +452,8 @@ def build_workdir(test, arm):
         fixture_t5()
     if test == "t7":
         fixture_t7()
+    if test == "t8":
+        fixture_t8()
     (wd / "task.txt").write_text(PROMPTS[f"{test}-{arm}"])
     return wd
 
@@ -454,6 +510,7 @@ def measure(sid):
     con.close()
     inp = outp = cost = 0
     bypass = 0
+    refused = 0
     skills = 0
     for (r,) in rows:
         try:
@@ -479,15 +536,24 @@ def measure(sid):
                 bypass += 1
             if "mina skill" in cmd:
                 skills += 1
-    return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={bypass} skills={skills}"
+            # a direct mina call that the sandbox wrapper REFUSED changed nothing
+            # (exit 1, "only 'mina skill' is exposed") — harmless; subtract below
+            out = str(st.get("output", ""))
+            if "only 'mina skill' is exposed" in out:
+                refused += 1
+    eff = max(0, bypass - refused)
+    return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={eff} refused={refused} skills={skills}"
 
 
 def summarize_audit(text):
     edits = text.count("edit_ok")
     rejects = text.count("edit_reject")
-    reads = sum(1 for l in text.splitlines() if l.split("\t")[0] in ("read", "read_head"))
+    reads = sum(1 for l in text.splitlines() if l.split("\t", 1)[0] in ("read", "read_head"))
+    # tool split: apply-mode logs "edit_ok\tapply...", positional logs "edit_ok\tedit"
+    apply_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tapply"))
+    pos_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tedit"))
     drift = text.count("drift\t")
-    return f"edits={edits} rejects={rejects} reads={reads} drift={drift}"
+    return f"edits={edits} rejects={rejects} reads={reads} apply={apply_n} pos={pos_n} drift={drift}"
 
 
 def success(test):
@@ -522,13 +588,19 @@ def success(test):
         ok = all(f in s for f in finals)
         missing = [f for f in finals if f not in s]
         return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
+    if test == "t8":
+        s = read("cfg.rs")
+        finals = [f"TARGET_{k} = {101 + k}" for k in range(1, 6)]
+        ok = all(f in s for f in finals)
+        missing = [f for f in finals if f not in s]
+        return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
     return "NA", ""
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
