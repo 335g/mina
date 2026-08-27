@@ -140,6 +140,21 @@ console.log(first, second, third);
 """)
 
 
+def fixture_t7():
+    """T7: 600-line cfg.rs, 8 scattered targets, drift-rejection at scale.
+    TARGET_k = 100+k at scattered lines; task: increment each by 1."""
+    targets = {1: 30, 2: 90, 3: 150, 4: 210, 5: 270, 6: 400, 7: 520, 8: 590}
+    lines = ["// generated configuration\n"]
+    for i in range(1, 601):
+        if i in targets.values():
+            k = [n for n, ln in targets.items() if ln == i][0]
+            lines.append(f"let TARGET_{k} = {100 + k};\n")
+        else:
+            v = (i * 7 + 3) % 503
+            lines.append(f"let filler_{i}_value = {v}; // noise\n")
+    (WORK / "ws" / "cfg.rs").write_text("".join(lines))
+
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -165,7 +180,35 @@ Work in small steps: mread a range (e.g. mread cfg.rs 1:20), then medit the exac
 text you saw. When both changes are in place, verify with a final mread and reply
 with exactly: DONE
 Do not modify anything else.""",
-    # Test6: does consulting `mina skill` change the tool decision?
+    # Test7: rejection recovery at scale (600 lines, drift, 8 edits).
+    # Same real rejection messages in both arms; only the `mina skill` reference
+    # differs (both may use mread/medit/mcheck).
+    "t7-A": """Edit cfg.rs (a large generated file) in the current directory.
+It contains 8 target constants, each currently equal to 100 + its number
+(e.g. TARGET_3 = 103). Change EACH one so its value is incremented by 1
+(TARGET_3 becomes 104). Updating all 8 is required.
+
+Available file commands:
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+
+mina also provides skill guides for how to use these tools:
+run `mina skill` for the index and `mina skill <topic>` to read one
+(topics: read, edit, persist, errors). If an edit is rejected, follow the
+guidance in the errors guide before retrying.
+When all 8 targets are updated, verify each final value with mread and reply
+with exactly: DONE""",
+    "t7-B": """Edit cfg.rs (a large generated file) in the current directory.
+It contains 8 target constants, each currently equal to 100 + its number
+(e.g. TARGET_3 = 103). Change EACH one so its value is incremented by 1
+(TARGET_3 becomes 104). Updating all 8 is required.
+
+Available file commands:
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+
+When all 8 targets are updated, verify each final value with mread and reply
+with exactly: DONE""",
     # Same task and FULL toolset (mread/medit/mrename/mcheck) for both arms.
     # Arm A is told the skill index/guides exist; Arm B is not.
     "t6-A": """Refactor the TypeScript project in the current directory
@@ -318,10 +361,24 @@ def build_workdir(test, arm):
         p.write_text(
             f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
         p.chmod(0o755)
-    if test == "t6":
-        # provide the real `mina` binary so `mina skill` works inside the sandbox
+    if test in ("t6", "t7") and arm == "A":
+        # expose ONLY `mina skill` (real binary would let the model shortcut edits
+        # via `mina session apply` directly and defeat the shim capture — observed
+        # in a t7 smoke). File ops must go through medit/mread.
         p = wd / "bin" / "mina"
-        p.write_text(f"#!/usr/bin/env bash\nexec {MINA} \"$@\"\n")
+        p.write_text(
+            f"#!/usr/bin/env bash\n"
+            f"if [ \"${{1:-}}\" = \"skill\" ]; then exec {MINA} \"$@\"; fi\n"
+            f"echo \"error: only 'mina skill' is exposed here; use medit/mread for file operations\" >&2\n"
+            f"exit 1\n")
+        p.chmod(0o755)
+    if test == "t7":
+        # drift: after the first successful edit, TARGET_5 moves 105 -> 1050,
+        # so the model's remembered old string for it is no longer found
+        p = wd / "bin" / "medit"
+        p.write_text(
+            f"#!/usr/bin/env bash\n{env} export MAB_DRIFT_OLD='let TARGET_5 = 105;'; export MAB_DRIFT_NEW='let TARGET_5 = 1050;'; "
+            f"exec python3 {SHIMS}/edit_shim.py apply \"$@\"\n")
         p.chmod(0o755)
     if test == "t2":
         fixture_t2()
@@ -339,6 +396,8 @@ def build_workdir(test, arm):
         fixture_t5()
     elif test == "t6":
         fixture_t5()
+    if test == "t7":
+        fixture_t7()
     (wd / "task.txt").write_text(PROMPTS[f"{test}-{arm}"])
     return wd
 
@@ -457,13 +516,19 @@ def success(test):
         s = read("utils.ts") + read("data.ts") + read("main.ts")
         ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
         return ("OK" if ok else "FAIL"), f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
+    if test == "t7":
+        s = read("cfg.rs")
+        finals = [f"TARGET_{k} = {101 + k}" for k in range(1, 9)]
+        ok = all(f in s for f in finals)
+        missing = [f for f in finals if f not in s]
+        return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
     return "NA", ""
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
