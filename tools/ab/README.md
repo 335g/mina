@@ -23,6 +23,9 @@ python3 tools/ab/ab.py run t3 B 1     # arm B(positional edit)
 python3 tools/ab/ab.py run t2 A 1     # t2(拒否理由) arm A(specific) 
 python3 tools/ab/ab.py run t2 B 1     # arm B(generic)
 
+python3 tools/ab/ab.py run t4 A 1     # t4(apply vs LSP rename) arm A(apply)
+python3 tools/ab/ab.py run t4 B 1     # arm B(mrename = LSP rename)
+
 # 計測だけ再計算 (DB から)
 python3 tools/ab/ab.py stats t3 A 1
 ```
@@ -51,6 +54,16 @@ python3 tools/ab/ab.py stats t3 A 1
   Arm B: `e <path> <documentedit-json>` → `mina session edit`（start/end を char で
   自前計算。checksum も自分で得る必要がある）。
 - 指標: 成功率（`USD`/`price(` が残っていない）、編集試行・拒否回数、トークン。
+
+### t4: LSP 意味 rename（mrename） vs apply
+- タスク: rename.ts で `USD→JPY`・`price→amount` を全箇所リネーム。
+- Arm A: `medit`（=`mina session apply`）。Arm B: `mrename <path> <old> <new>` =
+  `shims/rename_shim.py`（サーバー内部で typescript-language-server を stdio 起動し
+  `textDocument/rename` の WorkspaceEdit を適用）。
+- 成功判定: `USD`/`price` が残っていない。コンプライアンス:`rename` 監査行あり・直接編集
+  （sed -i / python replace / session apply/edit 直呼び）なし。
+- 依存: `typescript-language-server`（MAB_LSP_BIN で差替可。rust-analyzer 1.98 は
+  --stdio 廃止＋rename が content modified で拒否されるため非推奨）。
 
 ## 成果物
 
