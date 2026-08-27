@@ -55,6 +55,11 @@ python3 tools/ab/ab.py stats t3 A 1
   自前計算。checksum も自分で得る必要がある）。
 - 指標: 成功率（`USD`/`price(` が残っていない）、編集試行・拒否回数、トークン。
 
+### t5: LSP rename vs apply — 出現多数・複数ファイル
+- 3 ファイル（utils/data/main.ts）に `USD` x12・`price` x9 を分散。A=apply ループ、B=mrename。
+- 結果: A 2/5（出現取りこぼし）・B 5/5、トークン −49%・コスト −57%（LSP 優位）。
+- 小タスク（t4）では均衡。**規模が実用的になると LSP が勝つ** 使い分けの境界データ。
+
 ### t4: LSP 意味 rename（mrename） vs apply
 - タスク: rename.ts で `USD→JPY`・`price→amount` を全箇所リネーム。
 - Arm A: `medit`（=`mina session apply`）。Arm B: `mrename <path> <old> <new>` =
