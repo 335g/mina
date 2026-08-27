@@ -105,3 +105,16 @@ stdin に JSON 配列 `[{"old":"…","new":"…"},…]`。
 ### 永続化（H1）
 
 `session edit` は保存しない（dirty のまま）。成功時 dirty なら stderr に1行 `note: buffer is dirty (not saved); persist with: session exec '"Save"'`。`session apply` / `--hunks-stdin` は Save まで行い dirty を解消する。
+
+### スキル（`mina skill`、2026-08-27 追記）
+
+エージェント向けの判断・手順の参考書。**索引と内容を分離**（トークン削減 — AB 実測 t1 の「必要な分だけ読む」を適用）:
+
+| 呼び出し | 出力 | 終了コード |
+|---|---|---|
+| `mina skill` | 索引（1トピック1行・約80トークン） | 0 |
+| `mina skill <topic>` | そのトピックの内容のみ（read/edit/rename/persist/errors。各 150〜250トークン） | 0 |
+| `mina skill <未知>` | stderr に英語の理由＋既知トピック一覧 | 1 |
+
+- daemon 不要（静的コンテンツ）。内容は tools/ab の A/B 実測（t1〜t5）に基づく行動レベルの**判断指針**（例: rename = 多箇所/複数ファイルは LSP mrename、少数は apply）。
+- エージェントの使い方: `mina skill` で発見 → 必要なトピックだけ `mina skill <top>` でロード。常時ロードするのは索引のみ。
