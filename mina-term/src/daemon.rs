@@ -869,6 +869,27 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // Rename / References（ADR-0029）: 内容指定の意味リネームと参照列挙。
+                // LSP の await をロック外で行うため専用処理（serve_peek_definition_at
+                // と同格）。Rename はテキストを変える（headless ゲートの例外）。
+                if let Ok(Command::Rename { path, old, new }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_rename(&daemon, &path, &old, &new).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
+                if let Ok(Command::References { path, old }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_references(&daemon, &path, &old).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 // GetServerInfo（issue #27/D1）: daemon のビルド世代と累積メトリクスを
                 // 軽量応答（ServerMessage::ServerInfo）で返す読み取り専用コマンド。
                 // GetInlayHints と同じく専用処理する。
@@ -1161,6 +1182,359 @@ async fn serve_peek_definition_at(
         },
         None => empty(),
     }
+}
+
+/// [`Command::References`] の処理（ADR-0029）。`old` の最初の識別子出現を解決し、
+/// `textDocument/references` で全参照位置（定義含む）を軽量応答で返す。
+/// 読み取り専用 — テキスト・世代は変えない。
+///
+/// 失敗は `error: Some(…)` で表す: 入力不正・対象が読めない・LSP 非対応
+/// （`rename not supported` と同型）・シンボル未解決（ロード中含む）・LSP エラー。
+async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> ServerMessage {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let path_str = path_buf.to_string_lossy().into_owned();
+    let err = |msg: String| ServerMessage::ReferencesResult {
+        path: path_str.clone(),
+        locations: Vec::new(),
+        total: 0,
+        error: Some(msg),
+    };
+    if old.is_empty() {
+        return err("invalid input: old must be non-empty".into());
+    }
+    // 対象テキスト: 開文書優先 → ディスク（serve_peek_definition_at と同型）
+    let text = {
+        let d = daemon.lock().await;
+        d.editor
+            .doc_id_for_path(&path_buf)
+            .map(|id| d.editor.document(id).text().to_string())
+    };
+    let (text, _status) = match text {
+        Some(t) => (Some(t), None),
+        None => read_open_target(&path_str).await,
+    };
+    let Some(text) = text else {
+        return err(format!("cannot open {path}"));
+    };
+    if lsp::server_for(&path_buf).is_none() {
+        return err(format!(
+            "references not supported for {} (no LSP server configured)",
+            path_buf.display()
+        ));
+    }
+    let focused = {
+        let d = daemon.lock().await;
+        d.editor.focused_path().map(Path::to_path_buf)
+    };
+    let session = match lsp::ensure(daemon, &path_buf).await {
+        Ok(s) => s,
+        Err(e) => return err(format!("LSP error: {e}")),
+    };
+    // 対象文書を didOpen（現在の文書にしか応えないため必須）
+    lsp::open_document(&session, &path_buf, &text).await;
+    // ワークスペース内の同拡張子ファイルを didOpen（未開ファイルの参照を
+    // 取りこぼさない — 実測: ra は開いていないファイルの参照を返さない）
+    lsp::open_workspace_files(daemon, &session, &path_buf).await;
+    // 識別子位置の解決（コメント・文字列内には解決しない — T3 の誤位置事故を予防）
+    let Some(char_idx) = lsp::find_symbol_char_idx(&text, &path_buf, old) else {
+        return err(format!(
+            "symbol not found: {old:?} in {}",
+            path_buf.display()
+        ));
+    };
+    let (line, character) = {
+        let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return err("LSP セッションのロックを取得できませんでした".into());
+        };
+        s.char_to_lsp_pos(&text, char_idx)
+    };
+    let locations = match lsp::references_at(&session, &path_buf, line, character).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    // フォーカス文書を借りていたら復元（開き直し + 診断更新 — 自己修復）
+    restore_focus_after_semantic(daemon, &session, &focused, &path_buf).await;
+    let mut out = Vec::with_capacity(locations.len());
+    for (uri, line) in locations {
+        let Ok(p) = path_from_uri(&uri) else {
+            return err(format!("LSP 応答に file:// 以外の URI が含まれています: {uri}"));
+        };
+        out.push(mina_protocol::ReferenceLocation {
+            path: p.to_string_lossy().into_owned(),
+            line,
+        });
+    }
+    let n = out.len();
+    ServerMessage::ReferencesResult {
+        path: path_str,
+        locations: out,
+        total: n,
+        error: None,
+    }
+}
+
+/// [`Command::Rename`] の処理（ADR-0029）。内容指定（`old` の最初の識別子出現）を
+/// 位置に解決し、LSP rename の WorkspaceEdit を適用・保存して、影響範囲
+/// （ファイル数・編集数・変更一覧）を軽量応答で返す。
+///
+/// 応答の意味論（作業順序）:
+/// 1. 全ファイルの編集を検証（範囲・重複）してから適用を始める — 検証失敗は
+///    ディスク無変更で拒否（apply の原子 bunch と同じ「Save 前失敗なら無変更」）。
+/// 2. 開いている文書はメモリ（Document）へ適用し履歴に記録（undo は文書ごと
+///    独立に保たれる — Q5）。開いていないファイルはディスク読み → 書換。
+/// 3. 開いている文書も含め全変更をディスクへ書き、世代を進める。
+async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) -> ServerMessage {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let err = |msg: String| ServerMessage::RenameResult {
+        generation: 0,
+        files: 0,
+        edits: 0,
+        changed: Vec::new(),
+        error: Some(msg),
+    };
+    if old.is_empty() || new.is_empty() {
+        return err("invalid input: old and new must be non-empty".into());
+    }
+    // 対象テキスト: 開文書優先 → ディスク
+    let text = {
+        let d = daemon.lock().await;
+        d.editor
+            .doc_id_for_path(&path_buf)
+            .map(|id| d.editor.document(id).text().to_string())
+    };
+    let (text, _status) = match text {
+        Some(t) => (Some(t), None),
+        None => read_open_target(path_buf.to_string_lossy().as_ref()).await,
+    };
+    let Some(text) = text else {
+        return err(format!("cannot open {path}"));
+    };
+    // LSP 非対応パス: spawn せず明示的に拒否（入力エラー — 再試行で通らない）
+    if lsp::server_for(&path_buf).is_none() {
+        return err(format!(
+            "rename not supported for {} (no LSP server configured)",
+            path_buf.display()
+        ));
+    }
+    let focused = {
+        let d = daemon.lock().await;
+        d.editor.focused_path().map(Path::to_path_buf)
+    };
+    let session = match lsp::ensure(daemon, &path_buf).await {
+        Ok(s) => s,
+        Err(e) => return err(format!("LSP error: {e}")),
+    };
+    lsp::open_document(&session, &path_buf, &text).await;
+    // ワークスペース内の同拡張子ファイルを didOpen（未開ファイルの参照を
+    // 取りこぼさない — 実測: ra は開いていないファイルの参照を返さない）
+    lsp::open_workspace_files(daemon, &session, &path_buf).await;
+    // 識別子位置の解決（コメント・文字列内には解決しない）
+    let Some(char_idx) = lsp::find_symbol_char_idx(&text, &path_buf, old) else {
+        return err(format!("symbol not found: {old:?} in {}", path_buf.display()));
+    };
+    let (line, character) = {
+        let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return err("LSP セッションのロックを取得できませんでした".into());
+        };
+        s.char_to_lsp_pos(&text, char_idx)
+    };
+    let raw = match lsp::rename_at(&session, &path_buf, line, character, new).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    // 各ファイルの編集を char インデックスへ変換・検証（適用前に全失敗を検出 —
+    // 検証失敗ならディスク無変更で拒否）
+    let enc = session.lock().await.encoding();
+    let mut files: Vec<lsp::RenameFile> = Vec::new();
+    for f in &raw {
+        let target = match path_from_uri(&f.uri) {
+            Ok(p) => p,
+            Err(msg) => return err(msg),
+        };
+        let text = {
+            let d = daemon.lock().await;
+            d.editor
+                .doc_id_for_path(&target)
+                .map(|id| d.editor.document(id).text().to_string())
+        };
+        let (text, _status) = match text {
+            Some(t) => (Some(t), None),
+            None => read_open_target(target.to_string_lossy().as_ref()).await,
+        };
+        let Some(text) = text else {
+            return err(format!("cannot open {} (rename target)", target.display()));
+        };
+        let edits = match lsp::lsp_edits_to_char(&text, enc, &f.edits) {
+            Ok(v) => v,
+            Err(msg) => return err(format!("{}: {msg}", target.display())),
+        };
+        if !edits.is_empty() {
+            files.push(lsp::RenameFile {
+                path: target,
+                edits,
+            });
+        }
+    }
+    if files.is_empty() {
+        return err(format!(
+            "symbol not found: {old:?} in {} (rename produced no edits)",
+            path_buf.display()
+        ));
+    }
+    match apply_and_save_rename(daemon, &session, &focused, &path_buf, &files).await {
+        Ok(generation) => ServerMessage::RenameResult {
+            generation,
+            files: files.len(),
+            edits: files.iter().map(|f| f.edits.len()).sum(),
+            changed: files
+                .iter()
+                .map(|f| f.path.to_string_lossy().into_owned())
+                .collect(),
+            error: None,
+        },
+        Err(msg) => err(msg),
+    }
+}
+
+/// LSP 応答の `file://` URI をパスへ変換する。
+/// ponytail: percent-decode はしない（mina の URI 生成も encode しない）。
+/// 空白等を含むパスは既存の既知制限（lsp.rs uri() と同じ）。
+fn path_from_uri(uri: &str) -> Result<PathBuf, String> {
+    uri.strip_prefix("file://")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("file:// 以外の URI です: {uri}"))
+}
+
+/// rename の WorkspaceEdit を適用（メモリ）・保存（ディスク）し、応答時の世代を返す。
+///
+/// - 開いている文書: `Transaction::replace_ranges` で履歴付き適用（Q5: リネーム
+///   全体は undo 対象外だが、文書ごとの undo 履歴をテキストと整合させる）。
+/// - 開いていないファイル: ディスクから読んだテキストに適用 → そのまま書き戻す。
+/// - 全ファイルを検証済み（serve_rename 側）なので、ここでの失敗は I/O のみ。
+/// - フォーカス文書の LSP 同期（restore / sync + pull）で診断を追従させる。
+async fn apply_and_save_rename(
+    daemon: &Mutex<Daemon>,
+    session: &Mutex<lsp::LspSession>,
+    focused: &Option<PathBuf>,
+    target: &Path,
+    files: &[lsp::RenameFile],
+) -> Result<u64, String> {
+    // フェーズ1（ロック内）: 開文書への適用・記録。未開ファイルのパスを収集。
+    let mut to_write: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+    let mut unopened: Vec<&lsp::RenameFile> = Vec::new();
+    let mut open_doc_ids: Vec<(PathBuf, mina_view::DocumentId)> = Vec::new();
+    {
+        let mut d = daemon.lock().await;
+        for f in files {
+            if let Some(doc_id) = d.editor.doc_id_for_path(&f.path) {
+                // 開文書: 全編集を1トランザクションにまとめて適用（履歴付き）
+                let edits: Vec<(usize, usize, String)> = f
+                    .edits
+                    .iter()
+                    .map(|e| (e.start, e.end, e.text.clone()))
+                    .collect();
+                let old_doc = d.editor.document(doc_id).clone();
+                let tx = mina_core::Transaction::replace_ranges(&old_doc, &edits);
+                let selection_after = d.editor.selection(); // クランプは apply_document 側
+                d.editor.apply_document(doc_id, tx, selection_after);
+                d.record_event(
+                    EventSource::Headless,
+                    EventKind::ReplaceRange,
+                    f.edits.first().map(|e| Range {
+                        anchor: e.start,
+                        head: e.end,
+                    }),
+                    f.edits.first().map(|e| e.text.clone()),
+                );
+                let new_text = d.editor.document(doc_id).text().to_string();
+                to_write.push((f.path.clone(), new_text));
+                open_doc_ids.push((f.path.clone(), doc_id));
+            } else {
+                unopened.push(f);
+            }
+        }
+    }
+    // フェーズ1b（ロック外）: 未開ファイルを読み、編集を適用して書戻し対象に加える
+    for f in unopened {
+        let path_str = f.path.to_string_lossy().into_owned();
+        let (text, _status) = read_open_target(&path_str).await;
+        let Some(text) = text else {
+            return Err(format!("cannot read {} for rename", f.path.display()));
+        };
+        let new_text = lsp::apply_char_edits(&text, &f.edits);
+        to_write.push((f.path.clone(), new_text));
+    }
+    // フェーズ2（ロック外）: ディスク書き込み（全検証済み。失敗は I/O のみ）
+    for (path, text) in &to_write {
+        if let Err(e) = tokio::fs::write(path, text.as_bytes()).await {
+            return Err(format!("save failed: {}: {e}", path.display()));
+        }
+    }
+    // フェーズ3（ロック内）: dirty クリア・ベースライン更新・Save 記録・世代確定
+    let mut d = daemon.lock().await;
+    for (path, doc_id) in &open_doc_ids {
+        let written = to_write
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
+        d.editor.mark_saved_doc(*doc_id, &written);
+        if let Ok(md) = std::fs::metadata(path) {
+            d.baselines.insert(
+                path.clone(),
+                DiskBaseline {
+                    mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    size: md.len(),
+                },
+            );
+        }
+        d.record_event(EventSource::Headless, EventKind::Save, None, None);
+    }
+    let generation = d.generation;
+    drop(d);
+    // フェーズ4（ロック外）: フォーカス文書へセッションを戻し、診断を追従させる
+    // （borrows の場合と target==focus の場合の両方を扱う — open_workspace_files
+    // が current_uri を動かすため、対象がフォーカス文書でも開き直しが必要）。
+    restore_focus_after_semantic(daemon, session, focused, target).await;
+    Ok(generation)
+}
+
+/// セマンティック要求（rename / references）でセッションのフォーカス文書を動かした
+/// 場合の復元。
+///
+/// 対象が (a) 同一 root の別ファイル（borrows）または (b) フォーカス文書そのもの、
+/// のどちらでも、フォーカス文書を現在テキストで didOpen し直し診断を再 pull する。
+/// `open_workspace_files` が current_uri を動かすため、(b) でも復元が必要（
+/// serve_peek_definition_at の restore と同型。Q10-(c)）。別 root の対象なら
+/// フォーカスのセッションには触れていないのでスキップ（自己修復に任せる）。
+async fn restore_focus_after_semantic(
+    daemon: &Mutex<Daemon>,
+    session: &Mutex<lsp::LspSession>,
+    focused: &Option<PathBuf>,
+    target: &Path,
+) {
+    let borrows = borrows_focus_session(focused, target);
+    let target_is_focus = focused.as_deref() == Some(target);
+    if !(borrows || target_is_focus) {
+        return; // 別 root: フォーカスのセッションには触れていない
+    }
+    let focused_text = {
+        let d = daemon.lock().await;
+        (d.editor.focused_path() == focused.as_deref())
+            .then(|| d.editor.current_document().text().to_string())
+    };
+    let Some(text) = focused_text else {
+        return;
+    };
+    let Some(fp) = focused else {
+        return;
+    };
+    let diags = lsp::restore_focus_with_diagnostics(session, fp, &text).await;
+    let mut d = daemon.lock().await;
+    if let Some(diags) = diags {
+        d.diagnostics = diags;
+    }
+    lsp::drain_into(&mut d);
 }
 
 /// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
@@ -2036,6 +2410,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::PeekDefinitionAt { .. } => {
             // handle_connection で専用処理される（ServerMessage::Peek 応答。
             // ADR-0025）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::Rename { .. } | Command::References { .. } => {
+            // handle_connection で専用処理される（ServerMessage::RenameResult /
+            // ReferencesResult 応答。ADR-0029）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::GetServerInfo => {
@@ -3862,6 +4241,9 @@ mod tests {
                 ServerMessage::Hints { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
+                ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
+                    continue
+                }
             }
         }
     }
@@ -3875,6 +4257,9 @@ mod tests {
                 ServerMessage::Hints { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
+                ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
+                    continue
+                }
             }
         }
     }
@@ -4731,6 +5116,166 @@ mod tests {
         )
         .await;
         assert_eq!(snap.diagnostics[0].start, 13, "didChange 同期後の位置に追従");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn rename_applies_workspace_edit_saves_and_reports_impact() {
+        // ADR-0029: 内容指定の意味リネームが mock の WorkspaceEdit（documentChanges
+        // 形式）を適用・保存し、影響範囲（files/edits/changed）を軽量応答で返す。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-rn-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-rn-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "let fee = 1\nlet tax = fee + 2\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // 初回解析が mock に載るのを待つ（didOpen 後の settle 用）
+        let _ = poll_snapshot(
+            &mut c,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        // リネーム: old の最初の識別子出現（fee の定義）を解決 → mock は全出現を
+        // documentChanges で返す → daemon が適用・保存
+        let mut line = serde_json::to_string(&Command::Rename {
+            path: path.clone(),
+            old: "fee".into(),
+            new: "dues".into(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        let msg = c.recv_message().await;
+        match msg {
+            ServerMessage::RenameResult {
+                generation,
+                files,
+                edits,
+                changed,
+                error,
+                ..
+            } => {
+                assert_eq!(error, None, "成功応答");
+                assert!(generation > 0, "編集+保存で世代が進む");
+                assert_eq!(files, 1);
+                assert_eq!(edits, 2, "定義と使用の2箇所");
+                assert_eq!(changed.len(), 1);
+                assert!(changed[0].ends_with(".rs"));
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+        // ディスクへ保存されている
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(contents, "let dues = 1\nlet tax = dues + 2\n");
+        // 開いている文書も更新されている（スナップショットで確認）
+        let snap = request(&mut c, &Command::GetState).await;
+        assert_eq!(snap.text, "let dues = 1\nlet tax = dues + 2\n");
+        assert!(!snap.dirty, "保存済みなので dirty でない");
+
+        // 未存在シンボルの rename は error（再試行可能）
+        let mut line = serde_json::to_string(&Command::Rename {
+            path: path.clone(),
+            old: "nosuch".into(),
+            new: "x".into(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        let msg = c.recv_message().await;
+        match msg {
+            ServerMessage::RenameResult { error, .. } => {
+                let e = error.expect("not found は error");
+                assert!(e.contains("nosuch"), "{e}");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn references_lists_symbol_locations() {
+        // ADR-0029: 内容指定の参照列挙が positions を軽量応答で返す。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("mina-ref-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("mina-ref-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "let fee = 1\nlet tax = fee + 2\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        let _ = poll_snapshot(
+            &mut c,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        let mut line = serde_json::to_string(&Command::References {
+            path: path.clone(),
+            old: "fee".into(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        let msg = c.recv_message().await;
+        match msg {
+            ServerMessage::ReferencesResult {
+                locations,
+                total,
+                error,
+                ..
+            } => {
+                assert_eq!(error, None);
+                assert_eq!(total, 2);
+                assert_eq!(locations.len(), 2);
+                assert_eq!(locations[0].line, 0, "定義行（includeDeclaration）");
+                assert_eq!(locations[1].line, 1, "使用行");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }
@@ -5757,6 +6302,10 @@ mod tests {
                     return (path, generation, hints)
                 }
                 ServerMessage::Response { .. } | ServerMessage::Push { .. } => continue,
+                ServerMessage::Peek { .. } | ServerMessage::ServerInfo { .. } => continue,
+                ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
+                    continue
+                }
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
             }
@@ -6031,6 +6580,9 @@ mod tests {
                 | ServerMessage::Push { .. }
                 | ServerMessage::Hints { .. }
                 | ServerMessage::ServerInfo { .. } => {
+                    continue;
+                }
+                ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
                     continue;
                 }
             }
