@@ -457,6 +457,53 @@ impl Editor {
         self.dirty.insert(doc_id);
     }
 
+    /// 指定文書にトランザクションを適用し、その文書の履歴に記録する。
+    ///
+    /// [`Editor::apply`] のフォーカス非依存版（意味リネーム等のマルチ文書適用 —
+    /// ADR-0029）。undo は文書ごと独立（Q5: リネーム全体は undo 対象外）だが、
+    /// 履歴に記録しないと undo が「変更前のテキスト前提」で再適用されて壊れる
+    /// ため、必ず履歴の invariant（「履歴 = 現在テキストへの逆適用列」）を保つ。
+    /// 文書を表示している全 View の選択も新文書長へクランプする（CRITICAL C1 と
+    /// 同趣旨: 文書が選択位置より短くなった後の範囲外アクセスによる panic 防止）。
+    pub fn apply_document(
+        &mut self,
+        doc_id: DocumentId,
+        transaction: Transaction,
+        selection_after: Selection,
+    ) {
+        if transaction.is_noop() {
+            return;
+        }
+        let selection_before = self
+            .views
+            .iter()
+            .flatten()
+            .find(|v| v.doc == doc_id)
+            .map(|v| v.selection.clone())
+            .unwrap_or_else(|| Selection::point(0));
+        let new_doc = transaction.apply(&self.documents[&doc_id]);
+        self.histories
+            .get_mut(&doc_id)
+            .expect("文書の履歴が存在しない")
+            .push(transaction, selection_before, selection_after);
+        self.documents.insert(doc_id, new_doc.clone());
+        let new_len = new_doc.len_chars();
+        for view in self.views.iter_mut().flatten() {
+            if view.doc == doc_id {
+                let clamp = |pos: usize| pos.min(new_len);
+                view.selection = Selection::new(
+                    view.selection
+                        .ranges()
+                        .iter()
+                        .map(|r| mina_core::Range::new(clamp(r.anchor()), clamp(r.head())))
+                        .collect(),
+                    view.selection.primary_index(),
+                );
+            }
+        }
+        self.dirty.insert(doc_id);
+    }
+
     /// フォーカス中の View の文書について undo できる変更があるか。
     pub fn can_undo(&self) -> bool {
         self.history().can_undo()
