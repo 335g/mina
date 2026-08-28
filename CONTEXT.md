@@ -100,6 +100,14 @@ _Avoid_: annotation, ghost text
 A transient preview of a symbol's definition shown in a popup, without changing the Selection or jumping to the definition. Triggered by `Space k` (`Command::PeekDefinition`); its result rides in a `StateSnapshot`'s `peek` field and is dismissed by the next key press. Read-only — it never edits or moves. The headless counterpart is `Command::PeekDefinitionAt` (position-addressed, ADR-0025), whose lightweight `ServerMessage::Peek` response carries only the definition snippet, never the full text.
 _Avoid_: definition popup, go-to preview
 
+**Rename**:
+The semantic replacement of a symbol's name across all its references, resolved by the language server (ADR-0029). Content-addressed for headless Clients (`session rename <path> <old> <new>`): the Daemon resolves `<old>` to the first identifier occurrence (comments and strings excluded) and the server rewrites every reference, possibly across several files. Distinct from apply, which is mechanical text replacement and cannot know a symbol's references. The response is a lightweight impact report (files/edits counts and changed paths), never the full text. Not undoable as a whole; each Document's own edits are still recorded so per-Document undo histories stay consistent.
+_Avoid_: rename as a text operation, refactor
+
+**Reference**:
+A location where a symbol is used, as reported by the language server (read-only, ADR-0029). Used to learn a symbol's impact before a Rename and to audit a Rename's completeness — the "did we miss any occurrences" check that mechanical replacement fails (T5). The response is a lightweight location list (path + 0-origin line), never the full text.
+_Avoid_: usage, impact scope
+
 **Colorscheme**:
 A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes. Built-in schemes ship with mina; user schemes are TOML files in the colorschemes directory and take precedence over built-ins of the same name. A scheme is selected by name from the config file or the `:colorscheme` command.
 _Avoid_: theme, palette
