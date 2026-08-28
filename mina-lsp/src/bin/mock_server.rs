@@ -113,11 +113,73 @@ fn main() {
                             },
                         })
                     });
-                    let resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": loc,
-                    });
+                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": loc });
+                    write_frame(&mut stdout, &resp);
+                }
+                "textDocument/rename" => {
+                    // 意味リネームのモック: 要求位置の単語を特定し、現在文書内の
+                    // 全出現を newName に置き換える WorkspaceEdit（documentChanges 形式
+                    // — 実測で rust-analyzer が返す形式）を返す。位置に単語が
+                    // 無ければ LSP error（解析待ち/シンボルなしの模擬）。
+                    let Some((uri, text)) = current.as_ref() else {
+                        let resp = json!({ "jsonrpc": "2.0", "id": id, "result": null });
+                        write_frame(&mut stdout, &resp);
+                        continue;
+                    };
+                    let pos = &msg["params"]["position"];
+                    let line = pos["line"].as_u64().unwrap_or(0) as u32;
+                    let character = pos["character"].as_u64().unwrap_or(0) as u32;
+                    let new_name = msg["params"]["newName"].as_str().unwrap_or("");
+                    if let Some(occ) = occurrences_at(text, line, character, utf16) {
+                        let edits = occ
+                            .iter()
+                            .map(|(l, bs, be)| json!({
+                                "range": {
+                                    "start": { "line": l, "character": lsp_char_col_at(text, *l, *bs, utf16) },
+                                    "end": { "line": l, "character": lsp_char_col_at(text, *l, *be, utf16) },
+                                },
+                                "newText": new_name,
+                            }))
+                            .collect::<Vec<_>>();
+                        let resp = json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "documentChanges": [{
+                                    "textDocument": { "uri": uri, "version": 1 },
+                                    "edits": edits,
+                                }],
+                            },
+                        });
+                        write_frame(&mut stdout, &resp);
+                    } else {
+                        let resp = json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32602, "message": "No references found at position" },
+                        });
+                        write_frame(&mut stdout, &resp);
+                    }
+                }
+                "textDocument/references" => {
+                    let Some((uri, text)) = current.as_ref() else {
+                        let resp = json!({ "jsonrpc": "2.0", "id": id, "result": [] });
+                        write_frame(&mut stdout, &resp);
+                        continue;
+                    };
+                    let pos = &msg["params"]["position"];
+                    let line = pos["line"].as_u64().unwrap_or(0) as u32;
+                    let character = pos["character"].as_u64().unwrap_or(0) as u32;
+                    let locs = occurrences_at(text, line, character, utf16)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|(l, bs, be)| json!({
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": l, "character": lsp_char_col_at(text, *l, *bs, utf16) },
+                                "end": { "line": l, "character": lsp_char_col_at(text, *l, *be, utf16) },
+                            },
+                        }))
+                        .collect::<Vec<_>>();
+                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": locs });
                     write_frame(&mut stdout, &resp);
                 }
                 _ => {}
@@ -248,4 +310,85 @@ fn write_frame(out: &mut impl Write, msg: &Value) {
         .expect("header");
     out.write_all(&data).expect("body");
     out.flush().expect("flush");
+}
+
+/// LSP 座標（行・encoding 単位の列）を char 列に変換して行内の位置を特定し、
+/// その位置にある識別子（単語）を返す。無ければ None。
+fn word_at(text: &str, line: u32, character: u32, utf16: bool) -> Option<String> {
+    let line_text = text.lines().nth(line as usize)?;
+    let char_col = if utf16 {
+        // UTF-16 単位 → char 列（ASCII 中心のテスト fixture なので 1:1 だが
+        // 一般化しておく: サロゲートペアを数える）
+        let mut units = 0u32;
+        let mut col = 0usize;
+        for ch in line_text.chars() {
+            let w = ch.len_utf16() as u32;
+            if units + w > character {
+                break;
+            }
+            units += w;
+            col += 1;
+        }
+        col
+    } else {
+        character as usize
+    };
+    let mut start = char_col.min(line_text.len());
+    let mut end = start;
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    while start > 0 && is_word(line_text.as_bytes()[start - 1]) {
+        start -= 1;
+    }
+    while end < line_text.len() && is_word(line_text.as_bytes()[end]) {
+        end += 1;
+    }
+    if start == end {
+        None
+    } else {
+        Some(line_text[start..end].to_string())
+    }
+}
+
+/// テキスト内の単語の全出現（行・開始 byte・終了 byte）。指定位置に単語が
+/// 無ければ None。
+fn occurrences_at(
+    text: &str,
+    line: u32,
+    character: u32,
+    utf16: bool,
+) -> Option<Vec<(u32, usize, usize)>> {
+    let word = word_at(text, line, character, utf16)?;
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find(&word) {
+        let i = search_from + rel;
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+        let after = i + word.len();
+        let after_ok = after == bytes.len()
+            || !bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_';
+        if before_ok && after_ok {
+            let l = text[..i].matches('\n').count() as u32;
+            out.push((l, i, after));
+        }
+        search_from = after;
+    }
+    Some(out)
+}
+
+/// 行・byte 位置 → LSP の character（advertise した encoding の単位）。
+fn lsp_char_col_at(text: &str, line: u32, byte_off: usize, utf16: bool) -> u32 {
+    let line_text = text.lines().nth(line as usize).unwrap_or("");
+    let byte_in_line = byte_off.saturating_sub(
+        text.split('\n')
+            .take(line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>(),
+    );
+    let byte_in_line = byte_in_line.min(line_text.len());
+    if utf16 {
+        line_text[..byte_in_line].encode_utf16().count() as u32
+    } else {
+        byte_in_line as u32
+    }
 }
