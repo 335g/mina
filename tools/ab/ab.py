@@ -171,6 +171,44 @@ def fixture_t8():
     (WORK / "ws" / "cfg.rs").write_text("".join(lines))
 
 
+def fixture_t9():
+    """T9 (M2): Rust analog of T5 — 3-file crate, many occurrences
+    (USD x12, price x7), cross-file. The regime where mina's OWN semantic
+    rename (`session rename`, ADR-0029) should beat an apply loop."""
+    (WORK / "ws" / "Cargo.toml").write_text(
+        "[package]\nname = \"abrs\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
+    (WORK / "ws" / "src").mkdir(parents=True, exist_ok=True)
+    (WORK / "ws" / "src" / "lib.rs").write_text("pub mod utils;\npub mod data;\n")
+    (WORK / "ws" / "src" / "utils.rs").write_text(
+        """pub const USD: u64 = 100;
+
+pub fn price(x: u64) -> u64 {
+    x * USD
+}
+""")
+    (WORK / "ws" / "src" / "data.rs").write_text(
+        """use crate::utils::USD;
+use crate::utils::price;
+
+pub const ITEMS: [u64; 6] = [USD * 1, USD * 2, USD * 3, USD * 4, USD * 5, USD * 10];
+
+pub fn total(a: u64, b: u64) -> u64 {
+    price(a) + price(b) + price(a * b) + price(a + b)
+}
+""")
+    (WORK / "ws" / "src" / "main.rs").write_text(
+        """use abrs::utils::{USD, price};
+use abrs::data::{ITEMS, total};
+
+fn main() {
+    let first = ITEMS[0] + USD;
+    let second = price(USD) + USD * 2;
+    let third = total(USD, price(USD));
+    println!("{first} {second} {third}");
+}
+""")
+
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -340,6 +378,34 @@ You MUST use these commands for all file access (no other file commands):
 First mread rename.ts to see the file, then use mrename for USD->JPY and for
 price->amount, then verify with a final mread that no "USD" or "price"
 remains, and reply with exactly: DONE""",
+    # T9 (M2): Rust analog of T5. Arm A = apply loop (medit). Arm B = mrename
+    # backed by mina's OWN `session rename` (ADR-0029) instead of the harness's
+    # tsserver shim — measures whether the productized rename keeps the T5 win.
+    "t9-A": """Refactor the Rust crate in the current directory
+(src/utils.rs, src/data.rs, src/main.rs):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+Work file by file, occurrence by occurrence. When done, verify that no
+occurrence of "USD" or "price" remains in ANY of the .rs files and reply with
+exactly: DONE""",
+    "t9-B": """Refactor the Rust crate in the current directory
+(src/utils.rs, src/data.rs, src/main.rs):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  mrename <path> <old> <new> perform a LANGUAGE-AWARE RENAME of the symbol whose
+     first identifier occurrence is <old> in <path> — mina (`session rename`)
+     finds and updates every reference (definition, calls, uses) across files
+     in one call and saves. One mrename per symbol is enough; do not loop
+     over occurrences. First mread the files to see the crate, then mrename
+     for USD->JPY and for price->amount, then verify with a final mread that
+     no "USD" or "price" remains in ANY .rs file, and reply with exactly: DONE""",
     "t3-A": """Refactor the project in the current directory (files f1.rs and f2.rs):
   - rename the constant USD to JPY (all occurrences)
   - rename the method price() to amount() (its definition and all calls)
@@ -413,11 +479,18 @@ def build_workdir(test, arm):
     if test == "t8":
         # both edit tools present: medit (positional) and mapply (content-resolved)
         wr("mapply", "edit_shim.py", "apply")
-    if (test == "t6") or (test in ("t4", "t5") and arm == "B"):
-        p = wd / "bin" / "mrename"
-        p.write_text(
-            f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
-        p.chmod(0o755)
+    if (test == "t6") or (test in ("t4", "t5") and arm == "B") or (test == "t9" and arm == "B"):
+        if test == "t9":
+            # mrename backed by mina's OWN session rename (M2, ADR-0029)
+            p = wd / "bin" / "mrename"
+            p.write_text(
+                f"#!/usr/bin/env bash\n{env} exec python3 {SHIMS}/rename_mina_shim.py \"$@\"\n")
+            p.chmod(0o755)
+        else:
+            p = wd / "bin" / "mrename"
+            p.write_text(
+                f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
+            p.chmod(0o755)
     if test in ("t6", "t7", "t8") and arm == "A":
         p = wd / "bin" / "mina"
         p.write_text(
@@ -450,6 +523,8 @@ def build_workdir(test, arm):
         fixture_t5()
     elif test == "t6":
         fixture_t5()
+    elif test == "t9":
+        fixture_t9()
     if test == "t7":
         fixture_t7()
     if test == "t8":
@@ -529,7 +604,7 @@ def measure(sid):
             st = d.get("state") or {}
             st_in = st.get("input") or {}
             cmd = str(st_in.get("command", "")) if isinstance(st_in, dict) else ""
-            bypass_words = ("session apply", "session edit",
+            bypass_words = ("session apply", "session edit", "session rename",
                             "sed -i", "perl -pi", "re.sub", "python3 - <<",
                             "python3 -c", "python3 -f", ".replace(")
             if any(w in cmd for w in bypass_words):
@@ -594,13 +669,18 @@ def success(test):
         ok = all(f in s for f in finals)
         missing = [f for f in finals if f not in s]
         return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
+    if test == "t9":
+        s = read("src/utils.rs") + read("src/data.rs") + read("src/main.rs")
+        ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
+        return ("OK" if ok else "FAIL"), \
+            f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
     return "NA", ""
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
