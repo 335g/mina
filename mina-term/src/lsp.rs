@@ -188,6 +188,12 @@ impl LspSession {
         self.current_uri.as_deref()
     }
 
+    /// ネゴシエート済みの位置 encoding（rename の WorkspaceEdit 座標変換など
+    /// ロック外でも使えるようコピーで返す）。
+    pub fn encoding(&self) -> PositionEncoding {
+        self.encoding
+    }
+
     /// 文字インデックス → LSP 座標（ネゴシエート済み encoding 込み）。
     /// カーソル基準の TUI 要求（[`Command::PeekDefinition`]）が、位置指定の
     /// [`definition_peek_at`] に渡す座標を作るために使う。
@@ -659,6 +665,473 @@ pub async fn definition_peek_at_line_col(
     definition_peek_at(session, path, text, lsp_line, lsp_character).await
 }
 
+// ---- 意味リネーム・参照（ADR-0029） ----
+
+/// 1ファイル分の rename 編集（LSP 座標を char インデックスへ変換済み）。
+pub struct RenameFile {
+    pub path: PathBuf,
+    /// 適用前テキストに対する char 範囲の置換。同一ファイル内で重複しない
+    /// （[`lsp_edits_to_char`] が保証）。
+    pub edits: Vec<RenameEdit>,
+}
+
+/// char インデックス範囲のテキスト置換。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameEdit {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+/// WorkspaceEdit の要素（まだ LSP 座標のまま。文字への変換は対象ファイルの
+/// テキストが必要なため、daemon 側で [`lsp_edits_to_char`] を呼ぶ）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawFileEdits {
+    pub uri: String,
+    pub edits: Vec<RawLspEdit>,
+}
+
+/// WorkspaceEdit 内の 1 編集（LSP 座標の range + 新テキスト）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawLspEdit {
+    pub range: LspRange,
+    pub new_text: String,
+}
+
+/// rename / references が「解析待ち」と判定する条件。
+///
+/// rust-analyzer はワークスペースロード完了前に rename / references を要求
+/// されると `error`（ContentModified「-32801」や「No references found」）を返す
+/// （M0 実測: 1.98.0）。mina-lsp の [`Client`] は LSP の error 応答を `Null` に
+/// 潰して返すため（mina-lsp/src/lib.rs reader）、ここでは「結果が Null」を
+/// リトライ条件とする。Null か結果かを区別できないため、シンボルが本当に
+/// rename 不能な場合もリトライ予算（約 10 秒）だけ余分に待ってから
+/// 「not found」扱いになる。
+const SEMANTIC_RETRIES: usize = 20;
+const SEMANTIC_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// `textDocument/rename` を実行し、WorkspaceEdit を内部形へ変換して返す。
+///
+/// - `Ok(Some(files))`: 適用すべき編集（`changes` / `documentChanges` の両形式に
+///   対応。resource 変更（create/delete/rename file）は未対応としてエラー）。
+/// - `Ok(None)`: リトライ予算を使い切っても結果が得られなかった = 解析未完
+///   または対象位置に rename 可能なシンボルがない。
+/// - `Err(msg)`: 恒久的エラー（タイムアウト・サーバ死亡・未対応の WorkspaceEdit）。
+/// `textDocument/rename` を実行し、WorkspaceEdit を内部形へ変換して返す。
+///
+/// - `Ok(files)`: 適用すべき編集（`changes` / `documentChanges` の両形式に
+///   対応。resource 変更（create/delete/rename file）は未対応としてエラー）。
+///   空リストは「rename できるものが無い」（シンボル未解決・解析未完の可能性）。
+/// - `Err(msg)`: 恒久的エラー（タイムアウト・サーバ死亡・未対応の WorkspaceEdit）。
+pub async fn rename_at(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    line: u32,
+    character: u32,
+    new_name: &str,
+) -> Result<Vec<RawFileEdits>, String> {
+    // 解析前は null または空の WorkspaceEdit が返る — どちらも解析待ちとして
+    // リトライする（予算切れ後の空は「rename 結果なし」として daemon 側が扱う）。
+    let is_loading = |r: &Value| r.is_null() || workspace_edit_is_empty(r);
+    let result = request_with_loading_retry(
+        session,
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": uri(path) },
+            "position": { "line": line, "character": character },
+            "newName": new_name,
+        }),
+        is_loading,
+    )
+    .await?;
+    parse_workspace_edit(&result)
+}
+
+/// `textDocument/references` を実行し、参照位置（uri, 0-origin 行番号）を返す。
+/// `includeDeclaration` で定義も含めた全参照を要求する。戻り値は `None` が
+/// 解析未完（リトライ予算切れ）。
+pub async fn references_at(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    line: u32,
+    character: u32,
+) -> Result<Vec<(String, u32)>, String> {
+    // 解析前の "空配列"（rust-analyzer がロード中に返す）も解析待ちとして
+    // リトライし、2回連続で同一になるまで待つ（インクリメンタルに増える参照を
+    // 取りこぼさない — T5 の教訓）。予算切れ後の空は「参照なし」として返す。
+    let is_loading = |r: &Value| r.is_null() || r.as_array().map_or(true, |a| a.is_empty());
+    let result = request_with_loading_retry(
+        session,
+        "textDocument/references",
+        json!({
+            "textDocument": { "uri": uri(path) },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true },
+        }),
+        is_loading,
+    )
+    .await?;
+    let Some(items) = result.as_array() else {
+        return Err("textDocument/references の応答が配列ではありません".into());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let u = item
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or("references の Location に uri がありません")?;
+        let line = item
+            .pointer("/range/start/line")
+            .and_then(Value::as_u64)
+            .ok_or("references の Location に line がありません")?;
+        out.push((u.to_string(), line as u32));
+    }
+    Ok(out)
+}
+
+/// セマンティック要求（rename / references）の前に、ワークスペース内の同拡張子
+/// ファイルを didOpen する。
+///
+/// 実測（M0/M1）: rust-analyzer は didOpen していないファイルの参照を
+/// `textDocument/references` / `rename` の結果に含めない（開いていない
+/// main.rs の使用箇所が rename で取りこぼされた）。AB ハーネス（tools/ab）も
+/// 全ファイル didOpen を採用していた。対象拡張子のみ・生成ディレクトリ
+/// （target/.git 等）除外・件数と合計バイトの上限で防護する。
+pub async fn open_workspace_files(daemon: &Mutex<Daemon>, session: &Mutex<LspSession>, path: &Path) {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return;
+    };
+    let root = workspace_root(path);
+    let mut files = Vec::new();
+    collect_workspace_files(&root, ext, &mut files, 0);
+    // ディスクから読む（上限付き）。開文書の未保存編集は後で優先する。
+    let mut to_open: Vec<(PathBuf, String)> = Vec::new();
+    for f in files {
+        if let Some(text) = read_open_capped(&f).await {
+            to_open.push((f, text));
+        }
+    }
+    // 開文書の未保存編集を優先（ディスクとズレた didOpen で解析を汚さない）
+    {
+        let d = daemon.lock().await;
+        for (path, text) in &mut to_open {
+            if let Some(id) = d.editor.doc_id_for_path(path) {
+                *text = d.editor.document(id).text().to_string();
+            }
+        }
+    }
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return;
+    };
+    if session.client.is_dead() {
+        return;
+    }
+    for (path, text) in to_open {
+        session.did_open(&path, &text).await;
+    }
+}
+
+/// ワークスペース走査の上限（防護。実プロジェクトのソースは数十ファイルだが、
+/// 生成物を紛れ込ませないため件数・合計バイトで切る）。
+const MAX_WORKSPACE_OPEN_FILES: usize = 400;
+const MAX_WORKSPACE_OPEN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `root` 以下を再帰走査し、`ext` と同じ拡張子のファイルを収集する。
+/// 生成ディレクトリ（target/.git/node_modules 等）と上限を超えた分は無視。
+fn collect_workspace_files(
+    dir: &Path,
+    ext: &str,
+    out: &mut Vec<PathBuf>,
+    mut bytes: u64,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_WORKSPACE_OPEN_FILES || bytes >= MAX_WORKSPACE_OPEN_BYTES {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // 生成物・メタデータのディレクトリは再帰しない
+            if matches!(name, "target" | ".git" | "node_modules" | "vendor" | "build" | "dist") {
+                continue;
+            }
+            collect_workspace_files(&path, ext, out, bytes);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            continue;
+        }
+        if let Ok(md) = std::fs::metadata(&path) {
+            if md.is_file() && md.len() <= MAX_WORKSPACE_OPEN_BYTES {
+                bytes += md.len();
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// サイズ上限付きのディスク読み（ディレクトリ・過大は None）。
+async fn read_open_capped(path: &Path) -> Option<String> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let meta = file.metadata().await.ok()?;
+    if !meta.is_file() || meta.len() > MAX_WORKSPACE_OPEN_BYTES {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(MAX_WORKSPACE_OPEN_BYTES + 1)
+        .read_to_string(&mut s)
+        .await
+        .ok()?;
+    if s.len() as u64 > MAX_WORKSPACE_OPEN_BYTES {
+        return None;
+    }
+    Some(s)
+}
+
+/// WorkspaceEdit が編集を 1 件も含まないか（`changes`/`documentChanges` の両方を
+/// 見る）。解析前の空応答と、確定した「何も編集がない」は区別できないため、
+/// リトライ側はこれを解析待ちとして扱う（予算切れ後はそのまま空として返す）。
+fn workspace_edit_is_empty(value: &Value) -> bool {
+    let changes_empty = value
+        .get("changes")
+        .map_or(true, |c| c.as_object().map_or(true, |o| o.is_empty()));
+    let dc_empty = value
+        .get("documentChanges")
+        .map_or(true, |d| d.as_array().map_or(true, |a| a.is_empty()));
+    changes_empty && dc_empty
+}
+
+/// LSP リクエストを投げ、結果が「解析待ち」の形（`is_loading` が真）の間、
+/// または結果がまだ安定しない間（2回連続で同一にならない）リトライする。
+/// `Err` は恒久的な失敗（タイムアウト・サーバ死亡）のみ。
+///
+/// リトライ予算（[`SEMANTIC_RETRIES`] × [`SEMANTIC_RETRY_WAIT`] ≈ 10 秒）を
+/// 使い切ったら「最後の結果」を返す（解析が不完全かもしれないが、保持できる
+/// 最良の情報を返す — 呼び出し側が空/不完全をそのまま扱う）。
+async fn request_with_loading_retry(
+    session: &Mutex<LspSession>,
+    method: &str,
+    params: Value,
+    is_loading: fn(&Value) -> bool,
+) -> Result<Value, String> {
+    let mut prev: Option<Value> = None;
+    let mut retried = 0;
+    loop {
+        let result = {
+            let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+                return Err("LSP セッションのロックを取得できませんでした".into());
+            };
+            if session.client.is_dead() {
+                return Err("LSP サーバが停止しています（再起動を待つか再実行してください）".into());
+            }
+            session
+                .client
+                .request(method, params.clone())
+                .await
+                .map_err(|e| format!("LSP エラー: {e}"))?
+        };
+        let loading = is_loading(&result);
+        if !loading && prev.as_ref() == Some(&result) {
+            return Ok(result); // 2回連続で同一 = 解析が安定
+        }
+        if retried >= SEMANTIC_RETRIES {
+            return Ok(result); // 予算切れ: 最後の結果（空/不完全の可能性）を返す
+        }
+        prev = Some(result);
+        retried += 1;
+        tokio::time::sleep(SEMANTIC_RETRY_WAIT).await;
+    }
+}
+
+/// WorkspaceEdit をパースする。`changes`（uri → edits マップ）と
+/// `documentChanges`（TextDocumentEdit 配列）の両形式に対応し、両方があれば
+/// 併合する。resource 変更（CreateFile / RenameFile / DeleteFile）を含む
+/// `documentChanges` は未対応としてエラーを返す（シンボル rename では発生しない）。
+fn parse_workspace_edit(value: &Value) -> Result<Vec<RawFileEdits>, String> {
+    let mut out = Vec::new();
+    if let Some(changes) = value.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            let edits: Vec<RawLspEdit> = serde_json::from_value(edits.clone())
+                .map_err(|e| format!("WorkspaceEdit.changes を解釈できません: {e}"))?;
+            out.push(RawFileEdits {
+                uri: uri.clone(),
+                edits,
+            });
+        }
+    }
+    if let Some(doc_changes) = value.get("documentChanges").and_then(Value::as_array) {
+        for item in doc_changes {
+            let Some(edits) = item.get("edits") else {
+                return Err(
+                    "未対応の WorkspaceEdit です（resource 変更 = ファイル作成/削除/移動が含まれる）"
+                        .into(),
+                );
+            };
+            let u = item
+                .pointer("/textDocument/uri")
+                .and_then(Value::as_str)
+                .ok_or("WorkspaceEdit.documentChanges に textDocument.uri がありません")?;
+            let edits: Vec<RawLspEdit> = serde_json::from_value(edits.clone())
+                .map_err(|e| format!("WorkspaceEdit.documentChanges.edits を解釈できません: {e}"))?;
+            out.push(RawFileEdits {
+                uri: u.to_string(),
+                edits,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// LSP 座標の編集を、対象テキストに対する char インデックスの置換に変換する。
+/// 範囲がファイルを超える・範囲が逆転・同一ファイル内で編集範囲が重複する場合は
+/// エラー（適用前に検出してディスクを汚さない）。
+pub fn lsp_edits_to_char(
+    text: &str,
+    enc: PositionEncoding,
+    edits: &[RawLspEdit],
+) -> Result<Vec<RenameEdit>, String> {
+    let index = LineIndex::new(text);
+    let len = text.chars().count();
+    let line_count = text.lines().count() as u32;
+    let mut out = Vec::with_capacity(edits.len());
+    for e in edits {
+        // 行が文書を超える場合、lsp_pos_to_char_indexed は最終行へクランプする
+        // （診断向けの既定挙動）。rename は陳腐化した range の適用が破壊的
+        // なので、ここでは明示的に範囲外として拒否する（適用前に全失敗を検出）。
+        if e.range.start.line >= line_count || e.range.end.line >= line_count {
+            return Err(format!(
+                "WorkspaceEdit の行がファイルを超えています (行 {}/{})",
+                e.range.start.line.max(e.range.end.line),
+                line_count
+            ));
+        }
+        let start = lsp_pos_to_char_indexed(&index, text, e.range.start.line, e.range.start.character, enc);
+        let end = lsp_pos_to_char_indexed(&index, text, e.range.end.line, e.range.end.character, enc);
+        if start > end || end > len {
+            return Err(format!(
+                "WorkspaceEdit の範囲がファイルを超えています [{start}, {end}) / 長さ {len}"
+            ));
+        }
+        out.push(RenameEdit {
+            start,
+            end,
+            text: e.new_text.clone(),
+        });
+    }
+    // 重複検査（LSP が保証するが、防御: 重複適用は破壊的）。
+    let mut sorted: Vec<_> = out.iter().collect();
+    sorted.sort_by_key(|e| e.start);
+    for w in sorted.windows(2) {
+        if w[1].start < w[0].end {
+            return Err("WorkspaceEdit 内に重複する編集範囲があります".into());
+        }
+    }
+    Ok(out)
+}
+
+/// 同一ファイル内の複数置換を、range 降順（bottom-up）で適用した新しいテキストを返す。
+/// 編集は char インデックス基準（適用前テキストに対するもの）。
+pub fn apply_char_edits(text: &str, edits: &[RenameEdit]) -> String {
+    let mut out = text.to_string();
+    let mut edits: Vec<_> = edits.iter().collect();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+    for e in edits {
+        let start_byte = char_byte_idx(&out, e.start);
+        let end_byte = char_byte_idx(&out, e.end);
+        out.replace_range(start_byte..end_byte, &e.text);
+    }
+    out
+}
+
+/// char インデックス → バイトインデックス（末尾 clamp）。`Rope` の char/byte 変換が
+/// できない場面で使う（この関数は小さい編集リストに対してのみ呼ばれる）。
+fn char_byte_idx(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(b, _)| b)
+}
+
+/// `old` の最初の「識別子としての」出現位置（char インデックス）を返す。
+///
+/// tree-sitter でリーフの識別子ノード（kind に "identifier" を含む）に限定して
+/// マッチするため、コメント・文字列リテラル内の出現には解決しない（T3 の
+/// 「誤位置への静かな適用」の事故クラスを予防）。grammar が無い言語・パース
+/// 失敗時は単語境界検索にフォールバックする。
+pub fn find_symbol_char_idx(text: &str, path: &Path, old: &str) -> Option<usize> {
+    if old.is_empty() || text.is_empty() {
+        return None;
+    }
+    if let Some(def) = mina_loader::language_for_path(&path.to_string_lossy()) {
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&(def.grammar)()).is_ok() {
+            if let Some(tree) = parser.parse(text, None) {
+                if let Some(found) = first_identifier_leaf(text, &tree, old) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    // fallback: 単語境界による最初の出現（コメント除外は効かない — 言語不明時）。
+    first_word_occurrence(text, old)
+}
+
+/// ツリーを pre-order に走査し、テキストが `old` と一致する最初のリーフ識別子
+/// ノードの char インデックスを返す。
+fn first_identifier_leaf(text: &str, tree: &tree_sitter::Tree, old: &str) -> Option<usize> {
+    let mut cursor = tree.root_node().walk();
+    let mut done = false;
+    while !done {
+        let node = cursor.node();
+        if node.child_count() == 0
+            && node.is_named()
+            && node.kind().contains("identifier")
+            && text.as_bytes().get(node.start_byte()..node.end_byte()) == Some(old.as_bytes())
+        {
+            return Some(text[..node.start_byte()].chars().count());
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                done = true;
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// 単語境界（先頭/末尾が英数字・`_` 以外）での最初の出現位置。
+fn first_word_occurrence(text: &str, old: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + old.len() <= bytes.len() {
+        if &bytes[i..i + old.len()] == old.as_bytes() {
+            let before_ok = i == 0 || !b_alnum(bytes[i - 1]);
+            let after = i + old.len();
+            let after_ok = after == bytes.len() || !b_alnum(bytes[after]);
+            if before_ok && after_ok {
+                return Some(text[..i].chars().count());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn b_alnum(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 // ---- daemon 統合 ----
 
 /// 必要なら LSP セッションを spawn + initialize する（初回 .rs オープン時）。
@@ -1049,6 +1522,132 @@ mod tests {
         assert!(first_definition_target(&json!([])).is_none());
         assert!(first_definition_target(&json!([null, null])).is_none());
         assert!(first_definition_target(&json!({ "foo": 1 })).is_none());
+    }
+
+    #[test]
+    fn parse_workspace_edit_handles_changes_and_document_changes() {
+        use serde_json::json;
+        let pos = |l: u32, c: u32| json!({ "line": l, "character": c });
+        let edit = |l: u32, c: u32, new: &str| json!({
+            "range": { "start": pos(l, c), "end": pos(l, c + 3) },
+            "newText": new,
+        });
+        // changes 形式（uri → 編集リスト）
+        let v = json!({
+            "changes": { "file:///a.rs": [edit(0, 1, "AAA")], "file:///b.rs": [edit(2, 0, "BBB")] }
+        });
+        let files = parse_workspace_edit(&v).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].uri, "file:///a.rs");
+        assert_eq!(files[0].edits[0].new_text, "AAA");
+        // documentChanges 形式（TextDocumentEdit）
+        let v = json!({
+            "documentChanges": [{
+                "textDocument": { "uri": "file:///c.rs", "version": 1 },
+                "edits": [edit(1, 5, "CCC")],
+            }]
+        });
+        let files = parse_workspace_edit(&v).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].uri, "file:///c.rs");
+        assert_eq!(files[0].edits[0].new_text, "CCC");
+        // 両方があれば併合
+        let v = json!({
+            "changes": { "file:///a.rs": [edit(0, 1, "AAA")] },
+            "documentChanges": [{
+                "textDocument": { "uri": "file:///d.rs", "version": 1 },
+                "edits": [edit(0, 0, "DDD")],
+            }]
+        });
+        let files = parse_workspace_edit(&v).unwrap();
+        assert_eq!(files.len(), 2);
+        // resource 変更（CreateFile 等）は未対応としてエラー
+        let v = json!({
+            "documentChanges": [{ "kind": "create", "uri": "file:///new.rs" }]
+        });
+        assert!(parse_workspace_edit(&v).is_err());
+        // 空 WorkspaceEdit
+        assert_eq!(parse_workspace_edit(&json!({})).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn lsp_edits_to_char_converts_and_validates() {
+        let text = "ab cd\nef gh";
+        let raw = |l: u32, s: u32, e: u32, new: &str| RawLspEdit {
+            range: LspRange {
+                start: mina_lsp::LspPosition { line: l, character: s },
+                end: mina_lsp::LspPosition { line: l, character: e },
+            },
+            new_text: new.into(),
+        };
+        // utf-8: 列 = バイト（ASCII は char と一致）
+        let edits = lsp_edits_to_char(text, PositionEncoding::Utf8, &[raw(0, 0, 2, "XX")]).unwrap();
+        assert_eq!(edits, vec![RenameEdit { start: 0, end: 2, text: "XX".into() }]);
+        // 範囲が文書を超える → エラー
+        assert!(lsp_edits_to_char(text, PositionEncoding::Utf8, &[raw(5, 0, 1, "X")]).is_err());
+        // 範囲の逆転 → エラー
+        assert!(lsp_edits_to_char(text, PositionEncoding::Utf8, &[raw(0, 3, 1, "X")]).is_err());
+        // 重複範囲 → エラー（適用順で破壊するため）
+        let dup = [raw(0, 0, 3, "A"), raw(0, 2, 4, "B")];
+        assert!(lsp_edits_to_char(text, PositionEncoding::Utf8, &dup).is_err());
+        // 同一位置への複数編集（0-len insert）は重複とみなさない
+        let ins = [raw(0, 2, 2, "A"), raw(0, 4, 4, "B")];
+        assert_eq!(lsp_edits_to_char(text, PositionEncoding::Utf8, &ins).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn apply_char_edits_applies_bottom_up() {
+        // 後方の編集が前方の編集の位置を崩さない（降順適用）
+        let text = "aaaa bbbb cccc";
+        let edits = [
+            RenameEdit { start: 0, end: 4, text: "X".into() },
+            RenameEdit { start: 5, end: 9, text: "Y".into() },
+            RenameEdit { start: 10, end: 14, text: "Z".into() },
+        ];
+        assert_eq!(apply_char_edits(text, &edits), "X Y Z");
+        // 複数行に跨る
+        let text = "foo\nbar\nbaz";
+        let edits = [
+            RenameEdit { start: 0, end: 3, text: "F".into() },
+            RenameEdit { start: 4, end: 7, text: "B".into() },
+            RenameEdit { start: 8, end: 11, text: "C".into() },
+        ];
+        assert_eq!(apply_char_edits(text, &edits), "F\nB\nC");
+        // 全文長が変わる編集（挿入）の後に来る編集も正しい
+        let text = "ab";
+        let edits = [
+            RenameEdit { start: 0, end: 0, text: "<>".into() },
+            RenameEdit { start: 2, end: 2, text: "[]".into() },
+        ];
+        assert_eq!(apply_char_edits(text, &edits), "<>ab[]");
+    }
+
+    #[test]
+    fn find_symbol_char_idx_skips_comments_and_strings() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("sym-test.rs");
+        // コメントと文字列内の出現は無視し、最初の識別子（定義）に解決する
+        let text = "// rate = 1\nlet rate = 2;\nlet s = \"rate\";\nlet t = rate * 3;\n";
+        let idx = find_symbol_char_idx(text, &path, "rate").unwrap();
+        // "let rate" — 2行目の 'rate' の開始位置: "// rate = 1\n" (12 chars) + "let " (4) = 16
+        assert_eq!(&text[idx..idx + 4], "rate");
+        assert_eq!(idx, 16);
+        // 無い名前は None
+        assert!(find_symbol_char_idx(text, &path, "nope").is_none());
+        // 空・空文字列
+        assert!(find_symbol_char_idx("", &path, "rate").is_none());
+        assert!(find_symbol_char_idx(text, &path, "").is_none());
+    }
+
+    #[test]
+    fn first_word_occurrence_is_boundary_aware() {
+        let text = "let rate2 = rate * rate_2; // rate";
+        // rate2 や rate_2 には一致せず、境界付きの rate に一致する
+        let idx = first_word_occurrence(text, "rate").unwrap();
+        assert_eq!(&text[idx..idx + 4], "rate");
+        assert_eq!(idx, 12, "'rate2' を飛ばして 2 つ目の rate に一致: {text:?}");
+        assert!(first_word_occurrence("rate2", "rate").is_none());
+        assert!(first_word_occurrence(text, "absent").is_none());
     }
 
     #[test]
