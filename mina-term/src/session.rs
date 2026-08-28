@@ -33,6 +33,7 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 use mina_protocol::{ClientKind, Command, DocumentEdit, InlayHint, StateSnapshot};
+use mina_protocol::{ReferenceLocation, ServerMessage};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -112,6 +113,28 @@ pub enum SessionCmd {
         path: PathBuf,
         /// Position as `line:col` (1-origin, col is a char count)
         pos: String,
+    },
+    /// Semantic rename of a symbol via LSP (ADR-0029). Content-addressed: `<old>`
+    /// is resolved to the first identifier occurrence by the daemon; the language
+    /// server rewrites all references (possibly across files) and the result is
+    /// applied and saved. Response reports the impact: `N files, M edits` plus the
+    /// changed file list. No positional math by the agent.
+    Rename {
+        /// File containing the symbol (relative to the agent's cwd)
+        path: PathBuf,
+        /// Symbol name to rename
+        old: String,
+        /// New name
+        new: String,
+    },
+    /// List the reference locations of a symbol via LSP (ADR-0029, read-only).
+    /// Resolves `<old>` like Rename and prints `path:line` (1-origin) locations
+    /// without fetching full text — use with `--lines` to read.
+    References {
+        /// File containing the symbol (relative to the agent's cwd)
+        path: PathBuf,
+        /// Symbol name to look up
+        old: String,
     },
 }
 
@@ -249,6 +272,39 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
             // JSON で出力する（トークン削減 — ADR-0025）。
             println!("{}", serde_json::to_string_pretty(&peek)?);
         }
+        SessionCmd::Rename { path, old, new } => {
+            // 成功: `renamed: <old> -> <new> (N files, M edits)` と変更ファイル一覧
+            // （トークン最小・モデルが影響範囲を確認できる形 — Q3）。
+            // 失敗: stderr に理由、exit 1（入力エラー: 再試行不可）または
+            // exit 2（再試行可能: シンボル未解決・LSP エラー・保存失敗）。
+            let outcome = execute_rename(&path.to_string_lossy(), &old, &new).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("renamed: {e}");
+                std::process::exit(rename_exit_code(e));
+            }
+            println!("renamed: {old} -> {new} ({} files, {} edits)", outcome.files, outcome.edits);
+            for f in &outcome.changed {
+                println!("changed: {f}");
+            }
+        }
+        SessionCmd::References { path, old } => {
+            // 成功: `N references in M files:` に続けて `path:line`（1-origin。
+            // エージェントは位置から --lines で読む — T1 の原則でスニペットは返さない）。
+            // 失敗: stderr に理由、exit 1/2（Rename と同じ分類）。
+            let outcome = execute_references(&path.to_string_lossy(), &old).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("references: {e}");
+                std::process::exit(references_exit_code(e));
+            }
+            let mut files = std::collections::BTreeSet::new();
+            for loc in &outcome.locations {
+                files.insert(loc.path.as_str());
+            }
+            println!("{} references in {} files:", outcome.total, files.len());
+            for loc in &outcome.locations {
+                println!("{}:{}", loc.path, loc.line + 1);
+            }
+        }
     }
     Ok(())
 }
@@ -385,6 +441,132 @@ fn slice_lines(text: &str, start: usize, end: Option<usize>) -> LineSlice {
     }
 }
 
+/// `session rename` の結果（[`ServerMessage::RenameResult`] の展開形）。
+struct RenameOutcome {
+    files: usize,
+    edits: usize,
+    changed: Vec<String>,
+    error: Option<String>,
+}
+
+/// `session references` の結果（[`ServerMessage::ReferencesResult`] の展開形）。
+struct ReferencesOutcome {
+    locations: Vec<ReferenceLocation>,
+    total: usize,
+    error: Option<String>,
+}
+
+/// rename の失敗を exit コードに分類する（ADR-0029）: 入力エラー（not supported /
+/// invalid input）は再試行しても通らないので 1、それ以外（シンボル未解決・
+/// LSP エラー・保存失敗）は再試行可能なので 2。
+fn rename_exit_code(e: &str) -> i32 {
+    if e.starts_with("rename not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// references の失敗の exit コード分類（rename と同型）。
+fn references_exit_code(e: &str) -> i32 {
+    if e.starts_with("references not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// daemon に接続し、内容指定の意味リネーム（[`Command::Rename`]）を実行する
+/// （ADR-0029）。応答は全文を運ばない [`ServerMessage::RenameResult`]。
+async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOutcome> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る
+    let command = Command::Rename {
+        path: client::absolutize(path),
+        old: old.to_string(),
+        new: new.to_string(),
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::RenameResult {
+            files,
+            edits,
+            changed,
+            error,
+            ..
+        }) => Ok(RenameOutcome {
+            files,
+            edits,
+            changed,
+            error,
+        }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "Rename にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::ReferencesResult { .. }) => {
+            Err(invalid("Rename に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// daemon に接続し、シンボルの参照位置列挙（[`Command::References`]）を実行する
+/// （ADR-0029）。応答は全文を運ばない [`ServerMessage::ReferencesResult`]。
+async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutcome> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let command = Command::References {
+        path: client::absolutize(path),
+        old: old.to_string(),
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::ReferencesResult {
+            locations,
+            total,
+            error,
+            ..
+        }) => Ok(ReferencesOutcome {
+            locations,
+            total,
+            error,
+        }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "References にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. }) => {
+            Err(invalid("References に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
 /// daemon に接続し、指定位置の定義を軽量応答（[`ServerMessage::Peek`]）で受け取る。
 async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protocol::Peek> {
     let socket = crate::daemon::socket_path();
@@ -438,6 +620,10 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         }
         Ok(mina_protocol::ServerMessage::Hints { .. })
         | Ok(mina_protocol::ServerMessage::Peek { .. }) => {
+            Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
+        }
+        Ok(mina_protocol::ServerMessage::RenameResult { .. })
+        | Ok(mina_protocol::ServerMessage::ReferencesResult { .. }) => {
             Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
