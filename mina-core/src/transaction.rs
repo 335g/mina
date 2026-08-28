@@ -119,6 +119,38 @@ impl Transaction {
         }
     }
 
+    /// 複数の範囲置換を1つのトランザクションにまとめる（ADR-0029: LSP rename の
+    /// WorkspaceEdit 適用用）。`edits` は `(start, end, text)` の char 範囲置換で、
+    /// 互いに重複しないこと（呼び出し側が検証済み。ここでは start 昇順にソート）。
+    /// 範囲が文書を超える場合のクランプはしない — 検証済みの範囲だけを渡すこと。
+    /// 逆変換には各範囲の削除前テキストが埋め込まれ、undo で元の文書を必要としない。
+    pub fn replace_ranges(doc: &Document, edits: &[(usize, usize, String)]) -> Self {
+        let mut sorted: Vec<&(usize, usize, String)> = edits.iter().collect();
+        sorted.sort_by_key(|e| e.0);
+        let mut operations = Vec::new();
+        let mut inverse = Vec::new();
+        let mut pos = 0;
+        for (start, end, text) in sorted {
+            operations.push(Operation::Retain(*start - pos));
+            inverse.push(Operation::Retain(*start - pos));
+            operations.push(Operation::Insert(text.clone()));
+            inverse.push(Operation::Delete(text.chars().count()));
+            if end > start {
+                operations.push(Operation::Delete(*end - *start));
+                let deleted = doc.text().slice(*start..*end).to_string();
+                inverse.push(Operation::Insert(deleted));
+            }
+            pos = *end;
+        }
+        let trailing = doc.len_chars() - pos;
+        operations.push(Operation::Retain(trailing));
+        inverse.push(Operation::Retain(trailing));
+        Self {
+            operations,
+            inverse,
+        }
+    }
+
     /// このトランザクションを `doc` に適用した新しい文書を返す。
     ///
     /// # Panics
