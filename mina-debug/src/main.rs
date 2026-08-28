@@ -244,6 +244,13 @@ impl Conn {
                 ErrorKind::InvalidData,
                 "unexpected server info response".to_string(),
             )),
+            // ADR-0029: Rename / References 応答もこの CLI では使わない
+            Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+                Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "unexpected semantic response".to_string(),
+                ))
+            }
             Err(e) => Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!("不正な応答: {e}"),

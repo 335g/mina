@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// 古い daemon に新コマンドを送っても動作しないため version を上げる。
 /// v6: `Command::InsertAtLineEnd` / `InsertAtLineStart`（Helix の `A`/`I`。
 /// ADR-0023）。
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 編集モード（wire 型。mina-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +107,16 @@ pub enum Command {
         /// 1-origin 列番号（文字数単位）。
         col: u32,
     },
+    /// シンボルの意味リネーム（ADR-0029）。内容指定: `old` の最初の識別子出現を
+    /// daemon が解決し、LSP の `textDocument/rename` で全参照（複数ファイル含む）を
+    /// 置換して保存する。応答は全文を運ばない軽量 [`ServerMessage::RenameResult`]。
+    /// 読み取り専用でない（テキストを変える）ため、通常経路は headless の
+    /// `session rename`（daemon は headless ゲートをこのコマンドに限って解放する）。
+    Rename { path: String, old: String, new: String },
+    /// シンボルの参照位置の列挙（読み取り専用。ADR-0029）。`old` の最初の識別子
+    /// 出現を解決し、LSP の `textDocument/references` で全参照位置を返す。
+    /// 応答は全文を運ばない軽量 [`ServerMessage::ReferencesResult`]。
+    References { path: String, old: String },
 }
 
 /// 移動の種類（wire 型）。
@@ -229,6 +239,43 @@ pub enum ServerMessage {
         /// 定義のスニペット（数行。改行区切り）。空なら定義が見つからなかった。
         text: String,
     },
+    /// [`Command::Rename`] の応答（ADR-0029）。全文スナップショットを運ばない
+    /// 軽量応答 — 影響範囲（ファイル数・編集数・変更ファイル一覧）だけを返し、
+    /// エージェントが「意図通りか」を確認できるようにする。
+    /// 失敗は `error: Some(…)` で表す（`files`/`edits` は 0）。
+    RenameResult {
+        /// 応答時点の世代（編集が適用されたため進んでいる）。
+        generation: u64,
+        /// 変更したファイル数。
+        files: usize,
+        /// 適用した編集の総数。
+        edits: usize,
+        /// 変更したファイルのパス一覧（相対表示用。絶対パス）。
+        changed: Vec<String>,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+    /// [`Command::References`] の応答（ADR-0029）。参照位置の軽量一覧。
+    /// 失敗は `error: Some(…)` で表す（`locations` は空）。
+    ReferencesResult {
+        /// 参照元のファイルパス。
+        path: String,
+        /// 参照位置（パス・0-origin 行番号の昇順）。
+        locations: Vec<ReferenceLocation>,
+        /// 参照の総数。
+        total: usize,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+}
+
+/// [`Command::References`] の応答に含まれる参照位置 1 件（ADR-0029）。
+/// パスと 0-origin 行番号のみ — 行の内容は渡さない（エージェントは位置から
+/// 範囲 read で引く。T1 の原則）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceLocation {
+    pub path: String,
+    pub line: u32,
 }
 
 /// daemon 起動からの累積メトリクス（[`ServerMessage::ServerInfo`] に載る。

@@ -456,6 +456,13 @@ pub(crate) async fn request_hints(
             std::io::ErrorKind::InvalidData,
             "unexpected server info response",
         )),
+        // ADR-0029: Rename / References 応答もこの経路では期待しない
+        Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected semantic response",
+            ))
+        }
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -503,6 +510,13 @@ pub(crate) async fn request_peek(
             std::io::ErrorKind::InvalidData,
             "unexpected server info response",
         )),
+        // ADR-0029: Rename / References 応答もこの経路では期待しない
+        Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected semantic response",
+            ))
+        }
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -545,6 +559,13 @@ pub(crate) async fn request<T: serde::Serialize>(
             std::io::ErrorKind::InvalidData,
             "unexpected server info response",
         )),
+        // ADR-0029: Rename / References 応答もこの経路では期待しない
+        Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected semantic response",
+            ))
+        }
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -628,7 +649,9 @@ async fn read_loop(
             // （エージェント専用経路）。万一届いても応答は無視する。
             Ok(ServerMessage::Hints { .. })
             | Ok(ServerMessage::Peek { .. })
-            | Ok(ServerMessage::ServerInfo { .. }) => {}
+            | Ok(ServerMessage::ServerInfo { .. })
+            | Ok(ServerMessage::RenameResult { .. })
+            | Ok(ServerMessage::ReferencesResult { .. }) => {}
             Err(e) => {
                 let _ = res_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
