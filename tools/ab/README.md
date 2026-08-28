@@ -67,13 +67,25 @@ python3 tools/ab/ab.py stats t3 A 1
   `textDocument/rename` の WorkspaceEdit を適用）。
 - 成功判定: `USD`/`price` が残っていない。コンプライアンス:`rename` 監査行あり・直接編集
   （sed -i / python replace / session apply/edit 直呼び）なし。
-- 依存: `typescript-language-server`（MAB_LSP_BIN で差替可。rust-analyzer 1.98 は
-  --stdio 廃止＋rename が content modified で拒否されるため非推奨）。
+- 依存: `typescript-language-server`（MAB_LSP_BIN で差替可）。rust-analyzer は
+  t4/t5 では「content modified」で拒否されたが、M0 実測で**ロード未完了が原因**と判明
+  （テストクレートが親 workspace にネストされワークスペースロードに失敗していた）。
+  rust-analyzer 1.98 の rename は正常動作し、mina 本体の `session rename`（t9）で使用。
+
+### t9（M2）: mina 本体の `session rename` vs apply — Rust で T5 を再現
+- T5 の Rust 版フィクスチャ（3 ファイル crate: utils/data/main.rs、`USD` x15・`price` x9）。
+- Arm A: `medit`（=`mina session apply`）。Arm B: `mrename <path> <old> <new>` =
+  `shims/rename_mina_shim.py`（`mina session rename` のパススルー。ADR-0029）。
+- 結果: A 3/5（`price` 取りこぼし）・B 5/5、トークン −61.6%・コスト −61%・wall −56%
+  （製品化 rename が shim と同等以上の優位を実 rust-analyzer で再現）。
+- 注意: mrename はコールド時に daemon + rust-analyzer の起動・ロード待ち（数秒〜10 秒）が
+  乗る。run 間は `pkill -f "target/debug/mina daemon"` で daemon を落としてから実行する。
 
 ## 成果物
 
-- `shims/read_shim.py` / `edit_shim.py` — read/edit の実体（モード切替・ドリフト注入・
-  監査ログ）。`ab.py` が arm ごとに `bin/r` `bin/e` ラッパーを生成する。
+- `shims/read_shim.py` / `edit_shim.py` / `rename_mina_shim.py` — read/edit/rename の
+  実体（モード切替・ドリフト注入・監査ログ）。`ab.py` が arm ごとに `bin/r` `bin/e`
+  `bin/mrename` ラッパーを生成する。
 - `ab.py` — フィクスチャ生成・workdir 構築（opencode.json 含む）・実行・計測・成功判定。
 - 結果の解釈は `docs/agent-editor-ab-results.md` に追記する。
 
