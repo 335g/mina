@@ -1,6 +1,6 @@
 # mina Context
 
-mina is a terminal editor/viewer under construction. Development starts from the text-editing core (UI-agnostic), and the terminal layer comes later.
+mina is a terminal editor/viewer under construction: a UI-agnostic text-editing core, with a resident Daemon owning editor state. The terminal UI (mina-term) and the headless session CLI for agents are both Clients of that Daemon.
 
 ## Language
 
