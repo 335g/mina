@@ -88,6 +88,19 @@ python3 tools/ab/ab.py stats t3 A 1
 - 実装済みの動作検証: 2 ファイル（import 跨ぎ）で references 5 件 / rename 2 ファイル 5 編集
   （tsserver は閉じたファイルを null で拒否するため keep-open 方式 — ADR-0030）。
 
+### t11: 汎用2ファイル機能追加タスク — naive 契約 vs mina session 契約
+- LSP を使わない「読む→理解→直す」の実務タスク。フィクスチャ: 単体コンパイルできる
+  Rust クレート（config.rs / main.rs、各 ~600 行）に `max_conns` を追加する
+  （struct フィールド + Default + decode + validate + main の env 読込の 5 編集）。
+- Arm A（素朴）: `mread` = 全文ダンプ（read_naive_shim、行番号なし・範囲不可）、
+  `medit` = 無検証の先頭置換（edit_naive_shim、checksum なし・存在確認のみ）。
+- Arm B（mina）: `mread` = 番号付き範囲 read（`session get --lines`）、
+  `medit` = `session apply`（Open→検証→Save 一体、NOT FOUND で exit 2）。
+- 仕掛け: 全文 read のトークン圧迫 / drift 注入（最初の成功編集直後に decode 構文行を
+  外部書き換え — 両 arm の次編集の anchor が古くなる。回復コストが差になる）。
+- 成功判定: 5 編集の文字列検査 + **`cargo check --offline` が green**（ハーネス側で実行）。
+- 実行: `python3 tools/ab/ab.py run t11 A 1..5` / `run t11 B 1..5`。
+
 ## 成果物
 
 - `shims/read_shim.py` / `edit_shim.py` / `rename_mina_shim.py` — read/edit/rename の
