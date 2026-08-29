@@ -209,6 +209,79 @@ fn main() {
 """)
 
 
+def fixture_t11():
+    """T11: general 2-file feature task (no LSP). Config gains max_conns:
+    struct field + Default + decode + validate (+ env read in main.rs).
+    ~600 lines/file so full reads are costly; drift rewrites the decode
+    construct line after the first successful edit (both arms). Compiles
+    standalone — `cargo check` is part of the success predicate."""
+    (WORK / "ws" / "Cargo.toml").write_text(
+        "[package]\nname = \"abfeat\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
+    (WORK / "ws" / "src").mkdir(parents=True, exist_ok=True)
+    config_head = """// minimal structured configuration for the ab feature fixture
+// (keep this file plain and valid Rust — `cargo check` is the ground truth)
+
+pub struct Config {
+    pub timeout: u64,
+    pub retries: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            timeout: 5000,
+            retries: 3,
+        }
+    }
+}
+
+// decode: tiny JSON-ish parser (key presence decides the value)
+pub fn decode(json: &str) -> Result<Config, String> {
+    let timeout = if json.contains("\"timeout\"") { 5000 } else { 5000 };
+    let retries = if json.contains("\"retries\"") { 3 } else { 3 };
+    Ok(Config { timeout, retries })
+}
+
+// validate: bounds checks
+pub fn validate(cfg: &Config) -> Result<(), String> {
+    if cfg.timeout > 86_400_000 {
+        return Err("timeout too large".to_string());
+    }
+    if cfg.retries > 10 {
+        return Err("too many retries".to_string());
+    }
+    Ok(())
+}
+"""
+    lines = [config_head]
+    lines.append("// ---- generated noise: keep this file large (contract realism) ----\n")
+    for i in range(41, 601):
+        v = (i * 7 + 3) % 503
+        lines.append(f"fn cfg_noise_{i}() -> u64 {{ {v} }}\n")
+    (WORK / "ws" / "src" / "config.rs").write_text("".join(lines))
+    main_head = """mod config;
+use config::{decode, validate, Config};
+
+fn main() {
+    let t = std::env::var("TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+    let r = std::env::var("MAX_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let cfg = Config { timeout: t, retries: r };
+    if let Err(e) = validate(&cfg) {
+        eprintln!("config invalid: {e}");
+        std::process::exit(1);
+    }
+    let _d = decode("{}");
+    println!("timeout={} retries={}", cfg.timeout, cfg.retries);
+}
+"""
+    mlines = [main_head]
+    mlines.append("// ---- generated noise: keep this file large (contract realism) ----\n")
+    for i in range(31, 601):
+        v = (i * 13 + 7) % 251
+        mlines.append(f"fn main_noise_{i}() -> u64 {{ {v} }}\n")
+    (WORK / "ws" / "src" / "main.rs").write_text("".join(mlines))
+
+
 def fixture_t10():
     """T10 (Stage 4): TypeScript analog of T9 — 3-file TS project, many
     occurrences (USD x21, price x9), cross-file with imports. Regime where
@@ -427,6 +500,49 @@ You MUST use these commands for all file access (no other file commands):
 Work file by file, occurrence by occurrence. When done, verify that no
 occurrence of "USD" or "price" remains in ANY of the .rs files and reply with
 exactly: DONE""",
+    "t11-A": """Implement a small feature in the Rust crate (src/config.rs and
+src/main.rs): add a connection limit to the Config struct. Do ALL of the
+following:
+
+1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
+2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
+3. In fn decode, read the json key "max_conns" (with the same default 1024)
+   and include max_conns in the returned Config.
+4. In fn validate, reject configs with max_conns > 65535 with
+   Err("max_conns too large").
+5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
+   max_conns into the Config built in main.
+
+After the edits, run `cargo check` in this directory and make sure it passes.
+Reply with exactly: DONE
+
+Available file commands (use ONLY these for file access):
+  mread <path>               print the entire file
+  medit <path> <old> <new>   replace the first occurrence of <old> with <new>
+If an edit reports "text not found", re-read the file and retry.""",
+    "t11-B": """Implement a small feature in the Rust crate (src/config.rs and
+src/main.rs): add a connection limit to the Config struct. Do ALL of the
+following:
+
+1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
+2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
+3. In fn decode, read the json key "max_conns" (with the same default 1024)
+   and include max_conns in the returned Config.
+4. In fn validate, reject configs with max_conns > 65535 with
+   Err("max_conns too large").
+5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
+   max_conns into the Config built in main.
+
+After the edits, run `cargo check` in this directory and make sure it passes.
+Reply with exactly: DONE
+
+Available file commands (use ONLY these for file access):
+  mread <path> [start:end]   read numbered lines of a file (JSON: lines with n/text)
+  medit <path> <old> <new>   verified content-based apply (opens, locates, saves)
+  mcheck <path>              print the file checksum
+Use mread with a range to read only the lines you need before each edit. If an
+edit is rejected, re-read the affected range and retry. You can pass the line
+text you saw verbatim as <old> — it is used to locate the edit.""",
     "t9-B": """Refactor the Rust crate in the current directory
 (src/utils.rs, src/data.rs, src/main.rs):
   - rename the constant USD to JPY (every occurrence in every file)
@@ -514,8 +630,10 @@ def build_workdir(test, arm):
     read_mode = "range"
     if test == "t2":
         edit_mode = "apply-generic" if arm == "B" else "apply"
-    else:  # t3
+    elif test in ("t1", "t3"):
         edit_mode = "edit" if arm == "B" else "apply"
+    else:
+        edit_mode = "apply"
     if arm == "B" and test == "t1":
         read_mode = "full"
     lsp_env = ""
@@ -537,6 +655,29 @@ def build_workdir(test, arm):
     wr("mread", "read_shim.py", read_mode)
     wr("medit", "edit_shim.py", edit_mode)
     wr("mcheck", "check_shim.py", "x")
+    if test == "t11":
+        # T11 arms. A = naive generic tools (full-file reads, blind replace,
+        # no checksum — the "cat + sed" contract). B = the mina session
+        # contract (numbered range reads, verified apply).
+        if arm == "A":
+            wr("mread", "read_naive_shim.py", "x")
+            wr("medit", "edit_naive_shim.py", "x")
+            (wd / "bin" / "mcheck").unlink()
+        else:
+            wr("mread", "read_shim.py", "range")
+            wr("medit", "edit_shim.py", "apply")
+        fixture_t11()
+        # drift: after the first successful edit, the decode construct line is
+        # externally rewritten (retries-adjacent region), so the model's
+        # remembered anchor for the NEXT edit is stale in BOTH arms — recovery
+        # cost is what differs (full re-read vs bounded re-read + verification)
+        p = wd / "bin" / "medit"
+        shim = "edit_naive_shim.py" if arm == "A" else "edit_shim.py"
+        mode = "x" if arm == "A" else "apply"
+        p.write_text(
+            f"#!/usr/bin/env bash\n{env} export MAB_DRIFT_OLD='Ok(Config {{ timeout, retries }})'; export MAB_DRIFT_NEW='Ok(Config {{ timeout, retries /* external */ }})'; "
+            f"exec python3 {SHIMS}/{shim} {mode} \"$@\"\n")
+        p.chmod(0o755)
     if test == "t8":
         # both edit tools present: medit (positional) and mapply (content-resolved)
         wr("mapply", "edit_shim.py", "apply")
