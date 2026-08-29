@@ -5,18 +5,14 @@
 //! 間に届いた診断は次のキー入力で表示される。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use mina_lsp::{Client, LspRange, PositionEncoding, PublishDiagnostic};
-use mina_protocol::{ActivityKind, Diagnostic, InlayHint, Severity, StateSnapshot};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use mina_protocol::{Diagnostic, InlayHint, Severity};
+use serde::Deserialize;use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
-
-use crate::daemon::Daemon;
 
 /// 1回の publish で取り込む診断の上限（5c: 診断 flood 対策）。
 const MAX_DIAGNOSTICS: usize = 500;
@@ -42,7 +38,8 @@ pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// LSP セッションの状態（1セッション = 1サーバ。S3 は rust-analyzer のみ）。
 pub struct LspSession {
-    client: Client,
+    /// pub(crate): daemon 統合（ensure / drain / settle）が生死判定に読む。
+    pub(crate) client: Client,
     encoding: PositionEncoding,
     version: i64,
     current_uri: Option<String>,
@@ -61,7 +58,7 @@ pub fn server_for(path: &Path) -> Option<&'static str> {
 /// `file://` URI。
 ///
 /// ponytail: パスの percent-encoding は未対応（空白を含むパスは壊れる）。
-fn uri(path: &Path) -> String {
+pub(crate) fn uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
@@ -791,108 +788,6 @@ pub async fn references_at(
     Ok(out)
 }
 
-/// セマンティック要求（rename / references）の前に、ワークスペース内の同拡張子
-/// ファイルを didOpen する。
-///
-/// 実測（M0/M1）: rust-analyzer は didOpen していないファイルの参照を
-/// `textDocument/references` / `rename` の結果に含めない（開いていない
-/// main.rs の使用箇所が rename で取りこぼされた）。AB ハーネス（tools/ab）も
-/// 全ファイル didOpen を採用していた。対象拡張子のみ・生成ディレクトリ
-/// （target/.git 等）除外・件数と合計バイトの上限で防護する。
-pub async fn open_workspace_files(daemon: &Mutex<Daemon>, session: &Mutex<LspSession>, path: &Path) {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return;
-    };
-    let root = workspace_root(path);
-    let mut files = Vec::new();
-    collect_workspace_files(&root, ext, &mut files, 0);
-    // ディスクから読む（上限付き）。開文書の未保存編集は後で優先する。
-    let mut to_open: Vec<(PathBuf, String)> = Vec::new();
-    for f in files {
-        if let Some(text) = read_open_capped(&f).await {
-            to_open.push((f, text));
-        }
-    }
-    // 開文書の未保存編集を優先（ディスクとズレた didOpen で解析を汚さない）
-    {
-        let d = daemon.lock().await;
-        for (path, text) in &mut to_open {
-            if let Some(id) = d.editor.doc_id_for_path(path) {
-                *text = d.editor.document(id).text().to_string();
-            }
-        }
-    }
-    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
-        return;
-    };
-    if session.client.is_dead() {
-        return;
-    }
-    for (path, text) in to_open {
-        session.did_open(&path, &text).await;
-    }
-}
-
-/// ワークスペース走査の上限（防護。実プロジェクトのソースは数十ファイルだが、
-/// 生成物を紛れ込ませないため件数・合計バイトで切る）。
-const MAX_WORKSPACE_OPEN_FILES: usize = 400;
-const MAX_WORKSPACE_OPEN_BYTES: u64 = 64 * 1024 * 1024;
-
-/// `root` 以下を再帰走査し、`ext` と同じ拡張子のファイルを収集する。
-/// 生成ディレクトリ（target/.git/node_modules 等）と上限を超えた分は無視。
-fn collect_workspace_files(
-    dir: &Path,
-    ext: &str,
-    out: &mut Vec<PathBuf>,
-    mut bytes: u64,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if out.len() >= MAX_WORKSPACE_OPEN_FILES || bytes >= MAX_WORKSPACE_OPEN_BYTES {
-            break;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // 生成物・メタデータのディレクトリは再帰しない
-            if matches!(name, "target" | ".git" | "node_modules" | "vendor" | "build" | "dist") {
-                continue;
-            }
-            collect_workspace_files(&path, ext, out, bytes);
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
-            continue;
-        }
-        if let Ok(md) = std::fs::metadata(&path) {
-            if md.is_file() && md.len() <= MAX_WORKSPACE_OPEN_BYTES {
-                bytes += md.len();
-                out.push(path);
-            }
-        }
-    }
-}
-
-/// サイズ上限付きのディスク読み（ディレクトリ・過大は None）。
-async fn read_open_capped(path: &Path) -> Option<String> {
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let meta = file.metadata().await.ok()?;
-    if !meta.is_file() || meta.len() > MAX_WORKSPACE_OPEN_BYTES {
-        return None;
-    }
-    let mut s = String::new();
-    file.take(MAX_WORKSPACE_OPEN_BYTES + 1)
-        .read_to_string(&mut s)
-        .await
-        .ok()?;
-    if s.len() as u64 > MAX_WORKSPACE_OPEN_BYTES {
-        return None;
-    }
-    Some(s)
-}
-
 /// WorkspaceEdit が編集を 1 件も含まないか（`changes`/`documentChanges` の両方を
 /// 見る）。解析前の空応答と、確定した「何も編集がない」は区別できないため、
 /// リトライ側はこれを解析待ちとして扱う（予算切れ後はそのまま空として返す）。
@@ -1134,61 +1029,6 @@ fn b_alnum(b: u8) -> bool {
 
 // ---- daemon 統合 ----
 
-/// 必要なら LSP セッションを spawn + initialize する（初回 .rs オープン時）。
-///
-/// セッションは WorkspaceRoot 毎に持つ（ADR-0010）: 異なるプロジェクトの
-/// ファイルを開いても、それぞれの root で spawn されたサーバに解析させる。
-/// M1: spawn + initialize（最大10秒）は daemon ロック外で行うため、この関数は
-/// `&Mutex<Daemon>` を受け取り、daemon ロックは短時間だけ掴む。
-/// M3: 既存セッションが死んでいたら新しいセッションで置き換える。
-pub async fn ensure(
-    daemon: &Mutex<Daemon>,
-    path: &Path,
-) -> Result<Arc<Mutex<LspSession>>, String> {
-    let root = workspace_root(path);
-    // 既存セッション（root に生きていれば）を再利用する
-    {
-        let d = daemon.lock().await;
-        if let Some(session) = d.lsp_sessions.get(&root) {
-            let reuse = match session.try_lock() {
-                Ok(s) => !s.client.is_dead(),
-                Err(_) => true, // 同期中: 生きているとみなして再利用
-            };
-            if reuse {
-                return Ok(session.clone());
-            }
-        }
-    }
-    // 未作成 or 死亡: ロックを離して spawn + initialize（M1）
-    // ponytail: MINA_LSP_COMMAND はテスト用シーム（daemon 統合テストが mock
-    // サーバを指す）。本番では server_for の組み込みテーブルを使う。
-    let command = std::env::var("MINA_LSP_COMMAND").unwrap_or_else(|_| {
-        server_for(path)
-            .expect("ensure は LSP 対応ファイルでのみ呼ばれる")
-            .to_string()
-    });
-    let session = LspSession::new(&command, &root).await?;
-    let arc = Arc::new(Mutex::new(session));
-    // 保存（短いロック・await なし）。
-    let mut d = daemon.lock().await;
-    // 同時 ensure レース: 既存が生きていればそちらを優先する
-    if let Some(existing) = d.lsp_sessions.get(&root) {
-        let alive = match existing.try_lock() {
-            Ok(s) => !s.client.is_dead(),
-            Err(_) => true, // 同期中: 生きているとみなす
-        };
-        if alive {
-            // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
-            // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
-            return Ok(existing.clone());
-        }
-    }
-    // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
-    // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
-    d.lsp_sessions.insert(root, arc.clone());
-    Ok(arc)
-}
-
 /// 文書を開いたことを LSP に通知する（daemon ロック外・lsp mutex のみ）。
 ///
 /// MEDIUM-4: ロック取得にもタイムアウトを付け、他タスクが hung サーバの
@@ -1223,38 +1063,6 @@ pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
 
 /// 未処理の LSP 通知を取り込み、daemon の診断を維持する。
 ///
-/// 診断の実体は pull（[`pull_after_edit`] / [`settle_open_diagnostics`]）で更新する。
-/// ここでは MEDIUM-3（サーバ死亡時のクリア）だけを行う。push（publishDiagnostics）
-/// は flycheck（cargo check・ディスク基準）由来で、編集内容と食い違う stale な
-/// 診断を publish することがあり、pull の結果を上書きしないよう適用しない。
-pub fn drain_into(daemon: &mut Daemon) {
-    let Some(path) = daemon.editor.focused_path() else {
-        daemon.diagnostics.clear();
-        return;
-    };
-    let Some(session) = daemon.lsp_sessions.get(&workspace_root(path)) else {
-        // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
-        // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
-        daemon.diagnostics.clear();
-        return;
-    };
-    let doc_uri = uri(path);
-    let Ok(session) = session.try_lock() else {
-        return;
-    };
-    // MEDIUM-3: サーバが死んだら古い診断を残さない（下線・カウントが文書と
-    // 不整合のまま表示され続ける）。再 spawn は次回 .rs Open 時（ADR-0009）。
-    // ヒントも同様に消す（死んだサーバの解析結果は表示・配信しない。ADR-0020）。
-    if session.client.is_dead() {
-        daemon.diagnostics.clear();
-        daemon.hints.clear();
-        daemon.hint_order.clear();
-    } else if session.current_uri() != Some(doc_uri.as_str()) {
-        // フォーカスが LSP 対象外の文書に移ったら診断は残さない
-        daemon.diagnostics.clear();
-    }
-}
-
 /// 編集後の診断を pull で取り込む（daemon ロック外・lsp mutex のみ）。
 ///
 /// didChange の直後は解析未完了で pull が空を返すため、[`PULL_SETTLE`] だけ
@@ -1280,92 +1088,6 @@ pub async fn pull_after_edit(
     let diags = session.pull_diagnostics(path, text).await;
     let hints = session.pull_inlay_hints(path, text).await;
     (diags, hints)
-}
-
-/// Open 直後の診断追跡タスク: 初期解析が完了するまで pull を繰り返し、
-/// 診断と inlay hint を daemon に反映する。更新のたびに購読者（TUI）へ
-/// push する — ヒント・診断は generation を進めないため、クライアント側は
-/// 内容比較（`snapshot != state`）で再描画する（#24 のフィードバック）。
-///
-/// rust-analyzer の初期解析（crate ロード）は数秒かかり、その間の pull は空を
-/// 返す。非空が 2 回連続で返ったら解析完了とみなして終了する（空の連続は
-/// 「解析未完」と区別できないため安定判定しない。30 秒間空ならクリーン
-/// ファイルとみなして停止）。フォーカスが別文書に移ったら中断する。
-/// 上限 120 回 = 60 秒。
-pub async fn settle_open_diagnostics(
-    daemon: &Mutex<Daemon>,
-    session: Arc<Mutex<LspSession>>,
-    path: PathBuf,
-    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
-) {
-    settle_open_diagnostics_loop(daemon, session, path.clone(), push_tx).await;
-    // ADR-0028: ループの全出口（安定・タイムアウト・フォーカス移動・サーバ死）で
-    // 活動を除去する（追加は Open 側が spawn 前に行う。idempotent なので安全）。
-    let mut d = daemon.lock().await;
-    d.remove_activity(&path, ActivityKind::DiagnosticsSettle);
-}
-
-async fn settle_open_diagnostics_loop(
-    daemon: &Mutex<Daemon>,
-    session: Arc<Mutex<LspSession>>,
-    path: PathBuf,
-    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
-) {
-    let mut prev: Option<usize> = None;
-    for i in 0..120 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        // 現在のテキストを掴んでから pull（フォーカス移動・編集の最中は中断）
-        let text = {
-            let d = daemon.lock().await;
-            if d.editor.focused_path().map(Path::to_path_buf).as_deref() != Some(path.as_path()) {
-                return;
-            }
-            d.editor.current_document().text().to_string()
-        };
-        let pulled = {
-            let Ok(mut s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
-                continue;
-            };
-            if s.client.is_dead() {
-                return;
-            }
-            // ヒントも診断と同じループで pull し、キャッシュに載せる（ADR-0020）。
-            // 解析未完の間は空が返るが、次の反復で追いつく。
-            (
-                s.pull_diagnostics(&path, &text).await,
-                s.pull_inlay_hints(&path, &text).await,
-            )
-        };
-        let Some(diags) = pulled.0 else {
-            continue; // 解析中のキャンセル等: 次回に持ち越し
-        };
-        let n = diags.len();
-        let mut d = daemon.lock().await;
-        d.diagnostics = diags;
-        if let Some(hints) = pulled.1 {
-            d.cache_hints(path.clone(), &text, hints);
-        }
-        // ヒント・診断の反映は generation を進めないが、見え方を変える。
-        // 購読者へスナップショットを作り直して配る（クライアントは内容比較で
-        // 再描画する。自分の応答と同じ内容なら捨てられる）。
-        let snap = crate::daemon::snapshot(&mut d, None);
-        drop(d);
-        // 発信元はコマンドでない（LSP settle）ため None を包み、全クライアントに届く。
-        let _ = push_tx.send((None, snap));
-        if n > 0 {
-            // 非空が返った = 解析完了の確証。2回連続同じ件数なら安定とみなす
-            // （誤検出: 解析未完の空（0,0,0...）を安定と誤認しないため、
-            //  空の場合は安定判定しない）。
-            if prev == Some(n) {
-                return;
-            }
-        } else if i >= 60 {
-            // 30秒間空のまま: クリーンファイルとみなして停止（解析が遅くても
-            // 次の編集の pull で自己修復する）。
-            return;
-        }
-        prev = Some(n);
-    }
 }
 
 /// セッションを掴んで inlay hint を pull する（ロック取得はタイムアウト付き）。
@@ -1409,6 +1131,8 @@ pub async fn restore_focus_with_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+#[cfg(test)]
+use std::sync::Arc;
 
     #[test]
     fn workspace_root_prefers_nearest_manifest_over_outer_git() {
@@ -1702,51 +1426,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_replaces_dead_session() {
-        // M3/ADR-0009: サーバが死んだら次の .rs Open で再 spawn される。
-        // 死亡セッションを返し続けず、新しいセッションに置き換わることを検証する。
-        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
-        if !std::path::Path::new(bin).exists() {
-            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
-            return;
-        }
-        let daemon = Arc::new(Mutex::new(Daemon::new()));
-        let session = LspSession::new(bin, Path::new("/tmp"))
-            .await
-            .expect("initialize");
-        let dead = Arc::new(Mutex::new(session));
-        daemon
-            .lock()
-            .await
-            .lsp_sessions
-            .insert(workspace_root(Path::new("/tmp/x.rs")), dead.clone());
-
-        // サーバを殺して is_dead になるまで待つ（reader タスクが EOF を拾う）
-        dead.lock().await.client.kill().await;
-        let mut is_dead = false;
-        for _ in 0..100 {
-            if dead.lock().await.client.is_dead() {
-                is_dead = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(is_dead, "サーバを殺すと is_dead になる");
-
-        let replaced = ensure(&daemon, Path::new("/tmp/x.rs"))
-            .await
-            .expect("再 spawn できる");
-        assert!(
-            !Arc::ptr_eq(&dead, &replaced),
-            "新しいセッションで置き換わる"
-        );
-        assert!(
-            !replaced.lock().await.client.is_dead(),
-            "返るセッションは生きている"
-        );
-    }
-
-    #[tokio::test]
     async fn pull_converts_cjk_utf16_positions() {
         // 欠陥の E2E 検証: --cjk の mock が返す pull 診断の UTF-16 単位の位置が、
         // pull_diagnostics（convert_diagnostics → position.rs 変換）を経て
@@ -1777,60 +1456,6 @@ mod tests {
         assert_eq!(d.start, 2, "あ(1単位)+😀(2単位) の後: {d:?}");
         assert_eq!(d.end, 6, "TODO は4文字: {d:?}");
         assert_eq!(d.message, "mock: TODO found");
-    }
-
-    #[tokio::test]
-    async fn drain_into_clears_stale_diagnostics_when_server_dies() {
-        // MEDIUM-3: サーバが死んだ後も古い診断（下線・カウント）が残り続けない。
-        // 死んだ時点でクリアし、再 spawn 後の Open で新しく載る。
-        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
-        if !std::path::Path::new(bin).exists() {
-            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
-            return;
-        }
-        let mut daemon = Daemon::new();
-        let path = PathBuf::from("/tmp/x.rs");
-        daemon
-            .editor
-            .open_with_path(path.clone(), "fn main() { TODO }");
-        let session = Arc::new(Mutex::new(
-            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
-        ));
-        daemon
-            .lsp_sessions
-            .insert(workspace_root(&path), session.clone());
-
-        // pull で TODO 診断を取り込んでから殺す（MEDIUM-3 の前提: 診断がある状態）
-        session
-            .lock()
-            .await
-            .did_open(&path, "fn main() { TODO }")
-            .await;
-        let diags = session
-            .lock()
-            .await
-            .pull_diagnostics(&path, "fn main() { TODO }")
-            .await
-            .expect("pull 診断が返る");
-        daemon.diagnostics = diags;
-        assert!(!daemon.diagnostics.is_empty(), "診断が入っている");
-
-        // サーバを殺す → drain で古い診断がクリアされる
-        session.lock().await.client.kill().await;
-        let mut is_dead = false;
-        for _ in 0..100 {
-            if session.lock().await.client.is_dead() {
-                is_dead = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(is_dead, "サーバを殺すと is_dead になる");
-        drain_into(&mut daemon);
-        assert!(
-            daemon.diagnostics.is_empty(),
-            "サーバ死亡後の古い診断は残らない"
-        );
     }
 
     #[tokio::test]

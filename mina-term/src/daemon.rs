@@ -384,9 +384,7 @@ impl Daemon {
             self.interactive_clients.remove(&conn_id);
         }
         if self.insert_owner == Some(conn_id) && self.editor.mode() == mina_view::Mode::Insert {
-            self.editor.end_group();
-            self.editor.set_mode(mina_view::Mode::Normal);
-            self.insert_owner = None;
+            close_insert_session(self, mina_view::Mode::Normal);
         }
         // ADR-0027: 最後の Interactive クライアント切断時、そのクライアントが
         // Hello でリセットを宣言していれば全 View のカーソルを先頭へ戻す。
@@ -609,9 +607,7 @@ async fn watch_disk(
                 };
                 // 外部書き込みとして Insert グループを閉じる（ADR-0007 と同原則）
                 if d.insert_owner.is_some() {
-                    d.editor.end_group();
-                    d.editor.set_mode(mina_view::Mode::Normal);
-                    d.insert_owner = None;
+                    close_insert_session(&mut d, mina_view::Mode::Normal);
                 }
                 if d.editor.reload_doc(doc_id, text) {
                     reloaded = true;
@@ -658,27 +654,14 @@ async fn watch_disk(
                 d.lsp_sessions.get(&lsp::workspace_root(path)).cloned()
             };
             if let Some(session) = session {
-                // ADR-0028: 外部変更リロードの LSP 同期中もActivity として公開する（フォーカス
-                // 文書のみ。lsp_sync はフォーカス文書の場合にだけ設定される）。
-                let mut d = daemon.lock().await;
-                d.add_activity(path, ActivityKind::ReloadSync, "再読込同期中");
-                drop(d);
-                lsp::sync(&session, path, text).await;
-                // ヒントも編集と同経路で pull してキャッシュに載せる（ADR-0020）
-                let (pulled_diags, pulled_hints) =
-                    lsp::pull_after_edit(&session, path, text).await;
-                let mut d = daemon.lock().await;
-                d.remove_activity(path, ActivityKind::ReloadSync);
-                if let Some(diags) = pulled_diags {
-                    d.diagnostics = diags;
-                }
-                if let Some(hints) = pulled_hints {
-                    d.cache_hints(path.clone(), text, hints);
-                }
-                lsp::drain_into(&mut d);
-                // pull 診断は generation を変えないので、スナップショットを
-                // 作り直して push する（診断の変化を購読者へ届ける）
-                snap = Some(snapshot(&mut d, snap.and_then(|s| s.status)));
+                // ADR-0028: 同期中を Activity として公開する（フォーカス文書のみ。
+                // lsp_sync はフォーカス文書の場合にだけ設定される）。
+                snap = Some(sync_after_edit(
+                    &daemon,
+                    Some((session, path.clone(), text.clone())),
+                    snap.and_then(|s| s.status),
+                    Some((ActivityKind::ReloadSync, "再読込同期中")),
+                ).await);
             }
         }
         // 世代が進んでいれば全購読者へ配る（ADR-0013 と同条件）。発信元は
@@ -982,6 +965,107 @@ async fn write_message(
 /// didOpen し直し + 診断の再 pull」で対応する（Q10-(c)。切り替えウィンドウ中に
 /// 入った編集は全文同期の復元で整合する）。LSP の await は daemon ロック外
 /// （ADR-0009）。読み取り専用: 世代・push・イベントは進めない。
+/// 位置指定 LSP 要求（peek_at / references / rename）の共通お膳立て:
+/// 正規化 → テキスト解決（開文書優先・ディスク）→ LSP 対応ゲート →
+/// フォーカス文書の記録 → セッション確保 → 対象の didOpen までを1経路に持つ。
+/// 成功時、呼び出し側は LSP クエリだけを行い、借りていた場合は
+/// [`restore_focus_session`] / [`restore_focus_after_semantic`] で返す
+/// （Q10-(c) の自己修復）。失敗理由は呼び出し側が固有の空応答・エラー文に写像する。
+///
+/// serve_inlay_hints は使わない（キャッシュ高速経路と世代付き空応答が構造を
+/// 分けるため、独自のお膳立てを維持する）。
+struct Borrowed {
+    path: PathBuf,
+    /// 正規化後の表示用パス（空応答・応答の path フィールド用）。
+    path_str: String,
+    text: String,
+    /// お膳立て時点のフォーカス文書（復元用。テキストは復元時に最新を読む）。
+    focused: Option<PathBuf>,
+    session: Arc<Mutex<LspSession>>,
+}
+
+/// 借用お膳立ての失敗理由。
+enum BorrowFail {
+    /// 対象が開文書にもディスクにもない（メッセージは元入力をそのまま使う）。
+    CannotOpen,
+    /// LSP 非対応パス（.rs 以外）。表示用に正規化後のパスを渡す。
+    NoServer(String),
+    /// spawn + initialize 失敗。
+    SpawnFailed(String),
+}
+
+async fn prepare_borrowed_session(
+    daemon: &Mutex<Daemon>,
+    path: &str,
+) -> Result<Borrowed, BorrowFail> {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let path_str = path_buf.to_string_lossy().into_owned();
+    // 対象テキスト: Editor の開文書を優先し、なければディスク読み
+    // （SEC-1 検証済み。ADR-0008 の read_open_target を再利用）。
+    let text = {
+        let d = daemon.lock().await;
+        d.editor
+            .doc_id_for_path(&path_buf)
+            .map(|id| d.editor.document(id).text().to_string())
+    };
+    let (text, _status) = match text {
+        Some(t) => (Some(t), None),
+        None => read_open_target(&path_str).await,
+    };
+    let Some(text) = text else {
+        return Err(BorrowFail::CannotOpen);
+    };
+    // LSP 非対応パス（.rs 以外）: サーバを spawn しない
+    if lsp::server_for(&path_buf).is_none() {
+        return Err(BorrowFail::NoServer(path_str));
+    }
+    // フォーカス文書（復元用。テキストは復元時に最新を読む）
+    let focused = {
+        let d = daemon.lock().await;
+        d.editor.focused_path().map(Path::to_path_buf)
+    };
+    let session = match ensure(daemon, &path_buf).await {
+        Ok(s) => s,
+        Err(e) => return Err(BorrowFail::SpawnFailed(e)),
+    };
+    // 切り替え: 対象文書を didOpen（現在の文書にしか応えないため、対象を開く
+    // ことは必須）。既に開いている場合の再 didOpen は無害。
+    lsp::open_document(&session, &path_buf, &text).await;
+    Ok(Borrowed {
+        path: path_buf,
+        path_str,
+        text,
+        focused,
+        session,
+    })
+}
+
+/// セマンティック要求（references / rename）共通の位置解決:
+/// ワークスペース内の同拡張子ファイルを didOpen してから（未開ファイルの参照を
+/// 取りこぼさない — 実測: ra は開いていないファイルの参照を返さない）、識別子
+/// `old` の最初の出現を LSP 座標（行:列）へ解決する。コメント・文字列内には
+/// 解決しない（T3 の誤位置事故を予防）。失敗は `Err(エラーメッセージ)`
+/// （シンボル未解決・セッションロック待ち）。
+async fn resolve_symbol_lsp_pos(
+    daemon: &Mutex<Daemon>,
+    session: &Arc<Mutex<LspSession>>,
+    path: &Path,
+    text: &str,
+    old: &str,
+) -> Result<(u32, u32), String> {
+    open_workspace_files(daemon, session, path).await;
+    let Some(char_idx) = lsp::find_symbol_char_idx(text, path, old) else {
+        return Err(format!("symbol not found: {old:?} in {}", path.display()));
+    };
+    let (line, character) = {
+        let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return Err("LSP セッションのロックを取得できませんでした".into());
+        };
+        s.char_to_lsp_pos(text, char_idx)
+    };
+    Ok((line, character))
+}
+
 async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let path_str = path_buf.to_string_lossy().into_owned();
@@ -1035,7 +1119,7 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
         let d = daemon.lock().await;
         d.editor.focused_path().map(Path::to_path_buf)
     };
-    let session = match lsp::ensure(daemon, &path_buf).await {
+    let session = match ensure(daemon, &path_buf).await {
         Ok(s) => s,
         Err(_) => {
             // spawn + initialize 失敗: 空ヒントで応答する
@@ -1097,7 +1181,7 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
         }
     };
     let peek = if lsp::server_for(&path).is_some() {
-        match lsp::ensure(daemon, &path).await {
+        match ensure(daemon, &path).await {
             Ok(session) => {
                 // セッションを借りた（開き直し）ので現在のテキストで didOpen する。
                 // 既に開いている場合の再 didOpen は無害（idempotent）。
@@ -1130,49 +1214,24 @@ async fn serve_peek_definition_at(
     line: u32,
     col: u32,
 ) -> ServerMessage {
-    let path_buf = normalize_open_path(PathBuf::from(path)).await;
-    let path_str = path_buf.to_string_lossy().into_owned();
     let empty = || ServerMessage::Peek {
-        path: path_str.clone(),
+        path: path.to_string(),
         line: 0,
         text: String::new(),
     };
-    // 要求パスのテキスト: Editor の開文書を優先し、なければディスク読み
-    // （SEC-1 検証済み。ADR-0008 の read_open_target を再利用）。
-    let text = {
-        let d = daemon.lock().await;
-        d.editor
-            .doc_id_for_path(&path_buf)
-            .map(|id| d.editor.document(id).text().to_string())
+    // 読み込み不可・LSP 非対応・spawn 失敗はすべて定義なしで応答する
+    // （お膳立ての理由は空応答の形では区別しない）。
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(_) => return empty(),
     };
-    let (text, _status) = match text {
-        Some(t) => (Some(t), None),
-        None => read_open_target(&path_str).await,
-    };
-    let Some(text) = text else {
-        return empty(); // 読み込み不可: 定義なし
-    };
-    // LSP 非対応パス（.rs 以外）: 定義なしで応答する（サーバを spawn しない）
-    if lsp::server_for(&path_buf).is_none() {
-        return empty();
-    }
-    // フォーカス文書（復元用。テキストは復元時に最新を読む）
-    let focused = {
-        let d = daemon.lock().await;
-        d.editor.focused_path().map(Path::to_path_buf)
-    };
-    let session = match lsp::ensure(daemon, &path_buf).await {
-        Ok(s) => s,
-        Err(_) => return empty(), // spawn + initialize 失敗: 定義なし
-    };
-    let borrows = borrows_focus_session(&focused, &path_buf);
-    // 切り替え: 対象文書を didOpen（現在の文書にしか応えないため、対象を開く
-    // ことは必須）。既に開いている場合の再 didOpen は無害。
-    lsp::open_document(&session, &path_buf, &text).await;
-    let peek = lsp::definition_peek_at_line_col(&session, &path_buf, &text, line, col).await;
+    let borrows = borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let peek =
+        lsp::definition_peek_at_line_col(&borrowed.session, &borrowed.path, &borrowed.text, line, col)
+            .await;
     if borrows {
         // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
-        restore_focus_session(daemon, &session, &focused).await;
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
     }
     match peek {
         Some(p) => ServerMessage::Peek {
@@ -1191,69 +1250,41 @@ async fn serve_peek_definition_at(
 /// 失敗は `error: Some(…)` で表す: 入力不正・対象が読めない・LSP 非対応
 /// （`rename not supported` と同型）・シンボル未解決（ロード中含む）・LSP エラー。
 async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> ServerMessage {
-    let path_buf = normalize_open_path(PathBuf::from(path)).await;
-    let path_str = path_buf.to_string_lossy().into_owned();
+    if old.is_empty() {
+        return err_refs(path, "invalid input: old must be non-empty".into());
+    }
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err_refs(path, format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err_refs(
+                path,
+                format!("references not supported for {p} (no LSP server configured)"),
+            )
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err_refs(path, format!("LSP error: {e}")),
+    };
     let err = |msg: String| ServerMessage::ReferencesResult {
-        path: path_str.clone(),
+        path: borrowed.path_str.clone(),
         locations: Vec::new(),
         total: 0,
         error: Some(msg),
     };
-    if old.is_empty() {
-        return err("invalid input: old must be non-empty".into());
-    }
-    // 対象テキスト: 開文書優先 → ディスク（serve_peek_definition_at と同型）
-    let text = {
-        let d = daemon.lock().await;
-        d.editor
-            .doc_id_for_path(&path_buf)
-            .map(|id| d.editor.document(id).text().to_string())
-    };
-    let (text, _status) = match text {
-        Some(t) => (Some(t), None),
-        None => read_open_target(&path_str).await,
-    };
-    let Some(text) = text else {
-        return err(format!("cannot open {path}"));
-    };
-    if lsp::server_for(&path_buf).is_none() {
-        return err(format!(
-            "references not supported for {} (no LSP server configured)",
-            path_buf.display()
-        ));
-    }
-    let focused = {
-        let d = daemon.lock().await;
-        d.editor.focused_path().map(Path::to_path_buf)
-    };
-    let session = match lsp::ensure(daemon, &path_buf).await {
-        Ok(s) => s,
-        Err(e) => return err(format!("LSP error: {e}")),
-    };
-    // 対象文書を didOpen（現在の文書にしか応えないため必須）
-    lsp::open_document(&session, &path_buf, &text).await;
-    // ワークスペース内の同拡張子ファイルを didOpen（未開ファイルの参照を
-    // 取りこぼさない — 実測: ra は開いていないファイルの参照を返さない）
-    lsp::open_workspace_files(daemon, &session, &path_buf).await;
     // 識別子位置の解決（コメント・文字列内には解決しない — T3 の誤位置事故を予防）
-    let Some(char_idx) = lsp::find_symbol_char_idx(&text, &path_buf, old) else {
-        return err(format!(
-            "symbol not found: {old:?} in {}",
-            path_buf.display()
-        ));
-    };
-    let (line, character) = {
-        let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
-            return err("LSP セッションのロックを取得できませんでした".into());
+    let (line, character) =
+        match resolve_symbol_lsp_pos(daemon, &borrowed.session, &borrowed.path, &borrowed.text, old)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return err(e),
         };
-        s.char_to_lsp_pos(&text, char_idx)
-    };
-    let locations = match lsp::references_at(&session, &path_buf, line, character).await {
+    let locations = match lsp::references_at(&borrowed.session, &borrowed.path, line, character).await
+    {
         Ok(v) => v,
         Err(e) => return err(e),
     };
     // フォーカス文書を借りていたら復元（開き直し + 診断更新 — 自己修復）
-    restore_focus_after_semantic(daemon, &session, &focused, &path_buf).await;
+    restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path).await;
     let mut out = Vec::with_capacity(locations.len());
     for (uri, line) in locations {
         let Ok(p) = path_from_uri(&uri) else {
@@ -1266,10 +1297,20 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
     }
     let n = out.len();
     ServerMessage::ReferencesResult {
-        path: path_str,
+        path: borrowed.path_str,
         locations: out,
         total: n,
         error: None,
+    }
+}
+
+/// 失敗応答の共有形（references のエラー応答）。
+fn err_refs(path: &str, msg: String) -> ServerMessage {
+    ServerMessage::ReferencesResult {
+        path: path.to_string(),
+        locations: Vec::new(),
+        total: 0,
+        error: Some(msg),
     }
 }
 
@@ -1284,7 +1325,6 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
 ///    独立に保たれる — Q5）。開いていないファイルはディスク読み → 書換。
 /// 3. 開いている文書も含め全変更をディスクへ書き、世代を進める。
 async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) -> ServerMessage {
-    let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let err = |msg: String| ServerMessage::RenameResult {
         generation: 0,
         files: 0,
@@ -1295,56 +1335,29 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     if old.is_empty() || new.is_empty() {
         return err("invalid input: old and new must be non-empty".into());
     }
-    // 対象テキスト: 開文書優先 → ディスク
-    let text = {
-        let d = daemon.lock().await;
-        d.editor
-            .doc_id_for_path(&path_buf)
-            .map(|id| d.editor.document(id).text().to_string())
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err(format!("rename not supported for {p} (no LSP server configured)"))
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
-    let (text, _status) = match text {
-        Some(t) => (Some(t), None),
-        None => read_open_target(path_buf.to_string_lossy().as_ref()).await,
-    };
-    let Some(text) = text else {
-        return err(format!("cannot open {path}"));
-    };
-    // LSP 非対応パス: spawn せず明示的に拒否（入力エラー — 再試行で通らない）
-    if lsp::server_for(&path_buf).is_none() {
-        return err(format!(
-            "rename not supported for {} (no LSP server configured)",
-            path_buf.display()
-        ));
-    }
-    let focused = {
-        let d = daemon.lock().await;
-        d.editor.focused_path().map(Path::to_path_buf)
-    };
-    let session = match lsp::ensure(daemon, &path_buf).await {
-        Ok(s) => s,
-        Err(e) => return err(format!("LSP error: {e}")),
-    };
-    lsp::open_document(&session, &path_buf, &text).await;
-    // ワークスペース内の同拡張子ファイルを didOpen（未開ファイルの参照を
-    // 取りこぼさない — 実測: ra は開いていないファイルの参照を返さない）
-    lsp::open_workspace_files(daemon, &session, &path_buf).await;
     // 識別子位置の解決（コメント・文字列内には解決しない）
-    let Some(char_idx) = lsp::find_symbol_char_idx(&text, &path_buf, old) else {
-        return err(format!("symbol not found: {old:?} in {}", path_buf.display()));
-    };
-    let (line, character) = {
-        let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
-            return err("LSP セッションのロックを取得できませんでした".into());
+    let (line, character) =
+        match resolve_symbol_lsp_pos(daemon, &borrowed.session, &borrowed.path, &borrowed.text, old)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return err(e),
         };
-        s.char_to_lsp_pos(&text, char_idx)
-    };
-    let raw = match lsp::rename_at(&session, &path_buf, line, character, new).await {
+    let raw = match lsp::rename_at(&borrowed.session, &borrowed.path, line, character, new).await {
         Ok(v) => v,
         Err(e) => return err(e),
     };
     // 各ファイルの編集を char インデックスへ変換・検証（適用前に全失敗を検出 —
     // 検証失敗ならディスク無変更で拒否）
-    let enc = session.lock().await.encoding();
+    let enc = borrowed.session.lock().await.encoding();
     let mut files: Vec<lsp::RenameFile> = Vec::new();
     for f in &raw {
         let target = match path_from_uri(&f.uri) {
@@ -1378,10 +1391,12 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     if files.is_empty() {
         return err(format!(
             "symbol not found: {old:?} in {} (rename produced no edits)",
-            path_buf.display()
+            borrowed.path.display()
         ));
     }
-    match apply_and_save_rename(daemon, &session, &focused, &path_buf, &files).await {
+    match apply_and_save_rename(daemon, &borrowed.session, &borrowed.focused, &borrowed.path, &files)
+        .await
+    {
         Ok(generation) => ServerMessage::RenameResult {
             generation,
             files: files.len(),
@@ -1518,23 +1533,10 @@ async fn restore_focus_after_semantic(
     if !(borrows || target_is_focus) {
         return; // 別 root: フォーカスのセッションには触れていない
     }
-    let focused_text = {
-        let d = daemon.lock().await;
-        (d.editor.focused_path() == focused.as_deref())
-            .then(|| d.editor.current_document().text().to_string())
-    };
-    let Some(text) = focused_text else {
-        return;
-    };
-    let Some(fp) = focused else {
-        return;
-    };
-    let diags = lsp::restore_focus_with_diagnostics(session, fp, &text).await;
-    let mut d = daemon.lock().await;
-    if let Some(diags) = diags {
-        d.diagnostics = diags;
-    }
-    lsp::drain_into(&mut d);
+    // 本体は restore_focus_session と共通（対象がフォーカス文書そのものの場合も
+    // open_workspace_files が current_uri を動かしたため開き直しが必要。
+    // serve_peek_definition_at の restore と同型。Q10-(c)）。
+    restore_focus_session(daemon, session, focused).await;
 }
 
 /// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
@@ -1569,8 +1571,332 @@ async fn restore_focus_session(
             if let Some(diags) = diags {
                 d.diagnostics = diags;
             }
-            lsp::drain_into(&mut d);
+            drain_into(&mut d);
         }
+    }
+}
+
+// ---- daemon 統合（lsp.rs から移設: 下記4関数は Daemon 状態を読み書くため、
+// プロトコル層 lsp.rs は Daemon を知らなくてよいのが正しいモジュール境界。
+// lsp.rs は LspSession と純 LSP プロトコル関数のみを残す） ----
+
+/// 必要なら LSP セッションを spawn + initialize する（初回 .rs オープン時）。
+///
+/// セッションは WorkspaceRoot 毎に持つ（ADR-0010）: 異なるプロジェクトの
+/// ファイルを開いても、それぞれの root で spawn されたサーバに解析させる。
+/// M1: spawn + initialize（最大10秒）は daemon ロック外で行うため、この関数は
+/// `&Mutex<Daemon>` を受け取り、daemon ロックは短時間だけ掴む。
+/// M3: 既存セッションが死んでいたら新しいセッションで置き換える。
+async fn ensure(
+    daemon: &Mutex<Daemon>,
+    path: &Path,
+) -> Result<Arc<Mutex<LspSession>>, String> {
+    let root = lsp::workspace_root(path);
+    // 既存セッション（root に生きていれば）を再利用する
+    {
+        let d = daemon.lock().await;
+        if let Some(session) = d.lsp_sessions.get(&root) {
+            let reuse = match session.try_lock() {
+                Ok(s) => !s.client.is_dead(),
+                Err(_) => true, // 同期中: 生きているとみなして再利用
+            };
+            if reuse {
+                return Ok(session.clone());
+            }
+        }
+    }
+    // 未作成 or 死亡: ロックを離して spawn + initialize（M1）
+    // ponytail: MINA_LSP_COMMAND はテスト用シーム（daemon 統合テストが mock
+    // サーバを指す）。本番では server_for の組み込みテーブルを使う。
+    let command = std::env::var("MINA_LSP_COMMAND").unwrap_or_else(|_| {
+        lsp::server_for(path)
+            .expect("ensure は LSP 対応ファイルでのみ呼ばれる")
+            .to_string()
+    });
+    let session = lsp::LspSession::new(&command, &root).await?;
+    let arc = Arc::new(Mutex::new(session));
+    // 保存（短いロック・await なし）。
+    let mut d = daemon.lock().await;
+    // 同時 ensure レース: 既存が生きていればそちらを優先する
+    if let Some(existing) = d.lsp_sessions.get(&root) {
+        let alive = match existing.try_lock() {
+            Ok(s) => !s.client.is_dead(),
+            Err(_) => true, // 同期中: 生きているとみなす
+        };
+        if alive {
+            // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
+            // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
+            return Ok(existing.clone());
+        }
+    }
+    // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
+    // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
+    d.lsp_sessions.insert(root, arc.clone());
+    Ok(arc)
+}
+
+/// セマンティック要求（rename / references）の前に、ワークスペース内の同拡張子
+/// ファイルを didOpen する。
+///
+/// 実測（M0/M1）: rust-analyzer は didOpen していないファイルの参照を
+/// `textDocument/references` / `rename` の結果に含めない（開いていない
+/// main.rs の使用箇所が rename で取りこぼされた）。AB ハーネス（tools/ab）も
+/// 全ファイル didOpen を採用していた。対象拡張子のみ・生成ディレクトリ
+/// （target/.git 等）除外・件数と合計バイトの上限で防護する。
+async fn open_workspace_files(
+    daemon: &Mutex<Daemon>,
+    session: &Mutex<LspSession>,
+    path: &Path,
+) {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return;
+    };
+    let root = lsp::workspace_root(path);
+    let mut files = Vec::new();
+    collect_workspace_files(&root, ext, &mut files, 0);
+    // ディスクから読む（上限付き）。開文書の未保存編集は後で優先する。
+    let mut to_open: Vec<(PathBuf, String)> = Vec::new();
+    for f in files {
+        if let Some(text) = read_open_capped(&f).await {
+            to_open.push((f, text));
+        }
+    }
+    // 開文書の未保存編集を優先（ディスクとズレた didOpen で解析を汚さない）
+    {
+        let d = daemon.lock().await;
+        for (path, text) in &mut to_open {
+            if let Some(id) = d.editor.doc_id_for_path(path) {
+                *text = d.editor.document(id).text().to_string();
+            }
+        }
+    }
+    let Ok(mut session) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return;
+    };
+    if session.client.is_dead() {
+        return;
+    }
+    for (path, text) in to_open {
+        session.did_open(&path, &text).await;
+    }
+}
+
+/// ワークスペース走査の上限（防護。実プロジェクトのソースは数十ファイルだが、
+/// 生成物を紛れ込ませないため件数・合計バイトで切る）。
+const MAX_WORKSPACE_OPEN_FILES: usize = 400;
+const MAX_WORKSPACE_OPEN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `root` 以下を再帰走査し、`ext` と同じ拡張子のファイルを収集する。
+/// 生成ディレクトリ（target/.git/node_modules 等）と上限を超えた分は無視。
+fn collect_workspace_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, mut bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_WORKSPACE_OPEN_FILES || bytes >= MAX_WORKSPACE_OPEN_BYTES {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // 生成物・メタデータのディレクトリは再帰しない
+            if matches!(name, "target" | ".git" | "node_modules" | "vendor" | "build" | "dist")
+            {
+                continue;
+            }
+            collect_workspace_files(&path, ext, out, bytes);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            continue;
+        }
+        if let Ok(md) = std::fs::metadata(&path) {
+            if md.is_file() && md.len() <= MAX_WORKSPACE_OPEN_BYTES {
+                bytes += md.len();
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// サイズ上限付きのディスク読み（ディレクトリ・過大は None）。
+async fn read_open_capped(path: &Path) -> Option<String> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let meta = file.metadata().await.ok()?;
+    if !meta.is_file() || meta.len() > MAX_WORKSPACE_OPEN_BYTES {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(MAX_WORKSPACE_OPEN_BYTES + 1)
+        .read_to_string(&mut s)
+        .await
+        .ok()?;
+    if s.len() as u64 > MAX_WORKSPACE_OPEN_BYTES {
+        return None;
+    }
+    Some(s)
+}
+
+/// 診断の実体は pull（[lsp::pull_after_edit] / [`settle_open_diagnostics`]）で更新する。
+/// ここでは MEDIUM-3（サーバ死亡時のクリア）だけを行う。push（publishDiagnostics）
+/// は flycheck（cargo check・ディスク基準）由来で、編集内容と食い違う stale な
+/// 診断を publish することがあり、pull の結果を上書きしないよう適用しない。
+fn drain_into(daemon: &mut Daemon) {
+    let Some(path) = daemon.editor.focused_path() else {
+        daemon.diagnostics.clear();
+        return;
+    };
+    let Some(session) = daemon.lsp_sessions.get(&lsp::workspace_root(path)) else {
+        // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
+        // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
+        daemon.diagnostics.clear();
+        return;
+    };
+    let doc_uri = lsp::uri(path);
+    let Ok(session) = session.try_lock() else {
+        return;
+    };
+    // MEDIUM-3: サーバが死んだら古い診断を残さない（下線・カウントが文書と
+    // 不整合のまま表示され続ける）。再 spawn は次回 .rs Open 時（ADR-0009）。
+    // ヒントも同様に消す（死んだサーバの解析結果は表示・配信しない。ADR-0020）。
+    if session.client.is_dead() {
+        daemon.diagnostics.clear();
+        daemon.hints.clear();
+        daemon.hint_order.clear();
+    } else if session.current_uri() != Some(doc_uri.as_str()) {
+        // フォーカスが LSP 対象外の文書に移ったら診断は残さない
+        daemon.diagnostics.clear();
+    }
+}
+
+/// Open 直後の診断追跡タスク: 初期解析が完了するまで pull を繰り返し、
+/// 診断と inlay hint を daemon に反映する。更新のたびに購読者（TUI）へ
+/// push する — ヒント・診断は generation を進めないため、クライアント側は
+/// 内容比較（`snapshot != state`）で再描画する（#24 のフィードバック）。
+///
+/// rust-analyzer の初期解析（crate ロード）は数秒かかり、その間の pull は空を
+/// 返す。非空が 2 回連続で返ったら解析完了とみなして終了する（空の連続は
+/// 「解析未完」と区別できないため安定判定しない。30 秒間空ならクリーン
+/// ファイルとみなして停止）。フォーカスが別文書に移ったら中断する。
+/// 上限 120 回 = 60 秒。
+async fn settle_open_diagnostics(
+    daemon: &Mutex<Daemon>,
+    session: Arc<Mutex<LspSession>>,
+    path: PathBuf,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
+) {
+    settle_open_diagnostics_loop(daemon, session, path.clone(), push_tx).await;
+    // ADR-0028: ループの全出口（安定・タイムアウト・フォーカス移動・サーバ死）で
+    // 活動を除去する（追加は Open 側が spawn 前に行う。idempotent なので安全）。
+    let mut d = daemon.lock().await;
+    d.remove_activity(&path, ActivityKind::DiagnosticsSettle);
+}
+
+async fn settle_open_diagnostics_loop(
+    daemon: &Mutex<Daemon>,
+    session: Arc<Mutex<LspSession>>,
+    path: PathBuf,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
+) {
+    let mut prev: Option<usize> = None;
+    for i in 0..120 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // 現在のテキストを掴んでから pull（フォーカス移動・編集の最中は中断）
+        let text = {
+            let d = daemon.lock().await;
+            if d.editor.focused_path().map(Path::to_path_buf).as_deref() != Some(path.as_path()) {
+                return;
+            }
+            d.editor.current_document().text().to_string()
+        };
+        let pulled = {
+            let Ok(mut s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
+                continue;
+            };
+            if s.client.is_dead() {
+                return;
+            }
+            // ヒントも診断と同じループで pull し、キャッシュに載せる（ADR-0020）。
+            // 解析未完の間は空が返るが、次の反復で追いつく。
+            (
+                s.pull_diagnostics(&path, &text).await,
+                s.pull_inlay_hints(&path, &text).await,
+            )
+        };
+        let Some(diags) = pulled.0 else {
+            continue; // 解析中のキャンセル等: 次回に持ち越し
+        };
+        let n = diags.len();
+        let mut d = daemon.lock().await;
+        d.diagnostics = diags;
+        if let Some(hints) = pulled.1 {
+            d.cache_hints(path.clone(), &text, hints);
+        }
+        // ヒント・診断の反映は generation を進めないが、見え方を変える。
+        // 購読者へスナップショットを作り直して配る（クライアントは内容比較で
+        // 再描画する。自分の応答と同じ内容なら捨てられる）。
+        let snap = snapshot(&mut d, None);
+        drop(d);
+        // 発信元はコマンドでない（LSP settle）ため None を包み、全クライアントに届く。
+        let _ = push_tx.send((None, snap));
+        if n > 0 {
+            // 非空が返った = 解析完了の確証。2回連続同じ件数なら安定とみなす
+            // （誤検出: 解析未完の空（0,0,0...）を安定と誤認しないため、
+            //  空の場合は安定判定しない）。
+            if prev == Some(n) {
+                return;
+            }
+        } else if i >= 60 {
+            // 30秒間空のまま: クリーンファイルとみなして停止（解析が遅くても
+            // 次の編集の pull で自己修復する）。
+            return;
+        }
+        prev = Some(n);
+    }
+}
+
+/// M1/ADR-0009: 編集後の LSP 全文同期 + pull を1経路に集約する（コマンド編集・
+/// DocumentEdit・外部リロード watch_disk の3箇所が同じ規律を個別に再現していた）。
+///
+/// ロック規律はこの関数だけが知る: 同期対象（セッション・パス・テキスト）の
+/// 取り出しは呼び出し側のロック内で済ませておき、ここでは LSP の await を
+/// ロック外で行い、結果を re-lock して反映してからスナップショットを返す。
+/// `target` が None でも drain_into（診断クリア・サーバ死亡時の古い診断除去）
+/// は実行される。`activity` は同期の前後で公開する Activity（ADR-0028。
+/// リロード時のみ使用）。
+async fn sync_after_edit(
+    daemon: &Mutex<Daemon>,
+    target: Option<(Arc<Mutex<LspSession>>, PathBuf, String)>,
+    status: Option<String>,
+    activity: Option<(ActivityKind, &'static str)>,
+) -> StateSnapshot {
+    if let Some((kind, label)) = activity {
+        let path = target.as_ref().map(|(_, path, _)| path.as_path());
+        if let Some(path) = path {
+            let mut d = daemon.lock().await;
+            d.add_activity(path, kind, label);
+            drop(d);
+        }
+    }
+    if let Some((session, path, text)) = &target {
+        lsp::sync(session, path, text).await;
+        let (pulled_diags, pulled_hints) = lsp::pull_after_edit(session, path, text).await;
+        let mut d = daemon.lock().await;
+        if let Some((kind, _)) = activity {
+            d.remove_activity(path, kind);
+        }
+        if let Some(diags) = pulled_diags {
+            d.diagnostics = diags;
+        }
+        if let Some(hints) = pulled_hints {
+            d.cache_hints(path.clone(), text, hints);
+        }
+        drain_into(&mut d);
+        snapshot(&mut d, status)
+    } else {
+        let mut d = daemon.lock().await;
+        drain_into(&mut d);
+        snapshot(&mut d, status)
     }
 }
 
@@ -1720,9 +2046,7 @@ async fn process_command(
                             if let Some(doc_id) = d.editor.doc_id_for_path(&path_buf) {
                                 // 外部書き込みとして Insert グループを閉じる
                                 if d.insert_owner.is_some() {
-                                    d.editor.end_group();
-                                    d.editor.set_mode(mina_view::Mode::Normal);
-                                    d.insert_owner = None;
+                                    close_insert_session(&mut d, mina_view::Mode::Normal);
                                 }
                                 if d.editor.reload_doc(doc_id, new_text) {
                                     d.record_event(
@@ -1741,7 +2065,7 @@ async fn process_command(
                     // didOpen を再通知する（フルテキスト同期なので再利用への
                     // 再通知は無害）。
                     let session = if lsp::server_for(&path_buf).is_some() {
-                        match lsp::ensure(&daemon, &path_buf).await {
+                        match ensure(&daemon, &path_buf).await {
                             Ok(s) => Some(s),
                             Err(_) => None, // サーバが無くても文書は保持される
                         }
@@ -1760,7 +2084,7 @@ async fn process_command(
                         let path_task = path_buf.clone();
                         let push_task = push_tx.clone();
                         tokio::spawn(async move {
-                            lsp::settle_open_diagnostics(
+                            settle_open_diagnostics(
                                 &daemon_task,
                                 session_task,
                                 path_task,
@@ -1770,7 +2094,7 @@ async fn process_command(
                         });
                     }
                     let mut d = daemon.lock().await;
-                    lsp::drain_into(&mut d);
+                    drain_into(&mut d);
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
                     snapshot(&mut d, None)
@@ -1782,7 +2106,7 @@ async fn process_command(
                     // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
                     // daemon ロック外で行う。失敗時は status に載せる。
                     let session = if contents.is_some() && lsp::server_for(&path_buf).is_some() {
-                        match lsp::ensure(&daemon, &path_buf).await {
+                        match ensure(&daemon, &path_buf).await {
                             Ok(s) => Some(s),
                             Err(msg) => {
                                 open_status = Some(msg);
@@ -1837,7 +2161,7 @@ async fn process_command(
                         let path_task = path_buf.clone();
                         let push_task = push_tx.clone();
                         tokio::spawn(async move {
-                            lsp::settle_open_diagnostics(
+                            settle_open_diagnostics(
                                 &daemon_task,
                                 session_task,
                                 path_task,
@@ -1847,7 +2171,7 @@ async fn process_command(
                         });
                     }
                     let mut d = daemon.lock().await;
-                    lsp::drain_into(&mut d);
+                    drain_into(&mut d);
                     snapshot(&mut d, open_status)
                 }
             }
@@ -2003,28 +2327,7 @@ async fn process_command(
                     None
                 };
                 drop(d);
-                if let Some((session, path, text)) = sync_target {
-                    lsp::sync(&session, &path, &text).await;
-                    // 編集後のライブ診断は push ではなく pull で取る（flycheck は
-                    // ディスク基準のため編集内容を反映しない。上流フィードバック
-                    // どおり pull を扱う）。解析完了まで短く待ってから打つ。
-                    // ヒントも同じ経路で pull する（ADR-0020）。
-                    let (pulled_diags, pulled_hints) =
-                        lsp::pull_after_edit(&session, &path, &text).await;
-                    let mut d = daemon.lock().await;
-                    if let Some(diags) = pulled_diags {
-                        d.diagnostics = diags;
-                    }
-                    if let Some(hints) = pulled_hints {
-                        d.cache_hints(path.clone(), &text, hints);
-                    }
-                    lsp::drain_into(&mut d);
-                    snapshot(&mut d, None)
-                } else {
-                    let mut d = daemon.lock().await;
-                    lsp::drain_into(&mut d);
-                    snapshot(&mut d, None)
-                }
+                sync_after_edit(daemon, sync_target, None, None).await
             }
             Err(_) => {
                 // ADR-0011: Command として解釈できなければ DocumentEdit を試す
@@ -2062,23 +2365,8 @@ async fn process_command(
                         drop(d);
                         if let Some(rejected) = rejected {
                             rejected
-                        } else if let Some((session, path, text)) = sync_target {
-                            lsp::sync(&session, &path, &text).await;
-                            let (pulled_diags, pulled_hints) =
-                                lsp::pull_after_edit(&session, &path, &text).await;
-                            let mut d = daemon.lock().await;
-                            if let Some(diags) = pulled_diags {
-                                d.diagnostics = diags;
-                            }
-                            if let Some(hints) = pulled_hints {
-                                d.cache_hints(path.clone(), &text, hints);
-                            }
-                            lsp::drain_into(&mut d);
-                            snapshot(&mut d, None)
                         } else {
-                            let mut d = daemon.lock().await;
-                            lsp::drain_into(&mut d);
-                            snapshot(&mut d, None)
+                            sync_after_edit(daemon, sync_target, None, None).await
                         }
                     }
                     Err(_) => {
@@ -2319,6 +2607,16 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
 
 /// 書き込み競合の後勝ち奪取（HIGH-1 確定設計）: 別クライアントが開いた Insert
 /// グループが開いている間に、非所有者の書き込みが来たら、先にそのグループを
+/// ADR-0007/HIGH-1: 開いている Insert グループを閉じ、モードを移す。
+/// 不変条件「mode == Insert ⟺ insert_owner == Some(_)」の解除を1箇所に持つ
+/// （切断・外部書き込み・奪取・SetMode の4経路が以前は3行を個別に再現していた）。
+/// 呼び出し側が事前に条件（所有者一致・外部書き込み・奪取）を判定する。
+fn close_insert_session(daemon: &mut Daemon, mode: mina_view::Mode) {
+    daemon.editor.end_group();
+    daemon.editor.set_mode(mode);
+    daemon.insert_owner = None;
+}
+
 /// 閉じて Normal に戻してから編集を適用する。これにより 1 つの UndoGroup に
 /// 異なるクライアントの編集が混入しない（単一書き手への直列化）。
 ///
@@ -2327,9 +2625,7 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
 fn preempt(daemon: &mut Daemon, conn_id: u64) {
     if let Some(owner) = daemon.insert_owner {
         if owner != conn_id && daemon.editor.mode() == mina_view::Mode::Insert {
-            daemon.editor.end_group();
-            daemon.editor.set_mode(mina_view::Mode::Normal);
-            daemon.insert_owner = None;
+            close_insert_session(daemon, mina_view::Mode::Normal);
         }
     }
 }
@@ -2648,10 +2944,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 enter_insert(daemon, conn_id);
             } else {
                 if current == mina_view::Mode::Insert {
-                    daemon.editor.end_group();
-                    daemon.insert_owner = None;
+                    close_insert_session(daemon, new_mode);
+                } else {
+                    daemon.editor.set_mode(new_mode);
                 }
-                daemon.editor.set_mode(new_mode);
             }
             (snapshot(daemon, None), new_mode != current)
         }
@@ -2806,6 +3102,106 @@ pub fn socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use mina_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
+
+    // lsp.rs から移設（daemon 統合の ensure / drain_into を直接検証する）
+    #[tokio::test]
+    async fn ensure_replaces_dead_session() {
+        // M3/ADR-0009: サーバが死んだら次の .rs Open で再 spawn される。
+        // 死亡セッションを返し続けず、新しいセッションに置き換わることを検証する。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let daemon = Arc::new(Mutex::new(Daemon::new()));
+        let session = lsp::LspSession::new(bin, Path::new("/tmp"))
+            .await
+            .expect("initialize");
+        let dead = Arc::new(Mutex::new(session));
+        daemon
+            .lock()
+            .await
+            .lsp_sessions
+            .insert(lsp::workspace_root(Path::new("/tmp/x.rs")), dead.clone());
+
+        // サーバを殺して is_dead になるまで待つ（reader タスクが EOF を拾う）
+        dead.lock().await.client.kill().await;
+        let mut is_dead = false;
+        for _ in 0..100 {
+            if dead.lock().await.client.is_dead() {
+                is_dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(is_dead, "サーバを殺すと is_dead になる");
+
+        let replaced = ensure(&daemon, Path::new("/tmp/x.rs"))
+            .await
+            .expect("再 spawn できる");
+        assert!(
+            !Arc::ptr_eq(&dead, &replaced),
+            "新しいセッションで置き換わる"
+        );
+        assert!(
+            !replaced.lock().await.client.is_dead(),
+            "返るセッションは生きている"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_into_clears_stale_diagnostics_when_server_dies() {
+        // MEDIUM-3: サーバが死んだ後も古い診断（下線・カウント）が残り続けない。
+        // 死んだ時点でクリアし、再 spawn 後の Open で新しく載る。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let mut daemon = Daemon::new();
+        let path = PathBuf::from("/tmp/x.rs");
+        daemon
+            .editor
+            .open_with_path(path.clone(), "fn main() { TODO }");
+        let session = Arc::new(Mutex::new(
+            lsp::LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        daemon
+            .lsp_sessions
+            .insert(lsp::workspace_root(&path), session.clone());
+
+        // pull で TODO 診断を取り込んでから殺す（MEDIUM-3 の前提: 診断がある状態）
+        session
+            .lock()
+            .await
+            .did_open(&path, "fn main() { TODO }")
+            .await;
+        let diags = session
+            .lock()
+            .await
+            .pull_diagnostics(&path, "fn main() { TODO }")
+            .await
+            .expect("pull 診断が返る");
+        daemon.diagnostics = diags;
+        assert!(!daemon.diagnostics.is_empty(), "診断が入っている");
+
+        // サーバを殺す → drain で古い診断がクリアされる
+        session.lock().await.client.kill().await;
+        let mut is_dead = false;
+        for _ in 0..100 {
+            if session.lock().await.client.is_dead() {
+                is_dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(is_dead, "サーバを殺すと is_dead になる");
+        drain_into(&mut daemon);
+        assert!(
+            daemon.diagnostics.is_empty(),
+            "サーバ死亡後の古い診断は残らない"
+        );
+    }
 
     fn daemon() -> Daemon {
         Daemon::new()
