@@ -40,6 +40,9 @@ pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
 pub struct LspSession {
     /// pub(crate): daemon 統合（ensure / drain / settle）が生死判定に読む。
     pub(crate) client: Client,
+    /// initialize 応答から導出したサーバ能力（ADR-0030 Stage 3）。機能ゲートは
+    /// daemon 側（rename / references / peek）と pull 側（診断 / inlay hints）が読む。
+    pub(crate) caps: ServerCapabilities,
     encoding: PositionEncoding,
     version: i64,
     current_uri: Option<String>,
@@ -48,6 +51,41 @@ pub struct LspSession {
     /// `textDocument.languageId`（spawn 元ファイルの言語。ADR-0030）。
     /// セッション生成後に変わらない（root+言語キーの拡張は Stage 4）。
     language_id: String,
+}
+
+/// initialize 応答の capabilities から導出したサーバ能力（ADR-0030 Stage 3）。
+///
+/// 未 advertise の機能は要求しない（要求すると MethodNotFound 等の往復・10 秒リトライ
+/// を無駄にする — 検証済みサーバ以外は capability が自然なゲートになる）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ServerCapabilities {
+    /// `textDocument/diagnostic`（pull 診断）を提供する。
+    pub(crate) pull_diagnostics: bool,
+    /// `textDocument/inlayHint` を提供する。
+    pub(crate) inlay_hints: bool,
+    /// `textDocument/rename` を提供する。
+    pub(crate) rename: bool,
+    /// `textDocument/references` を提供する。
+    pub(crate) references: bool,
+    /// `textDocument/definition` を提供する。
+    pub(crate) definition: bool,
+}
+
+/// initialize 応答から能力を導出する。`renameProvider: false` 等の明示 false と
+/// キー欠落は非対応扱い、`true` とオブジェクト形式（RenameOptions 等）は対応扱い。
+fn capabilities_of(result: &Value) -> ServerCapabilities {
+    let cap = |path: &str| -> bool {
+        result
+            .pointer(&format!("/capabilities{path}"))
+            .is_some_and(|v| !matches!(v, Value::Bool(false)))
+    };
+    ServerCapabilities {
+        pull_diagnostics: result.pointer("/capabilities/diagnosticProvider").is_some(),
+        inlay_hints: cap("/inlayHintProvider"),
+        rename: cap("/renameProvider"),
+        references: cap("/referencesProvider"),
+        definition: cap("/definitionProvider"),
+    }
 }
 
 /// `file://` URI。
@@ -107,6 +145,7 @@ impl LspSession {
             .request("initialize", params)
             .await
             .map_err(|e| format!("initialize に失敗しました: {e}"))?;
+        let caps = capabilities_of(&result);
         let encoding = match result
             .pointer("/capabilities/positionEncoding")
             .and_then(|v| v.as_str())
@@ -125,6 +164,7 @@ impl LspSession {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             client,
+            caps,
             encoding,
             version: 0,
             current_uri: None,
@@ -191,7 +231,12 @@ impl LspSession {
     /// 現在の診断を維持する）。rust-analyzer はライブ（in-memory）の診断を
     /// push（publishDiagnostics）ではなく pull で返すため、編集後の診断更新は
     /// この経路で行う（上流フィードバック: クライアントは両方扱うべき）。
+    /// サーバが `diagnosticProvider` を advertise していなければ `Some(空)` ——
+    /// 診断を提供しないサーバとして正しく空にする（要求しない。Stage 3）。
     pub async fn pull_diagnostics(&mut self, path: &Path, text: &str) -> Option<Vec<Diagnostic>> {
+        if !self.caps.pull_diagnostics {
+            return Some(Vec::new());
+        }
         let doc_uri = uri(path);
         if self.current_uri.as_deref() != Some(doc_uri.as_str()) {
             return None;
@@ -214,7 +259,12 @@ impl LspSession {
     ///
     /// 診断の pull と同じ形状: 現在の文書以外には応えない（`None`）。応答は
     /// 全文範囲のヒント配列。座標はネゴシエート済み encoding で変換する。
+    /// サーバが `inlayHintProvider` を advertise していなければ `Some(空)` ——
+    /// 表示や配信のないサーバとして正しく空にする（要求しない。Stage 3）。
     pub async fn pull_inlay_hints(&mut self, path: &Path, text: &str) -> Option<Vec<InlayHint>> {
+        if !self.caps.inlay_hints {
+            return Some(Vec::new());
+        }
         let doc_uri = uri(path);
         if self.current_uri.as_deref() != Some(doc_uri.as_str()) {
             return None;
@@ -1120,6 +1170,42 @@ mod tests {
     use super::*;
 #[cfg(test)]
 use std::sync::Arc;
+
+    #[test]
+    fn capabilities_of_parses_initialize_response() {
+        // 全機能 advertise（rust-analyzer / mock 相当）: 全部対応
+        let caps = capabilities_of(&json!({
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "diagnosticProvider": { "identifier": "x" },
+                "inlayHintProvider": {},
+                "renameProvider": true,
+                "referencesProvider": true,
+            }
+        }));
+        assert!(caps.pull_diagnostics);
+        assert!(caps.inlay_hints);
+        assert!(caps.rename);
+        assert!(caps.references);
+        assert!(!caps.definition, "未 advertise は非対応");
+        // 何も advertise しないサーバ（未検証サーバの自然なゲート）
+        let none = capabilities_of(&json!({ "capabilities": {} }));
+        assert!(!none.pull_diagnostics && !none.inlay_hints && !none.rename && !none.references);
+        assert!(!none.definition);
+        // 明示 false は非対応扱い。オブジェクト形式（RenameOptions 等）は対応扱い
+        let mixed = capabilities_of(&json!({
+            "capabilities": {
+                "renameProvider": false,
+                "definitionProvider": true,
+            }
+        }));
+        assert!(!mixed.rename);
+        assert!(mixed.definition);
+        let obj = capabilities_of(&json!({
+            "capabilities": { "renameProvider": { "prepareProvider": true } }
+        }));
+        assert!(obj.rename, "オブジェクト形式の renameProvider は対応");
+    }
 
     #[test]
     fn lsp_pos_to_char_utf8_multi_line() {
