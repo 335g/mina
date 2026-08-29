@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""mina A/B read/edit shim — read side.
+"""minae A/B read/edit shim — read side.
 
 Model-facing interface (bash-only agent):
     r <path> [start:end]
-        read lines of <path> via mina `session get --lines` (numbered lines).
+        read lines of <path> via minae `session get --lines` (numbered lines).
         Without a range, prints a short head (first 25 lines) to avoid dumping
         the whole file (the model must use ranges — that is the point).
         Out-of-range start prints the explained zero result (Q3/R1).
 
 Mode selectable via argv[0] wrapper (read_shim.py range|full ...).
-Mode "full": `mina session get` full snapshot is printed instead (for the
+Mode "full": `minae session get` full snapshot is printed instead (for the
 Arm-B comparison) — forces whole-file reads.
 
 Environment:
-    MAB_MINABIN   path to the mina binary
+    MAB_MINABIN   path to the minae binary
     MAB_AUDIT     audit log path (append lines)
 """
 import json, os, subprocess, sys

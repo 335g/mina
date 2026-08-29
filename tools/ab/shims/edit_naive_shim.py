@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mina A/B edit shim — naive (blind replace) edit side.
+"""minae A/B edit shim — naive (blind replace) edit side.
 
 Model-facing interface (bash-only agent):
     e <path> <old> <new>

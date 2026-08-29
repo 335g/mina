@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""opencode ツール制御 A/B ハーネス（mina CLI 経由のエディタ契約を実LLMで測る）。
+"""opencode ツール制御 A/B ハーネス（minae CLI 経由のエディタ契約を実LLMで測る）。
 
 使い方:
     ab.py run <t2|t3> <A|B> <idx>   — 1 run 実行（workdir /tmp/ab-run/ws、計測込み）
@@ -7,7 +7,7 @@
 
 コマンド構成:
   - opencode.json に bash 専用 agent（native read/edit/glob/grep を無効化）を書き、
-    `opencode run --agent <agent>` で実行。ファイル読み書きは全て mina CLI をラップ
+    `opencode run --agent <agent>` で実行。ファイル読み書きは全て minae CLI をラップ
     した shim（r / e）を通す。
   - 計測は ~/.local/share/opencode/opencode.db の step-finish（tokens/cost）から。
   - 設計意図: 手段の差（範囲read vs 全文read / apply vs edit / 拒否理由の有無）だけを
@@ -31,9 +31,9 @@ OPENCODE = os.environ.get(
     "OPENCODE_BIN",
     "/Users/335g/.local/share/mise/installs/opencode/1.14.30/opencode",
 )
-MINA = os.environ.get("MAB_MINABIN", str(REPO / "target" / "debug" / "mina"))
+MINA = os.environ.get("MAB_MINABIN", str(REPO / "target" / "debug" / "minae"))
 MODEL = os.environ.get("MAB_MODEL", "opencode/gpt-5.4-nano")
-AGENT = "mina-bash"
+AGENT = "minae-bash"
 
 TOOLS_OFF = {
     "bash": True,
@@ -173,7 +173,7 @@ def fixture_t8():
 
 def fixture_t9():
     """T9 (M2): Rust analog of T5 — 3-file crate, many occurrences
-    (USD x12, price x7), cross-file. The regime where mina's OWN semantic
+    (USD x12, price x7), cross-file. The regime where minae's OWN semantic
     rename (`session rename`, ADR-0029) should beat an apply loop."""
     (WORK / "ws" / "Cargo.toml").write_text(
         "[package]\nname = \"abrs\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
@@ -285,7 +285,7 @@ fn main() {
 def fixture_t10():
     """T10 (Stage 4): TypeScript analog of T9 — 3-file TS project, many
     occurrences (USD x21, price x9), cross-file with imports. Regime where
-    mina's OWN semantic rename (`session rename` via typescript-language-server,
+    minae's OWN semantic rename (`session rename` via typescript-language-server,
     ADR-0030 Stage 4) should beat an apply loop."""
     (WORK / "ws" / "package.json").write_text('{"name": "abts", "private": true}\n')
     (WORK / "ws" / "src").mkdir(parents=True, exist_ok=True)
@@ -342,7 +342,7 @@ Work in small steps: mread a range (e.g. mread cfg.rs 1:20), then medit the exac
 text you saw. When both changes are in place, verify with a final mread and reply
 with exactly: DONE
 Do not modify anything else.""",
-    # Test8: does `mina skill` steer AWAY from the positional trap when both
+    # Test8: does `minae skill` steer AWAY from the positional trap when both
     # a positional tool (medit) and a content-resolved tool (mapply) exist?
     # Task gives explicit line numbers -> positional pull. Tools neutral.
     "t8-A": """Audit constants in cfg.rs. The five target lines are exactly:
@@ -360,8 +360,8 @@ Available file commands:
   mapply <path> <old> <new>            replacement of the first occurrence of <old>
   mcheck <path>                        print the file checksum
 
-mina also provides skill guides: run `mina skill` for the index and
-`mina skill <topic>` to read one (read/edit/errors). Consult the edit guide
+minae also provides skill guides: run `minae skill` for the index and
+`minae skill <topic>` to read one (read/edit/errors). Consult the edit guide
 BEFORE choosing how you will perform the updates.
 When all 5 values are updated, verify with mread and reply with exactly: DONE""",
     "t8-B": """Audit constants in cfg.rs. The five target lines are exactly:
@@ -381,7 +381,7 @@ Available file commands:
 
 When all 5 values are updated, verify with mread and reply with exactly: DONE""",
 
-    # Same real rejection messages in both arms; only the `mina skill` reference
+    # Same real rejection messages in both arms; only the `minae skill` reference
     # differs (both may use mread/medit/mcheck).
     "t7-A": """Edit cfg.rs (a large generated file) in the current directory.
 It contains 8 target constants, each currently equal to 100 + its number
@@ -392,8 +392,8 @@ Available file commands:
   mread <path> [start:end]   read lines of a file (numbered)
   medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
 
-mina also provides skill guides for how to use these tools:
-run `mina skill` for the index and `mina skill <topic>` to read one
+minae also provides skill guides for how to use these tools:
+run `minae skill` for the index and `minae skill <topic>` to read one
 (topics: read, edit, persist, errors). If an edit is rejected, follow the
 guidance in the errors guide before retrying.
 When all 8 targets are updated, verify each final value with mread and reply
@@ -422,8 +422,8 @@ Available file commands (in $PATH):
   mrename <path> <old> <new> language-aware rename (all references, one call)
   mcheck <path>              print a file checksum
 
-mina also provides skill guides for how to use these editing tools:
-run `mina skill` to list the topics, and `mina skill <topic>` to read one
+minae also provides skill guides for how to use these editing tools:
+run `minae skill` to list the topics, and `minae skill <topic>` to read one
 (topics: read, edit, rename, persist, errors). Consult the relevant guide
 BEFORE deciding how you will perform the renames.
 When done, verify that no occurrence of "USD" or "price" remains in ANY of
@@ -487,7 +487,7 @@ First mread rename.ts to see the file, then use mrename for USD->JPY and for
 price->amount, then verify with a final mread that no "USD" or "price"
 remains, and reply with exactly: DONE""",
     # T9 (M2): Rust analog of T5. Arm A = apply loop (medit). Arm B = mrename
-    # backed by mina's OWN `session rename` (ADR-0029) instead of the harness's
+    # backed by minae's OWN `session rename` (ADR-0029) instead of the harness's
     # tsserver shim — measures whether the productized rename keeps the T5 win.
     "t9-A": """Refactor the Rust crate in the current directory
 (src/utils.rs, src/data.rs, src/main.rs):
@@ -551,7 +551,7 @@ text you saw verbatim as <old> — it is used to locate the edit.""",
 You MUST use these commands for all file access (no other file commands):
   mread <path> [start:end]   read lines of a file (numbered)
   mrename <path> <old> <new> perform a LANGUAGE-AWARE RENAME of the symbol whose
-     first identifier occurrence is <old> in <path> — mina (`session rename`)
+     first identifier occurrence is <old> in <path> — minae (`session rename`)
      finds and updates every reference (definition, calls, uses) across files
      in one call and saves. One mrename per symbol is enough; do not loop
      over occurrences. First mread the files to see the crate, then mrename
@@ -577,7 +577,7 @@ You MUST use these commands for all file access (no other file commands):
   mread <path> [start:end]   read lines of a file (numbered)
   mrename <path> <old> <new> perform a LANGUAGE-AWARE RENAME of the symbol whose
      first identifier occurrence is <old> in <path> — the language server
-     (typescript-language-server via mina `session rename`) finds and updates
+     (typescript-language-server via minae `session rename`) finds and updates
      every reference (definition, calls, imports, uses) across files in one
      call and saves. One mrename per symbol is enough; do not loop over
      occurrences. First mread the files to see the project, then mrename for
@@ -620,7 +620,7 @@ def build_workdir(test, arm):
     (wd / "audit.log").write_text("")
     # bash-only agent config
     cfg = {"agent": {AGENT: {
-        "description": "bash-only agent for mina A/B",
+        "description": "bash-only agent for minae A/B",
         "tools": TOOLS_OFF,
         "permission": {"bash": "allow"},
         "maxSteps": 30,
@@ -657,7 +657,7 @@ def build_workdir(test, arm):
     wr("mcheck", "check_shim.py", "x")
     if test == "t11":
         # T11 arms. A = naive generic tools (full-file reads, blind replace,
-        # no checksum — the "cat + sed" contract). B = the mina session
+        # no checksum — the "cat + sed" contract). B = the minae session
         # contract (numbered range reads, verified apply).
         if arm == "A":
             wr("mread", "read_naive_shim.py", "x")
@@ -683,10 +683,10 @@ def build_workdir(test, arm):
         wr("mapply", "edit_shim.py", "apply")
     if (test == "t6") or (test in ("t4", "t5") and arm == "B") or (test in ("t9", "t10") and arm == "B"):
         if test in ("t9", "t10"):
-            # mrename backed by mina's OWN session rename (M2, ADR-0029)
+            # mrename backed by minae's OWN session rename (M2, ADR-0029)
             p = wd / "bin" / "mrename"
             p.write_text(
-                f"#!/usr/bin/env bash\n{env} exec python3 {SHIMS}/rename_mina_shim.py \"$@\"\n")
+                f"#!/usr/bin/env bash\n{env} exec python3 {SHIMS}/rename_minae_shim.py \"$@\"\n")
             p.chmod(0o755)
         else:
             p = wd / "bin" / "mrename"
@@ -694,11 +694,11 @@ def build_workdir(test, arm):
                 f"#!/usr/bin/env bash\n{env}{lsp_env} exec python3 {SHIMS}/rename_shim.py \"$@\"\n")
             p.chmod(0o755)
     if test in ("t6", "t7", "t8") and arm == "A":
-        p = wd / "bin" / "mina"
+        p = wd / "bin" / "minae"
         p.write_text(
             f"#!/usr/bin/env bash\n"
             f"if [ \"${{1:-}}\" = \"skill\" ]; then exec {MINA} \"$@\"; fi\n"
-            f"echo \"error: only 'mina skill' is exposed here; use medit/mread for file operations\" >&2\n"
+            f"echo \"error: only 'minae skill' is exposed here; use medit/mread for file operations\" >&2\n"
             f"exit 1\n")
         p.chmod(0o755)
     if test == "t7":
@@ -815,12 +815,12 @@ def measure(sid):
                             "python3 -c", "python3 -f", ".replace(")
             if any(w in cmd for w in bypass_words):
                 bypass += 1
-            if "mina skill" in cmd:
+            if "minae skill" in cmd:
                 skills += 1
-            # a direct mina call that the sandbox wrapper REFUSED changed nothing
-            # (exit 1, "only 'mina skill' is exposed") — harmless; subtract below
+            # a direct minae call that the sandbox wrapper REFUSED changed nothing
+            # (exit 1, "only 'minae skill' is exposed") — harmless; subtract below
             out = str(st.get("output", ""))
-            if "only 'mina skill' is exposed" in out:
+            if "only 'minae skill' is exposed" in out:
                 refused += 1
     eff = max(0, bypass - refused)
     return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={eff} refused={refused} skills={skills}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mina A/B shim — LSP semantic rename (T4).
+"""minae A/B shim — LSP semantic rename (T4).
 
     mrename <path> <old> <new>
         Runs rust-analyzer (LSP over stdio) in the project containing <path>,

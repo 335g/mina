@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""mina A/B shim — checksum query (positional-edit arm needs it).
+"""minae A/B shim — checksum query (positional-edit arm needs it).
 
     mcheck <path>
-        opens <path> via mina and prints only the current checksum (one number),
+        opens <path> via minae and prints only the current checksum (one number),
         so the model can build a positional DocumentEdit JSON.
         Output is tiny (no full text) — keeps reads ranged.
 Env: MAB_MINABIN

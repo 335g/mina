@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""mina A/B shim — semantic rename via mina's OWN `session rename` (M2, ADR-0029).
+"""minae A/B shim — semantic rename via minae's OWN `session rename` (M2, ADR-0029).
 
     mrename <path> <old> <new>
-        Runs `mina session rename <path> <old> <new>`: content-addressed — mina
+        Runs `minae session rename <path> <old> <new>`: content-addressed — minae
         resolves <old> to the first identifier occurrence (comments/strings
         excluded), the language server (rust-analyzer) rewrites every reference
         across files, and the result is applied and saved to disk. Output is
-        mina's own impact line:
+        minae's own impact line:
             renamed: <old> -> <new> (N files, M edits)
             changed: <abs path>...
-        Passthrough of mina's exit code: 0 success / 1 input error (not
+        Passthrough of minae's exit code: 0 success / 1 input error (not
         supported, bad args — do not retry) / 2 retryable (symbol not found,
         LSP error, analysis incomplete — re-read and retry).
 """
@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-MINA = os.environ.get("MAB_MINABIN", "mina")
+MINA = os.environ.get("MAB_MINABIN", "minae")
 AUDIT = os.environ.get("MAB_AUDIT", "")
 
 
@@ -38,7 +38,7 @@ def main():
         audit("rename", f"{old}->{new} ok")
         out = r.stdout.strip()
         print(out)
-        # mina prints the impact on stdout; stderr may carry a dirty note — keep it
+        # minae prints the impact on stdout; stderr may carry a dirty note — keep it
         if r.stderr.strip():
             print(r.stderr.strip(), file=sys.stderr)
     else:

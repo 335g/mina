@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mina A/B read/edit shim — edit side.
+"""minae A/B read/edit shim — edit side.
 
 Model-facing interface (bash-only agent):
     e <path> <old> <new>          (edit mode: apply)   content-resolved replace (first occurrence)
@@ -9,9 +9,9 @@ Model-facing interface (bash-only agent):
 Mode selectable via argv[0] wrapper (edit_shim.py apply|edit|apply-generic).
 
 Difference between modes:
-  apply        : runs `mina session apply <path> <old> <new>` — content-
+  apply        : runs `minae session apply <path> <old> <new>` — content-
                  resolved, no positions, verified + saved in one call.
-  edit         : runs `mina session edit <json>` where the model supplies
+  edit         : runs `minae session edit <json>` where the model supplies
                  {start,end,text,checksum,expected_text} in char indices —
                  the positional path (must compute offsets itself).
   generic      : same as apply, but rejection/not-found stderr is rewritten to

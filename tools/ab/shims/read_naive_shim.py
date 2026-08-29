@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mina A/B read shim — naive (full-file) read side.
+"""minae A/B read shim — naive (full-file) read side.
 
 Model-facing interface (bash-only agent):
     r <path>
