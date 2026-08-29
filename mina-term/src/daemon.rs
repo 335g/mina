@@ -394,6 +394,12 @@ impl Daemon {
         self.languages.clone()
     }
 
+    /// パスに対応する LSP セッション（`session_root_for` のキーで引く）。
+    fn session_for(&self, path: &Path) -> Option<Arc<Mutex<LspSession>>> {
+        self.session_root_for(path)
+            .and_then(|root| self.lsp_sessions.get(&root).cloned())
+    }
+
     /// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
     /// ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
     /// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
@@ -715,8 +721,7 @@ async fn watch_disk(
         if let Some((path, text)) = &lsp_sync {
             let session = {
                 let d = daemon.lock().await;
-                d.session_root_for(path)
-                    .and_then(|root| d.lsp_sessions.get(&root).cloned())
+                d.session_for(path)
             };
             if let Some(session) = session {
                 // ADR-0028: 同期中を Activity として公開する（フォーカス文書のみ。
@@ -1306,8 +1311,13 @@ async fn serve_peek_definition_at(
         Ok(b) => b,
         Err(_) => return empty(),
     };
-    // サーバが definition を提供していなければ peek なし（空応答。Stage 3）
+    // サーバが definition を提供していなければ peek なし（空応答。Stage 3）。
+    // prepare が対象を didOpen 済みのため、借用していた場合はフォーカス文書へ
+    // 戻す（戻さないと LSP の current_uri が対象のまま — 次回編集の同期スキップ・
+    // 診断消失。敵対的検証 P1）。
     if !borrowed.session.lock().await.caps.definition {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
         return empty();
     }
     let borrows = daemon
@@ -1354,7 +1364,11 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
     };
     // サーバが references を提供していなければ即「not supported」（exit 1、再試行不可）。
     // 未 advertise のサーバに要求するとリトライ予算（約10秒）を無駄にする（Stage 3）。
+    // prepare が対象を didOpen 済みのため、借用していたらフォーカス文書へ戻す
+    // （戻さないと current_uri が対象のまま — 同期スキップ・診断消失。敵対的検証 P1）。
     if !borrowed.session.lock().await.caps.references {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
         return err_refs(
             path,
             format!(
@@ -1443,8 +1457,12 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
     // サーバが rename を提供していなければ即「not supported」（exit 1、再試行不可）。
-    // 未 advertise のサーバに要求するとワークスペース走査 + リトライ予算を無駄にする（Stage 3）。
+    // 未 advertise のサーバに要求するとワークスペース走査 + リトライ予算を無駄にする
+    // （Stage 3）。prepare が対象を didOpen 済みのため、借用していたらフォーカス文書へ
+    // 戻す（戻さないと current_uri が対象のまま — 同期スキップ・診断消失。敵対的検証 P1）。
     if !borrowed.session.lock().await.caps.rename {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
         return err(format!(
             "rename not supported for {} (LSP server が rename を advertise していません)",
             borrowed.path_str
@@ -1853,10 +1871,7 @@ fn drain_into(daemon: &mut Daemon) {
         daemon.diagnostics.clear();
         return;
     };
-    let Some(session) = daemon
-        .session_root_for(path)
-        .and_then(|root| daemon.lsp_sessions.get(&root))
-    else {
+    let Some(session) = daemon.session_for(path) else {
         // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
         // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
         daemon.diagnostics.clear();
@@ -2439,8 +2454,7 @@ async fn process_command(
                         // フォーカス文書の WorkspaceRoot に対応するセッションだけを
                         // 同期対象にする（ADR-0010）。LSP 対応以外の文書にはセッションが
                         // なく、同期スキップ + drain_into で診断が消える。
-                        d.session_root_for(&path)
-                            .and_then(|root| d.lsp_sessions.get(&root).cloned())
+                        d.session_for(&path)
                             .map(|session| {
                                 let text = d.editor.current_document().text().to_string();
                                 (session, path, text)
@@ -2476,8 +2490,7 @@ async fn process_command(
                         let sync_target = if rejected.is_none() {
                             // 編集後の LSP 同期（Command 編集と同じ経路。ADR-0009）
                             d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
-                                d.session_root_for(&path)
-                                    .and_then(|root| d.lsp_sessions.get(&root).cloned())
+                                d.session_for(&path)
                                     .map(|session| {
                                         let text =
                                             d.editor.current_document().text().to_string();
@@ -3397,23 +3410,53 @@ root-markers = [".docsroot"]
 
     #[tokio::test]
     async fn capabilities_gate_features_for_bare_server() {
-        // Stage 3 の負の経路: 能力を advertise しないサーバ（MINA_LSP_BARE の mock）に
-        // は機能要求が出ず、rename / references は「not supported」（exit 1 相当・再試行
-        // 不可のメッセージ）を即返し、peek は空になる（未 advertise サーバへの
-        // 10 秒リトライ・ワークスペース走査を防ぐ）。
+        // Stage 3 の負の経路: 能力を advertise しないサーバ（--bare の mock）には
+        // 機能要求が出ず、rename / references は「not supported」（exit 1 相当）を
+        // 即返し、peek は空になる。
+        //
+        // 実装上の注意: env（MINA_LSP_*）や XDG を変えると並列テストと競合するため、
+        // bare なセッションを直接 spawn して daemon に注入する。prepare_borrowed_session
+        // は ensure の再利用（root に生きたセッション）でこのセッションを掴む。
         let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
         if !std::path::Path::new(bin).exists() {
             eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
             return;
         }
-        unsafe { std::env::set_var("MINA_LSP_COMMAND", &bin) };
-        unsafe { std::env::set_var("MINA_LSP_BARE", "1") };
         let dir = std::env::temp_dir().join(format!("mina-caps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
+        // 失敗時も litter を残さない（temp 直下の .rs が他テストの workspace 走査に
+        // 混入してフレークの原因になる — 敵対的検証で発見）
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
         let path = dir.join("x.rs");
         std::fs::write(&path, "fn foo() {}").expect("write");
-        let path_str = path.to_string_lossy().into_owned();
+        // prepare_borrowed_session は normalize_open_path（canonicalize）するため、
+        // root キーも正準化後のパスから計算する（/var → /private/var を取り違えると
+        // ensure の再利用が外れて実サーバが spawn される）
+        let canon = std::fs::canonicalize(&path).expect("canonicalize");
+        let path_str = canon.to_string_lossy().into_owned();
         let daemon = Arc::new(Mutex::new(Daemon::new()));
+        let root = daemon.lock().await.languages.workspace_root(&canon);
+        let session = Arc::new(Mutex::new(
+            lsp::LspSession::new_with_config(bin, &root, &["--bare".to_string()], "rust", None)
+                .await
+                .expect("bare initialize"),
+        ));
+        let cap_bare = {
+            let s = session.lock().await;
+            !s.caps.rename
+                && !s.caps.references
+                && !s.caps.definition
+                && !s.caps.inlay_hints
+                && !s.caps.pull_diagnostics
+        };
+        assert!(cap_bare, "--bare は何も advertise しない");
+        daemon.lock().await.lsp_sessions.insert(root, session);
         match serve_rename(&daemon, &path_str, "foo", "bar").await {
             ServerMessage::RenameResult { error: Some(e), .. } => {
                 assert!(e.starts_with("rename not supported"), "{e}")
@@ -3430,9 +3473,15 @@ root-markers = [".docsroot"]
             ServerMessage::Peek { text, .. } => assert!(text.is_empty(), "peek は空のはず: {text}"),
             other => panic!("peek は空応答のはず: {other:?}"),
         }
-        unsafe { std::env::remove_var("MINA_LSP_BARE") };
-        unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
-        let _ = std::fs::remove_dir_all(&dir);
+        // 注入した bare セッションが借用され復元されたか（借用フローが壊れていないこと）
+        // 注意: 1 文に 2 つの daemon.lock() を書くと同一タスクで自己デッドロックする
+        // （非再入 tokio Mutex。一時ガードは文末まで生存）ため、ガードを block で区切る。
+        let alive = {
+            let d = daemon.lock().await;
+            let root = d.languages.workspace_root(&canon);
+            d.lsp_sessions.contains_key(&root)
+        };
+        assert!(alive, "bare セッションは残っている");
     }
 
     #[tokio::test]
@@ -5823,8 +5872,20 @@ root-markers = [".docsroot"]
         let _reset = ResetEnv;
 
         let dir = std::env::temp_dir();
+        // フィクスチャは PID スコープのサブディレクトリに置く（temp 直下に置くと
+        // workspace 走査（root=temp 全体）が他の残骸 .rs を取り込み結果が揺れる —
+        // 敵対的検証で発見。Drop ガードで失敗時も残骸を残さない）。
+        let work = dir.join(format!("mina-rn-work-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&work);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(work.clone());
         let sock = dir.join(format!("mina-rn-sock-{}.sock", std::process::id()));
-        let file = dir.join(format!("mina-rn-file-{}.rs", std::process::id()));
+        let file = work.join("fixture.rs");
         let _ = std::fs::remove_file(&sock);
         std::fs::write(&file, "let fee = 1\nlet tax = fee + 2\n").unwrap();
         start_server(&sock).await;
@@ -5919,8 +5980,20 @@ root-markers = [".docsroot"]
         let _reset = ResetEnv;
 
         let dir = std::env::temp_dir();
+        // フィクスチャは PID スコープのサブディレクトリに置く（temp 直下に置くと
+        // workspace 走査（root=temp 全体）が他の残骸 .rs を取り込み結果が揺れる —
+        // 敵対的検証で発見。Drop ガードで失敗時も残骸を残さない）。
+        let work = dir.join(format!("mina-ref-work-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&work);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(work.clone());
         let sock = dir.join(format!("mina-ref-sock-{}.sock", std::process::id()));
-        let file = dir.join(format!("mina-ref-file-{}.rs", std::process::id()));
+        let file = work.join("fixture.rs");
         let _ = std::fs::remove_file(&sock);
         std::fs::write(&file, "let fee = 1\nlet tax = fee + 2\n").unwrap();
         start_server(&sock).await;
