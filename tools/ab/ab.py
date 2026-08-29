@@ -237,8 +237,8 @@ impl Default for Config {
 
 // decode: tiny JSON-ish parser (key presence decides the value)
 pub fn decode(json: &str) -> Result<Config, String> {
-    let timeout = if json.contains("\"timeout\"") { 5000 } else { 5000 };
-    let retries = if json.contains("\"retries\"") { 3 } else { 3 };
+    let timeout = if json.contains("\\\"timeout\\\"") { 5000 } else { 5000 };
+    let retries = if json.contains("\\\"retries\\\"") { 3 } else { 3 };
     Ok(Config { timeout, retries })
 }
 
@@ -729,6 +729,8 @@ def build_workdir(test, arm):
         fixture_t9()
     elif test == "t10":
         fixture_t10()
+    elif test == "t11":
+        fixture_t11()
     if test == "t7":
         fixture_t7()
     if test == "t8":
@@ -827,12 +829,22 @@ def measure(sid):
 def summarize_audit(text):
     edits = text.count("edit_ok")
     rejects = text.count("edit_reject")
-    reads = sum(1 for l in text.splitlines() if l.split("\t", 1)[0] in ("read", "read_head"))
+    reads = sum(1 for l in text.splitlines() if l.split("\t", 1)[0] in ("read", "read_head", "read_full"))
     # tool split: apply-mode logs "edit_ok\tapply...", positional logs "edit_ok\tedit"
     apply_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tapply"))
     pos_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tedit"))
     drift = text.count("drift\t")
     return f"edits={edits} rejects={rejects} reads={reads} apply={apply_n} pos={pos_n} drift={drift}"
+
+
+def cargo_check_ok():
+    """Ground truth for T11: the fixture crate must still compile."""
+    try:
+        p = subprocess.run(["cargo", "check", "--offline"], cwd=str(WORK / "ws"),
+                           capture_output=True, text=True, timeout=120)
+        return p.returncode == 0
+    except Exception:
+        return False
 
 
 def success(test):
@@ -873,6 +885,19 @@ def success(test):
         ok = all(f in s for f in finals)
         missing = [f for f in finals if f not in s]
         return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
+    if test == "t11":
+        cf = read("src/config.rs")
+        mn = read("src/main.rs")
+        need = [
+            "max_conns: u32" in cf,             # 1 struct field
+            "max_conns: 1024" in cf,            # 2 default (+3 decode default)
+            "cfg.max_conns" in cf,              # 3/4 decode wires it; validate bounds it
+            "65535" in cf,                      # 4 validate bound
+            "max_conns" in mn and "MAX_CONNS" in mn,  # 5 env read + wired
+        ]
+        comp = cargo_check_ok()
+        ok = all(need) and comp
+        return ("OK" if ok else "FAIL"), f"field={'max_conns: u32' in cf} default={'max_conns: 1024' in cf} cfg={'cfg.max_conns' in cf} bound={'65535' in cf} main={'max_conns' in mn and 'MAX_CONNS' in mn} cargo={'OK' if comp else 'FAIL'}"
     if test in ("t9", "t10"):
         ext = 'ts' if test == 't10' else 'rs'
         last = 'index' if test == 't10' else 'main'
@@ -886,7 +911,7 @@ def success(test):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
