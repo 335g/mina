@@ -407,6 +407,26 @@ impl Daemon {
         })
     }
 
+    /// パスに対応する LSP セッションのキーを引く。テーブルで計算した root に
+    /// セッションがあればそれを返す。なければ「パスを包含する最長の既存キー」に
+    /// フォールバックする — languages.toml の root-markers を稼働中に編集すると
+    /// 稼働中セッションのキーが変わり、同期スキップ・診断消失・重複 spawn が起きる
+    /// ため（敵対的検証で発見: P1）。
+    ///
+    /// `ensure` の spawn 判定では使わない: ネストしたワークスペース（/a と /a/c の
+    /// 両セッションが正当に共存）で祖先セッションを誤って再利用しない（ADR-0010）。
+    fn session_root_for(&self, path: &Path) -> Option<PathBuf> {
+        let fresh = self.languages.workspace_root(path);
+        if self.lsp_sessions.contains_key(&fresh) {
+            return Some(fresh);
+        }
+        self.lsp_sessions
+            .keys()
+            .filter(|k| path.starts_with(k))
+            .max_by_key(|k| k.components().count())
+            .cloned()
+    }
+
     /// クライアント切断時の後始末: Insert モードで開いたままの undo グループを
     /// 閉じ、モードを Normal に戻す（ADR-0007）。閉じ忘れると、常駐 daemon の
     /// 履歴がセッションを跨いで編集を同一 undo グループに統合してしまう
@@ -695,7 +715,8 @@ async fn watch_disk(
         if let Some((path, text)) = &lsp_sync {
             let session = {
                 let d = daemon.lock().await;
-                d.lsp_sessions.get(&d.languages.workspace_root(path)).cloned()
+                d.session_root_for(path)
+                    .and_then(|root| d.lsp_sessions.get(&root).cloned())
             };
             if let Some(session) = session {
                 // ADR-0028: 同期中を Activity として公開する（フォーカス文書のみ。
@@ -1600,9 +1621,6 @@ async fn restore_focus_after_semantic(
     restore_focus_session(daemon, session, focused).await;
 }
 
-/// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
-/// ことになる（ADR-0010）… 実装は [`Daemon::borrows_focus_session`]。
-
 /// LSP セッションを借りた場合の復元（Q10-(c)）: フォーカス文書がこの間に
 /// 移動していなければ、現在テキストで didOpen し直し + 診断を再 pull して
 /// 更新停止を自己修復する。serve_inlay_hints と serve_peek_definition_at で共用。
@@ -1811,8 +1829,8 @@ fn drain_into(daemon: &mut Daemon) {
         return;
     };
     let Some(session) = daemon
-        .lsp_sessions
-        .get(&daemon.languages.workspace_root(path))
+        .session_root_for(path)
+        .and_then(|root| daemon.lsp_sessions.get(&root))
     else {
         // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
         // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
@@ -2396,11 +2414,12 @@ async fn process_command(
                         // フォーカス文書の WorkspaceRoot に対応するセッションだけを
                         // 同期対象にする（ADR-0010）。LSP 対応以外の文書にはセッションが
                         // なく、同期スキップ + drain_into で診断が消える。
-                        let root = d.languages.workspace_root(&path);
-                        d.lsp_sessions.get(&root).cloned().map(|session| {
-                            let text = d.editor.current_document().text().to_string();
-                            (session, path, text)
-                        })
+                        d.session_root_for(&path)
+                            .and_then(|root| d.lsp_sessions.get(&root).cloned())
+                            .map(|session| {
+                                let text = d.editor.current_document().text().to_string();
+                                (session, path, text)
+                            })
                     })
                 } else {
                     None
@@ -2432,11 +2451,13 @@ async fn process_command(
                         let sync_target = if rejected.is_none() {
                             // 編集後の LSP 同期（Command 編集と同じ経路。ADR-0009）
                             d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
-                                let root = d.languages.workspace_root(&path);
-                                d.lsp_sessions.get(&root).cloned().map(|session| {
-                                    let text = d.editor.current_document().text().to_string();
-                                    (session, path, text)
-                                })
+                                d.session_root_for(&path)
+                                    .and_then(|root| d.lsp_sessions.get(&root).cloned())
+                                    .map(|session| {
+                                        let text =
+                                            d.editor.current_document().text().to_string();
+                                        (session, path, text)
+                                    })
                             })
                         } else {
                             None
@@ -3275,6 +3296,73 @@ language-server = "typescript-language-server"
         assert_eq!(spec.language_id, "typescript");
         assert_eq!(spec.command, "typescript-language-server");
         // 後始末（env 復元 + 一時ディレクトリ削除）
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_lookup_survives_root_marker_edit() {
+        // 敵対的検証 P1 の回帰テスト: languages.toml の root-markers を稼働中に
+        // 編集すると fresh root が変わるが、セッションは spawn 時のキーのまま。
+        // session_root_for の prefix フォールバックで同じセッションを見失わない
+        // （見失うと同期スキップ・診断消失・重複 spawn になる）。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("mina-langs-drift-{}", std::process::id()));
+        let xdg = dir.join("xdg");
+        std::fs::create_dir_all(xdg.join("mina")).expect("tmp dirs");
+        let cfg = xdg.join("mina/languages.toml");
+        let old = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        // 初期: text は root-markers なし → 汎用集合（tmp 内にマーカーなし → 親フォールバック）
+        std::fs::write(
+            &cfg,
+            r#"
+[[language]]
+name = "text"
+file-types = ["txt"]
+"#,
+        )
+        .expect("write");
+        let mut daemon = Daemon::new();
+        let file = dir.join("proj").join("docs").join("memo.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).expect("dirs");
+        std::fs::write(&file, "hi").expect("file");
+        let old_root = daemon.languages.workspace_root(&file); // 旧テーブル: docs
+        let session = Arc::new(Mutex::new(
+            lsp::LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        daemon.lsp_sessions.insert(old_root.clone(), session.clone());
+        // root-markers を追加（proj 直下に .docsroot）→ fresh root は proj に変わる
+        std::thread::sleep(std::time::Duration::from_millis(20)); // mtime 分解能
+        std::fs::write(dir.join("proj").join(".docsroot"), "").expect("marker");
+        std::fs::write(
+            &cfg,
+            r#"
+[[language]]
+name = "text"
+file-types = ["txt"]
+root-markers = [".docsroot"]
+"#,
+        )
+        .expect("write");
+        let _ = daemon.languages_refresh(); // ゲート相当: キャッシュが fresh に
+        let fresh = daemon.languages.workspace_root(&file);
+        assert_ne!(fresh, old_root, "root-markers 編集で root が変わる前提");
+        assert!(!daemon.lsp_sessions.contains_key(&fresh));
+        // 見失わない: prefix フォールバックが旧キー（docs）を返す
+        let found = daemon
+            .session_root_for(&file)
+            .expect("稼働中セッションを見失わない");
+        assert_eq!(found, old_root, "旧キーにフォールバックする");
+        assert!(Arc::ptr_eq(&daemon.lsp_sessions[&found], &session));
+        // 後始末
         match old {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
