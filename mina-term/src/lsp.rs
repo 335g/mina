@@ -1444,6 +1444,17 @@ fn capabilities_of_parses_initialize_response() {
     }
 
     #[test]
+    fn find_symbol_char_idx_works_for_typescript() {
+        // Stage 4: TS も tree-sitter で識別子に限定して解決する
+        let grammar = mina_loader::language_by_name("typescript");
+        let text =
+            "// foo = 1\nconst foo = 2;\nexport function bar() { return foo; }\n";
+        let idx = find_symbol_char_idx(grammar, text, "foo").unwrap();
+        assert_eq!(&text[idx..idx + 3], "foo", "コメント内の foo は無視して const foo に解決");
+        assert_eq!(idx, "// foo = 1\nconst ".len());
+    }
+
+    #[test]
     fn first_word_occurrence_is_boundary_aware() {
         let text = "let rate2 = rate * rate_2; // rate";
         // rate2 や rate_2 には一致せず、境界付きの rate に一致する
