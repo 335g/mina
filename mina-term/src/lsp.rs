@@ -201,6 +201,28 @@ impl LspSession {
         self.current_uri = Some(doc_uri);
     }
 
+    /// 前の文書を閉じずに didOpen する（バッチ用）。
+    ///
+    /// セマンティック要求の前段（`open_workspace_files`）で workspace 内の同拡張子
+    /// ファイルを**開いたまま保持**する — tsserver 等は閉じたファイルの参照/rename を
+    /// 返さない（probe 実測）。rust-analyzer も開いているファイルの参照しか返さないため
+    /// どちらの流儀にも適合する。`current_uri` は最後に開いた文書（復元・pull は
+    /// 要求後にフォーカス文書を開き直して戻す）。
+    pub async fn did_open_keep(&mut self, path: &Path, text: &str) {
+        let doc_uri = uri(path);
+        self.version += 1;
+        let params = json!({
+            "textDocument": {
+                "uri": doc_uri,
+                "languageId": self.language_id,
+                "version": self.version,
+                "text": text,
+            }
+        });
+        let _ = self.client.notify("textDocument/didOpen", params).await;
+        self.current_uri = Some(doc_uri);
+    }
+
     /// 全文同期の didChange を送る。
     pub async fn did_change(&mut self, path: &Path, text: &str) {
         self.version += 1;
@@ -998,11 +1020,17 @@ fn char_byte_idx(text: &str, char_idx: usize) -> usize {
 /// マッチするため、コメント・文字列リテラル内の出現には解決しない（T3 の
 /// 「誤位置への静かな適用」の事故クラスを予防）。grammar が無い言語・パース
 /// 失敗時は単語境界検索にフォールバックする。
-pub fn find_symbol_char_idx(text: &str, path: &Path, old: &str) -> Option<usize> {
+pub fn find_symbol_char_idx(
+    grammar: Option<&'static mina_loader::LanguageDef>,
+    text: &str,
+    old: &str,
+) -> Option<usize> {
     if old.is_empty() || text.is_empty() {
         return None;
     }
-    if let Some(def) = mina_loader::language_for_path(&path.to_string_lossy()) {
+    // grammar は languages.toml の `[[language]].grammar` 経由で渡される
+    // （ADR-0030 Stage 4）。None なら tree-sitter による識別子限定は諦めて fallback。
+    if let Some(def) = grammar {
         let mut parser = tree_sitter::Parser::new();
         if parser.set_language(&(def.grammar)()).is_ok() {
             if let Some(tree) = parser.parse(text, None) {
@@ -1079,6 +1107,15 @@ pub async fn open_document(session: &Mutex<LspSession>, path: &Path, text: &str)
         return; // サーバが忙しい: didOpen は次回の .rs Open で送られる
     };
     session.did_open(path, text).await;
+}
+
+/// 文書を「閉じずに」開いたことを LSP に通知する（`open_document` の keep 版。
+/// [`LspSession::did_open_keep`] 参照）。
+pub async fn open_document_keep(session: &Mutex<LspSession>, path: &Path, text: &str) {
+    let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+        return; // サーバが忙しい: 欠落は次の Open で補われる
+    };
+    session.did_open_keep(path, text).await;
 }
 
 /// 編集後に全文同期する（現在の文書が LSP の監視対象のときだけ）。
@@ -1176,7 +1213,9 @@ mod tests {
 use std::sync::Arc;
 
     #[test]
-    fn capabilities_of_parses_initialize_response() {
+    
+
+fn capabilities_of_parses_initialize_response() {
         // 全機能 advertise（rust-analyzer / mock 相当）: 全部対応
         let caps = capabilities_of(&json!({
             "capabilities": {
@@ -1385,17 +1424,23 @@ use std::sync::Arc;
     fn find_symbol_char_idx_skips_comments_and_strings() {
         let dir = std::env::temp_dir();
         let path = dir.join("sym-test.rs");
-        // コメントと文字列内の出現は無視し、最初の識別子（定義）に解決する
+        // コメントと文字列内の出現は無視し、最初の識別子（定義）に解決する。
+        // grammar は languages.toml 経由で渡される（ADR-0030 Stage 4）:
+        // tree-sitter が使える場合と使えない場合（None = 単語境界 fallback）を両方検証する。
+        let grammar = mina_loader::language_by_name("rust");
         let text = "// rate = 1\nlet rate = 2;\nlet s = \"rate\";\nlet t = rate * 3;\n";
-        let idx = find_symbol_char_idx(text, &path, "rate").unwrap();
+        let idx = find_symbol_char_idx(grammar, text, "rate").unwrap();
         // "let rate" — 2行目の 'rate' の開始位置: "// rate = 1\n" (12 chars) + "let " (4) = 16
         assert_eq!(&text[idx..idx + 4], "rate");
         assert_eq!(idx, 16);
         // 無い名前は None
-        assert!(find_symbol_char_idx(text, &path, "nope").is_none());
+        assert!(find_symbol_char_idx(grammar, text, "nope").is_none());
         // 空・空文字列
-        assert!(find_symbol_char_idx("", &path, "rate").is_none());
-        assert!(find_symbol_char_idx(text, &path, "").is_none());
+        assert!(find_symbol_char_idx(grammar, "", "rate").is_none());
+        assert!(find_symbol_char_idx(grammar, text, "").is_none());
+        // grammar なし（言語未登録相当）は単語境界 fallback でヒットする
+        let idx = find_symbol_char_idx(None, text, "rate").unwrap();
+        assert_eq!(&text[idx..idx + 4], "rate");
     }
 
     #[test]

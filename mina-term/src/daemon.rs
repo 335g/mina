@@ -97,7 +97,7 @@ pub struct Daemon {
     /// WorkspaceRoot 毎の LSP セッション（初回 .rs オープン時に生成。以後は
     /// 温かいまま保持・reap なし）。各セッションは独立した Mutex で保護し、
     /// LSP の await は daemon ロック外で行う（ADR-0009/ADR-0010）。
-    pub(crate) lsp_sessions: HashMap<PathBuf, Arc<Mutex<LspSession>>>,
+    pub(crate) lsp_sessions: HashMap<(PathBuf, String), Arc<Mutex<LspSession>>>,
     /// 言語テーブル（ADR-0030）。最新性は [`Daemon::languages_refresh`] が管理する
     /// （languages.toml の mtime が変わったときだけ再読込）。
     pub(crate) languages: Arc<LanguageTable>,
@@ -205,7 +205,7 @@ impl Daemon {
         let Some(language_def) = self
             .editor
             .focused_path()
-            .and_then(|p| mina_loader::language_for_path(&p.to_string_lossy()))
+            .and_then(|p| self.languages.grammar_for_path(&p))
         else {
             self.syntax.remove(&doc_id);
             return Vec::new();
@@ -397,19 +397,27 @@ impl Daemon {
     /// パスに対応する LSP セッション（`session_root_for` のキーで引く）。
     fn session_for(&self, path: &Path) -> Option<Arc<Mutex<LspSession>>> {
         self.session_root_for(path)
-            .and_then(|root| self.lsp_sessions.get(&root).cloned())
+            .and_then(|key| self.lsp_sessions.get(&key).cloned())
     }
 
-    /// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
-    /// ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
-    /// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
-    /// 置き換わる）。
+    /// パスのセッションキー（WorkspaceRoot + languageId。ADR-0030 Stage 4）。
+    /// LSP サーバを持つ言語のパスのみ `Some`（markdown のようなルートマーカー専用言語は対象外）。
+    fn session_key(&self, path: &Path) -> Option<(PathBuf, String)> {
+        let lang = self.languages.language_for_path(path)?;
+        lang.language_server.as_ref()?;
+        Some((self.languages.workspace_root(path), lang.name.clone()))
+    }
+
+    /// フォーカス文書と同じ (WorkspaceRoot, languageId) で LSP 対応のときだけセッションを
+    /// 借りたことになる（ADR-0010 / ADR-0030 Stage 4）。別 root・別言語ならフォーカス文書
+    /// のセッションには触れていないので復元不要（借りたセッションの current_uri は次回
+    /// 要求の didOpen で置き換わる）。
     fn borrows_focus_session(&mut self, focused: &Option<PathBuf>, target: &Path) -> bool {
         let languages = self.languages_refresh();
         focused.as_deref().is_some_and(|fp| {
             fp != target
                 && languages.server_for(fp).is_some()
-                && languages.workspace_root(fp) == languages.workspace_root(target)
+                && self.session_key(fp) == self.session_key(target)
         })
     }
 
@@ -421,15 +429,16 @@ impl Daemon {
     ///
     /// `ensure` の spawn 判定では使わない: ネストしたワークスペース（/a と /a/c の
     /// 両セッションが正当に共存）で祖先セッションを誤って再利用しない（ADR-0010）。
-    fn session_root_for(&self, path: &Path) -> Option<PathBuf> {
-        let fresh = self.languages.workspace_root(path);
+    fn session_root_for(&self, path: &Path) -> Option<(PathBuf, String)> {
+        let fresh = self.session_key(path)?;
         if self.lsp_sessions.contains_key(&fresh) {
             return Some(fresh);
         }
+        // 言語もキーの一部: フォールバックは同言語のキーのみ（.rs のセッションに .ts を乗せない）
         self.lsp_sessions
             .keys()
-            .filter(|k| path.starts_with(k))
-            .max_by_key(|k| k.components().count())
+            .filter(|(root, lang)| *lang == fresh.1 && path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
             .cloned()
     }
 
@@ -1130,7 +1139,13 @@ async fn resolve_symbol_lsp_pos(
     old: &str,
 ) -> Result<(u32, u32), String> {
     open_workspace_files(daemon, session, path).await;
-    let Some(char_idx) = lsp::find_symbol_char_idx(text, path, old) else {
+    // サーバ（tsserver 等）は要求対象のファイルが開いている必要がある —
+    // open_workspace_files が last 開く文書で対象が閉じられると rename に null を
+    // 返す（probe 実測）。対象を**閉じずに**開き直し、ワークスペースの他ファイルも
+    // 開いたまま保つ（keep-open。did_open だと他ファイルを閉じてしまう）。
+    lsp::open_document_keep(session, path, text).await;
+    let grammar = daemon.lock().await.languages.grammar_for_path(path);
+    let Some(char_idx) = lsp::find_symbol_char_idx(grammar, text, old) else {
         return Err(format!("symbol not found: {old:?} in {}", path.display()));
     };
     let (line, character) = {
@@ -1707,11 +1722,17 @@ async fn ensure(
     // ゲートと同期させるため、まず最新テーブルを取得（mtime 差分のみ再読込）し、
     // root 判定（言語別マーカー。ADR-0030 Stage 2）と spawn の両方に使う。
     let languages = daemon.lock().await.languages_refresh();
+    let spec = languages
+        .server_for(path)
+        .ok_or_else(|| format!("LSP 非対応のパスです: {}", path.display()))?;
     let root = languages.workspace_root(path);
-    // 既存セッション（root に生きていれば）を再利用する
+    // セッションキーは (WorkspaceRoot, languageId)（ADR-0030 Stage 4）:
+    // 同一 root に複数言語が混在しても言語ごとにセッションを分ける。
+    let key = (root.clone(), spec.language_id.to_string());
+    // 既存セッション（キーに生きていれば）を再利用する
     {
         let d = daemon.lock().await;
-        if let Some(session) = d.lsp_sessions.get(&root) {
+        if let Some(session) = d.lsp_sessions.get(&key) {
             let reuse = match session.try_lock() {
                 Ok(s) => !s.client.is_dead(),
                 Err(_) => true, // 同期中: 生きているとみなして再利用
@@ -1725,9 +1746,6 @@ async fn ensure(
     // languages_refresh は mtime 差分だけ再読込するため、ゲート（先に呼ばれた
     // languages_refresh）と同じテーブルを参照する — 「新言語の追加」も次の
     // ゲート/ spawn で反映される（起動時 1 回読込では daemon 再起動まで効かない）。
-    let spec = languages
-        .server_for(path)
-        .ok_or_else(|| format!("LSP 非対応のパスです: {}", path.display()))?;
     // ponytail: MINA_LSP_COMMAND はテスト用シーム（daemon 統合テストが mock
     // サーバを指す）。本番では languages.toml のテーブルを使う。
     let command = std::env::var("MINA_LSP_COMMAND").unwrap_or_else(|_| spec.command.to_string());
@@ -1743,7 +1761,7 @@ async fn ensure(
     // 保存（短いロック・await なし）。テーブルは上の languages_refresh が更新済み。
     let mut d = daemon.lock().await;
     // 同時 ensure レース: 既存が生きていればそちらを優先する
-    if let Some(existing) = d.lsp_sessions.get(&root) {
+    if let Some(existing) = d.lsp_sessions.get(&key) {
         let alive = match existing.try_lock() {
             Ok(s) => !s.client.is_dead(),
             Err(_) => true, // 同期中: 生きているとみなす
@@ -1756,7 +1774,7 @@ async fn ensure(
     }
     // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
     // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
-    d.lsp_sessions.insert(root, arc.clone());
+    d.lsp_sessions.insert(key, arc.clone());
     Ok(arc)
 }
 
@@ -1801,8 +1819,12 @@ async fn open_workspace_files(
     if session.client.is_dead() {
         return;
     }
+    // 開いたファイルは閉じない（開いたまま保持）: 1セッション = 1開文書の設計では
+    // 直後の rename/references 要求時に他ファイルが didClose され、tsserver 等が
+    // 閉じたファイルの参照/編集を返さなくなる（probe 実測。ADR-0029 の
+    // 「開いていないファイルの参照を取りこぼさない」と同じ狙いの拡張）。
     for (path, text) in to_open {
-        session.did_open(&path, &text).await;
+        session.did_open_keep(&path, &text).await;
     }
 }
 
@@ -3257,11 +3279,13 @@ mod tests {
             .expect("initialize");
         let dead = Arc::new(Mutex::new(session));
         let root = daemon.lock().await.languages.workspace_root(Path::new("/tmp/x.rs"));
+        // セッションキーは (root, languageId)（ADR-0030 Stage 4）。テスト用コンストラクタ
+        // は言語 "rust" なのでキーも "rust" で一致させる。
         daemon
             .lock()
             .await
             .lsp_sessions
-            .insert(root, dead.clone());
+            .insert((root, "rust".to_string()), dead.clone());
 
         // サーバを殺して is_dead になるまで待つ（reader タスクが EOF を拾う）
         dead.lock().await.client.kill().await;
@@ -3307,32 +3331,34 @@ mod tests {
         std::fs::write(&path, "").expect("write");
         let mut daemon = Daemon::new();
         let table = daemon.languages_refresh();
+        // 組み込み既定には python は無い（typescript は Stage 4 で既定化済みのため
+        // 「新規追加」の題材に使えない）→ python を追加して反映を検証する
         assert!(
-            table.server_for(Path::new("/tmp/x.ts")).is_none(),
-            "初期状態では ts 非対応"
+            table.server_for(Path::new("/tmp/x.py")).is_none(),
+            "初期状態では py 非対応"
         );
         // ユーザーが言語を追加（mtime を確実に変えるため少し待つ）
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(
             &path,
             r#"
-[language-server.typescript-language-server]
-command = "typescript-language-server"
+[language-server.pyright]
+command = "pyright-langserver"
 
 [[language]]
-name = "typescript"
-file-types = ["ts"]
-language-server = "typescript-language-server"
+name = "python"
+file-types = ["py"]
+language-server = "pyright"
 "#,
         )
         .expect("write");
         // 再起動なし・次回のゲート相当の refresh で反映される
         let table = daemon.languages_refresh();
         let spec = table
-            .server_for(Path::new("/tmp/x.ts"))
+            .server_for(Path::new("/tmp/x.py"))
             .expect("追加した言語が次の refresh で認識される");
-        assert_eq!(spec.language_id, "typescript");
-        assert_eq!(spec.command, "typescript-language-server");
+        assert_eq!(spec.language_id, "python");
+        assert_eq!(spec.command, "pyright-langserver");
         // 後始末（env 復元 + 一時ディレクトリ削除）
         match old {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
@@ -3358,13 +3384,19 @@ language-server = "typescript-language-server"
         let cfg = xdg.join("mina/languages.toml");
         let old = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-        // 初期: text は root-markers なし → 汎用集合（tmp 内にマーカーなし → 親フォールバック）
+        // 初期: text は root-markers なし → 汎用集合（tmp 内にマーカーなし → 親フォールバック）。
+        // session_key が動くよう language-server 参照を持たせる（サーバ実体は使わない —
+        // セッションは直接挿入する）。
         std::fs::write(
             &cfg,
             r#"
+[language-server.mock]
+command = "x"
+
 [[language]]
 name = "text"
 file-types = ["txt"]
+language-server = "mock"
 "#,
         )
         .expect("write");
@@ -3376,16 +3408,23 @@ file-types = ["txt"]
         let session = Arc::new(Mutex::new(
             lsp::LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
-        daemon.lsp_sessions.insert(old_root.clone(), session.clone());
+        // キーは (root, languageId) — file の言語は text
+        daemon
+            .lsp_sessions
+            .insert((old_root.clone(), "text".to_string()), session.clone());
         // root-markers を追加（proj 直下に .docsroot）→ fresh root は proj に変わる
         std::thread::sleep(std::time::Duration::from_millis(20)); // mtime 分解能
         std::fs::write(dir.join("proj").join(".docsroot"), "").expect("marker");
         std::fs::write(
             &cfg,
             r#"
+[language-server.mock]
+command = "x"
+
 [[language]]
 name = "text"
 file-types = ["txt"]
+language-server = "mock"
 root-markers = [".docsroot"]
 "#,
         )
@@ -3393,12 +3432,12 @@ root-markers = [".docsroot"]
         let _ = daemon.languages_refresh(); // ゲート相当: キャッシュが fresh に
         let fresh = daemon.languages.workspace_root(&file);
         assert_ne!(fresh, old_root, "root-markers 編集で root が変わる前提");
-        assert!(!daemon.lsp_sessions.contains_key(&fresh));
-        // 見失わない: prefix フォールバックが旧キー（docs）を返す
+        assert!(!daemon.lsp_sessions.contains_key(&(fresh, "text".to_string())));
+        // 見失わない: prefix フォールバックが旧キー（docs, text）を返す
         let found = daemon
             .session_root_for(&file)
             .expect("稼働中セッションを見失わない");
-        assert_eq!(found, old_root, "旧キーにフォールバックする");
+        assert_eq!(found, (old_root, "text".to_string()), "旧キーにフォールバックする");
         assert!(Arc::ptr_eq(&daemon.lsp_sessions[&found], &session));
         // 後始末
         match old {
@@ -3456,7 +3495,11 @@ root-markers = [".docsroot"]
                 && !s.caps.pull_diagnostics
         };
         assert!(cap_bare, "--bare は何も advertise しない");
-        daemon.lock().await.lsp_sessions.insert(root, session);
+        daemon
+            .lock()
+            .await
+            .lsp_sessions
+            .insert((root, "rust".to_string()), session);
         match serve_rename(&daemon, &path_str, "foo", "bar").await {
             ServerMessage::RenameResult { error: Some(e), .. } => {
                 assert!(e.starts_with("rename not supported"), "{e}")
@@ -3479,7 +3522,7 @@ root-markers = [".docsroot"]
         let alive = {
             let d = daemon.lock().await;
             let root = d.languages.workspace_root(&canon);
-            d.lsp_sessions.contains_key(&root)
+            d.lsp_sessions.contains_key(&(root, "rust".to_string()))
         };
         assert!(alive, "bare セッションは残っている");
     }
@@ -3503,7 +3546,10 @@ root-markers = [".docsroot"]
         ));
         daemon
             .lsp_sessions
-            .insert(daemon.languages.workspace_root(&path), session.clone());
+            .insert(
+                (daemon.languages.workspace_root(&path), "rust".to_string()),
+                session.clone(),
+            );
 
         // pull で TODO 診断を取り込んでから殺す（MEDIUM-3 の前提: 診断がある状態）
         session
