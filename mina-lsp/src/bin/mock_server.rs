@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 
 fn main() {
     let utf16 = std::env::args().any(|a| a == "--cjk");
+    // MINA_LSP_BARE: 機能を何も advertise しない「未検証サーバ」を模擬する
+    // （Stage 3: 能力ゲートの負の経路をテストするため）。
+    let bare = std::env::var("MINA_LSP_BARE").is_ok();
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
@@ -41,20 +44,28 @@ fn main() {
             match msg.get("method").and_then(Value::as_str).unwrap_or("") {
                 "initialize" => {
                     let enc = if utf16 { "utf-16" } else { "utf-8" };
+                    // 全機能を advertise（rename / references / definition は実装済み）。
+                    // MINA_LSP_BARE なら positionEncoding と textDocumentSync のみ。
+                    let mut caps = json!({
+                        "positionEncoding": enc,
+                        "textDocumentSync": 1, // full sync
+                    });
+                    if !bare {
+                        caps["diagnosticProvider"] = json!({
+                            "identifier": "mock",
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false,
+                        });
+                        caps["inlayHintProvider"] = json!({});
+                        caps["renameProvider"] = json!(true);
+                        caps["referencesProvider"] = json!(true);
+                        caps["definitionProvider"] = json!(true);
+                    }
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": {
-                            "capabilities": {
-                                "positionEncoding": enc,
-                                "textDocumentSync": 1, // full sync
-                                "diagnosticProvider": {
-                                    "identifier": "mock",
-                                    "interFileDependencies": false,
-                                    "workspaceDiagnostics": false,
-                                },
-                                "inlayHintProvider": {},
-                            },
+                            "capabilities": caps,
                             "serverInfo": { "name": "mock-server" },
                         },
                     });
