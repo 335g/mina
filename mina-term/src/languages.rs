@@ -253,4 +253,57 @@ root-markers = ["Cargo.toml"]
         );
         assert!(err.is_err(), "未対応キーはエラー: {err:?}");
     }
+
+    #[test]
+    fn lang_referencing_missing_server_is_none_not_panic() {
+        // 言語が存在しないサーバ id を参照しても server_for は None（panic しない）。
+        let table = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[[language]]
+name = "text"
+file-types = ["txt"]
+language-server = "no-such-server"
+"#,
+            ),
+        );
+        assert!(table.server_for(Path::new("/tmp/a.txt")).is_none());
+    }
+
+    #[test]
+    fn empty_and_server_only_user_files_are_accepted() {
+        // 空ファイル・server セクションのみ（言語なし）は合成を壊さない。
+        let table = LanguageTable::from_strings(DEFAULT_LANGUAGES_TOML, Some(""));
+        assert!(
+            table.server_for(Path::new("/tmp/a.rs")).is_some(),
+            "空のユーザーファイルは既定テーブルを維持"
+        );
+        let table = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[language-server.extra]
+command = "extra-lsp"
+"#,
+            ),
+        );
+        assert!(
+            table.server_for(Path::new("/tmp/a.rs")).is_some(),
+            "server のみのユーザーファイルは言語を変えない"
+        );
+        assert_eq!(table.server_by_id("extra").unwrap().command, "extra-lsp");
+    }
+
+    #[test]
+    fn wrong_value_types_reject_the_whole_file() {
+        // 型エラー（command が数値）もファイル全体を破棄し、既定テーブルに落ちる。
+        let err = parse(
+            r#"
+[language-server.broken]
+command = 123
+"#,
+        );
+        assert!(err.is_err(), "型違いはエラー: {err:?}");
+    }
 }
