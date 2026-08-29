@@ -74,13 +74,17 @@ pub(crate) struct ServerCapabilities {
 /// initialize 応答から能力を導出する。`renameProvider: false` 等の明示 false と
 /// キー欠落は非対応扱い、`true` とオブジェクト形式（RenameOptions 等）は対応扱い。
 fn capabilities_of(result: &Value) -> ServerCapabilities {
+    // null / false / キー欠落は非対応扱い（null を advertise するサーバは spec 違反だが
+    // 稀にいる）。true とオブジェクト形式（RenameOptions 等）は対応扱い。
     let cap = |path: &str| -> bool {
         result
             .pointer(&format!("/capabilities{path}"))
-            .is_some_and(|v| !matches!(v, Value::Bool(false)))
+            .is_some_and(|v| !matches!(v, Value::Bool(false) | Value::Null))
     };
     ServerCapabilities {
-        pull_diagnostics: result.pointer("/capabilities/diagnosticProvider").is_some(),
+        // diagnosticProvider はオブジェクトのはずだが、null / false も cap() で
+        // 非対応扱いに揃える（他機能と同じ false/null 防御）。
+        pull_diagnostics: cap("/diagnosticProvider"),
         inlay_hints: cap("/inlayHintProvider"),
         rename: cap("/renameProvider"),
         references: cap("/referencesProvider"),
@@ -1201,6 +1205,11 @@ use std::sync::Arc;
         }));
         assert!(!mixed.rename);
         assert!(mixed.definition);
+        // null（spec 違反だが稀に advertise される）も非対応扱い
+        let null_cap = capabilities_of(&json!({
+            "capabilities": { "renameProvider": null }
+        }));
+        assert!(!null_cap.rename, "null は非対応扱い");
         let obj = capabilities_of(&json!({
             "capabilities": { "renameProvider": { "prepareProvider": true } }
         }));
