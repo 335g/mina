@@ -19,7 +19,7 @@ name = "rust"
 file-types = ["rs"]
 language-server = "rust-analyzer"
 root-markers = []  # 明示すれば汎用集合を置換（空 = マーカーなし = 親フォールバックのみ）
-# grammar = "rust"    # Stage 4 で有効化（mina-loader がハイライトを供給）
+grammar = "rust"  # mina-loader の grammar 名（ハイライト・シンボル解決）
 ```
 
 - **`[language-server.<id>]`**: サーバ起動と初期化の定義。`command` / `args` /
@@ -63,12 +63,14 @@ languages.toml は **Daemon 側の第 2 設定ソース**として別カテゴ�
 - バイナリは既定テーブル（現在は rust-analyzer 分）を埋め込み、ユーザーファイルは
   **name / id 単位で上書き・追加**する（言語は `name`、サーバは id）。深いマージはしない。
 
-## 形式の注意（未対応キー）
+## 既定エントリ（Stage 4 で TypeScript を追加）
 
-上記の例に `grammar` を書いたが、**このキーは現行ステージでは拒否される**
-（`deny_unknown_fields` によりファイル全体が破棄され、既定テーブルにフォールバック）。
-Stage 4 で有効化するまで、ユーザーファイルに書かないこと（例をそのまま貼り付けると
-全上書きが消える）。`root-markers` は Stage 2 で有効化済み。
+- `typescript`（typescript-language-server 5.x、`--stdio`、file-types `ts`）。
+- tree-sitter-typescript をハイライト・シンボル解決に使用（`grammar = "typescript"`）。
+- inlay hints の初期化チューニング（tsserver の `preferences`）は**t9 風 A/B 検証で
+  確定してから**既定 config に足す（規定サーバ方針: 検証済みの設定だけを同梱）。
+- 未検証のまま使えるのは LSP 標準機能（診断・定義・rename/references — 上記 E2E で確認）。
+- tsx / js / jsx 等の file-types は server 共有の別エントリとして追加可能（Stage 4 以降）。
 
 ## 規定サーバ方針
 
@@ -121,14 +123,22 @@ rename / references / definition）を導出し、機能ごとに要求を止め
   bindings）。これは汎用集合の合意設計どおりで、除外したければ rust に明示的な
   `root-markers` を書く（置換）。
 
-## 将来の衝突点（Stage 4 で解消）
+## 将来の衝突点（Stage 4 で実装済み）
 
-- セッションは WorkspaceRoot キー（ADR-0010）。同一 root に複数言語が混在する場合
-  （.rs + .ts 等）はキーを **(root, language)** に拡張し、言語ごとにサーバを分ける。
-- `grammar` キー: `[[language]]` の任意キー。mina-loader が grammar 名でハイライトを
-  供給し、未登録ならハイライト無し・LSP のみ（tree-sitter grammar は静的リンクのまま）。
+- **セッションキー**: WorkspaceRoot キー（ADR-0010）を **(WorkspaceRoot, languageId)** に拡張
+  した。同一 root に複数言語が混在する場合（.rs + .ts 等）も言語ごとに別セッション
+  （別サーバ）。`session_root_for` / `borrows_focus_session` も同言語キーのみを対象にする。
+- **`grammar` キー（実装済み）**: `[[language]]` の任意キー。mina-loader の静的レジストリを
+  grammar 名で引く。未登録・未指定ならハイライト無し・tree-sitter シンボル解決なし
+  （単語境界フォールバック）。シンボル位置解決（rename / references の `old` 解決）も
+  この grammar を使うため、TS の rename もコメント・文字列を除外した識別子に解決する。
+- **開文書の保持（keep-open）**: セマンティック要求の前段（`open_workspace_files`）で
+  ワークスペースの同拡張子ファイルを**開いたまま保持**する（`did_open_keep`）。
+  1 セッション = 1 開文書の設計で前の文書を didClose すると、**tsserver は閉じた
+  ファイルの rename/references を null/空で返す**（probe 実測）。要求対象も開き直す。
+  rust-analyzer の「開いていないファイルの参照を取りこぼす」対策（ADR-0029）と同方向。
 - 後回し: ファイル監視 + 稼働中セッションの再初期化、プロジェクト別 languages.toml、
-  サーバ特有の癖（references 前のワークスペース全 didOpen 等 — ADR-0029）の言語別設定化。
+  サーバ特有の癖の言語別設定化。
 
 ## Consequences
 
