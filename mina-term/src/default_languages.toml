@@ -16,3 +16,15 @@ config = { "rust-analyzer" = { inlayHints = { typeHints = { enable = true }, par
 name = "rust"
 file-types = ["rs"]
 language-server = "rust-analyzer"
+grammar = "rust"
+
+[language-server.typescript-language-server]
+command = "typescript-language-server"
+args = ["--stdio"]
+# init options（inlay hints 等）は t9 風 A/B 検証で確定してから足す（規定サーバ方針）
+
+[[language]]
+name = "typescript"
+file-types = ["ts"]
+language-server = "typescript-language-server"
+grammar = "typescript"

@@ -34,8 +34,8 @@ pub(crate) struct ServerConfig {
 
 /// 1 言語の定義。`name` は `textDocument.languageId` でもある。
 ///
-/// `grammar` キーは Stage 4 で有効化するため、現段階では受け付けない
-/// （未知キーはファイル全体を破棄）。
+/// `grammar` は mina-loader の静的レジストリ名（ハイライト・シンボル位置解決）。
+/// 未登録の grammar 名・未指定ならハイライト無し（LSP のみ）。ADR-0030 Stage 4。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Language {
@@ -48,6 +48,10 @@ pub(crate) struct Language {
     /// 空リストは「マーカーなし」= ファイル親フォールバックのみ。ADR-0030 Stage 2）。
     #[serde(rename = "root-markers", default)]
     pub(crate) root_markers: Option<Vec<String>>,
+    /// mina-loader の grammar 名（例: `"rust"` / `"typescript"`）。ハイライトと
+    /// シンボル位置解決（rename / references の識別子解決）に使う。ADR-0030 Stage 4。
+    #[serde(default)]
+    pub(crate) grammar: Option<String>,
 }
 
 /// languages.toml のファイル形式（`[language-server.<id>]` + `[[language]]`）。
@@ -160,6 +164,14 @@ impl LanguageTable {
             args: &server.args,
             config: server.config.as_ref(),
         })
+    }
+
+    /// パスの言語が `grammar` キーで参照する grammar（mina-loader）。未登録・未指定なら
+    /// `None` = ハイライト無し・tree-sitter を使わないシンボル解決（ADR-0030 Stage 4）。
+    pub(crate) fn grammar_for_path(&self, path: &Path) -> Option<&'static mina_loader::LanguageDef> {
+        self.language_for_path(path)
+            .and_then(|l| l.grammar.as_deref())
+            .and_then(mina_loader::language_by_name)
     }
 
     /// 開いたファイルを包含する最小の解析単位（WorkspaceRoot）を求める。
@@ -283,14 +295,14 @@ language-server = "typescript-language-server"
 
     #[test]
     fn unknown_keys_reject_the_whole_file() {
-        // deny_unknown_fields: grammar（Stage 4 で有効化予定）等の未対応キーは
-        // ファイル全体を破棄（現行ステージで未実装のキーを静かに無視しない）。
+        // deny_unknown_fields: 未対応キーはファイル全体を破棄（現行ステージで未実装の
+        // キーを静かに無視しない）。
         let err = parse(
             r#"
 [[language]]
 name = "rust"
 file-types = ["rs"]
-grammar = "rust"
+foo = 1
 "#,
         );
         assert!(err.is_err(), "未対応キーはエラー: {err:?}");
@@ -347,6 +359,45 @@ command = 123
 "#,
         );
         assert!(err.is_err(), "型違いはエラー: {err:?}");
+    }
+
+    #[test]
+    fn grammar_key_resolves_loader_language() {
+        // Stage 4: [[language]] の grammar キーが mina-loader の静的レジストリを
+        // 引く。未登録名・未指定は None（ハイライト無し）。
+        let table = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[[language]]
+name = "ts"
+file-types = ["ts"]
+grammar = "typescript"
+
+[[language]]
+name = "text"
+file-types = ["txt"]
+"#,
+            ),
+        );
+        assert_eq!(
+            table.grammar_for_path(Path::new("/tmp/a.ts")).unwrap().name,
+            "typescript"
+        );
+        // 未指定（text）→ None。未登録の grammar 名も None（パニックしない）。
+        assert!(table.grammar_for_path(Path::new("/tmp/a.txt")).is_none());
+        let bad = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[[language]]
+name = "x"
+file-types = ["xx"]
+grammar = "no-such-grammar"
+"#,
+            ),
+        );
+        assert!(bad.grammar_for_path(Path::new("/tmp/a.xx")).is_none());
     }
 
     /// workspace_root のテスト用テーブル（ユーザー環境に依存しない = 既定 rust のみ）。
