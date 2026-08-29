@@ -36,7 +36,7 @@ pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// LSP セッションの状態（1セッション = 1サーバ。S3 は rust-analyzer のみ）。
+/// LSP セッションの状態（1セッション = 1サーバ。言語テーブルは ADR-0030）。
 pub struct LspSession {
     /// pub(crate): daemon 統合（ensure / drain / settle）が生死判定に読む。
     pub(crate) client: Client,
@@ -45,14 +45,9 @@ pub struct LspSession {
     current_uri: Option<String>,
     /// initialize 応答で advertise された pull 診断の identifier。
     diagnostic_identifier: Option<String>,
-}
-
-/// 拡張子 → サーバコマンド（組み込みテーブル。設定ファイル化はサーバが増えてから）。
-pub fn server_for(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("rs") => Some("rust-analyzer"),
-        _ => None,
-    }
+    /// `textDocument.languageId`（spawn 元ファイルの言語。ADR-0030）。
+    /// セッション生成後に変わらない（root+言語キーの拡張は Stage 4）。
+    language_id: String,
 }
 
 /// `file://` URI。
@@ -83,42 +78,53 @@ pub fn workspace_root(path: &Path) -> PathBuf {
 }
 
 impl LspSession {
-    /// サーバを spawn し、initialize まで完了させる。
+    /// サーバを spawn し、initialize まで完了させる（**テスト専用**: 言語は rust、
+    /// init options なし。本番は [`new_with_config`] を使う）。
+    #[cfg(test)]
     pub async fn new(command: &str, root: &Path) -> Result<Self, String> {
         Self::new_with_args(command, root, &[]).await
     }
 
-    /// サーバを spawn し、initialize まで完了させる（テスト用: 起動引数付き）。
+    /// サーバを spawn し、initialize まで完了させる（**テスト専用**: 起動引数付き）。
+    #[cfg(test)]
     pub async fn new_with_args(command: &str, root: &Path, args: &[&str]) -> Result<Self, String> {
-        let (mut client, _reader) = Client::spawn(command, args)
+        let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        Self::new_with_config(command, root, &args, "rust", None).await
+    }
+
+    /// サーバを spawn し、initialize まで完了させる。
+    ///
+    /// 本番（daemon の `ensure`）は languages.toml のテーブル（ADR-0030）から
+    /// command / args / init options / languageId を渡す。init options はサーバ固有の
+    /// 不透明 JSON — 無ければ送らない（サーバ既定に任せる）。
+    pub async fn new_with_config(
+        command: &str,
+        root: &Path,
+        args: &[String],
+        language_id: &str,
+        init_options: Option<serde_json::Value>,
+    ) -> Result<Self, String> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (mut client, _reader) = Client::spawn(command, &args)
             .await
             .map_err(|e| format!("LSP サーバを起動できません: {e}"))?;
+        let mut params = json!({
+            "processId": null,
+            "rootUri": uri(root),
+            "capabilities": {
+                "textDocument": {
+                    "publishDiagnostics": { "relatedInformation": false },
+                    // inlay hint は static 登録のみ（resolve は使わない。ADR-0020）。
+                    "inlayHint": { "dynamicRegistration": false },
+                }
+            },
+            "positionEncodings": ["utf-8", "utf-16"],
+        });
+        if let Some(opts) = init_options {
+            params["initializationOptions"] = opts;
+        }
         let result = client
-            .request(
-                "initialize",
-                json!({
-                    "processId": null,
-                    "rootUri": uri(root),
-                    "capabilities": {
-                        "textDocument": {
-                            "publishDiagnostics": { "relatedInformation": false },
-                            // inlay hint は static 登録のみ（resolve は使わない。ADR-0020）。
-                            "inlayHint": { "dynamicRegistration": false },
-                        }
-                    },
-                    // S3: 対応サーバは rust-analyzer のみ。type + parameter ヒントだけを
-                    // 有効にし、他（closure-return 等）はサーバ既定（オフ）のままにする。
-                    "initializationOptions": {
-                        "rust-analyzer": {
-                            "inlayHints": {
-                                "typeHints": { "enable": true },
-                                "parameterHints": { "enable": true },
-                            }
-                        }
-                    },
-                    "positionEncodings": ["utf-8", "utf-16"],
-                }),
-            )
+            .request("initialize", params)
             .await
             .map_err(|e| format!("initialize に失敗しました: {e}"))?;
         let encoding = match result
@@ -143,6 +149,7 @@ impl LspSession {
             version: 0,
             current_uri: None,
             diagnostic_identifier,
+            language_id: language_id.to_string(),
         })
     }
 
@@ -161,7 +168,7 @@ impl LspSession {
         let params = json!({
             "textDocument": {
                 "uri": doc_uri,
-                "languageId": "rust",
+                "languageId": self.language_id,
                 "version": self.version,
                 "text": text,
             }

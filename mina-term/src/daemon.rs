@@ -27,6 +27,7 @@ use tokio::net::{UnixListener, UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::{Mutex, watch};
 use tokio::time::{Duration, timeout};
 
+use crate::languages::LanguageTable;
 use crate::lsp;
 use crate::lsp::LspSession;
 
@@ -97,6 +98,10 @@ pub struct Daemon {
     /// 温かいまま保持・reap なし）。各セッションは独立した Mutex で保護し、
     /// LSP の await は daemon ロック外で行う（ADR-0009/ADR-0010）。
     pub(crate) lsp_sessions: HashMap<PathBuf, Arc<Mutex<LspSession>>>,
+    /// 言語テーブル（ADR-0030）。起動時に初期ロードし、セッション spawn 時に
+    /// 再読込・差し替えされる（`ensure`）。ゲート（拡張子 → サーバ有無）と
+    /// spawn（command / args / init options / languageId）が参照する。
+    pub(crate) languages: Arc<LanguageTable>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
     pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
     /// パスごとの inlay hint キャッシュ（ADR-0020）。`HintCache.text_checksum` が
@@ -355,6 +360,8 @@ impl Daemon {
             editor: Editor::new(),
             viewport_height: 24,
             lsp_sessions: HashMap::new(),
+            // 起動時の初期ロード。以後は ensure の spawn 時に再読込・差し替え（ADR-0030）。
+            languages: LanguageTable::load().into_arc(),
             diagnostics: Vec::new(),
             insert_owner: None,
             interactive_clients: HashSet::new(),
@@ -1015,8 +1022,9 @@ async fn prepare_borrowed_session(
     let Some(text) = text else {
         return Err(BorrowFail::CannotOpen);
     };
-    // LSP 非対応パス（.rs 以外）: サーバを spawn しない
-    if lsp::server_for(&path_buf).is_none() {
+    // LSP 非対応パス（テーブルにサーバ割当なし）: サーバを spawn しない（ADR-0030）
+    let lsp_supported = daemon.lock().await.languages.server_for(&path_buf).is_some();
+    if !lsp_supported {
         return Err(BorrowFail::NoServer(path_str));
     }
     // フォーカス文書（復元用。テキストは復元時に最新を読む）
@@ -1090,8 +1098,9 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
             hints: Vec::new(),
         };
     };
-    // LSP 非対応パス（.rs 以外）: 空ヒントで応答する（サーバを spawn しない）
-    if lsp::server_for(&path_buf).is_none() {
+    // LSP 非対応パス（テーブルにサーバ割当なし）: 空ヒントで応答する（ADR-0030）
+    let lsp_supported = daemon.lock().await.languages.server_for(&path_buf).is_some();
+    if !lsp_supported {
         let d = daemon.lock().await;
         return ServerMessage::Hints {
             path: path_str,
@@ -1136,7 +1145,9 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
     // ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
     // いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
     // 置き換わる）。
-    let borrows_focus_session = !target_is_focused && borrows_focus_session(&focused, &path_buf);
+    let languages = daemon.lock().await.languages.clone();
+    let borrows_focus_session =
+        !target_is_focused && borrows_focus_session(&focused, &path_buf, &languages);
     // 切り替え: 対象文書を didOpen（前の文書は閉じられる）。pull は現在の文書に
     // しか応えない（current_uri 一致チェック）ため、対象を開くことは必須。
     lsp::open_document(&session, &path_buf, &text).await;
@@ -1168,19 +1179,20 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
 /// クライアント側の一時表示。push には載らない）。フォーカス文書を開き直すので
 /// 借用・復元は不要（serve_peek_definition_at と違い、対象は常にフォーカス文書）。
 async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
-    let (path, head, text) = {
+    let (path, head, text, lsp_supported) = {
         let mut d = daemon.lock().await;
         match d.editor.focused_path().map(Path::to_path_buf) {
             Some(path) => {
                 let head = d.editor.selection().primary().head();
                 let text = d.editor.current_document().text().to_string();
-                (path, head, text)
+                let lsp_supported = d.languages.server_for(&path).is_some();
+                (path, head, text, lsp_supported)
             }
             // 開いていない: peek なしのスナップショットで応答
             None => return ServerMessage::Response { snapshot: snapshot(&mut d, None) },
         }
     };
-    let peek = if lsp::server_for(&path).is_some() {
+    let peek = if lsp_supported {
         match ensure(daemon, &path).await {
             Ok(session) => {
                 // セッションを借りた（開き直し）ので現在のテキストで didOpen する。
@@ -1225,7 +1237,10 @@ async fn serve_peek_definition_at(
         Ok(b) => b,
         Err(_) => return empty(),
     };
-    let borrows = borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let borrows = {
+        let languages = daemon.lock().await.languages.clone();
+        borrows_focus_session(&borrowed.focused, &borrowed.path, &languages)
+    };
     let peek =
         lsp::definition_peek_at_line_col(&borrowed.session, &borrowed.path, &borrowed.text, line, col)
             .await;
@@ -1528,7 +1543,10 @@ async fn restore_focus_after_semantic(
     focused: &Option<PathBuf>,
     target: &Path,
 ) {
-    let borrows = borrows_focus_session(focused, target);
+    let borrows = {
+        let languages = daemon.lock().await.languages.clone();
+        borrows_focus_session(focused, target, &languages)
+    };
     let target_is_focus = focused.as_deref() == Some(target);
     if !(borrows || target_is_focus) {
         return; // 別 root: フォーカスのセッションには触れていない
@@ -1543,10 +1561,14 @@ async fn restore_focus_after_semantic(
 /// ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
 /// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
 /// 置き換わる）。
-fn borrows_focus_session(focused: &Option<PathBuf>, target: &Path) -> bool {
+fn borrows_focus_session(
+    focused: &Option<PathBuf>,
+    target: &Path,
+    languages: &LanguageTable,
+) -> bool {
     focused.as_deref().is_some_and(|fp| {
         fp != target
-            && lsp::server_for(fp).is_some()
+            && languages.server_for(fp).is_some()
             && lsp::workspace_root(fp) == lsp::workspace_root(target)
     })
 }
@@ -1605,18 +1627,28 @@ async fn ensure(
             }
         }
     }
-    // 未作成 or 死亡: ロックを離して spawn + initialize（M1）
+    // 未作成 or 死亡: 設定を再読込して spawn + initialize（M1 / ADR-0030）。
+    // languages.toml は spawn のたびに再読込し、差し替えたテーブルを保存する
+    // （起動時 1 回読込では daemon 再起動まで反映されない）。
+    let languages = LanguageTable::load();
+    let spec = languages
+        .server_for(path)
+        .ok_or_else(|| format!("LSP 非対応のパスです: {}", path.display()))?;
     // ponytail: MINA_LSP_COMMAND はテスト用シーム（daemon 統合テストが mock
-    // サーバを指す）。本番では server_for の組み込みテーブルを使う。
-    let command = std::env::var("MINA_LSP_COMMAND").unwrap_or_else(|_| {
-        lsp::server_for(path)
-            .expect("ensure は LSP 対応ファイルでのみ呼ばれる")
-            .to_string()
-    });
-    let session = lsp::LspSession::new(&command, &root).await?;
+    // サーバを指す）。本番では languages.toml のテーブルを使う。
+    let command = std::env::var("MINA_LSP_COMMAND").unwrap_or_else(|_| spec.command.to_string());
+    let session = lsp::LspSession::new_with_config(
+        &command,
+        &root,
+        spec.args,
+        spec.language_id,
+        spec.config.cloned(),
+    )
+    .await?;
     let arc = Arc::new(Mutex::new(session));
     // 保存（短いロック・await なし）。
     let mut d = daemon.lock().await;
+    d.languages = Arc::new(languages);
     // 同時 ensure レース: 既存が生きていればそちらを優先する
     if let Some(existing) = d.lsp_sessions.get(&root) {
         let alive = match existing.try_lock() {
@@ -2064,7 +2096,13 @@ async fn process_command(
                     // サーバが死んでいればここで再生成し、現在のバッファ内容で
                     // didOpen を再通知する（フルテキスト同期なので再利用への
                     // 再通知は無害）。
-                    let session = if lsp::server_for(&path_buf).is_some() {
+                    let session = if daemon
+                        .lock()
+                        .await
+                        .languages
+                        .server_for(&path_buf)
+                        .is_some()
+                    {
                         match ensure(&daemon, &path_buf).await {
                             Ok(s) => Some(s),
                             Err(_) => None, // サーバが無くても文書は保持される
@@ -2105,7 +2143,13 @@ async fn process_command(
                     let (contents, mut open_status) = read_open_target(&path_str).await;
                     // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
                     // daemon ロック外で行う。失敗時は status に載せる。
-                    let session = if contents.is_some() && lsp::server_for(&path_buf).is_some() {
+                    let lsp_supported = daemon
+                        .lock()
+                        .await
+                        .languages
+                        .server_for(&path_buf)
+                        .is_some();
+                    let session = if contents.is_some() && lsp_supported {
                         match ensure(&daemon, &path_buf).await {
                             Ok(s) => Some(s),
                             Err(msg) => {
