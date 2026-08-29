@@ -12,7 +12,7 @@
 ### 0.1 実行基盤（ハーネス）
 
 - **LLM**: opencode ゲートウェイ（`api.opencode.ai`、`OPENCODE_API_KEY` 認証）。`opencode run -m <model>` で疎通確認済み（gpt-5.4-nano / gemini-3.5-flash-lite が応答）。
-- **エージェントループ**: 独自ドライバ（Python または dev02 を拡張）。モデルに「ツール＝mina CLI」を渡し、`session get --lines` / `session apply` / `session edit` / `session exec` をサブプロセスで実行。API 応答の `usage`（input/output tokens）を記録。
+- **エージェントループ**: 独自ドライバ（Python または dev02 を拡張）。モデルに「ツール＝minae CLI」を渡し、`session get --lines` / `session apply` / `session edit` / `session exec` をサブプロセスで実行。API 応答の `usage`（input/output tokens）を記録。
 - **手段の有効/無効を「ツールセットの差」で制御**: 同一モデル・同一タスクに対し、露出するツールだけを変える。これでモデル自体の賢さを変数から排除する。
 - **隔離**: 各 run は独立した作業ディレクトリ＋isolated daemon。`pkill` で前回 daemon を落としてから開始。
 
@@ -45,8 +45,8 @@
 - 関心領域は上部の import と深部の定義・使用に散在するよう配置する。
 
 ### 2 つの Arm（同一タスク・同一モデル）
-- **Arm A（範囲 read）**: read ツール = `mina session get --lines start:end` のみ。grep 相当も mina/grep で行指定可能。
-- **Arm B（全文 read）**: read ツール = `mina session get`（全文スナップショット）のみ。
+- **Arm A（範囲 read）**: read ツール = `minae session get --lines start:end` のみ。grep 相当も minae/grep で行指定可能。
+- **Arm B（全文 read）**: read ツール = `minae session get`（全文スナップショット）のみ。
 
 ### 制御（同一にするもの）
 - ファイル内容・タスク文面・モデル・最大ステップ(≤20)・許可ツール（apply/edit は同一の `session apply` を両 arm で使用）。
@@ -88,7 +88,7 @@
 - **drift 注入**: エージェントが最初の apply を終えた直後、ハーネスが**別の非関連行**（例: 別フィールドにコメントを1行追加）を外部から書き込む。これにより次回 edit の expected_text が不一致になり拒否が発火する。
 
 ### 2 つの Arm（同一タスク・同一モデル・同一 drift）
-- **Arm A（具体理由）**: 拒否応答に `expected text mismatch: expected "...", found "..." at [lo, hi)` を載せる（現行 mina の C1 仕様）。
+- **Arm A（具体理由）**: 拒否応答に `expected text mismatch: expected "...", found "..." at [lo, hi)` を載せる（現行 minae の C1 仕様）。
 - **Arm B（汎用理由）**: 拒否応答は `edit rejected: document changed; re-read and retry`（理由・範囲なし）。
 
 ### 制御

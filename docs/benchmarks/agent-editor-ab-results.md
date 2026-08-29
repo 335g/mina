@@ -22,7 +22,7 @@
 
 ## テスト1: 範囲 read（ネイティブ Read の offset/limit を代用）
 
-※ opencode ネイティブ Read（offset/limit）を mina `--lines` の代用とした。同一メカニズム
+※ opencode ネイティブ Read（offset/limit）を minae `--lines` の代用とした。同一メカニズム
 （必要な行だけ渡す）。タスク: 700行の Rust 風ファイル深部の struct にフィールド追加。
 
 | arm | 入力トークン中央値 | コスト中央値 | 成功率 |
@@ -36,11 +36,11 @@
 
 ---
 
-## テスト3: コンテンツ解決型（apply）vs 位置指定（edit）— mina shim 強制
+## テスト3: コンテンツ解決型（apply）vs 位置指定（edit）— minae shim 強制
 
 **ハーネス**: tools/ab/。opencode を bash 専用 agent（native read/edit 無効）にし、
-read は `mread`（=`mina session get --lines`）、edit は `medit`（A=`mina session apply` /
-B=`mina session edit` 位置指定 JSON）に強制。コンプライアンス（shim 経由・直接 mina 呼び出し無し）を監査で判定。
+read は `mread`（=`minae session get --lines`）、edit は `medit`（A=`minae session apply` /
+B=`minae session edit` 位置指定 JSON）に強制。コンプライアンス（shim 経由・直接 minae 呼び出し無し）を監査で判定。
 タスク: f1.rs/f2.rs で `USD→JPY`、`price()→amount()` を全箇所リネーム（実ファイル変更あり）。
 
 | arm | 成功率 | billed トークン中央値 | コスト中央値 | 観察 |
@@ -133,11 +133,11 @@ import/export で結合）。A=apply ループ（`medit`、1回1出現）、B=`m
 
 ---
 
-## テスト6: `mina skill` 参照の有無 — 判断には差なし・トークンは増える
+## テスト6: `minae skill` 参照の有無 — 判断には差なし・トークンは増える
 
 **設計**: ツールセットは両 arm 同一（mread / medit / mrename / mcheck 全部あり）。タスクは T5
 と同じ多出現リネーム（LSP が正解の領域）。違いは**「skill 索引/詳細への参照手段の有無」だけ**。
-A = 指示文に「`mina skill` で索引、`mina skill <topic>` で各ガイドを参照せよ」を追記。
+A = 指示文に「`minae skill` で索引、`minae skill <topic>` で各ガイドを参照せよ」を追記。
 B = skill に言及しない。どちらも「どのツールでリネームするか」は指示しない。n=5/arm。
 
 | arm | 成功率 | billed 中央値 | コスト中央値 | mrename 採用 | skill 参照 |
@@ -165,8 +165,8 @@ skill 参照自体は 300〜500 トークン×1〜3回＋検証 read の増加�
 **設計**: T2 のヌル（小タスク・単一拒否・全文再読が安い）を改善し、600行の生成ファイルに
 8つのターゲット（TARGET_k = 100+k）を分散配置。タスク: 各値を +1 に。ドリフト: 最初の編集
 成功直後にハーネスが `TARGET_5 = 105` を `1050` に外部書換 → 記憶ベースの old 文字列が
-合わず拒否（NOT FOUND）。両 arm とも**同じ実メッセージ**。A のみ `mina skill` を参照可能
-（bin/mina は skill 専用ラッパーに制限 — 直接 session 呼び出しは shim 迂回として除外）。
+合わず拒否（NOT FOUND）。両 arm とも**同じ実メッセージ**。A のみ `minae skill` を参照可能
+（bin/minae は skill 専用ラッパーに制限 — 直接 session 呼び出しは shim 迂回として除外）。
 n=5/arm（準拠 run A=4, B=4）。
 
 | arm | 成功率 | billed 中央値 | コスト中央値 | 拒否後 recover | skill 参照 |
@@ -193,7 +193,7 @@ n=5/arm（準拠 run A=4, B=4）。
 **設計**: 残課題だった「skill がツールの罠（positional）を回避させるか」を直接計測。
 両 arm とも位置指定ツール `medit`（char オフセット JSON）と内容指定 `mapply` を中性記述で提供し、
 タスクに**明示的な行番号ヒント**（line 31: …line 191:）を仕込んで位置指定への誘因を作った
-（チケットの行番号指示に似た現実的な罠）。A のみ `mina skill` 参照可（edit トピックが
+（チケットの行番号指示に似た現実的な罠）。A のみ `minae skill` 参照可（edit トピックが
 「never compute positions」を明記）。タスク: 5 か所の値を +1。A は準拠 6 run、B は 5 run。
 
 | arm | 成功率 | billed 中央値 | コスト中央値 | positional 使用 | skill 参照 |
@@ -209,12 +209,12 @@ t3 の位置指定失敗は「強制された」あるいは「代替が無い�
 "never compute positions"）は**引き金が無い状態では効果を発揮しようがない** — A/B とも同一の
 選択・同一の成功で、skill 参照分のトークン（+61%）だけが乗った。
 
-**副産物（ハーネス改善）**: skill 用に公開した `mina` が「直接 `session apply` を試みる」挙動を
+**副産物（ハーネス改善）**: skill 用に公開した `minae` が「直接 `session apply` を試みる」挙動を
 誘発（A の多数で観測）。ラッパーが拒否（exit 1）すれば無害であるため、**「拒否された直接
 呼び出し」を bypass 勘定から除外**する判定を実装（refused カウント）。「壊れた/制限された経路を
 叩く」のはモデルの自然な探索であり、実害の有無で判定すべきという知見。
 
-**T6〜T8 の統合結論**: `mina skill` は、判断が（a）ツール説明から自明（T6）、（b）モデルが
+**T6〜T8 の統合結論**: `minae skill` は、判断が（a）ツール説明から自明（T6）、（b）モデルが
 自然に導出（T7）、（c）そもそも引き金が無い（T8）のいずれの領域でも付加価値を出さず、
 参照コストだけが乗る。**skill の価値領域はさらに狭く、現状の実測では確認できていない。**
 skill は「擬似コード的知識（exit コードの全レンジ・保存契約・非自明なツール）」の参照用として
@@ -223,18 +223,18 @@ skill は「擬似コード的知識（exit コードの全レンジ・保存契
 
 ---
 
-## テスト9（M2・2026-08-29）: mina 本体の `session rename` vs apply — Rust で T5 を再現
+## テスト9（M2・2026-08-29）: minae 本体の `session rename` vs apply — Rust で T5 を再現
 
 T5 の finding（多出現・複数ファイルで LSP rename が優位）を、ハーネスの tsserver shim では
-なく **mina 本体に実装した `session rename`（ADR-0029）** で再測定した。フィクスチャは T5 の
+なく **minae 本体に実装した `session rename`（ADR-0029）** で再測定した。フィクスチャは T5 の
 Rust 版: 3 ファイル crate（utils/data/main.rs）で `USD` x15・`price` x9 出現。A = `medit`
-（apply ループ）、B = `mrename`（`mina session rename` のパススルー shim）。モデル・計測は
+（apply ループ）、B = `mrename`（`minae session rename` のパススルー shim）。モデル・計測は
 T1〜T8 と同一（gpt-5.4-nano、opencode DB）。n=5/arm。
 
 | arm | 成功率 | billed 中央値 | コスト中央値 | wall 中央値 | ツール使用 |
 |---|---|---|---|---|---|
 | A apply（内容指定） | **3/5**（2 run が `price` を 1 箇所取りこぼし） | 30,597 | $0.0155 | 80s | 24 edits |
-| B `session rename`（mina 本体） | **5/5**（準拠 4/4） | **11,752** | **$0.0060** | **35s** | 2 rename 呼び出し |
+| B `session rename`（minae 本体） | **5/5**（準拠 4/4） | **11,752** | **$0.0060** | **35s** | 2 rename 呼び出し |
 | 差 | — | **−61.6%** | **−61%** | −56% | — |
 
 - A の失敗様態は T5 と同一: `price_left=True` — apply ループは出現を数え漏らす（
@@ -249,7 +249,7 @@ T1〜T8 と同一（gpt-5.4-nano、opencode DB）。n=5/arm。
 
 ---
 
-## テスト11（M3・2026-08-30）: 汎用2ファイル機能追加 — naive 契約 vs mina session 契約
+## テスト11（M3・2026-08-30）: 汎用2ファイル機能追加 — naive 契約 vs minae session 契約
 
 T1〜T10 は read 効率・edit 契約・rename 機能を個別のミクロタスクで測った。T11 は
 LSP を使わない実務タスク（「読む→理解→直す」）を 1 本にし、**ツール契約全体**（全文 read
@@ -277,8 +277,8 @@ decode 構文行を外部書き換え — 両 arm の次編集の anchor が古�
 ## 検証の限界（すべてのテストに共通）
 
 - 単一モデル（gpt-5.4-nano）・小標本（n=4〜5）。上位モデルでの再現は未実施。
-- T1 はネイティブ Read の代用、T2〜T8 は mina/LSP shim 強制（bash 専用 agent）。
-  bash は完全な shell なので「絶対に shim を使う」強制はできず、非準拠 run（直接 mina
+- T1 はネイティブ Read の代用、T2〜T8 は minae/LSP shim 強制（bash 専用 agent）。
+  bash は完全な shell なので「絶対に shim を使う」強制はできず、非準拠 run（直接 minae
   呼び出し・sed/python 直編集）は監査＋bypass 検出で除外した。
 - T2 はタスク規模の制約によるヌル結果。C1 の優位が測れる設計（大ファイル・複数拒否）は未実施。
 - T7 は大規模化したが、「拒否メッセージが既に文字列を名指しする」「範囲 read が使える」ため、
@@ -286,7 +286,7 @@ decode 構文行を外部書き換え — 両 arm の次編集の anchor が古�
 
 ## 総括
 
-- 実装面（mina）: 範囲 read・拒否理由・dirty 警告・CLI 世代・contract 表 — 実装済み。
+- 実装面（minae）: 範囲 read・拒否理由・dirty 警告・CLI 世代・contract 表 — 実装済み。
 - 実測面: **範囲 read でタスク完了トークン −50.8%、内容指定編集が位置指定より成功率 3/5 vs 0/5
   で 5 倍安い、拒否理由の具体性は小規模タスクでは有意差なし。LSP rename は小タスクでは
   apply とほぼ均衡（コスト −26%）だが、出現多数・複数ファイルでは apply より 2/5 vs 5/5・
@@ -295,7 +295,7 @@ decode 構文行を外部書き換え — 両 arm の次編集の anchor が古�
   wall −56%。Rust・実 rust-analyzer）**。
   **M3: 汎用2ファイル機能追加（LSP なし）でも naive 契約（全文 read＋無検証置換）に対して
   4/5 vs 5/5・トークン −40.9%・コスト −43.4%・wall −8%（tools/ab t11）**。
-  `mina skill` 参照は、判断がツール説明から自明なタスクでは**判断を変えずトークン +59%**
+  `minae skill` 参照は、判断がツール説明から自明なタスクでは**判断を変えずトークン +59%**
   （t6）、大規模拒否回復でも +21% で明確な上乗せなし（t7）— 判断はツール説明に載せるのが最安、
   skill は自明でない知識用。**
-- ツール資産: `tools/ab/`（opencode ツール制御 + mina/LSP shim + 計測）は再利用可能（t1〜t9）。
+- ツール資産: `tools/ab/`（opencode ツール制御 + minae/LSP shim + 計測）は再利用可能（t1〜t9）。

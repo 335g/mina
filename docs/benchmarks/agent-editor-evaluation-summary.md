@@ -5,7 +5,7 @@
 > 自明でない知識に限って価値があり、判断自体はツール説明に載せる方が最安。
 >
 > 本ドキュメントは一連の検証（agent-editor-performance-considerations.md →
-> ab-test-plans.md → ab-results.md）と、その mina CLI（skill サブコマンド）への
+> ab-test-plans.md → ab-results.md）と、その minae CLI（skill サブコマンド）への
 > 反映状況を 1 枚にまとめたもの。詳細は各文書を参照。
 
 ---
@@ -17,10 +17,10 @@
 | `agent-editor-performance-considerations.md` | 考察（エディタの理想形・失敗率低減の設計論）＋実装（--lines 等） |
 | `agent-editor-ab-test-plans.md` | 実LLM A/B のテストプラン（t1〜t3 設計） |
 | `agent-editor-ab-results.md` | 実測結果（t1〜t6・生データ・限界） |
-| `tools/ab/` | 再利用可能ハーネス（opencode ツール制御・mina/LSP shim・計測） |
+| `tools/ab/` | 再利用可能ハーネス（opencode ツール制御・minae/LSP shim・計測） |
 | **本ファイル** | 総括・スキル反映マップ |
 
-方法: opencode の bash 専用 agent（native read/edit 無効）＋ mina/LSP shim 強制。
+方法: opencode の bash 専用 agent（native read/edit 無効）＋ minae/LSP shim 強制。
 モデル `opencode/gpt-5.4-nano`、n=4〜5/arm、計測は opencode 使用量DB（input/output tokens・cost）。
 非準拠 run（直接編集・迂回）は監査＋bypass 検出で除外。
 
@@ -35,10 +35,10 @@
 | **T3** | apply（内容指定）vs 位置指定 edit | 成功率 **3/5 vs 0/5**、位置指定はトークン5倍・コスト5.9倍 | 位置指定は「拒否地獄」「誤位置への静かな適用」で失敗しやすい。内容指定が正面入口 |
 | **T4** | LSP rename vs apply（小タスク） | 両 5/5・LSP がトークン −5%・コスト −26% | 小規模ではほぼ均衡（LSP の優位は未顕在） |
 | **T5** | LSP rename vs apply（多数・複数ファイル） | **5/5 vs 2/5**（apply は出現取りこぼし）、トークン **−49%**・コスト **−57%** | 実用的規模では LSP が明確に優位 |
-| **T6** | `mina skill` 参照の有無 | 判断に差なし（両 arm mrename 採用・5/5）、skill 参照は **＋59% トークン** | 判断を促すカードとしてはツール説明が最安（skill 不要） |
+| **T6** | `minae skill` 参照の有無 | 判断に差なし（両 arm mrename 採用・5/5）、skill 参照は **＋59% トークン** | 判断を促すカードとしてはツール説明が最安（skill 不要） |
 | **T7** | 拒否回復の大規模再検証（600行・ドリフト）× skill | 4/4 vs 3/4（失敗1件は意味論スリップ）、skill 参照は **＋21% トークン**・成功率に明確な上乗せなし | skill の価値は「行為が自明でない領域」に限定（T6 と一致）。真価仮説（positional 等の罠の回避）は未検証 | 判断がツール説明から自明なら skill はコストだけ増える。skill は自明でない知識用 |
 | **T8** | positional 罠回避 × skill | 両 arm とも全 run が内容指定を選択（罠は自発されず、skill は判断を変えず）・skill 参照は **＋61% トークン** | 「skill が罠を回避させる」は**確認できず**（罠自体が自発されない）。skill の価値領域は現実測では未確認 | 判断はツール説明と exit 契約に担わせ、skill は契約知識の参照用に限定する設計が整合 |
-| **T9（M2）** | **mina 本体 `session rename`（LSP） vs apply（Rust・T5 再現）** | **5/5 vs 3/5**（apply は `price` を取りこぼし）、トークン **−61.6%**・コスト **−61%**・wall **−56%** | 検証で最良だった LSP rename の製品化（`session rename`, ADR-0029）が、ハーネス shim と同等以上の優位を実 rust-analyzer で再現 | 使い分け判断（skill rename トピック）は本体機能に裏付けられて確定 |
+| **T9（M2）** | **minae 本体 `session rename`（LSP） vs apply（Rust・T5 再現）** | **5/5 vs 3/5**（apply は `price` を取りこぼし）、トークン **−61.6%**・コスト **−61%**・wall **−56%** | 検証で最良だった LSP rename の製品化（`session rename`, ADR-0029）が、ハーネス shim と同等以上の優位を実 rust-analyzer で再現 | 使い分け判断（skill rename トピック）は本体機能に裏付けられて確定 |
 
 **横断的な実測知見**:
 1. 読む量＝費消の主因。必要な範囲だけ渡す（T1）。
@@ -51,9 +51,9 @@
 
 ---
 
-## 3. mina CLI への反映マップ（skill サブコマンド）
+## 3. minae CLI への反映マップ（skill サブコマンド）
 
-`mina skill`（索引）＋ `mina skill <topic>`（内容）。各トピックは検証結果を行動レベルで内蔵している。
+`minae skill`（索引）＋ `minae skill <topic>`（内容）。各トピックは検証結果を行動レベルで内蔵している。
 
 | skill topic | 内蔵する検証知見 | 根拠 |
 |---|---|---|
@@ -73,7 +73,7 @@ skill の read/edit/rename に明示。ヌル結果（T2）と逆方向（T6）�
 **skill の価値実測（T6〜T8）**: 3 領域 — 判断がツール説明から自明（T6）・モデルが自然に導出
 （T7）・そもそも引き金が無い（T8）— いずれでも skill 参照は付加価値を示さず、トークン +21〜61%。
 skill は「擬似コード的・契約知識（exit の全レンジ・保存・非自明なツール）」の参照用に限定し、
-判断の本体はツール説明と mina の契約（exit 0/1/2・拒否メッセージ）に担わせる設計が実測と整合
+判断の本体はツール説明と minae の契約（exit 0/1/2・拒否メッセージ）に担わせる設計が実測と整合
 （詳細: agent-editor-ab-results.md テスト6〜8）。
 
 **未反映（残課題）**: 上位モデルでの再現（全テスト nano のみ）。T2 の大規模再検証（=T7）と
@@ -81,16 +81,16 @@ skill の positional 罠回避（=T8）は実施済み — ともに skill の�
 
 ---
 
-## 4. 実装済み機能との対応（mina 本体）
+## 4. 実装済み機能との対応（minae 本体）
 
 | 機能 | 所在 | 根拠 |
 |---|---|---|
-| `session get --lines`（範囲 read・説明付きゼロ結果・クランプ） | mina-term/src/session.rs | T1, P1/Q3 |
-| `session apply`/`--hunks-stdin`（内容指定・検証・保存・exit 三値） | mina-term/src/session.rs | T3, T5, M1/N1 |
-| 拒否理由の具体化（expected/found/範囲・40 文字） | mina-term/src/daemon.rs | C1, G2 |
-| dirty 警告（edit 後 stderr 1行） | mina-term/src/session.rs | H1 |
-| `session info`（daemon/CLI 世代・metrics） | mina-term/src/session.rs | D1/I4 |
-| `mina skill`（索引＋トピック） | mina-term/src/skill.rs | 本検証の反映（下表） |
+| `session get --lines`（範囲 read・説明付きゼロ結果・クランプ） | minae-term/src/session.rs | T1, P1/Q3 |
+| `session apply`/`--hunks-stdin`（内容指定・検証・保存・exit 三値） | minae-term/src/session.rs | T3, T5, M1/N1 |
+| 拒否理由の具体化（expected/found/範囲・40 文字） | minae-term/src/daemon.rs | C1, G2 |
+| dirty 警告（edit 後 stderr 1行） | minae-term/src/session.rs | H1 |
+| `session info`（daemon/CLI 世代・metrics） | minae-term/src/session.rs | D1/I4 |
+| `minae skill`（索引＋トピック） | minae-term/src/skill.rs | 本検証の反映（下表） |
 | 契約表（exit・read/edit・hunks・永続化・skill） | docs/adr/0026 | R2 |
 
 ---

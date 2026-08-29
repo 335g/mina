@@ -1,6 +1,6 @@
 # HighlightGroup はフラットな正規集合 + UI ロールで固定する
 
-Helix は scoped 階層テーマ（dotted scope と親フォールバック）を使うが、mina の Colorscheme（名前付きロール→色の写像）は未実装であり、今回の成果物は taxonomy そのもの。tree-sitter の capture を**フラットな正規グループ集合**（comment / keyword / string / number / constant / function / type / parameter / field / operator / punctuation / attribute / error の13種）に写像する自前クエリを書く。UI ロール（カーソル / 選択 / 診断 Error・Warning / ステータス行 / コマンドライン / ポップアップ）も taxonomy に含め、将来の Colorscheme がハイライトと UI を一括でカバーする。wire・テーマ形式は小文字、Rust は `HighlightGroup` enum とする。
+Helix は scoped 階層テーマ（dotted scope と親フォールバック）を使うが、minae の Colorscheme（名前付きロール→色の写像）は未実装であり、今回の成果物は taxonomy そのもの。tree-sitter の capture を**フラットな正規グループ集合**（comment / keyword / string / number / constant / function / type / parameter / field / operator / punctuation / attribute / error の13種）に写像する自前クエリを書く。UI ロール（カーソル / 選択 / 診断 Error・Warning / ステータス行 / コマンドライン / ポップアップ）も taxonomy に含め、将来の Colorscheme がハイライトと UI を一括でカバーする。wire・テーマ形式は小文字、Rust は `HighlightGroup` enum とする。
 
 ## 検討した代替案
 

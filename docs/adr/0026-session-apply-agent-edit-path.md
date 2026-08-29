@@ -1,8 +1,8 @@
 # session apply: ヘッドレスエージェントの正規編集経路
 
-エージェントがファイルを編集する正規手順を、1コマンドの `mina session apply <path> <old> <new>` に集約する（issue #29 / F1、docs/dev-feedback.md 第2ラウンド 報告#3 の minae ヘルパーの製品化）。`session edit` は生の [`DocumentEdit`] JSON 実行のまま残し、`session apply` がその上に正規の利用手順を載せる。
+エージェントがファイルを編集する正規手順を、1コマンドの `minae session apply <path> <old> <new>` に集約する（issue #29 / F1、docs/dev-feedback.md 第2ラウンド 報告#3 の minae ヘルパーの製品化）。`session edit` は生の [`DocumentEdit`] JSON 実行のまま残し、`session apply` がその上に正規の利用手順を載せる。
 
-> **補足（R2/2026-08-26）**: エージェント向けの契約を1か所にまとめた表を本ADR末尾「エージェント向け契約表」に追加（dev02 README の契約表を mina 本体に移植）。`session get --lines`（トークン削減, P1）と `session info` の CLI 世代（I4）も新設。
+> **補足（R2/2026-08-26）**: エージェント向けの契約を1か所にまとめた表を本ADR末尾「エージェント向け契約表」に追加（dev02 README の契約表を minae 本体に移植）。`session get --lines`（トークン削減, P1）と `session info` の CLI 世代（I4）も新設。
 
 ## 動機
 
@@ -17,7 +17,7 @@ dev01 開発で minae ヘルパー（get → expected_text 検証 → edit → s
 
 ## 設計
 
-`mina session apply`（mina-term/src/session.rs）は1回の実行で次を順に行う:
+`minae session apply`（minae-term/src/session.rs）は1回の実行で次を順に行う:
 
 1. 接続・Hello(Headless)。以後のコマンドはすべて同じ接続（fresh read の保証）
 2. `Open { path }` — 未存在パスは空ファイルを作成して再 Open（Save で新規作成される）
@@ -64,7 +64,7 @@ dev01 開発で minae ヘルパー（get → expected_text 検証 → edit → s
 
 ## エージェント向け契約表（R2/2026-08-26 追記）
 
-dev02 README（tools.rs）で整備された契約を、mina 本体の `session` サブコマンドにも適用。エージェントはこの表だけで分岐できる（exit code の三値分類・失敗の意味・再試行可否を JSON パースなしで判定）。
+dev02 README（tools.rs）で整備された契約を、minae 本体の `session` サブコマンドにも適用。エージェントはこの表だけで分岐できる（exit code の三値分類・失敗の意味・再試行可否を JSON パースなしで判定）。
 
 ### 終了コード（三値分類）
 
@@ -106,15 +106,15 @@ stdin に JSON 配列 `[{"old":"…","new":"…"},…]`。
 
 `session edit` は保存しない（dirty のまま）。成功時 dirty なら stderr に1行 `note: buffer is dirty (not saved); persist with: session exec '"Save"'`。`session apply` / `--hunks-stdin` は Save まで行い dirty を解消する。
 
-### スキル（`mina skill`、2026-08-27 追記）
+### スキル（`minae skill`、2026-08-27 追記）
 
 エージェント向けの判断・手順の参考書。**索引と内容を分離**（トークン削減 — AB 実測 t1 の「必要な分だけ読む」を適用）:
 
 | 呼び出し | 出力 | 終了コード |
 |---|---|---|
-| `mina skill` | 索引（1トピック1行・約80トークン） | 0 |
-| `mina skill <topic>` | そのトピックの内容のみ（read/edit/rename/persist/errors。各 150〜250トークン） | 0 |
-| `mina skill <未知>` | stderr に英語の理由＋既知トピック一覧 | 1 |
+| `minae skill` | 索引（1トピック1行・約80トークン） | 0 |
+| `minae skill <topic>` | そのトピックの内容のみ（read/edit/rename/persist/errors。各 150〜250トークン） | 0 |
+| `minae skill <未知>` | stderr に英語の理由＋既知トピック一覧 | 1 |
 
 - daemon 不要（静的コンテンツ）。内容は tools/ab の A/B 実測（t1〜t5）に基づく行動レベルの**判断指針**（例: rename = 多箇所/複数ファイルは LSP mrename、少数は apply）。
-- エージェントの使い方: `mina skill` で発見 → 必要なトピックだけ `mina skill <top>` でロード。常時ロードするのは索引のみ。
+- エージェントの使い方: `minae skill` で発見 → 必要なトピックだけ `minae skill <top>` でロード。常時ロードするのは索引のみ。

@@ -18,7 +18,7 @@ T5 実測: 出現多数・複数ファイルのリネームで LSP rename 5/5 vs
 
 - **保存まで**適用する（apply と同じ「1 往復で完結」）。開いている文書はメモリ（Document）に適用して履歴に記録（文書ごとの undo 履歴の invariant を保つ。**リネーム全体は undo 対象外** — ヘッドレスの失敗回復は fresh read → 再適用が実測の正（T3/T7））。開いていないファイルはディスク読み → 書戻し。
 - **原子 bunch（拡張）**: 全ファイルの編集を「行がファイルを超える・範囲逆転・範囲重複」の検証を**適用前に全部**済ませ、検証に失敗すればディスク無変更で拒否（apply の「Save 前失敗なら無変更」の複数ファイル版）。適用後の失敗は I/O のみ。
-- **リトライ**: rust-analyzer はロード完了前の rename/references に error（ContentModified / "No references found"）や**空の結果**を返す。mina-lsp の Client は LSP error を `Null` に潰すため、結果が「null / 空編集 / 空配列」の間はリトライし、**2 回連続で同一になるまで待つ**（インクリメンタルに増える参照を取りこぼさない — T5 の教訓）。予算 ≈ 10 秒（`SEMANTIC_RETRIES` × 500ms）。予算切れは最後の結果をそのまま返す（参照なしは「0 件」として正直に伝える）。
+- **リトライ**: rust-analyzer はロード完了前の rename/references に error（ContentModified / "No references found"）や**空の結果**を返す。minae-lsp の Client は LSP error を `Null` に潰すため、結果が「null / 空編集 / 空配列」の間はリトライし、**2 回連続で同一になるまで待つ**（インクリメンタルに増える参照を取りこぼさない — T5 の教訓）。予算 ≈ 10 秒（`SEMANTIC_RETRIES` × 500ms）。予算切れは最後の結果をそのまま返す（参照なしは「0 件」として正直に伝える）。
 
 ## 未開ファイルの参照を取りこぼさない（実測必須の didOpen）
 

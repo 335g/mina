@@ -4,7 +4,7 @@
 
 ## 0. 目的
 
-同一エージェント・同一モデルで、**「ファイル直読みツール群(対照構成A)」と「mina ツール面(処置構成B)」** を同一タスクで実行し、**成功1タスクあたりの入力トークン**を比較する。これにより「LSP対応の有無」ではなく「軽量応答・変化検知・検証付き編集をプロトコルに焼き込む設計」が LLM コストを削るか、を実証する。
+同一エージェント・同一モデルで、**「ファイル直読みツール群(対照構成A)」と「minae ツール面(処置構成B)」** を同一タスクで実行し、**成功1タスクあたりの入力トークン**を比較する。これにより「LSP対応の有無」ではなく「軽量応答・変化検知・検証付き編集をプロトコルに焼き込む設計」が LLM コストを削るか、を実証する。
 
 ## 1. 用語(計測語彙。製品語彙 `CONTEXT.md` には混ぜない)
 
@@ -16,9 +16,9 @@
 
 ## 2. タスク
 
-**#30 「headless に Close を許可して deleted 状態から抜け出せるようにする」** (`github.com/335g/mina`)
+**#30 「headless に Close を許可して deleted 状態から抜け出せるようにする」** (`github.com/335g/minae`)
 
-- **ground truth**: マージコミット `77639c9` — `mina-term/src/daemon.rs` のみ +17/−5
+- **ground truth**: マージコミット `77639c9` — `minae-term/src/daemon.rs` のみ +17/−5
   1. headless 許可リスト(`process_command` 内 `matches!`)に `Command::Close` を追加
   2. 拒否メッセージを `"...和 Open"` から `"...和 Open, and Close"` に更新
   3. テスト `headless_client_is_restricted_to_document_edit_family` に headless の Close 成功ケースを追加(Close で status None・path None・空文書)
@@ -36,14 +36,14 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 ### 対照構成A (`--agent e2e-a`)
 
 - opencode 既定ツール(read / grep / write / edit / bash / glob / todo 等)をそのまま使用
-- mina カスタムツールは agent 設定で無効化
+- minae カスタムツールは agent 設定で無効化
 - ただし備考: opencode の lsp ツールはデフォルト無効のまま(構成AもLSPツールは使わない)
 
 ### 処置構成B (`--agent e2e-b`)
 
 - `read` / `grep` / `write` / `edit` を無効化 → **全文読みの経路を構造的に遮断**
 - `bash` は `cargo test` / `cargo build` / `cargo check` / `ls` / `find` / `pwd` のみ許可(それ以外 deny。`cat` 等の回し読みを封じる)
-- mina ツール5本を有効化:
+- minae ツール5本を有効化:
 
 | ツール | 実装 | 応答 |
 |---|---|---|
@@ -57,7 +57,7 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 
 ### 構成B のエージェントプロンプト(指示文)
 
-「あなたは mina エディタデーモンが提供するリポジトリでコードを編集している。この環境ではファイルの全文を読むことは**できない**。read/grep は無効化されている。mina_* ツールが正の情報源である: mina_state は全文なしで診断・世代・checksum を返し、mina_peek は定義スニペットを返し、mina_window は ±30 行の有界スライスを返し、mina_apply は検証付き編集を適用し、mina_wait は診断の settle を待つ。診断と定義は完全かつ最新であり、信頼せよ。エラーを知るには mina_state、シンボルを解決するには mina_peek を使い、どうしても見る必要がある行だけ mina_window を使え。他の手段で全文を復元しようとしてはいけない。」
+「あなたは minae エディタデーモンが提供するリポジトリでコードを編集している。この環境ではファイルの全文を読むことは**できない**。read/grep は無効化されている。mina_* ツールが正の情報源である: mina_state は全文なしで診断・世代・checksum を返し、mina_peek は定義スニペットを返し、mina_window は ±30 行の有界スライスを返し、mina_apply は検証付き編集を適用し、mina_wait は診断の settle を待つ。診断と定義は完全かつ最新であり、信頼せよ。エラーを知るには mina_state、シンボルを解決するには mina_peek を使い、どうしても見る必要がある行だけ mina_window を使え。他の手段で全文を復元しようとしてはいけない。」
 
 ## 4. 測定
 
@@ -88,7 +88,7 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 | セッション | `ses_fe57a25c…` (42 msgs) | `ses_fe55de61…` (63 msgs) |
 | タスク完了 | 〇 | 〇 |
 | 正しさ | Close許可・メッセージ更新・テスト追加 (挙動OK・diff等価)。さらに docs/adr/0026 も更新 | Close許可・メッセージ更新・テスト追加 (挙動OK・diff=ground truth と同スコープ) |
-| cargo test (-p mina-term) | 215/216 (1失敗は `stalled_response_writer` — **main HEAD でも失敗する pre-existing/macOS環境依存**、Close と無関係) | 同 |
+| cargo test (-p minae-term) | 215/216 (1失敗は `stalled_response_writer` — **main HEAD でも失敗する pre-existing/macOS環境依存**、Close と無関係) | 同 |
 | 入力トークン | **155,287** | **148,956** (−4.1%) |
 | 出力トークン | 9,642 | 13,015 (+35%) |
 | コスト | $0.0566 | $0.0574 |
@@ -182,15 +182,15 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 
 ### 実装内容
 
-- `mina-term/src/session.rs`: `WAIT_TIMEOUT=90s` 定数・`WaitOutcome` enum・分離ヘルパー `wait_with_timeout` を追加し、`session wait` 分岐を書き換え。プロセスは一時接続をしない (async fn は最初の poll まで接続しないため、正常系で無駄な接続なし)。
+- `minae-term/src/session.rs`: `WAIT_TIMEOUT=90s` 定数・`WaitOutcome` enum・分離ヘルパー `wait_with_timeout` を追加し、`session wait` 分岐を書き換え。プロセスは一時接続をしない (async fn は最初の poll まで接続しないため、正常系で無駄な接続なし)。
 - 回帰テスト `wait_with_timeout_returns_current_state_on_timeout` を追加 (分離ヘルパーを短いタイムアウトで検証。実 CLI の 90 秒定数に依存しない)。
 - `docs/adr/0014` の WaitFor 条項を更新 (「タイムアウトなし」→「CLI 側 90 秒/exit 2」)。
 - プローブ用ツール `tmp/e2e01/wt/.opencode/tools/mina_wait.ts` の説明文にタイムアウト仕様を追記 (tmp/ は gitignore のため追跡外)。
 
 ### 検証
 
-- `cargo test -p mina-term`: 222 passed (新テスト含む)。
-- 実バイナリでのエンドツーエンド: `mina session wait 18446744073709551615` が 91 秒で exit 2・現状スナップショットを JSON 出力・stderr に理由 (90 秒タイムアウト + 再接続 1 秒。初回は旧 daemon がソケットを掴んだままで fallback の GetState が parse エラー — `session info` で検知する想定の事故。daemon を立て直して成功)、`session wait 0` は即座に exit 0。
+- `cargo test -p minae-term`: 222 passed (新テスト含む)。
+- 実バイナリでのエンドツーエンド: `minae session wait 18446744073709551615` が 91 秒で exit 2・現状スナップショットを JSON 出力・stderr に理由 (90 秒タイムアウト + 再接続 1 秒。初回は旧 daemon がソケットを掴んだままで fallback の GetState が parse エラー — `session info` で検知する想定の事故。daemon を立て直して成功)、`session wait 0` は即座に exit 0。
 - 副次: フルスイートで間欠失敗していた既存テスト `disconnect_does_not_reset_while_another_interactive_remains` (最後の切断→GetState の競合) を、リセット伝播の待ちループを追加して修正 (本変更とは無関係の既存フレーク)。
 
 ### 次の一手 (次回セッション)
@@ -204,7 +204,7 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 
 ### タスクとベース
 
-- **タスク**: mina-protocol に `ActivityKind` / `Activity` 型と `StateSnapshot.activities` を追加し、daemon が Open / Save / 外部変更 Reload / LSP 診断確定の各経路で Activity を追加・除去 (増減で generation を進め、重複追加・存在しない除去は無視、settle ループの全出口で `DiagnosticsSettle` を除去)。スナップショットにはフォーカス文書の活動だけを載せる (設計は ADR-0028)。
+- **タスク**: minae-protocol に `ActivityKind` / `Activity` 型と `StateSnapshot.activities` を追加し、daemon が Open / Save / 外部変更 Reload / LSP 診断確定の各経路で Activity を追加・除去 (増減で generation を進め、重複追加・存在しない除去は無視、settle ループの全出口で `DiagnosticsSettle` を除去)。スナップショットにはフォーカス文書の活動だけを載せる (設計は ADR-0028)。
 - **ground truth**: `2e5b152..2efecf1` (4ファイル / +170/−3: protocol +31 / daemon +124 / lsp +15 / render +3。テストはシンプルなユニット2件: `activity_add_remove_bumps_generation` と `snapshot_carries_focused_activities`)。GT での `cargo test` は 380 passed / 0 failures を確認済み (別 worktree で検証)。
 - **ベース (合成)**: `2e5b152` + `c7c45fb` (wait 90s タイムアウト) + `31d955e` (切断リセットのフレーク修正) を worktree 内で cherry-pick (wait タイムアウトはベースより後にあるため。tmp/ は gitignore のため履歴汚染なし)。
 - **手順**: 各構成を 2 段階で測定 — ①実装 (タスク文どおり) ②安定化 (「現在のツリーを維持し cargo test 全 green に収束せよ。失敗している自作テストは修正・簡素化・削除してよい」)。①だけで「完了宣言 = 実装完了」とみなすと false-done を見逃すため (後述)。
@@ -252,7 +252,7 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 - `session.rs`: `Hunk` struct + `parse_hunks` + `apply_hunks` を追加。`apply` に `--hunks-stdin` 分岐。チェックサムは前の編集結果で連鎖、各 hunk の `old` は直前適用後の現在テキストに対し char インデックスで再計算 (行揺れ対応)。
 - 実バイナリ E2E: 3 hunk を 1 プロセスで適用 → `{edits:3, generation:7}` + exit 0 + 3 箇所が正しく置換され Save 成功。失敗 path: 2 番目の hunk が未発見 → exit 2 + `NOT FOUND` + **ディスク無変更** (1 番目はメモリ適用済みでも Save されない) を確認。
 - ツール `tmp/e2e01/wt/.opencode/tools/mina_apply.ts`: `hunks` 配列を受けて `--hunks-stdin` に流す形に変更 (opencode の schema は zod のため `array(object{old,new})` が利用可)。tmp のため追跡外、次回ベンチで実証。
-- `cargo test -p mina-term`: **223 passed / 0 failed** (8 回連続グリーン、`parse_hunks` テスト追加)。
+- `cargo test -p minae-term`: **223 passed / 0 failed** (8 回連続グリーン、`parse_hunks` テスト追加)。
 - 副次: 前回入れた切断リセットのフレーク修正が「Interactive を先に接続するとリセット自体を抑止する」と根本原因を捉えていなかったため、**Headless オブザーバで伝播を待つ**形に改め、8/8 グリーンで安定 (ADR-0027 の Interactive 判定に Headless は数えない点を利用)。
 
 ### 次の一手

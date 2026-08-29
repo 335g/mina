@@ -19,7 +19,7 @@ name = "rust"
 file-types = ["rs"]
 language-server = "rust-analyzer"
 root-markers = []  # 明示すれば汎用集合を置換（空 = マーカーなし = 親フォールバックのみ）
-grammar = "rust"  # mina-loader の grammar 名（ハイライト・シンボル解決）
+grammar = "rust"  # minae-loader の grammar 名（ハイライト・シンボル解決）
 ```
 
 - **`[language-server.<id>]`**: サーバ起動と初期化の定義。`command` / `args` /
@@ -30,7 +30,7 @@ grammar = "rust"  # mina-loader の grammar 名（ハイライト・シンボル
 
 ## 置き場所と読み手
 
-`$XDG_CONFIG_HOME/mina/languages.toml`（なければ `~/.config/mina/languages.toml`）。
+`$XDG_CONFIG_HOME/minae/languages.toml`（なければ `~/.config/minae/languages.toml`）。
 読み手は **Daemon** — LSP を spawn・保持する主体だから。既存 client Config
 （config.toml）の「Daemon は読まない」契約（CONTEXT.md の Config 項）は維持し、
 languages.toml は **Daemon 側の第 2 設定ソース**として別カテゴリとする。
@@ -74,7 +74,7 @@ languages.toml は **Daemon 側の第 2 設定ソース**として別カテゴ�
 
 ## 規定サーバ方針
 
-- **既定同梱エントリ = mina が検証済みのサーバのみ**。検証 = t9 風の A/B
+- **既定同梱エントリ = minae が検証済みのサーバのみ**。検証 = t9 風の A/B
   （tools/ab）で rename / references / inlay hints の実動作を確認済み、という意味。
   既定の init options（inlay hints のチューニング等）もこの検証とセットで同梱する。
 - **ユーザーが任意サーバを languages.toml に足すのは許可・非保証**。LSP 標準 + initialize
@@ -129,7 +129,7 @@ rename / references / definition）を導出し、機能ごとに要求を止め
 - **セッションキー**: WorkspaceRoot キー（ADR-0010）を **(WorkspaceRoot, languageId)** に拡張
   した。同一 root に複数言語が混在する場合（.rs + .ts 等）も言語ごとに別セッション
   （別サーバ）。`session_root_for` / `borrows_focus_session` も同言語キーのみを対象にする。
-- **`grammar` キー（実装済み）**: `[[language]]` の任意キー。mina-loader の静的レジストリを
+- **`grammar` キー（実装済み）**: `[[language]]` の任意キー。minae-loader の静的レジストリを
   grammar 名で引く。未登録・未指定ならハイライト無し・tree-sitter シンボル解決なし
   （単語境界フォールバック）。シンボル位置解決（rename / references の `old` 解決）も
   この grammar を使うため、TS の rename もコメント・文字列を除外した識別子に解決する。

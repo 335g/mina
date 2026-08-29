@@ -1,6 +1,6 @@
 # 構文ハイライト仕様 (Syntax Highlighting Spec)
 
-mina の TUI に構文ハイライトを実装するための仕様。決定事項は ADR-0016/0017/0018 に記録し、本稿は実装可能な詳細を定義する。
+minae の TUI に構文ハイライトを実装するための仕様。決定事項は ADR-0016/0017/0018 に記録し、本稿は実装可能な詳細を定義する。
 
 ## スコープ
 
@@ -15,18 +15,18 @@ mina の TUI に構文ハイライトを実装するための仕様。決定事�
 ## アーキテクチャ
 
 ```
-┌─ mina-loader (新規クレート) ─────────────────────────────┐
+┌─ minae-loader (新規クレート) ─────────────────────────────┐
 │  言語定義レジストリ: 拡張子/言語名 → grammar + ハイライトクエリ │
 │  deps: tree-sitter, tree-sitter-rust (M1)                │
 └──────────────┬────────────────────────────────────────────┘
                │ language_for_path()
-┌─ mina-term (daemon) ──────────────────────────────────────┐
+┌─ minae-term (daemon) ──────────────────────────────────────┐
 │  SyntaxStore: DocumentId → { tree, ハイライト範囲 }        │
 │  全編集源 (interactive / DocumentEdit / Reload) で更新     │
 │  → StateSnapshot.highlights: Vec<HighlightRange>          │
 └──────────────┬────────────────────────────────────────────┘
                │ 既存の応答 + push パイプライン (ADR-0006/0013)
-┌─ mina-term (client / render.rs) ──────────────────────────┐
+┌─ minae-term (client / render.rs) ──────────────────────────┐
 │  draw_line: (カーソル, 選択, 診断, グループ) でスタイル合成 │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -35,7 +35,7 @@ mina の TUI に構文ハイライトを実装するための仕様。決定事�
 
 ### HighlightGroup (13 種)
 
-wire・テーマ形式は小文字。Rust は `mina-protocol` の enum:
+wire・テーマ形式は小文字。Rust は `minae-protocol` の enum:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -97,9 +97,9 @@ pub struct HighlightRange {
 - **grammar 不在**（未知拡張子・未登録言語）: `highlights` は空。ハイライトなし（ADR-0017 のフォールバックなし方針）。
 - **性能**: 巨大ファイルで実用上問題が出た場合のみ対策を検討する（debounce 等）。プロファイリングが先（ponytail）。
 
-## mina-loader（M1）
+## minae-loader（M1）
 
-新クレート `mina-loader`（ADR-0003 が指名した将来クレート。依存方向: daemon → mina-loader → tree-sitter で成立）。
+新クレート `minae-loader`（ADR-0003 が指名した将来クレート。依存方向: daemon → minae-loader → tree-sitter で成立）。
 
 ```rust
 pub struct LanguageDef {
@@ -123,7 +123,7 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef>;
 
 **優先順位**: カーソル > 選択 > 診断 > グループ。上位は下位を置換し、属性は現行どおり合成する（カーソル+診断 = 青背景+下線、選択+診断 = 反転+下線）。勝利ロールの Style は全フィールドが尊重される。診断範囲内は「下線 + 診断色（Error/Warning で異なる）」がグループ色を置換する（M4 で確定。M3 の「下線 + グループ色」共存ルールは置き換え）。
 
-**暫定パレット**（M4 で `mina-term/src/colorscheme.rs` の `DEFAULT` スキームとしてデータ化済み。以下はその当初の定義）:
+**暫定パレット**（M4 で `minae-term/src/colorscheme.rs` の `DEFAULT` スキームとしてデータ化済み。以下はその当初の定義）:
 
 | グループ | SGR |
 |---|---|
@@ -145,7 +145,7 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef>;
 
 ## マイルストーン
 
-- **M1 — mina-loader**: クレート新設、レジストリ、rust grammar + ハイライトクエリ。検証: スニペットをパースして期待グループが得られるユニットテスト。
+- **M1 — minae-loader**: クレート新設、レジストリ、rust grammar + ハイライトクエリ。検証: スニペットをパースして期待グループが得られるユニットテスト。
 - **M2 — プロトコル + daemon**: `HighlightGroup` / `HighlightRange` / `StateSnapshot.highlights`、daemon の SyntaxStore（編集ごとのインクリメンタル再パース、Open/Close/Reload のライフサイクル、スナップショット生成時に範囲を充填）。
 - **M3 — renderer**: `draw_line` のグループ次元、暫定パレット、優先順位。検証: 既存の render テストを拡張（グループ付き行のエスケープ列検証）。
 - **M4 — Colorscheme 機構**: 名前付きスキームと切替（`:colorscheme`）、暫定パレットの外部化、色能力検出、診断 Error/Warning の色分け、UI ロールの enum 化。**全完了** — M4-1 (#18: データモデル + DEFAULT + renderer 参照化) / M4-2 (#19: `:colorscheme` 切替) / M4-3 (#20: 色能力検出、ADR-0019)。
@@ -153,6 +153,6 @@ pub fn language_by_name(name: &str) -> Option<&'static LanguageDef>;
 ## 関連文書
 
 - ADR-0016 (Syntax は Daemon 所有) / ADR-0017 (tree-sitter 採用) / ADR-0018 (フラット taxonomy)
-- ADR-0003 (mina-loader 指名) / ADR-0005 (daemon 所有モデル) / ADR-0006・0012・0013 (スナップショット・push) / ADR-0015 (外部リロード) / ADR-0001 (クリーンルーム)
+- ADR-0003 (minae-loader 指名) / ADR-0005 (daemon 所有モデル) / ADR-0006・0012・0013 (スナップショット・push) / ADR-0015 (外部リロード) / ADR-0001 (クリーンルーム)
 - docs/helix-architecture.md (参照設計)
 - CONTEXT.md (`Syntax`, `HighlightGroup`, `Colorscheme`)
