@@ -1,0 +1,15 @@
+# 埋め込み既定の言語テーブル（ADR-0030）
+# 検証済みサーバのみを同梱する（規定サーバ方針）。ユーザーファイル
+# ($XDG_CONFIG_HOME/mina/languages.toml) が name / id 単位で上書き・追加する。
+
+[language-server.rust-analyzer]
+command = "rust-analyzer"
+args = []
+# initializationOptions: rust-analyzer は inlay hints を明示 ON にしないと既定オフ
+# （ADR-0020 の型・パラメータヒントを維持。他はサーバ既定のまま）。
+config = { "rust-analyzer" = { inlayHints = { typeHints = { enable = true }, parameterHints = { enable = true } } } }
+
+[[language]]
+name = "rust"
+file-types = ["rs"]
+language-server = "rust-analyzer"

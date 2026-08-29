@@ -11,6 +11,7 @@ mod colorscheme;
 mod config;
 mod daemon;
 mod keymap;
+mod languages;
 mod lsp;
 mod render;
 mod session;
