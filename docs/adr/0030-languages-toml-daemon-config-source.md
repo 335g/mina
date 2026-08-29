@@ -95,6 +95,10 @@ rename / references / definition）を導出し、機能ごとに要求を止め
 - **peek（定義）**: `definitionProvider` が無ければ peek なし（空応答）。
 - キー欠落・明示 `false` は非対応扱い。`true` とオブジェクト形式（RenameOptions 等）は
   対応扱い。`renameProvider: false` を advertise するサーバは稀だが正しく扱える。
+- **ゲートで早期 return する場合もフォーカス文書へ復元する**: `prepare_borrowed_session`
+  が対象を didOpen 済みのため、借用していたら `restore_focus_*` を呼んでから応答する
+  （呼ばないと LSP の current_uri が対象のままになり、次回編集の同期スキップ・診断消失
+  を招く — 敵対的検証で発見して修正）。
 - 初期化オプションのスキーマはサーバ固有（rust-analyzer は `initializationOptions` で
   inlay hints を明示 ON にしないと既定オフ。TS / gopls は別キー・別経路）。よって
   config は言語ではなく**サーバ定義**に持たせる。capabilities から導出しない —
