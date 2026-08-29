@@ -1392,11 +1392,26 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
             ),
         );
     }
-    let err = |msg: String| ServerMessage::ReferencesResult {
-        path: borrowed.path_str.clone(),
-        locations: Vec::new(),
-        total: 0,
-        error: Some(msg),
+    // 中間エラー応答。エラー経路でも借用していたらフォーカス文書へ戻す — 戻さないと
+    // current_uri が対象のまま残り、次回のフォーカス編集が sync スキップ・診断消失に
+    // なる（敵対的検証 P2。err クロージャの各 return が自動的に restore する）。
+    let err = |msg: String| {
+        let borrowed_ref = &borrowed;
+        async move {
+            restore_focus_after_semantic(
+                daemon,
+                &borrowed_ref.session,
+                &borrowed_ref.focused,
+                &borrowed_ref.path,
+            )
+            .await;
+            ServerMessage::ReferencesResult {
+                path: borrowed_ref.path_str.clone(),
+                locations: Vec::new(),
+                total: 0,
+                error: Some(msg),
+            }
+        }
     };
     // 識別子位置の解決（コメント・文字列内には解決しない — T3 の誤位置事故を予防）
     let (line, character) =
@@ -1404,19 +1419,22 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
             .await
         {
             Ok(v) => v,
-            Err(e) => return err(e),
+            Err(e) => return err(e).await,
         };
     let locations = match lsp::references_at(&borrowed.session, &borrowed.path, line, character).await
     {
         Ok(v) => v,
-        Err(e) => return err(e),
+        Err(e) => return err(e).await,
     };
     // フォーカス文書を借りていたら復元（開き直し + 診断更新 — 自己修復）
     restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path).await;
     let mut out = Vec::with_capacity(locations.len());
     for (uri, line) in locations {
         let Ok(p) = path_from_uri(&uri) else {
-            return err(format!("LSP 応答に file:// 以外の URI が含まれています: {uri}"));
+            return err(format!(
+                "LSP 応答に file:// 以外の URI が含まれています: {uri}"
+            ))
+            .await;
         };
         out.push(mina_protocol::ReferenceLocation {
             path: p.to_string_lossy().into_owned(),
@@ -1453,7 +1471,8 @@ fn err_refs(path: &str, msg: String) -> ServerMessage {
 ///    独立に保たれる — Q5）。開いていないファイルはディスク読み → 書換。
 /// 3. 開いている文書も含め全変更をディスクへ書き、世代を進める。
 async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) -> ServerMessage {
-    let err = |msg: String| ServerMessage::RenameResult {
+    // borrow 前の入力エラー（restore 不要）
+    let err_input = |msg: String| ServerMessage::RenameResult {
         generation: 0,
         files: 0,
         edits: 0,
@@ -1461,15 +1480,39 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         error: Some(msg),
     };
     if old.is_empty() || new.is_empty() {
-        return err("invalid input: old and new must be non-empty".into());
+        return err_input("invalid input: old and new must be non-empty".into());
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen) => return err_input(format!("cannot open {path}")),
         Err(BorrowFail::NoServer(p)) => {
-            return err(format!("rename not supported for {p} (no LSP server configured)"))
+            return err_input(format!(
+                "rename not supported for {p} (no LSP server configured)"
+            ))
         }
-        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
+        Err(BorrowFail::SpawnFailed(e)) => return err_input(format!("LSP error: {e}")),
+    };
+    // 中間エラー応答。エラー経路でも借用していたらフォーカス文書へ戻す — 戻さないと
+    // current_uri が対象のまま残り、次回のフォーカス編集が sync スキップ・診断消失に
+    // なる（敵対的検証 P2。err クロージャの各 return が自動的に restore する）。
+    let err = |msg: String| {
+        let borrowed_ref = &borrowed;
+        async move {
+            restore_focus_after_semantic(
+                daemon,
+                &borrowed_ref.session,
+                &borrowed_ref.focused,
+                &borrowed_ref.path,
+            )
+            .await;
+            ServerMessage::RenameResult {
+                generation: 0,
+                files: 0,
+                edits: 0,
+                changed: Vec::new(),
+                error: Some(msg),
+            }
+        }
     };
     // サーバが rename を提供していなければ即「not supported」（exit 1、再試行不可）。
     // 未 advertise のサーバに要求するとワークスペース走査 + リトライ予算を無駄にする
@@ -1478,10 +1521,17 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     if !borrowed.session.lock().await.caps.rename {
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
-        return err(format!(
-            "rename not supported for {} (LSP server が rename を advertise していません)",
-            borrowed.path_str
-        ));
+        // err クロージャは async（restore 済みのため同形を直接返す）
+        return ServerMessage::RenameResult {
+            generation: 0,
+            files: 0,
+            edits: 0,
+            changed: Vec::new(),
+            error: Some(format!(
+                "rename not supported for {} (LSP server が rename を advertise していません)",
+                borrowed.path_str
+            )),
+        };
     }
     // 識別子位置の解決（コメント・文字列内には解決しない）
     let (line, character) =
@@ -1489,11 +1539,11 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
             .await
         {
             Ok(v) => v,
-            Err(e) => return err(e),
+            Err(e) => return err(e).await,
         };
     let raw = match lsp::rename_at(&borrowed.session, &borrowed.path, line, character, new).await {
         Ok(v) => v,
-        Err(e) => return err(e),
+        Err(e) => return err(e).await,
     };
     // 各ファイルの編集を char インデックスへ変換・検証（適用前に全失敗を検出 —
     // 検証失敗ならディスク無変更で拒否）
@@ -1502,7 +1552,7 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     for f in &raw {
         let target = match path_from_uri(&f.uri) {
             Ok(p) => p,
-            Err(msg) => return err(msg),
+            Err(msg) => return err(msg).await,
         };
         let text = {
             let d = daemon.lock().await;
@@ -1515,11 +1565,11 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
             None => read_open_target(target.to_string_lossy().as_ref()).await,
         };
         let Some(text) = text else {
-            return err(format!("cannot open {} (rename target)", target.display()));
+            return err(format!("cannot open {} (rename target)", target.display())).await;
         };
         let edits = match lsp::lsp_edits_to_char(&text, enc, &f.edits) {
             Ok(v) => v,
-            Err(msg) => return err(format!("{}: {msg}", target.display())),
+            Err(msg) => return err(format!("{}: {msg}", target.display())).await,
         };
         if !edits.is_empty() {
             files.push(lsp::RenameFile {
@@ -1532,7 +1582,8 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         return err(format!(
             "symbol not found: {old:?} in {} (rename produced no edits)",
             borrowed.path.display()
-        ));
+        ))
+        .await;
     }
     match apply_and_save_rename(daemon, &borrowed.session, &borrowed.focused, &borrowed.path, &files)
         .await
@@ -1547,7 +1598,7 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
                 .collect(),
             error: None,
         },
-        Err(msg) => err(msg),
+        Err(msg) => err(msg).await,
     }
 }
 
@@ -3366,6 +3417,58 @@ language-server = "pyright"
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn session_keys_split_mixed_language_same_root() {
+    // Stage 4: 同一 root に .rs と .ts が混在してもセッションキー (root, languageId) で
+    // 分割される。session_for / session_root_for は同言語キーのみ対象（.rs のセッションに
+    // .ts を乗せない・逆も然り）。
+    let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+    if !std::path::Path::new(bin).exists() {
+        eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("mina-mixed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+    let rs = dir.join("a.rs");
+    let ts = dir.join("a.ts");
+    std::fs::write(&rs, "fn f() {}").expect("write");
+    std::fs::write(&ts, "export function f() {}").expect("write");
+    let canon_rs = std::fs::canonicalize(&rs).unwrap();
+    let canon_ts = std::fs::canonicalize(&ts).unwrap();
+    let mut daemon = Daemon::new();
+    let root = daemon.languages.workspace_root(&canon_rs);
+    assert_eq!(root, daemon.languages.workspace_root(&canon_ts), "同一 root の前提");
+    let session_rs = Arc::new(Mutex::new(
+        lsp::LspSession::new(bin, &root).await.expect("initialize"),
+    ));
+    let session_ts = Arc::new(Mutex::new(
+        lsp::LspSession::new_with_config(
+            bin, &root, &["--bare".to_string()], "typescript", None,
+        )
+        .await
+        .expect("initialize"),
+    ));
+    daemon
+        .lsp_sessions
+        .insert((root.clone(), "rust".to_string()), session_rs.clone());
+    daemon
+        .lsp_sessions
+        .insert((root.clone(), "typescript".to_string()), session_ts.clone());
+    // 同 root でも言語ごとに別セッション
+    let got_rs = daemon.session_for(&canon_rs).expect("rs セッション");
+    let got_ts = daemon.session_for(&canon_ts).expect("ts セッション");
+    assert!(Arc::ptr_eq(&got_rs, &session_rs));
+    assert!(Arc::ptr_eq(&got_ts, &session_ts));
+    assert!(!Arc::ptr_eq(&got_rs, &got_ts), "言語ごとに別セッション");
+}
 
     #[tokio::test]
     async fn session_lookup_survives_root_marker_edit() {
