@@ -8,9 +8,9 @@ ADR-0011 (Command/DocumentEdit split) and ADR-0007 (undo-group boundaries) are i
 
 ### 1. CRITICAL — DocumentEdit can panic the daemon task; edit applied without generation/event; selection left out of range
 - **Spec**: ADR-0011 requires DocumentEdit to "neither read nor change the Selection" (snapshot selection byte-identical) while still being a real edit; ADR-0012 requires generation bump + ChangeEvent on every state-changing operation.
-- **Code evidence**: `apply_edit` (mina-term/src/daemon.rs:748) validates, then `preempt`, then:
+- **Code evidence**: `apply_edit` (minae-term/src/daemon.rs:748) validates, then `preempt`, then:
   - daemon.rs:770 `let selection_after = daemon.editor.selection();` (raw, unmapped)
-  - daemon.rs:771 `daemon.editor.apply(tx, selection_after)` — `Editor::apply` (mina-view/src/editor.rs:319) stores the **unchanged** selection and inserts the new doc
+  - daemon.rs:771 `daemon.editor.apply(tx, selection_after)` — `Editor::apply` (minae-view/src/editor.rs:319) stores the **unchanged** selection and inserts the new doc
   - daemon.rs:772 `daemon.editor.scroll_to_cursor(...)` — editor.rs:389-393 calls `rope.char_to_line(selection.primary().head())`, which **panics** when `head > len_chars` (ropey 1.6.1 rope.rs:689, `char_to_line` → `try_char_to_line(...).unwrap()`).
 - **Trigger**: doc "hello world", TUI cursor at 11 (`Goto DocumentEnd`), agent sends `DocumentEdit { start:0, end:11, text:"hi", checksum:fnv1a64(b"hello world") }`. Bounds/checksum pass; doc becomes "hi" (2 chars); selection stays [11,11]; `char_to_line(11)` panics. Since the panic occurs after `Editor::apply` but before the handler's `record_event` (daemon.rs:627-635), the edit **is** applied (text, dirty, history) with **no generation bump and no event** — violating ADR-0012's change-detection contract. The connection task dies without a response, and the daemon's stored selection stays [11,11], so subsequent commands that call `scroll_to_cursor` (e.g. `Move` Line via `j/k` — `step_line` returns the out-of-range `char_pos` unchanged, daemon.rs:876) panic again until a clamping command (Char move, Insert) runs. The existing e2e test `document_edit_replaces_range_without_touching_selection` (daemon.rs:1694) avoids this by placing the cursor at [0,0].
 - **Verdict**: DEVIATES — **CRITICAL** (panic risk + spec-breaking generation/event contract + daemon wedge).
@@ -31,7 +31,7 @@ ADR-0011 (Command/DocumentEdit split) and ADR-0007 (undo-group boundaries) are i
 
 ### 4. AMBIGUOUS/MINOR — "non-char-boundary" start/end cannot be detected or rejected; byte-miscounting clients get silent char-index semantics
 - **Spec**: task requirement — non-char-boundary start/end rejected with status, NOT clamped, NO panic.
-- **Code evidence**: the wire `Range` and `DocumentEdit.start/end` are documented as **char indices** (mina-protocol/src/lib.rs:78, 92; ADR-0011 "explicit character ranges"), and bounds are checked as `start <= end && end <= text.chars().count()` (daemon.rs:753-756). Every index in `[0, len_chars]` is a valid char boundary, so the daemon cannot distinguish a client that miscounted bytes. A byte-miscounting client (e.g. `start:1` inside a 2-byte char) passes checksum+bounds and the edit is applied at char-index semantics — no rejection, but also no panic and no clamping (verified: `Transaction::insert` uses ropey char-index `slice`; movement helpers clamp via `char_to_byte` → `text.len()`).
+- **Code evidence**: the wire `Range` and `DocumentEdit.start/end` are documented as **char indices** (minae-protocol/src/lib.rs:78, 92; ADR-0011 "explicit character ranges"), and bounds are checked as `start <= end && end <= text.chars().count()` (daemon.rs:753-756). Every index in `[0, len_chars]` is a valid char boundary, so the daemon cannot distinguish a client that miscounted bytes. A byte-miscounting client (e.g. `start:1` inside a 2-byte char) passes checksum+bounds and the edit is applied at char-index semantics — no rejection, but also no panic and no clamping (verified: `Transaction::insert` uses ropey char-index `slice`; movement helpers clamp via `char_to_byte` → `text.len()`).
 - **Verdict**: AMBIGUOUS — **MINOR**. The safety properties (no panic, no clamp) hold; the rejection requirement is un-implementable with the char-index wire type and is only observable if the wire were byte-addressed.
 - **Fix direction**: none required for v1; if byte-addressed edits are ever needed, add a separate wire type or document that indices are char-based.
 
@@ -52,9 +52,9 @@ ADR-0011 (Command/DocumentEdit split) and ADR-0007 (undo-group boundaries) are i
 
 ## Test results
 
-I have no shell/exec tool in this review environment, so **`cargo test -p mina-term -p mina-view -p mina-protocol` was not run**. Code was reviewed read-only; all cited tests were inspected in-source (mina-term/src/daemon.rs test module, mina-view/src/history.rs, editor.rs, mina-core, mina-protocol). Commands the supervisor should run:
+I have no shell/exec tool in this review environment, so **`cargo test -p minae-term -p minae-view -p minae-protocol` was not run**. Code was reviewed read-only; all cited tests were inspected in-source (minae-term/src/daemon.rs test module, minae-view/src/history.rs, editor.rs, minae-core, minae-protocol). Commands the supervisor should run:
 
-- `cargo test -p mina-term -p mina-view -p mina-protocol` (the two LSP tests skip unless `target/debug/mock-server` exists — run `cargo build --workspace` or `cargo test --workspace` first; they print "mock-server が未ビルドのためスキップ（cargo test --workspace で実行）").
+- `cargo test -p minae-term -p minae-view -p minae-protocol` (the two LSP tests skip unless `target/debug/mock-server` exists — run `cargo build --workspace` or `cargo test --workspace` first; they print "mock-server が未ビルドのためスキップ（cargo test --workspace で実行）").
 - `gh issue view 7`, `gh issue view 8`, `gh issue view 9` — I could not execute these; my issue mapping relies on the ADR docs, CONTEXT.md, and the task statement.
 
 ## Untested claims
