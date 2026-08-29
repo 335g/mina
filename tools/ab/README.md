@@ -94,7 +94,7 @@ python3 tools/ab/ab.py stats t3 A 1
   実体（モード切替・ドリフト注入・監査ログ）。`ab.py` が arm ごとに `bin/r` `bin/e`
   `bin/mrename` ラッパーを生成する。
 - `ab.py` — フィクスチャ生成・workdir 構築（opencode.json 含む）・実行・計測・成功判定。
-- 結果の解釈は `docs/agent-editor-ab-results.md` に追記する。
+- 結果の解釈は `docs/verification/agent-editor-ab-results.md` に追記する。
 
 ## 注記
 
