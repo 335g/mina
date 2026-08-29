@@ -1261,12 +1261,14 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
     };
     let peek = if lsp_supported {
         match ensure(daemon, &path).await {
-            Ok(session) => {
+            // サーバが definition を提供していなければ peek なし（Stage 3）
+            Ok(session) if session.lock().await.caps.definition => {
                 // セッションを借りた（開き直し）ので現在のテキストで didOpen する。
                 // 既に開いている場合の再 didOpen は無害（idempotent）。
                 lsp::open_document(&session, &path, &text).await;
                 lsp::definition_peek_at_char(&session, &path, &text, head).await
             }
+            Ok(_) => None, // definition 非対応サーバ: peek なし
             Err(_) => None, // サーバ spawn 失敗: peek なし
         }
     } else {
@@ -1304,6 +1306,10 @@ async fn serve_peek_definition_at(
         Ok(b) => b,
         Err(_) => return empty(),
     };
+    // サーバが definition を提供していなければ peek なし（空応答。Stage 3）
+    if !borrowed.session.lock().await.caps.definition {
+        return empty();
+    }
     let borrows = daemon
         .lock()
         .await
@@ -1346,6 +1352,17 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
         }
         Err(BorrowFail::SpawnFailed(e)) => return err_refs(path, format!("LSP error: {e}")),
     };
+    // サーバが references を提供していなければ即「not supported」（exit 1、再試行不可）。
+    // 未 advertise のサーバに要求するとリトライ予算（約10秒）を無駄にする（Stage 3）。
+    if !borrowed.session.lock().await.caps.references {
+        return err_refs(
+            path,
+            format!(
+                "references not supported for {} (LSP server が references を advertise していません)",
+                borrowed.path_str
+            ),
+        );
+    }
     let err = |msg: String| ServerMessage::ReferencesResult {
         path: borrowed.path_str.clone(),
         locations: Vec::new(),
@@ -1425,6 +1442,14 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
+    // サーバが rename を提供していなければ即「not supported」（exit 1、再試行不可）。
+    // 未 advertise のサーバに要求するとワークスペース走査 + リトライ予算を無駄にする（Stage 3）。
+    if !borrowed.session.lock().await.caps.rename {
+        return err(format!(
+            "rename not supported for {} (LSP server が rename を advertise していません)",
+            borrowed.path_str
+        ));
+    }
     // 識別子位置の解決（コメント・文字列内には解決しない）
     let (line, character) =
         match resolve_symbol_lsp_pos(daemon, &borrowed.session, &borrowed.path, &borrowed.text, old)
@@ -3367,6 +3392,46 @@ root-markers = [".docsroot"]
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn capabilities_gate_features_for_bare_server() {
+        // Stage 3 の負の経路: 能力を advertise しないサーバ（MINA_LSP_BARE の mock）に
+        // は機能要求が出ず、rename / references は「not supported」（exit 1 相当・再試行
+        // 不可のメッセージ）を即返し、peek は空になる（未 advertise サーバへの
+        // 10 秒リトライ・ワークスペース走査を防ぐ）。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &bin) };
+        unsafe { std::env::set_var("MINA_LSP_BARE", "1") };
+        let dir = std::env::temp_dir().join(format!("mina-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("x.rs");
+        std::fs::write(&path, "fn foo() {}").expect("write");
+        let path_str = path.to_string_lossy().into_owned();
+        let daemon = Arc::new(Mutex::new(Daemon::new()));
+        match serve_rename(&daemon, &path_str, "foo", "bar").await {
+            ServerMessage::RenameResult { error: Some(e), .. } => {
+                assert!(e.starts_with("rename not supported"), "{e}")
+            }
+            other => panic!("rename は not supported 応答のはず: {other:?}"),
+        }
+        match serve_references(&daemon, &path_str, "foo").await {
+            ServerMessage::ReferencesResult { error: Some(e), .. } => {
+                assert!(e.starts_with("references not supported"), "{e}")
+            }
+            other => panic!("references は not supported 応答のはず: {other:?}"),
+        }
+        match serve_peek_definition_at(&daemon, &path_str, 1, 1).await {
+            ServerMessage::Peek { text, .. } => assert!(text.is_empty(), "peek は空のはず: {text}"),
+            other => panic!("peek は空応答のはず: {other:?}"),
+        }
+        unsafe { std::env::remove_var("MINA_LSP_BARE") };
+        unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
