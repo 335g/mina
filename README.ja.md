@@ -62,7 +62,18 @@ $ mina session wait 42
 $ mina session rename src/lib.rs "USD" "JPY"
 ```
 
-各コマンドは JSON を返します。編集が拒否されたら該当範囲を読み直して再試行してください —— 拒否メッセージは何が一致しなくなったかを示します。`mina session hints <path>` と `mina session peek <path> <line>:<col>` は全文なしで inlay hints と定義ポップアップを取得します。`mina skill` は read / edit 契約のビルトインガイドを表示します。
+各コマンドは JSON を返します。編集が拒否されたら該当範囲を読み直して再試行してください —— 拒否メッセージは何が一致しなくなったかを示します。`mina session hints <path>` と `mina session peek <path> <line>:<col>` は全文なしで inlay hints と定義ポップアップを取得します。
+
+#### Agent skills（エージェント向けスキル）
+
+`mina skill` はエージェント向けのオンデマンド型スキル棚です: 無引数なら薄い索引（1トピック1行）を、`mina skill <topic>` ならそのトピックの内容だけを返します。
+
+```console
+$ mina skill           # 索引: read, edit, rename, persist, errors
+$ mina skill read      # read 契約（session get --lines の番号付き出力）
+```
+
+ガイドはツール選択（read / apply / rename 契約）とエラー回復を扱います。エージェントがパースできるよう、出力は英語・成功は exit 0 に統一され、未知トピックは exit 1 で理由と利用可能トピック一覧を返します。編集が拒否されたら `mina skill errors` が最初の参照先です。
 
 ## アーキテクチャ
 
@@ -77,11 +88,9 @@ $ mina session rename src/lib.rs "USD" "JPY"
 
 - [CONTEXT.md](CONTEXT.md) — ドメインモデルの正規用語集
 - [docs/helix-architecture.md](docs/helix-architecture.md) — アーキテクチャと設計ノート
-- [docs/benchmarks/](docs/benchmarks/) — 公開しているエージェントエディタ A/B 計測結果とテスト計画
-- [docs/verification/](docs/verification/) — 内部評価ノート（非公開）
+- [docs/benchmarks/](docs/benchmarks/) — 公開しているエージェントエディタ A/B 計測結果・テスト計画・評価ノート
 - [docs/adr/](docs/adr/) — 意思決定記録
 - [docs/spec/](docs/spec/) — ワイヤプロトコル仕様
-- [docs/verification/](docs/verification/) — エージェントエディタ A/B 計測結果と評価ノート
 
 mina は開発中です。荒い部分がある前提でお願いします。
 

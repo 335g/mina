@@ -62,7 +62,18 @@ $ mina session wait 42
 $ mina session rename src/lib.rs "USD" "JPY"
 ```
 
-Each command returns JSON. If an edit is rejected, re-read the affected range and retry — the rejection message says what no longer matches. `mina session hints <path>` and `mina session peek <path> <line>:<col>` fetch inlay hints and definition popups without the full text. `mina skill` prints built-in guides on the read/edit contract.
+Each command returns JSON. If an edit is rejected, re-read the affected range and retry — the rejection message says what no longer matches. `mina session hints <path>` and `mina session peek <path> <line>:<col>` fetch inlay hints and definition popups without the full text.
+
+#### Agent skills
+
+`mina skill` ships a load-on-demand skill shelf for agents: no arguments prints a thin index (one line per topic); `mina skill <topic>` prints just that topic's guide.
+
+```console
+$ mina skill           # index: read, edit, rename, persist, errors
+$ mina skill read      # the read contract (session get --lines, numbered output)
+```
+
+The guides cover tool choice (read / apply / rename contracts) and error recovery. They are written for machine parsing: English text, exit 0 on success; an unknown topic exits 1 with the reason and the available topics. If an edit is rejected, `mina skill errors` is the first stop.
 
 ## Architecture
 
@@ -77,11 +88,9 @@ Each command returns JSON. If an edit is rejected, re-read the affected range an
 
 - [CONTEXT.md](CONTEXT.md) — canonical glossary for the domain model
 - [docs/helix-architecture.md](docs/helix-architecture.md) — architecture and design notes
-- [docs/benchmarks/](docs/benchmarks/) — published agent-editor A/B measurement results and test plans
-- [docs/verification/](docs/verification/) — internal evaluation notes (not published)
+- [docs/benchmarks/](docs/benchmarks/) — published agent-editor A/B measurement results, test plans, and evaluation notes
 - [docs/adr/](docs/adr/) — decision records
 - [docs/spec/](docs/spec/) — wire protocol specification
-- [docs/verification/](docs/verification/) — agent-editor A/B measurement results and evaluation notes
 
 mina is under active construction; expect rough edges.
 
