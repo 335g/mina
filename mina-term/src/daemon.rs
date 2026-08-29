@@ -98,10 +98,11 @@ pub struct Daemon {
     /// 温かいまま保持・reap なし）。各セッションは独立した Mutex で保護し、
     /// LSP の await は daemon ロック外で行う（ADR-0009/ADR-0010）。
     pub(crate) lsp_sessions: HashMap<PathBuf, Arc<Mutex<LspSession>>>,
-    /// 言語テーブル（ADR-0030）。起動時に初期ロードし、セッション spawn 時に
-    /// 再読込・差し替えされる（`ensure`）。ゲート（拡張子 → サーバ有無）と
-    /// spawn（command / args / init options / languageId）が参照する。
+    /// 言語テーブル（ADR-0030）。最新性は [`Daemon::languages_refresh`] が管理する
+    /// （languages.toml の mtime が変わったときだけ再読込）。
     pub(crate) languages: Arc<LanguageTable>,
+    /// 最後に読んだ languages.toml の mtime（`languages_refresh` の再読込判定）。
+    languages_mtime: Option<std::time::SystemTime>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
     pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
     /// パスごとの inlay hint キャッシュ（ADR-0020）。`HintCache.text_checksum` が
@@ -360,8 +361,9 @@ impl Daemon {
             editor: Editor::new(),
             viewport_height: 24,
             lsp_sessions: HashMap::new(),
-            // 起動時の初期ロード。以後は ensure の spawn 時に再読込・差し替え（ADR-0030）。
+            // 起動時の初期ロード。以後は languages_refresh が mtime 差分だけ再読込（ADR-0030）。
             languages: LanguageTable::load().into_arc(),
+            languages_mtime: languages_file_mtime(),
             diagnostics: Vec::new(),
             insert_owner: None,
             interactive_clients: HashSet::new(),
@@ -375,6 +377,33 @@ impl Daemon {
             activities: HashMap::new(),
             metrics: ServerMetrics::default(),
         }
+    }
+
+    /// 最新の言語テーブルを返す。languages.toml の mtime が前回読込と異なれば
+    /// 再読込してキャッシュを差し替える（なければキャッシュを返すだけ）。
+    ///
+    /// ゲート（拡張子 → サーバ有無）と spawn（`ensure`）の**両方**がこれを使う。
+    /// spawn 時だけの再読込では「新言語の追加」がゲートを通過できず、次回
+    /// daemon 再起動まで反映されないため（敵対的検証で発見 — ADR-0030）。
+    pub(crate) fn languages_refresh(&mut self) -> Arc<LanguageTable> {
+        let mtime = languages_file_mtime();
+        if mtime != self.languages_mtime {
+            self.languages = LanguageTable::load().into_arc();
+            self.languages_mtime = mtime;
+        }
+        self.languages.clone()
+    }
+
+    /// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
+    /// ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
+    /// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
+    /// 置き換わる）。
+    fn borrows_focus_session(&mut self, focused: &Option<PathBuf>, target: &Path) -> bool {
+        focused.as_deref().is_some_and(|fp| {
+            fp != target
+                && self.languages_refresh().server_for(fp).is_some()
+                && lsp::workspace_root(fp) == lsp::workspace_root(target)
+        })
     }
 
     /// クライアント切断時の後始末: Insert モードで開いたままの undo グループを
@@ -402,6 +431,13 @@ impl Daemon {
             self.record_event(EventSource::External, EventKind::SelectionReset, None, None);
         }
     }
+}
+
+/// languages.toml の現在の mtime（ファイルがなければ `None`）。
+fn languages_file_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::config::config_dir().join("languages.toml"))
+        .ok()
+        .and_then(|m| m.modified().ok())
 }
 
 /// 可視行 [first_line, first_line+height) の byte 範囲（ADR-0021）。
@@ -1023,7 +1059,12 @@ async fn prepare_borrowed_session(
         return Err(BorrowFail::CannotOpen);
     };
     // LSP 非対応パス（テーブルにサーバ割当なし）: サーバを spawn しない（ADR-0030）
-    let lsp_supported = daemon.lock().await.languages.server_for(&path_buf).is_some();
+    let lsp_supported = daemon
+        .lock()
+        .await
+        .languages_refresh()
+        .server_for(&path_buf)
+        .is_some();
     if !lsp_supported {
         return Err(BorrowFail::NoServer(path_str));
     }
@@ -1099,7 +1140,12 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
         };
     };
     // LSP 非対応パス（テーブルにサーバ割当なし）: 空ヒントで応答する（ADR-0030）
-    let lsp_supported = daemon.lock().await.languages.server_for(&path_buf).is_some();
+    let lsp_supported = daemon
+        .lock()
+        .await
+        .languages_refresh()
+        .server_for(&path_buf)
+        .is_some();
     if !lsp_supported {
         let d = daemon.lock().await;
         return ServerMessage::Hints {
@@ -1145,9 +1191,8 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
     // ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
     // いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
     // 置き換わる）。
-    let languages = daemon.lock().await.languages.clone();
-    let borrows_focus_session =
-        !target_is_focused && borrows_focus_session(&focused, &path_buf, &languages);
+    let borrows_focus_session = !target_is_focused
+        && daemon.lock().await.borrows_focus_session(&focused, &path_buf);
     // 切り替え: 対象文書を didOpen（前の文書は閉じられる）。pull は現在の文書に
     // しか応えない（current_uri 一致チェック）ため、対象を開くことは必須。
     lsp::open_document(&session, &path_buf, &text).await;
@@ -1185,7 +1230,7 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
             Some(path) => {
                 let head = d.editor.selection().primary().head();
                 let text = d.editor.current_document().text().to_string();
-                let lsp_supported = d.languages.server_for(&path).is_some();
+                let lsp_supported = d.languages_refresh().server_for(&path).is_some();
                 (path, head, text, lsp_supported)
             }
             // 開いていない: peek なしのスナップショットで応答
@@ -1237,10 +1282,10 @@ async fn serve_peek_definition_at(
         Ok(b) => b,
         Err(_) => return empty(),
     };
-    let borrows = {
-        let languages = daemon.lock().await.languages.clone();
-        borrows_focus_session(&borrowed.focused, &borrowed.path, &languages)
-    };
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
     let peek =
         lsp::definition_peek_at_line_col(&borrowed.session, &borrowed.path, &borrowed.text, line, col)
             .await;
@@ -1543,10 +1588,7 @@ async fn restore_focus_after_semantic(
     focused: &Option<PathBuf>,
     target: &Path,
 ) {
-    let borrows = {
-        let languages = daemon.lock().await.languages.clone();
-        borrows_focus_session(focused, target, &languages)
-    };
+    let borrows = daemon.lock().await.borrows_focus_session(focused, target);
     let target_is_focus = focused.as_deref() == Some(target);
     if !(borrows || target_is_focus) {
         return; // 別 root: フォーカスのセッションには触れていない
@@ -1558,20 +1600,7 @@ async fn restore_focus_after_semantic(
 }
 
 /// フォーカス文書と同じ WorkspaceRoot で LSP 対応のときだけセッションを借りた
-/// ことになる（ADR-0010）。別 root ならフォーカス文書のセッションには触れて
-/// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
-/// 置き換わる）。
-fn borrows_focus_session(
-    focused: &Option<PathBuf>,
-    target: &Path,
-    languages: &LanguageTable,
-) -> bool {
-    focused.as_deref().is_some_and(|fp| {
-        fp != target
-            && languages.server_for(fp).is_some()
-            && lsp::workspace_root(fp) == lsp::workspace_root(target)
-    })
-}
+/// ことになる（ADR-0010）… 実装は [`Daemon::borrows_focus_session`]。
 
 /// LSP セッションを借りた場合の復元（Q10-(c)）: フォーカス文書がこの間に
 /// 移動していなければ、現在テキストで didOpen し直し + 診断を再 pull して
@@ -1627,10 +1656,11 @@ async fn ensure(
             }
         }
     }
-    // 未作成 or 死亡: 設定を再読込して spawn + initialize（M1 / ADR-0030）。
-    // languages.toml は spawn のたびに再読込し、差し替えたテーブルを保存する
-    // （起動時 1 回読込では daemon 再起動まで反映されない）。
-    let languages = LanguageTable::load();
+    // 未作成 or 死亡: 最新テーブルで spawn + initialize（M1 / ADR-0030）。
+    // languages_refresh は mtime 差分だけ再読込するため、ゲート（先に呼ばれた
+    // languages_refresh）と同じテーブルを参照する — 「新言語の追加」も次の
+    // ゲート/ spawn で反映される（起動時 1 回読込では daemon 再起動まで効かない）。
+    let languages = daemon.lock().await.languages_refresh();
     let spec = languages
         .server_for(path)
         .ok_or_else(|| format!("LSP 非対応のパスです: {}", path.display()))?;
@@ -1646,9 +1676,8 @@ async fn ensure(
     )
     .await?;
     let arc = Arc::new(Mutex::new(session));
-    // 保存（短いロック・await なし）。
+    // 保存（短いロック・await なし）。languages は languages_refresh が更新済み。
     let mut d = daemon.lock().await;
-    d.languages = Arc::new(languages);
     // 同時 ensure レース: 既存が生きていればそちらを優先する
     if let Some(existing) = d.lsp_sessions.get(&root) {
         let alive = match existing.try_lock() {
@@ -2099,7 +2128,7 @@ async fn process_command(
                     let session = if daemon
                         .lock()
                         .await
-                        .languages
+                        .languages_refresh()
                         .server_for(&path_buf)
                         .is_some()
                     {
@@ -2146,7 +2175,7 @@ async fn process_command(
                     let lsp_supported = daemon
                         .lock()
                         .await
-                        .languages
+                        .languages_refresh()
                         .server_for(&path_buf)
                         .is_some();
                     let session = if contents.is_some() && lsp_supported {
@@ -3191,6 +3220,59 @@ mod tests {
             !replaced.lock().await.client.is_dead(),
             "返るセッションは生きている"
         );
+    }
+
+    #[test]
+    fn languages_refresh_picks_up_newly_added_language() {
+        // 敵対的検証で発見した欠陥の回帰テスト: ゲートが古いテーブルを見ると
+        // 「languages.toml に新言語を足しても daemon 再起動まで反映されない」。
+        // mtime 差分再読込により、次のゲート/spawn で新言語が認識されることを
+        // 検証する（ADR-0030 の spawn 時再読込の約束）。
+        let dir = std::env::temp_dir().join(format!(
+            "mina-langs-refresh-{}",
+            std::process::id()
+        ));
+        let xdg = dir.join("xdg");
+        std::fs::create_dir_all(xdg.join("mina")).expect("tmp dirs");
+        let path = xdg.join("mina/languages.toml");
+        // XDG_CONFIG_HOME を差し替えて daemon を構築（既定は rust のみ）
+        let old = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        std::fs::write(&path, "").expect("write");
+        let mut daemon = Daemon::new();
+        let table = daemon.languages_refresh();
+        assert!(
+            table.server_for(Path::new("/tmp/x.ts")).is_none(),
+            "初期状態では ts 非対応"
+        );
+        // ユーザーが言語を追加（mtime を確実に変えるため少し待つ）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &path,
+            r#"
+[language-server.typescript-language-server]
+command = "typescript-language-server"
+
+[[language]]
+name = "typescript"
+file-types = ["ts"]
+language-server = "typescript-language-server"
+"#,
+        )
+        .expect("write");
+        // 再起動なし・次回のゲート相当の refresh で反映される
+        let table = daemon.languages_refresh();
+        let spec = table
+            .server_for(Path::new("/tmp/x.ts"))
+            .expect("追加した言語が次の refresh で認識される");
+        assert_eq!(spec.language_id, "typescript");
+        assert_eq!(spec.command, "typescript-language-server");
+        // 後始末（env 復元 + 一時ディレクトリ削除）
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
