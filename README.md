@@ -30,6 +30,7 @@ A resident **Daemon** holds all editor state — open documents, undo histories,
 
 - **Editing core** (UI-agnostic): documents, selections, undo groups, Normal / Insert / Select modes, search, external-change reload
 - **Language support** via LSP, per workspace root: diagnostics, inlay hints, definition peek, semantic rename and references
+- **Language servers** (embedded and verified per ADR-0030): `rust-analyzer` for Rust, `typescript-language-server` for TypeScript — with tree-sitter syntax highlighting for the same two. Any other LSP can be wired up via your `languages.toml` (user-added servers are unvetted but negotiate standard features); see the config docs.
 - **Headless agent interface**: `minae session` — bounded numbered reads (`get --lines`), one-shot verified edits (`apply`), positional edits (`edit`), state-change waiting (`wait`), hints and peek without full text, semantic rename (`rename`)
 - **Terminal UI** (optional): `minae open`
 - **Configable**: `languages.toml` for language servers (daemon-side), `config.toml` and user colorschemes (client-side), built-in `minae skill` guides for agents
