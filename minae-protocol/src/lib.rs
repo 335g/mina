@@ -1,0 +1,795 @@
+//! minae の daemon/client IPC の wire 型。
+//!
+//! 依存を持たない（serde のみ）。daemon とクライアントの両方が参照する。
+//! フレーミングは NDJSON: 1メッセージ = JSON 1行（`docs/adr/0006-state-snapshot-ipc.md`）。
+
+use serde::{Deserialize, Serialize};
+
+/// IPC プロトコルのバージョン。**wire 形式が変わったら必ず上げる**。
+///
+/// ソケットパスに埋め込まれ（`minae-{PROTOCOL_VERSION}.sock`）、古い daemon が
+/// 新しいクライアントに拾われるのを防ぐ（古い daemon は古いソケットに残り、
+/// 新クライアントは新しいソケットで新 daemon を自動起動する — クライアントの
+/// `ensure_daemon` と合わせて、バージョン不一致の応答を一切受けない）。
+///
+/// v4: `StateSnapshot.highlights` が全文ではなく可視範囲（first_line から
+/// viewport_height 行。ADR-0021）になった。
+/// v5: 編集コマンド拡張 — `Command::Change`（Helix の `c`）、
+/// `DeleteWordBackward`/`DeleteWordForward`（単語削除）、`Movement::WordEnd` /
+/// `LineStart`/`LineEnd`（単語末尾・行頭/行末）。追加のみで後方互換だが、
+/// 古い daemon に新コマンドを送っても動作しないため version を上げる。
+/// v6: `Command::InsertAtLineEnd` / `InsertAtLineStart`（Helix の `A`/`I`。
+/// ADR-0023）。
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// 編集モード（wire 型。minae-view の Mode とは別に持つ — protocol は依存を持たない）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    #[default]
+    Normal,
+    Insert,
+    Select,
+}
+
+/// クライアントが daemon へ送るコマンド。
+///
+/// 追加は後方互換（serde の外部タグ付け enum）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Command {
+    /// 現在の状態スナップショットを要求する。
+    GetState,
+    /// 世代が `generation` を超えるまでブロックし、超えた時点のスナップショットを
+    /// 返す（ADR-0012 #12）。状態は変えない。エージェントのモニタリングが
+    /// ポーリングの代わりに1リクエストで変化を待てる。
+    WaitFor { generation: u64 },
+    /// ファイルを読み込んで開く（読み込み失敗は StateSnapshot.status に報告）。
+    Open { path: String },
+    /// 選択を点に潰して移動する。ただし単語移動（[`Movement::Word`] /
+    /// [`Movement::WordEnd`]）は Helix 流に anchor を保持し、移動した分を
+    /// 選択状態にする（単語途中の b で現在の単語が選択される）。
+    Move { movement: Movement, direction: Direction },
+    /// anchor を保ったまま head を移動する（選択の拡張・縮小）。
+    Extend { movement: Movement, direction: Direction },
+    /// 文書の先頭/末尾へ絶対移動する。
+    Goto { target: GotoTarget },
+    /// 表示範囲をページ単位でスクロールする（正で下）。高さは daemon 側が知っている。
+    Scroll { pages: isize },
+    /// モードを切り替える。
+    SetMode { mode: Mode },
+    /// ターミナルの表示高さを通知する（カーソル追従スクロールに使う）。
+    SetViewport { height: usize },
+    /// 選択（またはカーソル位置）にテキストを挿入する。
+    Insert { text: String },
+    /// 後方削除（Backspace 相当）。
+    DeleteBackward,
+    /// 前方削除（Delete キー相当）。
+    DeleteForward,
+    /// 後方単語削除（Alt-Backspace / Ctrl-w 相当）。
+    DeleteWordBackward,
+    /// 前方単語削除（Alt-d 相当）。
+    DeleteWordForward,
+    /// 選択範囲を削除する。
+    DeleteRange,
+    /// 選択（またはカーソル位置）を削除して Insert モードへ入る（Helix の `c`）。
+    /// カーソル上では削除なしで Insert モードに入るだけ。削除は undo グループの外。
+    Change,
+    /// 各 Range を head の行の行末（改行の直前）へ点に潰して Insert モードへ
+    /// 入る（Helix の `A`。ADR-0023）。Select でも折りたたむ。
+    InsertAtLineEnd,
+    /// 各 Range を head の行の最初の非空白文字（空白のみの行は列 0）へ点に潰して
+    /// Insert モードへ入る（Helix の `I`。ADR-0023）。Select でも折りたたむ。
+    InsertAtLineStart,
+    /// 直近の変更グループを元に戻す。
+    Undo,
+    /// 直近に undo された変更グループをやり直す。
+    Redo,
+    /// 現在の文書をファイルに書き込む（結果は status に報告）。
+    Save,
+    /// フォーカス文書を閉じる。残りの文書があればそこへ移り、無ければ空状態に戻る（ADR-0015）。
+    Close,
+    /// サーバ（daemon）のビルド世代・累積メトリクスを開示する（読み取り専用。
+    /// issue #27/D1）。応答は [`ServerMessage::ServerInfo`]。スナップショットを
+    /// 運ばず、世代・イベント・push を進めない。
+    GetServerInfo,
+    /// 任意パスの inlay hint をテキストなしで取得する（ADR-0020。読み取り専用）。
+    /// 応答は [`ServerMessage::Hints`]。未開パスは daemon がディスクから読む。
+    GetInlayHints { path: String },
+    /// カーソル位置のシンボル定義を確認用スニペットとして返す（読み取り専用）。
+    /// 定義にジャンプせず、応答スナップショットの `peek` フィールドに載る。
+    PeekDefinition,
+    /// 指定位置（1-origin 行:列）のシンボル定義を、全文を読まずに確認する
+    /// （読み取り専用。ADR-0025）。応答は [`ServerMessage::Peek`]（軽量 —
+    /// スナップショット＝全文は返さない）。エージェントのトークン削減経路。
+    PeekDefinitionAt {
+        path: String,
+        /// 1-origin 行番号。
+        line: u32,
+        /// 1-origin 列番号（文字数単位）。
+        col: u32,
+    },
+    /// シンボルの意味リネーム（ADR-0029）。内容指定: `old` の最初の識別子出現を
+    /// daemon が解決し、LSP の `textDocument/rename` で全参照（複数ファイル含む）を
+    /// 置換して保存する。応答は全文を運ばない軽量 [`ServerMessage::RenameResult`]。
+    /// 読み取り専用でない（テキストを変える）ため、通常経路は headless の
+    /// `session rename`（daemon は headless ゲートをこのコマンドに限って解放する）。
+    Rename { path: String, old: String, new: String },
+    /// シンボルの参照位置の列挙（読み取り専用。ADR-0029）。`old` の最初の識別子
+    /// 出現を解決し、LSP の `textDocument/references` で全参照位置を返す。
+    /// 応答は全文を運ばない軽量 [`ServerMessage::ReferencesResult`]。
+    References { path: String, old: String },
+}
+
+/// 移動の種類（wire 型）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Movement {
+    Char,
+    Line,
+    /// 単語の先頭（Helix の `w`/`b`。Move では anchor を保持して選択を残す）。
+    Word,
+    /// 単語の末尾（Helix の `e`。Move では anchor を保持して選択を残す）。
+    WordEnd,
+    /// 行頭（列 0）。
+    LineStart,
+    /// 行末（改行の直前）。
+    LineEnd,
+}
+
+/// 移動方向（wire 型）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
+/// 絶対移動の目標。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GotoTarget {
+    DocumentStart,
+    DocumentEnd,
+}
+
+/// 選択範囲（wire 型。anchor/head は char インデックス）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Range {
+    pub anchor: usize,
+    pub head: usize,
+}
+
+/// 位置指定の文書編集（ADR-0011）。選択を読まない・変えない。
+///
+/// フォーカス文書に対して明示 char range で作用する:
+/// - insert: `start == end`
+/// - delete: `text` が空
+/// `checksum` はクライアントが最後に読んだ文書全文（UTF-8 バイト列）の
+/// FNV-1a 64。不一致（読み取り後に文書が変化）なら daemon は状態を変えず
+/// status で拒否する。
+///
+/// `expected_text` は局所検証用（B2）: `Some` なら checksum に加えて対象
+/// 範囲（start..end）の現テキストがこれと一致することも検証される。位置の
+/// ずれは checksum（全文）では検出できず expected_text（局所）で検出する
+/// ため、両者は相補的。`None` なら checksum のみ（従来どおり）。オプショナル
+/// 追加なのでプロトコル破壊的変更なし（欠落フィールドは None として扱う）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentEdit {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub checksum: u64,
+    /// 対象範囲に期待する現テキスト（局所検証）。None でチェックなし。
+    #[serde(default)]
+    pub expected_text: Option<String>,
+}
+
+/// FNV-1a 64 ハッシュ（[`DocumentEdit`] のチェックサム検証用）。
+///
+/// 安定性のため固定実装（`std::collections::DefaultHasher` は Rust バージョン
+/// 間で非安定）。検証用なので暗号学的強度は不要。
+pub fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// daemon → client のメッセージ（ADR-0013）。NDJSON 1行 = メッセージ1件。
+///
+/// コマンドへの応答（[`ServerMessage::Response`]）と、他クライアントの変更に
+/// よるサーバー発の状態通知（[`ServerMessage::Push`]）をタグで区別する。
+/// 従来の応答（タグなしの素の StateSnapshot）を置き換える（CLI の互換性は
+/// 考慮しない決定 — シリアライズ形状が単一で仕様が単純になる）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    /// クライアントのコマンドに対する応答。
+    Response { snapshot: StateSnapshot },
+    /// サーバーが能動的に通知する最新状態（他クライアントの変更など）。
+    /// 購読（Interactive クライアント）にのみ届く。
+    Push { snapshot: StateSnapshot },
+    /// サーバ情報（[`Command::GetServerInfo`] の応答、issue #27）。スナップショット
+    /// を運ばない軽量応答 — 古いビルドの daemon が新プロトコル項目を黙殺して
+    /// いないか（silent ignore）を検知可能にするための開示。`generation` は
+    /// daemon のビルド世代（Git commit hash）、`daemon_build_ts` はビルド日時
+    /// （Unix 秒）。`metrics` は daemon 起動からの累積カウント。
+    ServerInfo {
+        /// daemon のビルド世代（Git commit hash。取得不可なら "unknown"）。
+        generation: String,
+        /// daemon のビルド日時（Unix 秒。注入不可なら 0）。
+        daemon_build_ts: u64,
+        /// daemon 起動からの累積メトリクス（効果検証用）。
+        metrics: ServerMetrics,
+    },
+    /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
+    /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
+    Hints {
+        path: String,
+        /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
+        generation: u64,
+        hints: Vec<InlayHint>,
+    },
+    /// [`Command::PeekDefinitionAt`] の応答（ADR-0025）。エージェントが全文
+    /// テキストを読まずに定義を参照するための軽量経路 — スナップショット
+    /// （全文）を運ばない。`text` が空なら定義なし・LSP 非対応。
+    Peek {
+        /// 定義元ファイルのパス。
+        path: String,
+        /// 定義の開始行（1 始まり）。
+        line: u32,
+        /// 定義のスニペット（数行。改行区切り）。空なら定義が見つからなかった。
+        text: String,
+    },
+    /// [`Command::Rename`] の応答（ADR-0029）。全文スナップショットを運ばない
+    /// 軽量応答 — 影響範囲（ファイル数・編集数・変更ファイル一覧）だけを返し、
+    /// エージェントが「意図通りか」を確認できるようにする。
+    /// 失敗は `error: Some(…)` で表す（`files`/`edits` は 0）。
+    RenameResult {
+        /// 応答時点の世代（編集が適用されたため進んでいる）。
+        generation: u64,
+        /// 変更したファイル数。
+        files: usize,
+        /// 適用した編集の総数。
+        edits: usize,
+        /// 変更したファイルのパス一覧（相対表示用。絶対パス）。
+        changed: Vec<String>,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+    /// [`Command::References`] の応答（ADR-0029）。参照位置の軽量一覧。
+    /// 失敗は `error: Some(…)` で表す（`locations` は空）。
+    ReferencesResult {
+        /// 参照元のファイルパス。
+        path: String,
+        /// 参照位置（パス・0-origin 行番号の昇順）。
+        locations: Vec<ReferenceLocation>,
+        /// 参照の総数。
+        total: usize,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+}
+
+/// [`Command::References`] の応答に含まれる参照位置 1 件（ADR-0029）。
+/// パスと 0-origin 行番号のみ — 行の内容は渡さない（エージェントは位置から
+/// 範囲 read で引く。T1 の原則）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceLocation {
+    pub path: String,
+    pub line: u32,
+}
+
+/// daemon 起動からの累積メトリクス（[`ServerMessage::ServerInfo`] に載る。
+/// issue #27 の効果検証用 — headless エージェントの「編集までの手順数・全文再読・
+/// リトライ」を daemon 側の近似指標で観測する）。
+///
+/// セマンティクス: 成功数は `edits_total - edits_rejected_checksum -
+/// edits_rejected_expected_text - edits_noop` で導出できる。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerMetrics {
+    /// 受理した DocumentEdit の総数（拒否・no-op を含む）。
+    pub edits_total: u64,
+    /// checksum 不一致で拒否した数。
+    pub edits_rejected_checksum: u64,
+    /// expected_text 不一致で拒否した数。
+    pub edits_rejected_expected_text: u64,
+    /// 状態を変えなかった no-op 編集の数。
+    pub edits_noop: u64,
+    /// expected_text を使った編集の数（Some で届いた数。一致・不一致は問わない）。
+    pub edits_expected_text_used: u64,
+    /// GetState 実行回数（スナップショットは全文を返すため、
+    /// headless の全文再読回数の近似になる）。
+    pub get_state_total: u64,
+    /// WaitFor 実行回数。
+    pub wait_total: u64,
+    /// Save 実行回数。
+    pub save_total: u64,
+}
+
+/// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKind {
+    /// 対話型 TUI。
+    Interactive,
+    /// ヘッドレスクライアント（session exec / edit）。
+    Headless,
+}
+
+/// 接続開始時のハンドシェイク（ADR-0012）。最初のメッセージでなければならない。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub kind: ClientKind,
+    /// 最後の Interactive クライアント切断時に全 View のカーソルを先頭へ戻すか
+    /// （ADR-0027）。デフォルト true — 旧クライアントの無指定 Hello も
+    /// 「リセットする」として扱う。Headless には無意味（切断でリセットしない）。
+    #[serde(default = "default_true")]
+    pub reset_cursor_on_disconnect: bool,
+}
+
+/// [`Hello::reset_cursor_on_disconnect`] のデフォルト（true）。
+fn default_true() -> bool {
+    true
+}
+
+/// イベントの発生源（ADR-0012）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventSource {
+    /// 対話型 TUI の操作。
+    Interactive,
+    /// ヘッドレスクライアントの操作。
+    Headless,
+    /// daemon 自身が検知した外部要因（ファイルの外部変更など）。
+    External,
+}
+
+/// 状態変化イベントの種類（ADR-0012）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Insert,
+    Delete,
+    /// 位置指定編集（DocumentEdit）。
+    ReplaceRange,
+    Undo,
+    Redo,
+    Open,
+    Save,
+    /// フォーカス文書を閉じる（Command::Close）。
+    Close,
+    SetMode,
+    /// フォーカス文書が外部ツールによって変更された。
+    ExternalChange,
+    /// 最後の Interactive クライアント切断時のカーソルリセット（ADR-0027）。
+    SelectionReset,
+}
+
+/// 状態を変える操作1件の記録（ADR-0012）。bounded リングで保持され、
+/// 全スナップショットに同梱される。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeEvent {
+    /// このイベント適用後の世代。
+    pub generation: u64,
+    pub source: EventSource,
+    pub kind: EventKind,
+    /// 影響範囲（ある場合のみ）。
+    pub range: Option<Range>,
+    /// 挿入・置換テキスト（ある場合のみ）。
+    pub text: Option<String>,
+}
+
+/// 診断の深刻度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// 言語サーバが報告する問題（S3 で利用。StateSnapshot に含まれる）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub start: usize,
+    pub end: usize,
+    pub severity: Severity,
+    pub message: String,
+}
+
+/// LSP の inlay hint（ADR-0020。CONTEXT.md の InlayHint 定義）。
+///
+/// 読み取り専用の注釈: Document のテキストの一部ではなく、選択・編集・undo・
+/// checksum に一切関与しない。位置は char インデックス。`padding_left` /
+/// `padding_right` はサーバ指定の前後空白（LSP の `paddingLeft` / `paddingRight`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlayHint {
+    /// ヒントを挟み込む char インデックス。
+    pub position: usize,
+    /// 表示するテキスト（label が parts 配列なら連結済み）。
+    pub text: String,
+    pub padding_left: bool,
+    pub padding_right: bool,
+}
+
+/// 構文ハイライトのグループ（ADR-0018: フラットな正規集合）。
+///
+/// wire 形式は小文字（serde `rename_all`）。tree-sitter のハイライトクエリの
+/// capture 名と一致させる（minae-loader のクエリで使用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HighlightGroup {
+    Comment,
+    Keyword,
+    String,
+    Number,
+    Constant,
+    Function,
+    Type,
+    Parameter,
+    Field,
+    Operator,
+    Punctuation,
+    Attribute,
+    Error,
+}
+
+/// テキストの1区間に割り当てられたハイライトグループ（char インデックス）。
+///
+/// 範囲は重複しない（同じ char は1つのグループに属する。仕様書の不変条件）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightRange {
+    pub start: usize, // char index (inclusive)
+    pub end: usize,   // char index (exclusive)
+    pub group: HighlightGroup,
+}
+
+/// 進行中の非同期処理の種別（ADR-0028）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    /// LSP セッションの spawn + initialize。
+    LspInit,
+    /// 診断・inlay hint の settle（Open 後 or 編集後）。
+    DiagnosticsSettle,
+    /// 外部変更 Reload 後の LSP 同期 + pull。
+    ReloadSync,
+    /// 保存（write）。
+    Save,
+}
+
+/// 進行中の非同期処理の単位（ADR-0028）。開始で追加・終了で除去され、
+/// 結果の成否は語らない。空の集合 = 処理中なし。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// 表示用の短いラベル（"LSP 初期化中" など）。クライアントはそのまま表示する。
+    pub label: String,
+}
+
+/// daemon が返す編集状態の全体像（ADR-0006: 毎コマンドに全量を返す）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub text: String,
+    /// 全文の FNV-1a 64（[`DocumentEdit`] の checksum 検証用）。エージェントは
+    /// これをそのまま edit に渡すだけでよい（FNV-1a の再実装不要。ADR-0012 #12）。
+    pub checksum: u64,
+    pub selection: Vec<Range>,
+    pub primary_index: usize,
+    pub mode: Mode,
+    pub first_line: usize,
+    pub diagnostics: Vec<Diagnostic>,
+    /// フォーカス文書の inlay hint（ADR-0020。同じスナップショットのテキストと
+    /// 一致する位置。LSP 非対応・未取得の文書は空）。
+    pub inlay_hints: Vec<InlayHint>,
+    /// フォーカス文書の可視範囲の構文ハイライト（ADR-0021。可視範囲は
+    /// `first_line` から viewport_height 行。窓の上端を跨ぐトークンは範囲が
+    /// 窓より前に始まることもある）。範囲は昇順・重複しない。grammar 不在の
+    /// 言語は空。
+    pub highlights: Vec<HighlightRange>,
+    /// 開いているファイルのパス（未開なら None）。
+    pub path: Option<String>,
+    /// 保存済み状態から編集されているか。
+    pub dirty: bool,
+    /// 一時的なメッセージ（Open の失敗など）。ステータス行に表示される。
+    pub status: Option<String>,
+    /// 進行中の非同期処理の集合（ADR-0028。空 = 処理中なし）。増減は
+    /// generation を進める（診断・ヒントの反映は進めない）。
+    pub activities: Vec<Activity>,
+    /// 状態を変える操作ごとに増加する世代（ADR-0012）。
+    pub generation: u64,
+    /// 直近の状態変化イベント（bounded リング。古いものから破棄）。
+    pub events: Vec<ChangeEvent>,
+    /// フォーカス文書が外部で削除され、Close を待っている状態（ADR-0015）。
+    /// 値は削除されたパス。
+    pub deleted: Option<String>,
+    /// 定義の確認表示（[`Command::PeekDefinition`] の応答にのみ載る。それ以外は None）。
+    pub peek: Option<Peek>,
+}
+
+/// 定義の確認表示（[`Command::PeekDefinition`] の結果。ジャンプしない簡易確認用）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peek {
+    /// 定義元ファイルのパス。
+    pub path: String,
+    /// 定義の開始行（1 始まり）。
+    pub line: u32,
+    /// 定義のスニペット（数行。改行区切り）。
+    pub text: String,
+}
+
+impl Default for StateSnapshot {
+    /// 空文書・位置0の単一カーソル・Normal モード。
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            checksum: fnv1a64(b""),
+            selection: vec![Range { anchor: 0, head: 0 }],
+            primary_index: 0,
+            mode: Mode::Normal,
+            first_line: 0,
+            diagnostics: Vec::new(),
+            inlay_hints: Vec::new(),
+            highlights: Vec::new(),
+            path: None,
+            dirty: false,
+            status: None,
+            activities: Vec::new(),
+            generation: 0,
+            events: Vec::new(),
+            deleted: None,
+            peek: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlight_types_round_trip_with_lowercase_names() {
+        // wire 形式は小文字（HighlightGroup の rename_all）
+        let json = serde_json::to_string(&HighlightGroup::Function).unwrap();
+        assert_eq!(json, "\"function\"");
+        let back: HighlightGroup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HighlightGroup::Function);
+
+        let range = HighlightRange {
+            start: 4,
+            end: 7,
+            group: HighlightGroup::Keyword,
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        assert_eq!(json, "{\"start\":4,\"end\":7,\"group\":\"keyword\"}");
+        let back: HighlightRange = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, range);
+    }
+
+    #[test]
+    fn state_snapshot_round_trip() {
+        let snapshot = StateSnapshot {
+            text: "hello\nworld".to_string(),
+            checksum: fnv1a64(b"hello\nworld"),
+            selection: vec![Range { anchor: 2, head: 5 }],
+            primary_index: 0,
+            mode: Mode::Insert,
+            first_line: 1,
+            diagnostics: vec![Diagnostic {
+                start: 0,
+                end: 5,
+                severity: Severity::Warning,
+                message: "unused".to_string(),
+            }],
+            inlay_hints: vec![InlayHint {
+                position: 3,
+                text: ": i32".to_string(),
+                padding_left: false,
+                padding_right: true,
+            }],
+            highlights: vec![HighlightRange {
+                start: 0,
+                end: 5,
+                group: HighlightGroup::Comment,
+            }],
+            path: Some("test.rs".to_string()),
+            dirty: true,
+            status: Some("ok".to_string()),
+            generation: 7,
+            events: vec![ChangeEvent {
+                generation: 7,
+                source: EventSource::Interactive,
+                kind: EventKind::Insert,
+                range: None,
+                text: Some("x".to_string()),
+            }],
+            deleted: Some("test.rs".to_string()),
+            activities: vec![Activity {
+                kind: ActivityKind::LspInit,
+                label: "LSP 初期化中".to_string(),
+            }],
+            peek: Some(Peek {
+                path: "lib.rs".to_string(),
+                line: 42,
+                text: "fn frobnicate() {}".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let back: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn command_round_trip() {
+        let json = serde_json::to_string(&Command::GetState).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, Command::GetState);
+
+        // ADR-0025: 位置指定の定義確認も round-trip する
+        let peek = Command::PeekDefinitionAt {
+            path: "src/main.rs".into(),
+            line: 12,
+            col: 5,
+        };
+        let json = serde_json::to_string(&peek).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, peek);
+
+        let cmd = Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Backward,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, cmd);
+
+        let wait = Command::WaitFor { generation: 42 };
+        let json = serde_json::to_string(&wait).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, wait);
+
+        let del_word = Command::DeleteWordBackward;
+        let json = serde_json::to_string(&del_word).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, del_word);
+
+        let change = Command::Change;
+        let json = serde_json::to_string(&change).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, change);
+
+        for cmd in [Command::InsertAtLineEnd, Command::InsertAtLineStart] {
+            let json = serde_json::to_string(&cmd).expect("serialize");
+            let back: Command = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, cmd);
+        }
+
+        let end = Command::Move {
+            movement: Movement::LineEnd,
+            direction: Direction::Forward,
+        };
+        let json = serde_json::to_string(&end).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, end);
+
+        let hints = Command::GetInlayHints {
+            path: "src/main.rs".into(),
+        };
+        let json = serde_json::to_string(&hints).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hints);
+    }
+
+    #[test]
+    fn server_message_round_trip() {
+        let snap = StateSnapshot::default();
+        for msg in [
+            ServerMessage::Response {
+                snapshot: snap.clone(),
+            },
+            ServerMessage::Push { snapshot: snap },
+        ] {
+            let json = serde_json::to_string(&msg).expect("serialize");
+            let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, msg);
+            assert!(
+                json.starts_with("{\"type\":\"") && json.contains("\"snapshot\":"),
+                "タグ付きエンベロープ: {json}"
+            );
+        }
+
+        let hints = ServerMessage::Hints {
+            path: "src/main.rs".into(),
+            generation: 7,
+            hints: vec![InlayHint {
+                position: 1,
+                text: "i32".into(),
+                padding_left: false,
+                padding_right: false,
+            }],
+        };
+        let json = serde_json::to_string(&hints).expect("serialize");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hints);
+        assert!(json.contains("\"type\":\"hints\""), "タグ: {json}");
+    }
+
+    #[test]
+    fn inlay_hint_round_trip() {
+        let hint = InlayHint {
+            position: 10,
+            text: ": Vec<u8>".into(),
+            padding_left: false,
+            padding_right: true,
+        };
+        let json = serde_json::to_string(&hint).expect("serialize");
+        let back: InlayHint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hint);
+    }
+
+    #[test]
+    fn server_info_round_trip() {
+        // ServerInfo 応答（issue #27）の wire 形状が安定していること
+        let msg = ServerMessage::ServerInfo {
+            generation: "abc1234".into(),
+            daemon_build_ts: 1699999999,
+            metrics: ServerMetrics {
+                edits_total: 10,
+                edits_rejected_checksum: 1,
+                edits_rejected_expected_text: 2,
+                edits_noop: 3,
+                edits_expected_text_used: 4,
+                get_state_total: 5,
+                wait_total: 6,
+                save_total: 7,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+        // GetServerInfo コマンドも外部タグ付きで通る
+        let back: Command =
+            serde_json::from_str(&serde_json::to_string(&Command::GetServerInfo).unwrap()).unwrap();
+        assert_eq!(back, Command::GetServerInfo);
+    }
+
+    #[test]
+    fn document_edit_round_trip() {
+        let edit = DocumentEdit {
+            start: 2,
+            end: 5,
+            text: "x".into(),
+            checksum: 42,
+            expected_text: Some("hello".into()),
+        };
+        let json = serde_json::to_string(&edit).expect("serialize");
+        let back: DocumentEdit = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, edit);
+    }
+
+    #[test]
+    fn document_edit_expected_text_is_optional() {
+        // None は null で通る
+        let edit = DocumentEdit {
+            start: 0,
+            end: 0,
+            text: "".into(),
+            checksum: 0,
+            expected_text: None,
+        };
+        let back: DocumentEdit =
+            serde_json::from_str(&serde_json::to_string(&edit).unwrap()).unwrap();
+        assert_eq!(back.expected_text, None);
+        // フィールドなしの旧クライアント JSON も None として受信できる（非破壊）
+        let legacy = r#"{"start":1,"end":2,"text":"x","checksum":9}"#;
+        let back: DocumentEdit = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.expected_text, None);
+        assert_eq!(back.start, 1);
+    }
+
+    #[test]
+    fn fnv1a64_is_stable_and_byte_based() {
+        // 実装がバージョン間で変わらないこと（クライアント/daemon 両側で一致が前提）
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"hi\n"), fnv1a64("hi\n".as_bytes()));
+    }
+}
