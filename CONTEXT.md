@@ -45,8 +45,16 @@ One display region (one split) showing a Document with its own Selection and vie
 _Avoid_: pane, window
 
 **WorkspaceRoot**:
-The smallest analysis unit containing an opened file — the nearest directory with a manifest (`Cargo.toml`) or `.git`, falling back to the file's parent directory. The scope unit of an LSP session.
+The smallest analysis unit containing an opened file — the nearest directory that carries a project marker (a language's root markers or a recognized manifest, with `.git` as a universal marker), falling back to the file's parent directory. The scope unit of an LSP session. Nearest marker wins, so a Rust workspace member's `Cargo.toml` beats the outer workspace's.
 _Avoid_: project root, crate root
+
+**LanguageServer**:
+A language analysis process (rust-analyzer, …) spawned by the Daemon per WorkspaceRoot and served over LSP — the provider of Diagnostics, InlayHints, definitions, and Rename/References. Configured by the Languages config; mina ships vetted defaults in its embedded table and treats user-added servers as unvetted (LSP-standard features still work, negotiated via capabilities).
+_Avoid_: linter, analyzer, server (when LSP-specific)
+
+**Languages config**:
+The daemon-side configuration file (`languages.toml` under the config directory) mapping file types to LanguageServers — each server's command, arguments, initialization options (its `config`), and a language's root markers. Embedded defaults are merged with the user file, and the Daemon re-reads it when it spawns a server. Distinct from Config, which is client-local and never read by the Daemon.
+_Avoid_: language settings, server table
 
 **Command**:
 A selection-based editor action, resolved from key presses by the Keymap or sent directly by a Client (`session exec`), that reads and may change the Selection.
