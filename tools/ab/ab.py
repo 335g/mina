@@ -211,7 +211,7 @@ fn main() {
 
 def fixture_t10():
     """T10 (Stage 4): TypeScript analog of T9 — 3-file TS project, many
-    occurrences (USD x12, price x9), cross-file with imports. Regime where
+    occurrences (USD x21, price x9), cross-file with imports. Regime where
     mina's OWN semantic rename (`session rename` via typescript-language-server,
     ADR-0030 Stage 4) should beat an apply loop."""
     (WORK / "ws" / "package.json").write_text('{"name": "abts", "private": true}\n')
@@ -733,7 +733,9 @@ def success(test):
         missing = [f for f in finals if f not in s]
         return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
     if test in ("t9", "t10"):
-        s = read(f"src/utils.{'ts' if test == 't10' else 'rs'}") + read(f"src/data.{'ts' if test == 't10' else 'rs'}") + read(f"src/index.{'ts' if test == 't10' else 'rs'}")
+        ext = 'ts' if test == 't10' else 'rs'
+        last = 'index' if test == 't10' else 'main'
+        s = read(f"src/utils.{ext}") + read(f"src/data.{ext}") + read(f"src/{last}.{ext}")
         ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
         return ("OK" if ok else "FAIL"), \
             f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
