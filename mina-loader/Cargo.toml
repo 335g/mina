@@ -9,3 +9,4 @@ description = "Language registry for mina: tree-sitter grammars and highlight qu
 mina-protocol = { path = "../mina-protocol" }
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
