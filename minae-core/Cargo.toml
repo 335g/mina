@@ -1,9 +1,11 @@
 [package]
-name = "mina-core"
+name = "minae-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "UI-agnostic text-editing core for mina"
+license.workspace = true
+repository.workspace = true
+description = "UI-agnostic text-editing core for minae"
 
 [dependencies]
 ropey.workspace = true

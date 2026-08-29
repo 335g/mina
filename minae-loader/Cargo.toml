@@ -1,0 +1,14 @@
+[package]
+name = "minae-loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language registry for minae: tree-sitter grammars and highlight queries"
+
+[dependencies]
+minae-protocol = { path = "../minae-protocol", version = "0.0.1" }
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true

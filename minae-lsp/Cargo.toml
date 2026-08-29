@@ -1,9 +1,11 @@
 [package]
-name = "mina-lsp"
+name = "minae-lsp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "LSP client for mina (spawn, JSON-RPC, position conversion)"
+license.workspace = true
+repository.workspace = true
+description = "LSP client for minae (spawn, JSON-RPC, position conversion)"
 
 [dependencies]
 serde.workspace = true
@@ -14,3 +16,4 @@ tokio.workspace = true
 name = "mock-server"
 path = "src/bin/mock_server.rs"
 test = false
+publish = false

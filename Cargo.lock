@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "dev01"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "dev02"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -353,8 +353,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "mina-core"
-version = "0.1.0"
+name = "minae-core"
+version = "0.0.1"
 dependencies = [
  "ropey",
  "smallvec",
@@ -362,29 +362,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "mina-debug"
-version = "0.1.0"
+name = "minae-debug"
+version = "0.0.1"
 dependencies = [
  "cliclack",
  "libc",
- "mina-protocol",
+ "minae-protocol",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "mina-loader"
-version = "0.1.0"
+name = "minae-loader"
+version = "0.0.1"
 dependencies = [
- "mina-protocol",
+ "minae-protocol",
  "tree-sitter",
  "tree-sitter-rust",
  "tree-sitter-typescript",
 ]
 
 [[package]]
-name = "mina-lsp"
-version = "0.1.0"
+name = "minae-lsp"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -392,26 +392,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "mina-protocol"
-version = "0.1.0"
+name = "minae-protocol"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "mina-term"
-version = "0.1.0"
+name = "minae-term"
+version = "0.0.1"
 dependencies = [
  "clap",
  "cliclack",
  "futures-lite",
  "libc",
- "mina-core",
- "mina-loader",
- "mina-lsp",
- "mina-protocol",
- "mina-view",
+ "minae-core",
+ "minae-loader",
+ "minae-lsp",
+ "minae-protocol",
+ "minae-view",
  "serde",
  "serde_json",
  "termina",
@@ -422,10 +422,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "mina-view"
-version = "0.1.0"
+name = "minae-view"
+version = "0.0.1"
 dependencies = [
- "mina-core",
+ "minae-core",
 ]
 
 [[package]]

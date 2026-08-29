@@ -1,0 +1,30 @@
+[package]
+name = "minae-term"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal UI, daemon, and agent entry for minae"
+
+[[bin]]
+name = "minae"
+path = "src/main.rs"
+
+[dependencies]
+minae-core = { path = "../minae-core", version = "0.0.1" }
+minae-view = { path = "../minae-view", version = "0.0.1" }
+minae-protocol = { path = "../minae-protocol", version = "0.0.1" }
+minae-lsp = { path = "../minae-lsp", version = "0.0.1" }
+minae-loader = { path = "../minae-loader", version = "0.0.1" }
+tree-sitter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+libc.workspace = true
+termina.workspace = true
+futures-lite.workspace = true
+unicode-width.workspace = true
+clap.workspace = true
+cliclack.workspace = true

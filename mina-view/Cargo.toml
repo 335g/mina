@@ -1,9 +1,0 @@
-[package]
-name = "mina-view"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description = "UI-agnostic editor state for mina"
-
-[dependencies]
-mina-core = { path = "../mina-core" }

@@ -1,9 +1,11 @@
 [package]
-name = "mina-protocol"
+name = "minae-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Wire types for mina daemon/client IPC"
+license.workspace = true
+repository.workspace = true
+description = "Wire types for minae daemon/client IPC"
 
 [dependencies]
 serde.workspace = true

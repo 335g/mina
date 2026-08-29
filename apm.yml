@@ -1,6 +1,6 @@
-name: mina
+name: minae
 version: 1.0.0
-description: APM project for mina
+description: APM project for minae
 author: Yoshiki Kudo
 targets:
   - agent-skills
