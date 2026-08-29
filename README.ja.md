@@ -16,7 +16,7 @@
 
 この差を生む契約: 全文 read ではなく番号付きの範囲 read、そしてデーモンの状態に対して検証される内容指定の apply（古いテキストへの編集は具体的な理由つきで拒否され、ファイルを静かに壊さない）。デーモンは外部変更を自動リロードするため、エージェントは古いビューに対して編集しません。
 
-方法論・run 単位のデータ・詳細な考察: [docs/verification/agent-editor-ab-results.md](docs/verification/agent-editor-ab-results.md)（T11/M3）。ハーネス: [`tools/ab/`](tools/ab/README.md)。
+方法論・run 単位のデータ・詳細な考察: [docs/benchmarks/agent-editor-ab-results.md](docs/benchmarks/agent-editor-ab-results.md)（T11/M3）。ハーネス: [`tools/ab/`](tools/ab/README.md)。
 
 ## mina とは
 
@@ -77,6 +77,8 @@ $ mina session rename src/lib.rs "USD" "JPY"
 
 - [CONTEXT.md](CONTEXT.md) — ドメインモデルの正規用語集
 - [docs/helix-architecture.md](docs/helix-architecture.md) — アーキテクチャと設計ノート
+- [docs/benchmarks/](docs/benchmarks/) — 公開しているエージェントエディタ A/B 計測結果とテスト計画
+- [docs/verification/](docs/verification/) — 内部評価ノート（非公開）
 - [docs/adr/](docs/adr/) — 意思決定記録
 - [docs/spec/](docs/spec/) — ワイヤプロトコル仕様
 - [docs/verification/](docs/verification/) — エージェントエディタ A/B 計測結果と評価ノート

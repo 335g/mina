@@ -16,7 +16,7 @@ For agent-driven editing, mina's session contract measures better than generic f
 
 The contract that produces this: numbered range reads instead of full-file reads, and content-addressed applies validated against the daemon's state (a stale edit is rejected with a specific reason instead of silently corrupting the file). The daemon also auto-reloads external changes, so agents never edit against a stale view.
 
-Methodology, per-run data, and the full discussion: [docs/verification/agent-editor-ab-results.md](docs/verification/agent-editor-ab-results.md) (T11/M3). Harness: [`tools/ab/`](tools/ab/README.md).
+Methodology, per-run data, and the full discussion: [docs/benchmarks/agent-editor-ab-results.md](docs/benchmarks/agent-editor-ab-results.md) (T11/M3). Harness: [`tools/ab/`](tools/ab/README.md).
 
 ## What is mina
 
@@ -77,6 +77,8 @@ Each command returns JSON. If an edit is rejected, re-read the affected range an
 
 - [CONTEXT.md](CONTEXT.md) — canonical glossary for the domain model
 - [docs/helix-architecture.md](docs/helix-architecture.md) — architecture and design notes
+- [docs/benchmarks/](docs/benchmarks/) — published agent-editor A/B measurement results and test plans
+- [docs/verification/](docs/verification/) — internal evaluation notes (not published)
 - [docs/adr/](docs/adr/) — decision records
 - [docs/spec/](docs/spec/) — wire protocol specification
 - [docs/verification/](docs/verification/) — agent-editor A/B measurement results and evaluation notes
