@@ -57,26 +57,6 @@ pub(crate) fn uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
-/// 開いたファイルを包含する最小の解析単位（WorkspaceRoot）を求める。
-///
-/// ファイルの親から上方探索し、最寄りの `Cargo.toml` を含むディレクトリを返す
-/// （crates/ 配下の個別プロジェクト等、最小グループに閉じた LSP のため）。
-/// なければ最寄りの `.git`（worktree 等のファイル形式も含む）、それもなければ
-/// ファイルの親ディレクトリにフォールバックする（ADR-0010）。
-pub fn workspace_root(path: &Path) -> PathBuf {
-    let fallback = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut dir = fallback.to_path_buf();
-    loop {
-        if dir.join("Cargo.toml").exists() || dir.join(".git").exists() {
-            return dir;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_path_buf(),
-            None => return fallback.to_path_buf(),
-        }
-    }
-}
-
 impl LspSession {
     /// サーバを spawn し、initialize まで完了させる（**テスト専用**: 言語は rust、
     /// init options なし。本番は [`new_with_config`] を使う）。
@@ -1140,53 +1120,6 @@ mod tests {
     use super::*;
 #[cfg(test)]
 use std::sync::Arc;
-
-    #[test]
-    fn workspace_root_prefers_nearest_manifest_over_outer_git() {
-        let dir = std::env::temp_dir().join(format!("mina-lsp-root1-{}", std::process::id()));
-        let proj = dir.join("crates").join("foo");
-        std::fs::create_dir_all(proj.join("src")).expect("tmp dirs");
-        std::fs::write(proj.join("Cargo.toml"), "").expect("manifest");
-        std::fs::create_dir_all(dir.join(".git")).expect("git dir");
-        let file = proj.join("src").join("main.rs");
-        std::fs::write(&file, "").expect("file");
-        assert_eq!(workspace_root(&file), proj, "Cargo.toml が .git より優先");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn workspace_root_prefers_nearest_git_over_outer_manifest() {
-        let dir = std::env::temp_dir().join(format!("mina-lsp-root2-{}", std::process::id()));
-        let proj = dir.join("repo");
-        std::fs::create_dir_all(proj.join("src")).expect("tmp dirs");
-        std::fs::create_dir_all(proj.join(".git")).expect("git dir");
-        std::fs::write(dir.join("Cargo.toml"), "").expect("outer manifest");
-        let file = proj.join("src").join("main.rs");
-        std::fs::write(&file, "").expect("file");
-        assert_eq!(workspace_root(&file), proj, "内側の .git が外側の Cargo.toml より優先");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn workspace_root_accepts_git_file_worktree() {
-        let dir = std::env::temp_dir().join(format!("mina-lsp-root3-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
-        std::fs::write(dir.join(".git"), "gitdir: ../main/.git/worktrees/x").expect("gitfile");
-        let file = dir.join("lib.rs");
-        std::fs::write(&file, "").expect("file");
-        assert_eq!(workspace_root(&file), dir, ".git はファイル形式（worktree）でも目印になる");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn workspace_root_falls_back_to_file_parent() {
-        let dir = std::env::temp_dir().join(format!("mina-lsp-root4-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
-        let file = dir.join("notes.txt");
-        std::fs::write(&file, "").expect("file");
-        assert_eq!(workspace_root(&file), dir, "目印がなければファイルの親");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn lsp_pos_to_char_utf8_multi_line() {
