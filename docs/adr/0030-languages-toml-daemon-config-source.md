@@ -18,7 +18,7 @@ config = { "rust-analyzer" = { inlayHints = { typeHints = { enable = true }, par
 name = "rust"
 file-types = ["rs"]
 language-server = "rust-analyzer"
-root-markers = []     # Stage 2 で有効化（明示があれば汎用集合を置換）
+root-markers = []  # 明示すれば汎用集合を置換（空 = マーカーなし = 親フォールバックのみ）
 # grammar = "rust"    # Stage 4 で有効化（mina-loader がハイライトを供給）
 ```
 
@@ -58,10 +58,10 @@ languages.toml は **Daemon 側の第 2 設定ソース**として別カテゴ�
 
 ## 形式の注意（未対応キー）
 
-上記の例に `root-markers` / `grammar` を書いたが、**この 2 キーは現行ステージでは
-拒否される**（`deny_unknown_fields` によりファイル全体が破棄され、既定テーブルに
-フォールバック）。Stage 2（root-markers）・Stage 4（grammar）で有効化するまで、
-ユーザーファイルに書かないこと（例をそのまま貼り付けると全上書きが消える）。
+上記の例に `grammar` を書いたが、**このキーは現行ステージでは拒否される**
+（`deny_unknown_fields` によりファイル全体が破棄され、既定テーブルにフォールバック）。
+Stage 4 で有効化するまで、ユーザーファイルに書かないこと（例をそのまま貼り付けると
+全上書きが消える）。`root-markers` は Stage 2 で有効化済み。
 
 ## 規定サーバ方針
 
@@ -78,7 +78,7 @@ languages.toml は **Daemon 側の第 2 設定ソース**として別カテゴ�
   capabilities は「機能を持っているか」であり「機能が有効か」はサーバ独自のツマミで、
   capability には載らないため。
 
-## root-markers（Stage 2 で有効化）
+## root-markers（Stage 2 で実装済み）
 
 - 言語に `root-markers` の**明示がなければ汎用集合**（`Cargo.toml` / `package.json` /
   `pyproject.toml` / `go.mod` + `.git`）で WorkspaceRoot を判定。

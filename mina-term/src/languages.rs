@@ -5,12 +5,12 @@
 //! 既定テーブルにユーザーファイル（`$XDG_CONFIG_HOME/mina/languages.toml`）を
 //! language name / サーバ id 単位で上書き・追加して合成する。
 //!
-//! 読み込みタイミング: Daemon 起動時の初期ロード + LSP セッション spawn 時
-//! （`ensure`）の再読込。編集は次に新しいセッションが spawn される時点で反映され、
-//! 稼働中セッションはネゴシエーション済みのまま（再 initialize しない）。
+//! 読み込みタイミング: Daemon 起動時の初期ロード + 以降は mtime 差分だけ再読込
+//! （`languages_refresh`。ゲートと spawn の両方が参照する）。編集は次にゲート判定が
+//! 走る時点で反映され、稼働中セッションはネゴシエーション済みのまま（再 initialize しない）。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -34,8 +34,8 @@ pub(crate) struct ServerConfig {
 
 /// 1 言語の定義。`name` は `textDocument.languageId` でもある。
 ///
-/// `root-markers` / `grammar` は後続ステージ（ADR-0030: Stage 2 / Stage 4）で
-/// 有効化するため、現段階では受け付けない（未知キーはファイル全体を破棄）。
+/// `grammar` キーは Stage 4 で有効化するため、現段階では受け付けない
+/// （未知キーはファイル全体を破棄）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Language {
@@ -44,6 +44,10 @@ pub(crate) struct Language {
     pub(crate) file_types: Vec<String>,
     #[serde(rename = "language-server", default)]
     pub(crate) language_server: Option<String>,
+    /// WorkspaceRoot 判定のマーカー（明示すれば [`GENERIC_ROOT_MARKERS`] を置換。
+    /// 空リストは「マーカーなし」= ファイル親フォールバックのみ。ADR-0030 Stage 2）。
+    #[serde(rename = "root-markers", default)]
+    pub(crate) root_markers: Option<Vec<String>>,
 }
 
 /// languages.toml のファイル形式（`[language-server.<id>]` + `[[language]]`）。
@@ -70,6 +74,17 @@ pub(crate) struct ServerSpec<'a> {
     pub(crate) args: &'a [String],
     pub(crate) config: Option<&'a serde_json::Value>,
 }
+
+/// 汎用 WorkspaceRoot マーカー集合（言語が `root-markers` を明示しない場合。
+/// ADR-0030 Stage 2）。最寄りマーカー勝ち（ADR-0010）を維持する。
+/// `.git` は worktree の gitdir ファイル等でも目印になる（既存挙動の踏襲）。
+const GENERIC_ROOT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    ".git",
+];
 
 impl LanguageTable {
     /// 埋め込み既定 + ユーザーファイルを合成する。ユーザーファイルが存在しなければ
@@ -145,6 +160,33 @@ impl LanguageTable {
             args: &server.args,
             config: server.config.as_ref(),
         })
+    }
+
+    /// 開いたファイルを包含する最小の解析単位（WorkspaceRoot）を求める。
+    ///
+    /// ファイルの親から上方探索し、言語が `root-markers` を明示していれば
+    /// そのリストを**置換**として、未指定なら汎用集合（[`GENERIC_ROOT_MARKERS`]）
+    /// を使う。最寄りのマーカーを含むディレクトリが root。マーカーがなければ
+    /// ファイルの親ディレクトリにフォールバック（ADR-0010 の意図を維持）。
+    pub(crate) fn workspace_root(&self, path: &Path) -> PathBuf {
+        let explicit = self
+            .language_for_path(path)
+            .and_then(|l| l.root_markers.as_deref());
+        let fallback = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut dir = fallback.to_path_buf();
+        loop {
+            let hit = match explicit {
+                Some(markers) => markers.iter().any(|m| dir.join(m).exists()),
+                None => GENERIC_ROOT_MARKERS.iter().any(|m| dir.join(m).exists()),
+            };
+            if hit {
+                return dir;
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => return fallback.to_path_buf(),
+            }
+        }
     }
 
     /// 任意の言語のサーバ定義を引く。サーバ共有の参照解決（将来の Stage で使用）。
@@ -241,14 +283,14 @@ language-server = "typescript-language-server"
 
     #[test]
     fn unknown_keys_reject_the_whole_file() {
-        // deny_unknown_fields: root-markers 等の未対応キーはファイル全体を破棄
-        // （現行ステージで未実装のキーを静かに無視しない）。
+        // deny_unknown_fields: grammar（Stage 4 で有効化予定）等の未対応キーは
+        // ファイル全体を破棄（現行ステージで未実装のキーを静かに無視しない）。
         let err = parse(
             r#"
 [[language]]
 name = "rust"
 file-types = ["rs"]
-root-markers = ["Cargo.toml"]
+grammar = "rust"
 "#,
         );
         assert!(err.is_err(), "未対応キーはエラー: {err:?}");
@@ -305,5 +347,141 @@ command = 123
 "#,
         );
         assert!(err.is_err(), "型違いはエラー: {err:?}");
+    }
+
+    /// workspace_root のテスト用テーブル（ユーザー環境に依存しない = 既定 rust のみ）。
+    fn embedded_table() -> LanguageTable {
+        LanguageTable::from_strings(DEFAULT_LANGUAGES_TOML, None)
+    }
+
+    #[test]
+    fn workspace_root_prefers_nearest_manifest_over_outer_git() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root1-{}", std::process::id()));
+        let proj = dir.join("crates").join("foo");
+        std::fs::create_dir_all(proj.join("src")).expect("tmp dirs");
+        std::fs::write(proj.join("Cargo.toml"), "").expect("manifest");
+        std::fs::create_dir_all(dir.join(".git")).expect("git dir");
+        let file = proj.join("src").join("main.rs");
+        std::fs::write(&file, "").expect("file");
+        // 汎用集合の最寄りマーカー勝ち: 内側の Cargo.toml が外側の .git より優先
+        assert_eq!(embedded_table().workspace_root(&file), proj);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_prefers_nearest_git_over_outer_manifest() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root2-{}", std::process::id()));
+        let proj = dir.join("repo");
+        std::fs::create_dir_all(proj.join("src")).expect("tmp dirs");
+        std::fs::create_dir_all(proj.join(".git")).expect("git dir");
+        std::fs::write(dir.join("Cargo.toml"), "").expect("outer manifest");
+        let file = proj.join("src").join("main.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(embedded_table().workspace_root(&file), proj);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_accepts_git_file_worktree() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        std::fs::write(dir.join(".git"), "gitdir: ../main/.git/worktrees/x").expect("gitfile");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(embedded_table().workspace_root(&file), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_falls_back_to_file_parent() {
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "").expect("file");
+        // txt は言語未登録: 汎用集合でもマーカーが無ければファイル親
+        assert_eq!(embedded_table().workspace_root(&file), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_root_markers_replace_generic_set() {
+        // 明示 root-markers は汎用集合を置換する: 汎用マーカー（package.json）が
+        // 途中にあっても無視し、明示マーカー（.myroot）で止まる。
+        let table = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[[language]]
+name = "text"
+file-types = ["txt"]
+root-markers = [".myroot"]
+"#,
+            ),
+        );
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root5-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).expect("tmp dirs");
+        std::fs::write(dir.join(".myroot"), "").expect("marker");
+        std::fs::write(dir.join("sub").join("package.json"), "").expect("without");
+        let file = dir.join("sub").join("notes.txt");
+        std::fs::write(&file, "").expect("file");
+        // 汎用集合なら sub/package.json で止まるはず。置換なら .myroot の dir まで上がる。
+        assert_eq!(
+            table.workspace_root(&file),
+            dir,
+            "明示 root-markers が汎用集合（package.json）を無視して勝つ"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_empty_root_markers_ignore_git() {
+        // root-markers = []（空）は「マーカーなし」: .git を除外しファイル親に落ちる。
+        // — "git 管理しているがそこを root にしたくない" ユースケース（ADR-0030）。
+        let table = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[[language]]
+name = "text"
+file-types = ["txt"]
+root-markers = []
+"#,
+            ),
+        );
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root6-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("docs")).expect("tmp dirs");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        let file = repo.join("docs").join("memo.txt");
+        std::fs::write(&file, "").expect("file");
+        // 汎用集合なら repo/.git で止まる。置換（空）なら .git を無視して docs に落ちる。
+        assert_eq!(
+            table.workspace_root(&file),
+            repo.join("docs"),
+            "空の root-markers は .git を root 判定から除外する"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_without_explicit_markers_uses_generic_set() {
+        // 既定 rust は root-markers 未指定 → 汎用集合（Cargo.toml 含む）のまま。
+        let table = LanguageTable::from_strings(
+            DEFAULT_LANGUAGES_TOML,
+            Some(
+                r#"
+[[language]]
+name = "rust"
+file-types = ["rs"]
+"#,
+            ),
+        );
+        let dir = std::env::temp_dir().join(format!("mina-lsp-root7-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("tmp dirs");
+        std::fs::write(dir.join("Cargo.toml"), "").expect("manifest");
+        let file = dir.join("src").join("main.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(table.workspace_root(&file), dir, "rust は汎用集合の Cargo.toml で止まる");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

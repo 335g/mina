@@ -1,6 +1,9 @@
 # 埋め込み既定の言語テーブル（ADR-0030）
 # 検証済みサーバのみを同梱する（規定サーバ方針）。ユーザーファイル
 # ($XDG_CONFIG_HOME/mina/languages.toml) が name / id 単位で上書き・追加する。
+# root-markers を書かなければ WorkspaceRoot 判定は汎用集合
+# （Cargo.toml / package.json / pyproject.toml / go.mod / .git）を使う。
+# 書けばそのリストで置換（.git を含めたければ自分で書く）。ADR-0030 Stage 2。
 
 [language-server.rust-analyzer]
 command = "rust-analyzer"
