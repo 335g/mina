@@ -76,9 +76,25 @@ Stage 4 で有効化するまで、ユーザーファイルに書かないこと
   （tools/ab）で rename / references / inlay hints の実動作を確認済み、という意味。
   既定の init options（inlay hints のチューニング等）もこの検証とセットで同梱する。
 - **ユーザーが任意サーバを languages.toml に足すのは許可・非保証**。LSP 標準 + initialize
-  応答の capability 動的判定（Stage 3）が共通機能（診断・定義ジャンプ等）を保証し、
-  inlay hints / rename 等はサーバが advertise しない限り自然に無効になる（10 秒リトライに
-  突入しない）。「ブロックする」のではなく「既定として何を検証・同梱するか」で規定する。
+  応答の capability 動的判定（実装済み — 下の「能力ゲート」節）が共通機能（診断・定義
+  ジャンプ等）を保証し、inlay hints / rename 等はサーバが advertise しない限り自然に無効に
+  なる（10 秒リトライに突入しない）。「ブロックする」のではなく「既定として何を検証・
+  同梱するか」で規定する。
+
+## 能力ゲート（Stage 3 で実装済み）
+
+initialize 応答の capabilities から [`ServerCapabilities`]（pull_diagnostics / inlay_hints /
+rename / references / definition）を導出し、機能ごとに要求を止める。
+
+- **diagnostic（pull）**: `diagnosticProvider` が無ければ診断を空にする（pull しない）。
+- **inlay hints**: `inlayHintProvider` が無ければヒントを空にする（編集ごとの pull をしない）。
+- **rename / references**: `renameProvider` / `referencesProvider` が無ければ daemon が
+  即「`rename not supported` / `references not supported`」（exit 1・再試行不可、ADR-0029 の
+  分類をそのまま使う）を返す — ワークスペース走査（didOpen-all）と 10 秒リトライ予算を
+  消費しない。
+- **peek（定義）**: `definitionProvider` が無ければ peek なし（空応答）。
+- キー欠落・明示 `false` は非対応扱い。`true` とオブジェクト形式（RenameOptions 等）は
+  対応扱い。`renameProvider: false` を advertise するサーバは稀だが正しく扱える。
 - 初期化オプションのスキーマはサーバ固有（rust-analyzer は `initializationOptions` で
   inlay hints を明示 ON にしないと既定オフ。TS / gopls は別キー・別経路）。よって
   config は言語ではなく**サーバ定義**に持たせる。capabilities から導出しない —
