@@ -25,23 +25,19 @@
 (undefined) @constant
 
 ; keyword
-; 匿名トークン: 一般的なキーワード。
+; 匿名トークン: 一般的なキーワード。asserts/class/import/module/type は匿名トークンで
+; （同名の named シンボル — 型注釈スーパータイプ等 — に解決されるため (node) 形式は不可）。
 [
-  "abstract" "accessor" "as" "assert" "async" "await" "break"
-  "case" "catch" "const" "continue" "debugger" "declare" "default"
+  "abstract" "accessor" "as" "assert" "asserts" "async" "await" "break"
+  "case" "catch" "class" "const" "continue" "debugger" "declare" "default"
   "delete" "do" "else" "enum" "export" "extends" "finally" "for" "from"
-  "function" "get" "global" "if" "implements" "in" "infer"
-  "instanceof" "interface" "is" "keyof" "let" "namespace" "new"
+  "function" "get" "global" "if" "implements" "import" "in" "infer"
+  "instanceof" "interface" "is" "keyof" "let" "module" "namespace" "new"
   "of" "override" "readonly" "private" "protected" "public" "return"
-  "satisfies" "set" "static" "switch" "throw" "try" "typeof"
+  "satisfies" "set" "static" "switch" "throw" "try" "type" "typeof"
   "using" "var" "void" "while" "with" "yield"
 ] @keyword
 ; 名前付きトークン (匿名文字列パターンではマッチできない)。
-(asserts) @keyword
-(class) @keyword
-(import) @keyword
-(module) @keyword
-(type) @keyword
 (this) @keyword
 (super) @keyword
 

@@ -15,10 +15,10 @@ use std::ops::Range;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 /// 1言語分の定義。`grammar` はパース用、`highlights` はハイライトクエリ。
+/// 拡張子 → 言語のマッピングは languages.toml が持つため、本クレートは拡張子を
+/// 持たない（ADR-0030 Stage 4 の単一ソース化。`language_by_name` で引かれる）。
 pub struct LanguageDef {
     pub name: &'static str,
-    /// ドット付き拡張子 (例: `[".rs"]`)。
-    pub extensions: &'static [&'static str],
     /// grammar を返す関数。`LanguageFn` → `Language` の変換が実行時のみのため
     /// const レジストリと両立する形として関数ポインタにしている (M1)。
     pub grammar: fn() -> Language,
@@ -37,7 +37,6 @@ fn typescript_grammar() -> Language {
 /// Rust（マイルストーン1の最初の言語）。
 pub const RUST: LanguageDef = LanguageDef {
     name: "rust",
-    extensions: &[".rs"],
     grammar: rust_grammar,
     highlights: include_str!("../highlights/rust.scm"),
 };
@@ -45,7 +44,6 @@ pub const RUST: LanguageDef = LanguageDef {
 /// TypeScript（Stage 4: 2言語目。languages.toml の既定エントリが参照する）。
 pub const TYPESCRIPT: LanguageDef = LanguageDef {
     name: "typescript",
-    extensions: &[".ts"],
     grammar: typescript_grammar,
     highlights: include_str!("../highlights/typescript.scm"),
 };
@@ -275,6 +273,23 @@ mod tests {
             names.push(name.strip_prefix('@').unwrap_or(name).to_string());
         }
         names
+    }
+
+    #[test]
+    fn typescript_method_name_is_function_not_field() {
+        // 同一ノードへの複数 capture（method_definition name の @function と
+        // property_identifier の @field）は優先順位で @function に確定する（loader の
+        // priority: Function=1。ADR-0018 の重複確定）。TS でも同様に振る舞う。
+        let def = language_by_name("typescript").expect("typescript が登録済み");
+        let src = "class C { foo() {} }";
+        let ranges = compute_highlights(def, src);
+        let start = "class C { ".len();
+        let r = ranges
+            .iter()
+            .find(|r| r.start == start)
+            .expect("foo がハイライトされる");
+        assert_eq!(r.group, HighlightGroup::Function, "foo は Function に確定: {ranges:?}");
+        assert_eq!(&src[r.start..r.end], "foo");
     }
 
     #[test]
