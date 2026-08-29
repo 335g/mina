@@ -399,10 +399,11 @@ impl Daemon {
     /// いないので復元不要（借りたセッションの current_uri は次回要求の didOpen で
     /// 置き換わる）。
     fn borrows_focus_session(&mut self, focused: &Option<PathBuf>, target: &Path) -> bool {
+        let languages = self.languages_refresh();
         focused.as_deref().is_some_and(|fp| {
             fp != target
-                && self.languages_refresh().server_for(fp).is_some()
-                && lsp::workspace_root(fp) == lsp::workspace_root(target)
+                && languages.server_for(fp).is_some()
+                && languages.workspace_root(fp) == languages.workspace_root(target)
         })
     }
 
@@ -694,7 +695,7 @@ async fn watch_disk(
         if let Some((path, text)) = &lsp_sync {
             let session = {
                 let d = daemon.lock().await;
-                d.lsp_sessions.get(&lsp::workspace_root(path)).cloned()
+                d.lsp_sessions.get(&d.languages.workspace_root(path)).cloned()
             };
             if let Some(session) = session {
                 // ADR-0028: 同期中を Activity として公開する（フォーカス文書のみ。
@@ -1642,7 +1643,10 @@ async fn ensure(
     daemon: &Mutex<Daemon>,
     path: &Path,
 ) -> Result<Arc<Mutex<LspSession>>, String> {
-    let root = lsp::workspace_root(path);
+    // ゲートと同期させるため、まず最新テーブルを取得（mtime 差分のみ再読込）し、
+    // root 判定（言語別マーカー。ADR-0030 Stage 2）と spawn の両方に使う。
+    let languages = daemon.lock().await.languages_refresh();
+    let root = languages.workspace_root(path);
     // 既存セッション（root に生きていれば）を再利用する
     {
         let d = daemon.lock().await;
@@ -1656,11 +1660,10 @@ async fn ensure(
             }
         }
     }
-    // 未作成 or 死亡: 最新テーブルで spawn + initialize（M1 / ADR-0030）。
+    // 未作成 or 死亡: 上の最新テーブルで spawn + initialize（M1 / ADR-0030）。
     // languages_refresh は mtime 差分だけ再読込するため、ゲート（先に呼ばれた
     // languages_refresh）と同じテーブルを参照する — 「新言語の追加」も次の
     // ゲート/ spawn で反映される（起動時 1 回読込では daemon 再起動まで効かない）。
-    let languages = daemon.lock().await.languages_refresh();
     let spec = languages
         .server_for(path)
         .ok_or_else(|| format!("LSP 非対応のパスです: {}", path.display()))?;
@@ -1676,7 +1679,7 @@ async fn ensure(
     )
     .await?;
     let arc = Arc::new(Mutex::new(session));
-    // 保存（短いロック・await なし）。languages は languages_refresh が更新済み。
+    // 保存（短いロック・await なし）。テーブルは上の languages_refresh が更新済み。
     let mut d = daemon.lock().await;
     // 同時 ensure レース: 既存が生きていればそちらを優先する
     if let Some(existing) = d.lsp_sessions.get(&root) {
@@ -1712,7 +1715,7 @@ async fn open_workspace_files(
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return;
     };
-    let root = lsp::workspace_root(path);
+    let root = daemon.lock().await.languages.workspace_root(path);
     let mut files = Vec::new();
     collect_workspace_files(&root, ext, &mut files, 0);
     // ディスクから読む（上限付き）。開文書の未保存編集は後で優先する。
@@ -1807,7 +1810,10 @@ fn drain_into(daemon: &mut Daemon) {
         daemon.diagnostics.clear();
         return;
     };
-    let Some(session) = daemon.lsp_sessions.get(&lsp::workspace_root(path)) else {
+    let Some(session) = daemon
+        .lsp_sessions
+        .get(&daemon.languages.workspace_root(path))
+    else {
         // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
         // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
         daemon.diagnostics.clear();
@@ -2388,9 +2394,9 @@ async fn process_command(
                 let sync_target = if is_edit {
                     d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
                         // フォーカス文書の WorkspaceRoot に対応するセッションだけを
-                        // 同期対象にする（ADR-0010）。.rs 以外の文書にはセッションが
+                        // 同期対象にする（ADR-0010）。LSP 対応以外の文書にはセッションが
                         // なく、同期スキップ + drain_into で診断が消える。
-                        let root = lsp::workspace_root(&path);
+                        let root = d.languages.workspace_root(&path);
                         d.lsp_sessions.get(&root).cloned().map(|session| {
                             let text = d.editor.current_document().text().to_string();
                             (session, path, text)
@@ -2426,7 +2432,7 @@ async fn process_command(
                         let sync_target = if rejected.is_none() {
                             // 編集後の LSP 同期（Command 編集と同じ経路。ADR-0009）
                             d.editor.focused_path().map(Path::to_path_buf).and_then(|path| {
-                                let root = lsp::workspace_root(&path);
+                                let root = d.languages.workspace_root(&path);
                                 d.lsp_sessions.get(&root).cloned().map(|session| {
                                     let text = d.editor.current_document().text().to_string();
                                     (session, path, text)
@@ -3191,11 +3197,12 @@ mod tests {
             .await
             .expect("initialize");
         let dead = Arc::new(Mutex::new(session));
+        let root = daemon.lock().await.languages.workspace_root(Path::new("/tmp/x.rs"));
         daemon
             .lock()
             .await
             .lsp_sessions
-            .insert(lsp::workspace_root(Path::new("/tmp/x.rs")), dead.clone());
+            .insert(root, dead.clone());
 
         // サーバを殺して is_dead になるまで待つ（reader タスクが EOF を拾う）
         dead.lock().await.client.kill().await;
@@ -3294,7 +3301,7 @@ language-server = "typescript-language-server"
         ));
         daemon
             .lsp_sessions
-            .insert(lsp::workspace_root(&path), session.clone());
+            .insert(daemon.languages.workspace_root(&path), session.clone());
 
         // pull で TODO 診断を取り込んでから殺す（MEDIUM-3 の前提: 診断がある状態）
         session
