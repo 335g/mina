@@ -81,6 +81,13 @@ python3 tools/ab/ab.py stats t3 A 1
 - 注意: mrename はコールド時に daemon + rust-analyzer の起動・ロード待ち（数秒〜10 秒）が
   乗る。run 間は `pkill -f "target/debug/mina daemon"` で daemon を落としてから実行する。
 
+### t10（Stage 4）: TS 版 T9 — typescript-language-server 経由の `session rename` vs apply
+- T9 の TypeScript 版フィクスチャ（3 ファイル: utils/data/index.ts、`USD` x11・`price` x9）。
+- Arm A: apply ループ / Arm B: `mrename`（mina `session rename` → typescript-language-server）。
+- 成功判定: `USD` / `price` が全 .ts に残っていない（クロスファイルの import も対象）。
+- 実装済みの動作検証: 2 ファイル（import 跨ぎ）で references 5 件 / rename 2 ファイル 5 編集
+  （tsserver は閉じたファイルを null で拒否するため keep-open 方式 — ADR-0030）。
+
 ## 成果物
 
 - `shims/read_shim.py` / `edit_shim.py` / `rename_mina_shim.py` — read/edit/rename の

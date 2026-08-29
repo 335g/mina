@@ -209,6 +209,41 @@ fn main() {
 """)
 
 
+def fixture_t10():
+    """T10 (Stage 4): TypeScript analog of T9 — 3-file TS project, many
+    occurrences (USD x12, price x9), cross-file with imports. Regime where
+    mina's OWN semantic rename (`session rename` via typescript-language-server,
+    ADR-0030 Stage 4) should beat an apply loop."""
+    (WORK / "ws" / "package.json").write_text('{"name": "abts", "private": true}\n')
+    (WORK / "ws" / "src").mkdir(parents=True, exist_ok=True)
+    (WORK / "ws" / "src" / "utils.ts").write_text(
+        """export const USD = 100;
+
+export function price(x: number): number {
+    return x * USD;
+}
+""")
+    (WORK / "ws" / "src" / "data.ts").write_text(
+        """import { USD } from "./utils";
+import { price } from "./utils";
+
+export const ITEMS = [USD * 1, USD * 2, USD * 3, USD * 4, USD * 5, USD * 10, USD * 11, USD * 12];
+
+export function total(a: number, b: number): number {
+    return price(a) + price(b) + price(a * b) + price(a + b);
+}
+""")
+    (WORK / "ws" / "src" / "index.ts").write_text(
+        """import { USD, price } from "./utils";
+import { ITEMS, total } from "./data";
+
+const first = ITEMS[0] + USD;
+const second = price(USD) + USD * 2;
+const third = total(USD, price(USD));
+console.log(first + " " + second + " " + third);
+""")
+
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -406,6 +441,32 @@ You MUST use these commands for all file access (no other file commands):
      over occurrences. First mread the files to see the crate, then mrename
      for USD->JPY and for price->amount, then verify with a final mread that
      no "USD" or "price" remains in ANY .rs file, and reply with exactly: DONE""",
+    "t10-A": """Refactor the TypeScript project in the current directory
+(src/utils.ts, src/data.ts, src/index.ts):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  medit <path> <old> <new>   replace the FIRST occurrence of <old> with <new>
+Work file by file, occurrence by occurrence. When done, verify that no
+occurrence of "USD" or "price" remains in ANY of the .ts files and reply with
+exactly: DONE""",
+    "t10-B": """Refactor the TypeScript project in the current directory
+(src/utils.ts, src/data.ts, src/index.ts):
+  - rename the constant USD to JPY (every occurrence in every file)
+  - rename the function price to amount (its definition and every call)
+
+You MUST use these commands for all file access (no other file commands):
+  mread <path> [start:end]   read lines of a file (numbered)
+  mrename <path> <old> <new> perform a LANGUAGE-AWARE RENAME of the symbol whose
+     first identifier occurrence is <old> in <path> — the language server
+     (typescript-language-server via mina `session rename`) finds and updates
+     every reference (definition, calls, imports, uses) across files in one
+     call and saves. One mrename per symbol is enough; do not loop over
+     occurrences. First mread the files to see the project, then mrename for
+     USD->JPY and for price->amount, then verify with a final mread that no
+     "USD" or "price" remains in ANY .ts file, and reply with exactly: DONE""",
     "t3-A": """Refactor the project in the current directory (files f1.rs and f2.rs):
   - rename the constant USD to JPY (all occurrences)
   - rename the method price() to amount() (its definition and all calls)
@@ -479,8 +540,8 @@ def build_workdir(test, arm):
     if test == "t8":
         # both edit tools present: medit (positional) and mapply (content-resolved)
         wr("mapply", "edit_shim.py", "apply")
-    if (test == "t6") or (test in ("t4", "t5") and arm == "B") or (test == "t9" and arm == "B"):
-        if test == "t9":
+    if (test == "t6") or (test in ("t4", "t5") and arm == "B") or (test in ("t9", "t10") and arm == "B"):
+        if test in ("t9", "t10"):
             # mrename backed by mina's OWN session rename (M2, ADR-0029)
             p = wd / "bin" / "mrename"
             p.write_text(
@@ -525,6 +586,8 @@ def build_workdir(test, arm):
         fixture_t5()
     elif test == "t9":
         fixture_t9()
+    elif test == "t10":
+        fixture_t10()
     if test == "t7":
         fixture_t7()
     if test == "t8":
@@ -669,8 +732,8 @@ def success(test):
         ok = all(f in s for f in finals)
         missing = [f for f in finals if f not in s]
         return ("OK" if ok else "FAIL"), f"missing={missing or 'none'}"
-    if test == "t9":
-        s = read("src/utils.rs") + read("src/data.rs") + read("src/main.rs")
+    if test in ("t9", "t10"):
+        s = read(f"src/utils.{'ts' if test == 't10' else 'rs'}") + read(f"src/data.{'ts' if test == 't10' else 'rs'}") + read(f"src/index.{'ts' if test == 't10' else 'rs'}")
         ok = "USD" not in s and "price" not in s and "JPY" in s and "amount" in s
         return ("OK" if ok else "FAIL"), \
             f"USD_left={'USD' in s} JPY={'JPY' in s} price_left={'price' in s} amount={'amount' in s}"
@@ -680,7 +743,7 @@ def success(test):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"])
+    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"])
     ap.add_argument("arm", choices=["A", "B"], nargs="?")
     ap.add_argument("idx", type=int, nargs="?")
     a = ap.parse_args()
