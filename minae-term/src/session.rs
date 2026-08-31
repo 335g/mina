@@ -12,6 +12,8 @@
 //!   （90 秒で時間切れ: 現状を返し exit code 2 = 再試行可能）
 //! - `minae session hints <path>` — 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
 //! - `minae session peek <path> <line>:<col>` — 指定位置（1-origin）の定義を全文なしで取得する（ADR-0025）
+//! - `minae session outline <path>` — シンボルの階層ツリー（名前・種別・範囲）を全文なしで取得する（ADR-0031）
+//! - `minae session at <path> <line>:<col>` — 指定位置を囲む記号とその正確な範囲を全文なしで取得する（ADR-0031）
 //!
 //! 例: `minae session exec '{"Insert": {"text": "hello"}}'`
 //! 例: `minae session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
@@ -20,6 +22,8 @@
 //! 例: `minae session wait 42`
 //! 例: `minae session hints src/main.rs`
 //! 例: `minae session peek src/main.rs 12:5`
+//! 例: `minae session outline src/main.rs`
+//! 例: `minae session at src/main.rs 12:5`
 //!
 //! daemon が動いていなければ自動起動される（TUI と同じ挙動）。終了コード:
 //! 0 = 成功（適用・no-op 含む）、1 = トランスポート/JSON エラー、
@@ -32,7 +36,7 @@ use std::io;
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use minae_protocol::{ClientKind, Command, DocumentEdit, InlayHint, StateSnapshot};
+use minae_protocol::{ClientKind, Command, DocumentEdit, InlayHint, OutlineSymbol, StateSnapshot};
 use minae_protocol::{ReferenceLocation, ServerMessage};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -135,6 +139,22 @@ pub enum SessionCmd {
         path: PathBuf,
         /// Symbol name to look up
         old: String,
+    },
+    /// Fetch the hierarchical symbol outline of any path without full text
+    /// (ADR-0031). Prints the symbol tree (name, kind, ranges) as JSON — the
+    /// ranges double as the addresses for later reads and edits.
+    Outline {
+        /// Path
+        path: PathBuf,
+    },
+    /// Report the symbol enclosing `<line>:<col>` (1-origin) with its exact
+    /// range and name-token range (ADR-0031). Reads no full text — use the
+    /// returned ranges with `--lines` / `apply`.
+    At {
+        /// Path
+        path: PathBuf,
+        /// Position as `line:col` (1-origin, col is a char count)
+        pos: String,
     },
 }
 
@@ -305,6 +325,37 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
                 println!("{}:{}", loc.path, loc.line + 1);
             }
         }
+        SessionCmd::Outline { path } => {
+            // 成功: シンボルの階層ツリーを JSON で出力する（全文なし — ADR-0031。
+            // エージェントは得られた range を読み・編集の住所にする）。
+            // 失敗: stderr に理由、exit 1（入力エラー: not supported / invalid）
+            // または exit 2（再試行可能: LSP エラー等）。
+            let outcome = execute_outline(&path.to_string_lossy()).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("outline: {e}");
+                std::process::exit(outline_exit_code(e));
+            }
+            // compact JSON で出力する（トークン削減が目的の経路なので、pretty の
+            // 空白を省く。262 記号で ~40% 削減 — ADR-0031 検証の実測）。
+            println!("{}", serde_json::to_string(&outcome.symbols)?);
+        }
+        SessionCmd::At { path, pos } => {
+            // 成功: 囲む記号（名前・種別・正確な範囲）を JSON で出力する —
+            // エージェントは範囲をそのまま apply / --lines の住所にできる。
+            // 記号なしは found: false で success（exit 0 — Peek の空定義と同じ流儀）。
+            // 失敗: stderr に理由、exit 1/2（Rename / References と同じ分類）。
+            let (line, col) = parse_position(&pos)?;
+            let outcome = execute_enclosing(&path.to_string_lossy(), line, col).await?;
+            if let Some(e) = outcome
+                .get("error")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                eprintln!("at: {e}");
+                std::process::exit(symbol_at_exit_code(e));
+            }
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+        }
     }
     Ok(())
 }
@@ -456,6 +507,12 @@ struct ReferencesOutcome {
     error: Option<String>,
 }
 
+/// `session outline` の結果（[`ServerMessage::Outline`] の展開形）。
+struct OutlineOutcome {
+    symbols: Vec<OutlineSymbol>,
+    error: Option<String>,
+}
+
 /// rename の失敗を exit コードに分類する（ADR-0029）: 入力エラー（not supported /
 /// invalid input）は再試行しても通らないので 1、それ以外（シンボル未解決・
 /// LSP エラー・保存失敗）は再試行可能なので 2。
@@ -517,7 +574,9 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
         | Ok(ServerMessage::ServerInfo { .. })
-        | Ok(ServerMessage::ReferencesResult { .. }) => {
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("Rename に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
@@ -560,8 +619,124 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
         | Ok(ServerMessage::ServerInfo { .. })
-        | Ok(ServerMessage::RenameResult { .. }) => {
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("References に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// outline の失敗を exit コードに分類する（ADR-0031）: 入力エラー（not supported /
+/// invalid）は再試行しても通らないので 1、それ以外（LSP エラー等）は再試行可能
+/// なので 2。
+fn outline_exit_code(e: &str) -> i32 {
+    if e.starts_with("outline not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// symbol range（`session at`）の失敗の exit コード分類（outline と同型）。
+fn symbol_at_exit_code(e: &str) -> i32 {
+    if e.starts_with("symbol range not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// daemon に接続し、シンボルの階層ツリーを軽量応答（[`ServerMessage::Outline`]）
+/// で受け取る（ADR-0031）。全文は運ばれない。
+async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let command = Command::Outline {
+        path: client::absolutize(path),
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::Outline {
+            symbols, error, ..
+        }) => Ok(OutlineOutcome { symbols, error }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "Outline にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+            Err(invalid("Outline に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// daemon に接続し、指定位置を囲む記号の範囲を軽量応答
+/// （[`ServerMessage::EnclosingSymbol`]）で受け取る（ADR-0031）。全文は運ばれない。
+async fn execute_enclosing(
+    path: &str,
+    line: u32,
+    col: u32,
+) -> io::Result<serde_json::Value> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let command = Command::EnclosingSymbol {
+        path: client::absolutize(path),
+        line,
+        col,
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::EnclosingSymbol {
+            path,
+            name,
+            kind,
+            range,
+            selection_range,
+            found,
+            error,
+        }) => Ok(serde_json::json!({
+            "path": path,
+            "name": name,
+            "kind": kind,
+            "range": range,
+            "selection_range": selection_range,
+            "found": found,
+            "error": error,
+        })),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "EnclosingSymbol にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. }) => {
+            Err(invalid("EnclosingSymbol に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
     }
@@ -619,7 +794,9 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
             Err(invalid("GetServerInfo にスナップショット応答が返った（旧 daemon: 再ビルドしてください）"))
         }
         Ok(minae_protocol::ServerMessage::Hints { .. })
-        | Ok(minae_protocol::ServerMessage::Peek { .. }) => {
+        | Ok(minae_protocol::ServerMessage::Peek { .. })
+        | Ok(minae_protocol::ServerMessage::Outline { .. })
+        | Ok(minae_protocol::ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
         }
         Ok(minae_protocol::ServerMessage::RenameResult { .. })
