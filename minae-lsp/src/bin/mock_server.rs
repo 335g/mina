@@ -60,6 +60,7 @@ fn main() {
                         caps["renameProvider"] = json!(true);
                         caps["referencesProvider"] = json!(true);
                         caps["definitionProvider"] = json!(true);
+                        caps["documentSymbolProvider"] = json!(true);
                     }
                     let resp = json!({
                         "jsonrpc": "2.0",
@@ -125,6 +126,23 @@ fn main() {
                         })
                     });
                     let resp = json!({ "jsonrpc": "2.0", "id": id, "result": loc });
+                    write_frame(&mut stdout, &resp);
+                }
+                "textDocument/documentSymbol" => {
+                    // 簡易アウトライン: 行ごとに `fn NAME` / `struct NAME` / `let NAME`
+                    // を走査して DocumentSymbol 配列（kind・range・selectionRange）を
+                    // 返す。階層（children）は持たない — 木構造の変換は lsp.rs の
+                    // ユニットテストで検証する。範囲は実測が必要な輪郭だけ正確に
+                    // （行全体が range・名前トークンが selectionRange）。
+                    let symbols = current
+                        .as_ref()
+                        .map(|(_, text)| outline_symbols(text, utf16))
+                        .unwrap_or_default();
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": symbols,
+                    });
                     write_frame(&mut stdout, &resp);
                 }
                 "textDocument/rename" => {
@@ -286,6 +304,42 @@ fn inlay_hints(text: &str, utf16: bool) -> Vec<Value> {
         }
     }
     hints
+}
+
+/// 簡易アウトライン（[`textDocument/documentSymbol`] のモック応答）:
+/// 行ごとに `fn NAME` / `struct NAME` / `let NAME` を走査し、DocumentSymbol 配列を
+/// 返す。range は行全体、selectionRange は名前トークン。kind: 12=Function /
+/// 23=Struct / 13=Variable。階層（children）は持たない — 入れ子変換は
+/// minae-term の lsp.rs ユニットテストで検証する。
+fn outline_symbols(text: &str, utf16: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (line_idx, line) in text.lines().enumerate() {
+        for (kw, kind) in [("fn ", 12u64), ("struct ", 23u64), ("let ", 13u64)] {
+            let Some(kw_pos) = line.find(kw) else {
+                continue;
+            };
+            let name_start = kw_pos + kw.len();
+            let name_end = line[name_start..]
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .map_or(line.len(), |e| name_start + e);
+            if name_start == name_end {
+                continue;
+            }
+            out.push(json!({
+                "name": &line[name_start..name_end],
+                "kind": kind,
+                "range": {
+                    "start": { "line": line_idx as u32, "character": 0 },
+                    "end": { "line": line_idx as u32, "character": lsp_char_col(line, line.len(), utf16) },
+                },
+                "selectionRange": {
+                    "start": { "line": line_idx as u32, "character": lsp_char_col(line, name_start, utf16) },
+                    "end": { "line": line_idx as u32, "character": lsp_char_col(line, name_end, utf16) },
+                },
+            }));
+        }
+    }
+    out
 }
 
 /// 行内バイト列 → LSP の character（advertise した encoding の単位）。
