@@ -18,8 +18,8 @@ use minae_core::{
 };
 use minae_protocol::{
     Activity, ActivityKind, ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource,
-    GotoTarget, Hello, HighlightRange, InlayHint, Range, ServerMessage, ServerMetrics, StateSnapshot,
-    fnv1a64,
+    GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range, ServerMessage, ServerMetrics,
+    StateSnapshot, SymbolKind, fnv1a64,
 };
 use minae_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -110,6 +110,12 @@ pub struct Daemon {
     /// （Q7: stale ヒントは新ヒント到着まで保持）。挿入順は `hint_order` で FIFO evict。
     pub(crate) hints: HashMap<PathBuf, HintCache>,
     pub(crate) hint_order: VecDeque<PathBuf>,
+    /// パスごとの outline キャッシュ（ADR-0031）。`OutlineCache.text_checksum` が
+    /// 現在のテキストと一致すれば新鮮（再取得不要）。これは inlay hint キャッシュ
+    /// （ADR-0020）と同型 — 未保存編集は影響しない（チェックサムが変われば
+    /// 不一致になり再取得される）。挿入順は `outline_order` で FIFO evict。
+    pub(crate) outlines: HashMap<PathBuf, OutlineCache>,
+    pub(crate) outline_order: VecDeque<PathBuf>,
     /// 開いている undo グループの所有者（= SetMode(Insert) で開いたクライアント）。
     ///
     /// HIGH-1: グループは接続スコープで所有される。所有者の切断のみがグループを
@@ -171,6 +177,14 @@ struct SyntaxCache {
 pub(crate) struct HintCache {
     pub(crate) text_checksum: u64,
     pub(crate) hints: Vec<InlayHint>,
+}
+
+/// パスごとの outline キャッシュ 1 件（ADR-0031）。テキストのチェックサムが
+/// 現在と一致する間だけ新鮮 — `at` / `outline` の 2 回目以降が LSP を呼ばずに済む
+/// （実測: LSP 要求は毎回の再解析で数秒かかる）。
+pub(crate) struct OutlineCache {
+    pub(crate) text_checksum: u64,
+    pub(crate) symbols: Vec<OutlineSymbol>,
 }
 
 /// ヒントキャッシュの上限（ADR-0020）。超過は挿入順の最古から除去する。
@@ -306,6 +320,25 @@ impl Daemon {
         }
     }
 
+    /// パスの outline をキャッシュに書き込む（ADR-0031）。チェックサムは取得
+    /// 時点のテキストから計算する（このテキストに対して取得済みという意味）。
+    /// 上限超過は挿入順の最古から除去する（HintCache と同じ FIFO）。
+    pub(crate) fn cache_outline(&mut self, path: PathBuf, text: &str, symbols: Vec<OutlineSymbol>) {
+        let checksum = fnv1a64(text.as_bytes());
+        if self
+            .outlines
+            .insert(path.clone(), OutlineCache { text_checksum: checksum, symbols })
+            .is_none()
+        {
+            self.outline_order.push_back(path.clone());
+        }
+        while self.outlines.len() > MAX_HINT_CACHE {
+            if let Some(old) = self.outline_order.pop_front() {
+                self.outlines.remove(&old);
+            }
+        }
+    }
+
     /// 進行中の処理を追加する（ADR-0028）。追加で generation を進める
     /// （診断・ヒントの反映は進めない — 増減だけが待ち合わせの対象）。
     /// 同一 kind の重複追加は無視（idempotent）。
@@ -374,6 +407,8 @@ impl Daemon {
             syntax: HashMap::new(),
             hints: HashMap::new(),
             hint_order: VecDeque::new(),
+            outlines: HashMap::new(),
+            outline_order: VecDeque::new(),
             activities: HashMap::new(),
             metrics: ServerMetrics::default(),
         }
@@ -952,6 +987,25 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // Outline / EnclosingSymbol（ADR-0031）: シンボルの階層ツリーと
+                // 位置を囲む記号の範囲を全文なしの軽量応答で返す。どちらも
+                // 読み取り専用 — PeekDefinitionAt と同じく専用処理する。
+                if let Ok(Command::Outline { path }) = serde_json::from_str::<Command>(line.trim()) {
+                    let message = serve_outline(&daemon, &path).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
+                if let Ok(Command::EnclosingSymbol { path, line, col }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_enclosing_symbol(&daemon, &path, line, col).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 // GetServerInfo（issue #27/D1）: daemon のビルド世代と累積メトリクスを
                 // 軽量応答（ServerMessage::ServerInfo）で返す読み取り専用コマンド。
                 // GetInlayHints と同じく専用処理する。
@@ -1354,6 +1408,248 @@ async fn serve_peek_definition_at(
         },
         None => empty(),
     }
+}
+
+/// outline キャッシュの高速経路（ADR-0031）: テキストのチェックサムが一致する
+/// エントリがあればクローンを返す（LSP 不問）。不一致・不在は `None`。
+async fn cached_outline(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<Vec<OutlineSymbol>> {
+    let text = resolve_doc_text(daemon, path_buf).await?;
+    let checksum = fnv1a64(text.as_bytes());
+    daemon
+        .lock()
+        .await
+        .outlines
+        .get(path_buf)
+        .filter(|c| c.text_checksum == checksum)
+        .map(|c| c.symbols.clone())
+}
+
+/// 対象テキストの解決（開文書優先・ディスク読み）。`prepare_borrowed_session` の
+/// 前半と同じ形（ADR-0008 の `read_open_target` を再利用）。キャッシュヒット判定用。
+async fn resolve_doc_text(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<String> {
+    let in_memory = {
+        let d = daemon.lock().await;
+        d.editor
+            .doc_id_for_path(path_buf)
+            .map(|id| d.editor.document(id).text().to_string())
+    };
+    match in_memory {
+        Some(t) => Some(t),
+        None => read_open_target(&path_buf.to_string_lossy()).await.0,
+    }
+}
+
+/// [`Command::Outline`] の処理（ADR-0031）: 任意パスのシンボル階層ツリーを
+/// 全文なしの軽量応答（[`ServerMessage::Outline`]）で返す。読み取り専用 —
+/// 世代・push・イベントは進めない。
+///
+/// お膳立て（正規化・テキスト解決・didOpen・復元）は PeekDefinitionAt /
+/// References と同じ `prepare_borrowed_session` 経路。失敗は `error: Some(…)`
+/// で表す: 対象が読めない・LSP 非対応・spawn 失敗は「not supported」系
+/// （exit 1、再試行不可）、LSP エラーは再試行可能（exit 2）。予算切れの
+/// 空ツリーは「0 件」として正直に返す（`error: None`）。
+async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    let err = |msg: String| ServerMessage::Outline {
+        path: path.to_string(),
+        generation: 0,
+        symbols: Vec::new(),
+        error: Some(msg),
+    };
+    // キャッシュ高速経路: テキストのチェックサムが一致する outline があれば
+    // LSP に触れずに返す（実測: セマンティック要求は毎回の再解析で数秒かかる）。
+    // 正規化とテキスト解決は prepare_borrowed_session の前半と同じ形。
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    if let Some(symbols) = cached_outline(daemon, &path_buf).await {
+        let msg = ServerMessage::Outline {
+            generation: daemon.lock().await.generation,
+            path: path_buf.to_string_lossy().into_owned(),
+            symbols,
+            error: None,
+        };
+        return record_metric(daemon, msg, true).await;
+    }
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err(format!("outline not supported for {p} (no LSP server configured)"))
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
+    };
+    // サーバが documentSymbol を提供していなければ即「not supported」（exit 1）。
+    // prepare が対象を didOpen 済みのため、借用していたらフォーカス文書へ戻す
+    // （戻さないと current_uri が対象のまま — 同期スキップ・診断消失）。
+    if !borrowed.session.lock().await.caps.document_symbols {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
+        return err(format!(
+            "outline not supported for {} (LSP server が documentSymbolProvider を advertise していません)",
+            borrowed.path_str
+        ));
+    }
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let fetched = lsp::document_symbols_at(&borrowed.session, &borrowed.path, &borrowed.text).await;
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    let (symbols, error) = match fetched {
+        Ok(s) => {
+            daemon.lock().await.cache_outline(borrowed.path.clone(), &borrowed.text, s.clone());
+            (s, None)
+        }
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let msg = ServerMessage::Outline {
+        generation: daemon.lock().await.generation,
+        path: borrowed.path_str,
+        symbols,
+        error,
+    };
+    record_metric(daemon, msg, true).await
+}
+
+/// [`Command::EnclosingSymbol`] の処理（ADR-0031）: 指定位置（1-origin 行:列）
+/// を囲む記号の名前・種別・正確な範囲（選択範囲含む）を全文なしの軽量応答で
+/// 返す。読み取り専用 — 世代・push・イベントは進めない。
+///
+/// documentSymbol の同じツリーから「その char 位置を含む最も深い記号」を引く
+/// （範囲はエージェントが全文を読まずに編集対象を特定する住所になる）。
+/// 位置がどの記号にも含まれない場合は `found: false`（`error: None`）で返す。
+async fn serve_enclosing_symbol(
+    daemon: &Mutex<Daemon>,
+    path: &str,
+    line: u32,
+    col: u32,
+) -> ServerMessage {
+    let err = |msg: String| ServerMessage::EnclosingSymbol {
+        path: path.to_string(),
+        name: String::new(),
+        kind: SymbolKind::Other,
+        range: Range { anchor: 0, head: 0 },
+        selection_range: Range { anchor: 0, head: 0 },
+        found: false,
+        error: Some(msg),
+    };
+    // キャッシュ高速経路: outline キャッシュ（テキスト一致）があれば LSP に触れず
+    // 位置解決だけで済ませる。実測: LSP 要求は再解析込みで数秒 — エージェントが
+    // 同一ファイルへ at を連打する場合の大半をこの経路が吸う。
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    if let Some(symbols) = cached_outline(daemon, &path_buf).await {
+        let Some(text) = resolve_doc_text(daemon, &path_buf).await else {
+            return err(format!("cannot open {path}"));
+        };
+        let char_idx = lsp::line_col_to_char_idx(&text, line, col);
+        let found = lsp::enclosing_symbol(&symbols, char_idx).cloned();
+        let msg = match found {
+            Some(sym) => ServerMessage::EnclosingSymbol {
+                path: path_buf.to_string_lossy().into_owned(),
+                name: sym.name,
+                kind: sym.kind,
+                range: sym.range,
+                selection_range: sym.selection_range,
+                found: true,
+                error: None,
+            },
+            None => ServerMessage::EnclosingSymbol {
+                path: path_buf.to_string_lossy().into_owned(),
+                name: String::new(),
+                kind: SymbolKind::Other,
+                range: Range { anchor: 0, head: 0 },
+                selection_range: Range { anchor: 0, head: 0 },
+                found: false,
+                error: None,
+            },
+        };
+        return record_metric(daemon, msg, false).await;
+    }
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err(format!(
+                "symbol range not supported for {p} (no LSP server configured)"
+            ))
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
+    };
+    if !borrowed.session.lock().await.caps.document_symbols {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
+        return err(format!(
+            "symbol range not supported for {} (LSP server が documentSymbolProvider を advertise していません)",
+            borrowed.path_str
+        ));
+    }
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let fetched = lsp::document_symbols_at(&borrowed.session, &borrowed.path, &borrowed.text).await;
+    // (line:col → char idx) → 囲む記号（最も深い）をツリーから引く。
+    // 位置解決に LSP を介さず、取得済みツリーの範囲だけで決まる。
+    let enclosing = fetched.as_ref().ok().and_then(|symbols| {
+        let char_idx = lsp::line_col_to_char_idx(&borrowed.text, line, col);
+        lsp::enclosing_symbol(symbols, char_idx).cloned()
+    });
+    if let Ok(symbols) = &fetched {
+        daemon
+            .lock()
+            .await
+            .cache_outline(borrowed.path.clone(), &borrowed.text, symbols.clone());
+    }
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    let msg = match (enclosing, fetched) {
+        (Some(sym), _) => ServerMessage::EnclosingSymbol {
+            path: borrowed.path_str,
+            name: sym.name,
+            kind: sym.kind,
+            range: sym.range,
+            selection_range: sym.selection_range,
+            found: true,
+            error: None,
+        },
+        (None, Ok(_)) => ServerMessage::EnclosingSymbol {
+            path: borrowed.path_str,
+            name: String::new(),
+            kind: SymbolKind::Other,
+            range: Range { anchor: 0, head: 0 },
+            selection_range: Range { anchor: 0, head: 0 },
+            found: false,
+            error: None,
+        },
+        (None, Err(e)) => ServerMessage::EnclosingSymbol {
+            path: borrowed.path_str,
+            name: String::new(),
+            kind: SymbolKind::Other,
+            range: Range { anchor: 0, head: 0 },
+            selection_range: Range { anchor: 0, head: 0 },
+            found: false,
+            error: Some(e),
+        },
+    };
+    record_metric(daemon, msg, false).await
+}
+
+/// ADR-0031 の計測: Outline / EnclosingSymbol の要求回数と応答シリアライズ bytes
+/// を ServerMetrics に累積する（エラー応答も配線に乗るため計上する）。
+async fn record_metric(daemon: &Mutex<Daemon>, msg: ServerMessage, outline: bool) -> ServerMessage {
+    let mut d = daemon.lock().await;
+    let bytes = serde_json::to_vec(&msg).map(|v| v.len() as u64).unwrap_or(0);
+    if outline {
+        d.metrics.outline_total += 1;
+        d.metrics.outline_bytes += bytes;
+    } else {
+        d.metrics.symbol_range_total += 1;
+        d.metrics.symbol_range_bytes += bytes;
+    }
+    msg
 }
 
 /// [`Command::References`] の処理（ADR-0029）。`old` の最初の識別子出現を解決し、
@@ -2922,6 +3218,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::Rename { .. } | Command::References { .. } => {
             // handle_connection で専用処理される（ServerMessage::RenameResult /
             // ReferencesResult 応答。ADR-0029）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::Outline { .. } | Command::EnclosingSymbol { .. } => {
+            // handle_connection で専用処理される（ServerMessage::Outline /
+            // EnclosingSymbol 応答。ADR-0031）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::GetServerInfo => {
@@ -5124,6 +5425,9 @@ root-markers = [".docsroot"]
                 ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
                     continue
                 }
+                ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
+                    continue
+                }
             }
         }
     }
@@ -5138,6 +5442,9 @@ root-markers = [".docsroot"]
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
                 ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
+                    continue
+                }
+                ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
                     continue
                 }
             }
@@ -6185,6 +6492,135 @@ root-markers = [".docsroot"]
     }
 
     #[tokio::test]
+    async fn outline_and_enclosing_symbol_via_mock() {
+        // ADR-0031: documentSymbol のツリーと位置→記号範囲が軽量応答で返る。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let work = dir.join(format!("minae-outline-work-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&work);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(work.clone());
+        let sock = dir.join(format!("minae-outline-sock-{}.sock", std::process::id()));
+        let file = work.join("fixture.rs");
+        let _ = std::fs::remove_file(&sock);
+        // 行ごとに `fn / struct / let` が 1 つずつ。mock は行単位のフラットな
+        // アウトラインを返す（木構造の変換は lsp.rs のユニットテストが検証）。
+        std::fs::write(&file, "pub fn run() {}\nstruct Thing;\nfn go() {}\nlet top = 1;\n")
+            .unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+
+        // Outline: 4 記号がフラットに返り、kind・selection_range（名前トークン）
+        // が正しい char インデックスで載る。エラーなし。
+        let mut line = serde_json::to_string(&Command::Outline {
+            path: path.clone(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::Outline {
+                symbols,
+                error,
+                ..
+            } => {
+                assert_eq!(error, None, "エラーなし: {symbols:?}");
+                assert_eq!(symbols.len(), 4, "記号数: {symbols:?}");
+                let thing = symbols.iter().find(|s| s.name == "Thing").unwrap();
+                assert_eq!(
+                    thing.kind,
+                    minae_protocol::SymbolKind::Type,
+                    "struct → Type: {thing:?}"
+                );
+                assert_eq!(
+                    thing.selection_range.anchor,
+                    23,
+                    "名前トークン Thing の char 位置: {thing:?}"
+                );
+                assert_eq!(thing.selection_range.head, 28);
+                assert!(symbols.iter().any(|s| s.kind == minae_protocol::SymbolKind::Function));
+                assert!(symbols.iter().any(|s| s.kind == minae_protocol::SymbolKind::Variable));
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // EnclosingSymbol: 2行目（1-origin）の構造体宣言の内部 → Thing とその範囲。
+        let mut line = serde_json::to_string(&Command::EnclosingSymbol {
+            path: path.clone(),
+            line: 2,
+            col: 9,
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::EnclosingSymbol {
+                name,
+                kind,
+                range,
+                selection_range,
+                found,
+                error,
+                ..
+            } => {
+                assert_eq!(error, None);
+                assert!(found, "2行目は struct Thing の中: {name}");
+                assert_eq!(name, "Thing");
+                assert_eq!(kind, minae_protocol::SymbolKind::Type);
+                assert_eq!(range.anchor, 16, "struct 行全体: {range:?}");
+                assert_eq!(range.head, 29, "行全体（`;` まで）: {range:?}");
+                assert_eq!(selection_range.anchor, 23);
+                assert_eq!(selection_range.head, 28);
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // どの記号にも含まれない位置（行数超過）→ found: false の成功応答。
+        let mut line = serde_json::to_string(&Command::EnclosingSymbol {
+            path: path.clone(),
+            line: 99,
+            col: 1,
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::EnclosingSymbol {
+                found, error, ..
+            } => {
+                assert_eq!(error, None);
+                assert!(!found, "範囲外は記号なし");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
     async fn generation_increments_on_state_changes_only() {
         // ADR-0012: 世代は状態を変える操作（Open/編集/undo）で増加し、
         // GetState（読み取り）では不変。
@@ -7210,6 +7646,9 @@ root-markers = [".docsroot"]
                 ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
                     continue
                 }
+                ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
+                    continue
+                }
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
             }
@@ -7268,6 +7707,42 @@ root-markers = [".docsroot"]
                 MAX_HINT_CACHE + 4
             ))),
             "最新は残る"
+        );
+    }
+
+    #[test]
+    fn outline_cache_invalidates_on_text_change_and_evicts_fifo() {
+        // ADR-0031: outline キャッシュはテキストのチェックサムで新鮮さを判定し、
+        // 上限超過は最古から除去する（HintCache と同じ契約）。
+        let mut d = daemon();
+        let sym = OutlineSymbol {
+            name: "f".into(),
+            kind: SymbolKind::Function,
+            range: Range { anchor: 0, head: 10 },
+            selection_range: Range { anchor: 3, head: 4 },
+            children: Vec::new(),
+        };
+        let p = PathBuf::from("/tmp/outline-cache.rs");
+        d.cache_outline(p.clone(), "pub fn f() {}", vec![sym.clone()]);
+        // 同じテキスト → ヒット
+        assert_eq!(
+            d.outlines.get(&p).map(|c| c.symbols.len()),
+            Some(1),
+            "同一テキストは新鮮"
+        );
+        // テキストが変わった（チェックサム不一致）→ 呼び出し側は再取得する（エントリは
+        // 残るが、`cached_outline` のフィルタで一致しなくなる。ここではエントリの
+        // checksum が取得時テキストに固定されることだけを検証する）。
+        d.cache_outline(p.clone(), "pub fn g() {}", vec![]);
+        assert_eq!(d.outlines.get(&p).map(|c| c.symbols.len()), Some(0), "再取得で上書き");
+        // FIFO evict
+        for i in 0..(MAX_HINT_CACHE + 5) {
+            d.cache_outline(PathBuf::from(format!("/tmp/outline-evict-{i}.rs")), "x", vec![]);
+        }
+        assert_eq!(d.outlines.len(), MAX_HINT_CACHE, "上限を超えない");
+        assert!(
+            !d.outlines.contains_key(Path::new("/tmp/outline-evict-0.rs")),
+            "最古が除去される"
         );
     }
 
@@ -7487,6 +7962,9 @@ root-markers = [".docsroot"]
                     continue;
                 }
                 ServerMessage::RenameResult { .. } | ServerMessage::ReferencesResult { .. } => {
+                    continue;
+                }
+                ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
                     continue;
                 }
             }

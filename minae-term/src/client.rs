@@ -457,7 +457,10 @@ pub(crate) async fn request_hints(
             "unexpected server info response",
         )),
         // ADR-0029: Rename / References 応答もこの経路では期待しない
-        Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+        Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected semantic response",
@@ -511,7 +514,10 @@ pub(crate) async fn request_peek(
             "unexpected server info response",
         )),
         // ADR-0029: Rename / References 応答もこの経路では期待しない
-        Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+        Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected semantic response",
@@ -560,7 +566,10 @@ pub(crate) async fn request<T: serde::Serialize>(
             "unexpected server info response",
         )),
         // ADR-0029: Rename / References 応答もこの経路では期待しない
-        Ok(ServerMessage::RenameResult { .. }) | Ok(ServerMessage::ReferencesResult { .. }) => {
+        Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected semantic response",
@@ -651,7 +660,9 @@ async fn read_loop(
             | Ok(ServerMessage::Peek { .. })
             | Ok(ServerMessage::ServerInfo { .. })
             | Ok(ServerMessage::RenameResult { .. })
-            | Ok(ServerMessage::ReferencesResult { .. }) => {}
+            | Ok(ServerMessage::ReferencesResult { .. })
+            | Ok(ServerMessage::Outline { .. })
+            | Ok(ServerMessage::EnclosingSymbol { .. }) => {}
             Err(e) => {
                 let _ = res_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
