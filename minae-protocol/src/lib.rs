@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 /// 古い daemon に新コマンドを送っても動作しないため version を上げる。
 /// v6: `Command::InsertAtLineEnd` / `InsertAtLineStart`（Helix の `A`/`I`。
 /// ADR-0023）。
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v7: `Command::Rename` / `References`（ADR-0029）。
+/// v8: `Command::Outline` / `EnclosingSymbol`（ADR-0031）。シンボルの階層リストを
+/// 全文なしで返す Outline と、位置を囲む記号の範囲を返す EnclosingSymbol。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// 編集モード（wire 型。minae-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +120,24 @@ pub enum Command {
     /// 出現を解決し、LSP の `textDocument/references` で全参照位置を返す。
     /// 応答は全文を運ばない軽量 [`ServerMessage::ReferencesResult`]。
     References { path: String, old: String },
+    /// シンボルの階層リストの取得（読み取り専用。ADR-0031）。任意パスの文書を
+    /// LSP の `textDocument/documentSymbol` で解析し、名前・種別・範囲（選択範囲
+    /// 含む）のツリーを返す。応答は全文を運ばない軽量 [`ServerMessage::Outline`]。
+    /// エージェントが全文を読まずに構造を把握し、得られた範囲をその後の
+    /// 読み・編集（range-read / apply）の住所にするための経路。
+    Outline { path: String },
+    /// 指定位置を囲むシンボルの取得（読み取り専用。ADR-0031）。`line:col`
+    /// （1-origin）から、その位置を含む最も深い記号の名前・種別・正確な範囲を
+    /// 返す（`documentSymbol` の selectionRange 由来）。エージェントが全文を
+    /// 読まずに「この関数を丸ごと置換する」等の編集範囲を得るための経路。
+    /// 応答は全文を運ばない軽量 [`ServerMessage::EnclosingSymbol`]。
+    EnclosingSymbol {
+        path: String,
+        /// 1-origin 行番号。
+        line: u32,
+        /// 1-origin 列番号（文字数単位）。
+        col: u32,
+    },
 }
 
 /// 移動の種類（wire 型）。
@@ -267,6 +288,38 @@ pub enum ServerMessage {
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
+    /// [`Command::Outline`] の応答（ADR-0031）。シンボルの階層ツリーを全文なしで
+    /// 返す軽量応答。失敗は `error: Some(…)` で表す（`symbols` は空）。
+    Outline {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
+        generation: u64,
+        /// シンボルの階層ツリー（位置昇順）。
+        symbols: Vec<OutlineSymbol>,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+    /// [`Command::EnclosingSymbol`] の応答（ADR-0031）。指定位置を囲む記号の
+    /// 名前・種別・正確な範囲（選択範囲 = 名前トークン）を全文なしで返す軽量応答。
+    /// 位置がどの記号にも含まれない・対象が読めない場合は `found: false`（
+    /// `name` は空・`range`/`selection_range` は位置 0）。
+    EnclosingSymbol {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 囲む記号の名前（見つからなければ空）。
+        name: String,
+        /// 記号の種別。
+        kind: SymbolKind,
+        /// 記号全体の範囲（char インデックス）。
+        range: Range,
+        /// 名前トークンの範囲（char インデックス）。
+        selection_range: Range,
+        /// 位置を囲む記号が見つかったか（`error` が None のときだけ意味を持つ）。
+        found: bool,
+        /// 失敗理由（成功時は None。`error` が Some なら `found` は false）。
+        error: Option<String>,
+    },
 }
 
 /// [`Command::References`] の応答に含まれる参照位置 1 件（ADR-0029）。
@@ -276,6 +329,34 @@ pub enum ServerMessage {
 pub struct ReferenceLocation {
     pub path: String,
     pub line: u32,
+}
+
+/// シンボルの種別（ADR-0031）。LSP の `SymbolKind`（26 種）を proto 側で
+/// 使う小さな集合に写像したもの — LSP を protocol に漏らさない（HighlightGroup
+/// と同じ流儀）。未知の kind は [`SymbolKind::Other`] に潰す。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolKind {
+    Module,
+    Function,
+    Method,
+    Type,
+    Enum,
+    Constant,
+    Variable,
+    #[default]
+    Other,
+}
+
+/// 記号 1 件（ADR-0031）。`range` は記号全体、`selection_range` は名前トークン
+/// の範囲（char インデックス）。`children` は入れ子の記号（階層ツリー）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlineSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub range: Range,
+    pub selection_range: Range,
+    pub children: Vec<OutlineSymbol>,
 }
 
 /// daemon 起動からの累積メトリクス（[`ServerMessage::ServerInfo`] に載る。
@@ -303,6 +384,14 @@ pub struct ServerMetrics {
     pub wait_total: u64,
     /// Save 実行回数。
     pub save_total: u64,
+    /// Outline 要求回数（ADR-0031）。
+    pub outline_total: u64,
+    /// Outline 応答の累積シリアライズ bytes（ADR-0031。トークン削減の実測用）。
+    pub outline_bytes: u64,
+    /// EnclosingSymbol 要求回数（ADR-0031）。
+    pub symbol_range_total: u64,
+    /// EnclosingSymbol 応答の累積シリアライズ bytes（ADR-0031）。
+    pub symbol_range_bytes: u64,
 }
 
 /// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
@@ -741,6 +830,10 @@ mod tests {
                 get_state_total: 5,
                 wait_total: 6,
                 save_total: 7,
+                outline_total: 8,
+                outline_bytes: 9,
+                symbol_range_total: 10,
+                symbol_range_bytes: 11,
             },
         };
         let json = serde_json::to_string(&msg).expect("serialize");
@@ -750,6 +843,75 @@ mod tests {
         let back: Command =
             serde_json::from_str(&serde_json::to_string(&Command::GetServerInfo).unwrap()).unwrap();
         assert_eq!(back, Command::GetServerInfo);
+    }
+
+    #[test]
+    fn outline_types_round_trip() {
+        // SymbolKind の wire 形式は小文字
+        assert_eq!(
+            serde_json::to_string(&SymbolKind::Method).unwrap(),
+            "\"method\""
+        );
+        // OutlineSymbol はツリーとして round-trip する
+        let symbol = OutlineSymbol {
+            name: "frobnicate".into(),
+            kind: SymbolKind::Function,
+            range: Range { anchor: 0, head: 30 },
+            selection_range: Range { anchor: 3, head: 13 },
+            children: vec![OutlineSymbol {
+                name: "inner".into(),
+                kind: SymbolKind::Variable,
+                range: Range { anchor: 10, head: 20 },
+                selection_range: Range { anchor: 14, head: 19 },
+                children: Vec::new(),
+            }],
+        };
+        let json = serde_json::to_string(&symbol).unwrap();
+        let back: OutlineSymbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, symbol);
+        assert!(json.contains("\"kind\":\"function\""));
+
+        // Outline / EnclosingSymbol コマンドの round-trip
+        for cmd in [
+            Command::Outline {
+                path: "src/lib.rs".into(),
+            },
+            Command::EnclosingSymbol {
+                path: "src/lib.rs".into(),
+                line: 12,
+                col: 5,
+            },
+        ] {
+            let back: Command =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
+
+        // Outline 応答を phrase として round-trip する
+        let msg = ServerMessage::Outline {
+            path: "src/lib.rs".into(),
+            generation: 3,
+            symbols: vec![symbol],
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+        assert!(json.contains("\"type\":\"outline\""));
+
+        let msg = ServerMessage::EnclosingSymbol {
+            path: "src/lib.rs".into(),
+            name: "frobnicate".into(),
+            kind: SymbolKind::Function,
+            range: Range { anchor: 0, head: 30 },
+            selection_range: Range { anchor: 3, head: 13 },
+            found: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+        assert!(json.contains("\"type\":\"enclosing_symbol\""));
     }
 
     #[test]
