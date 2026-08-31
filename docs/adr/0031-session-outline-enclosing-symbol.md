@@ -73,14 +73,38 @@ pub struct ServerMetrics {
 
 bytes は daemon が応答をシリアライズする時点で計上する。既存の軽量応答（Peek / RenameResult）への遡及カウンタ追加はしない（必要な実測が生じてから）。
 
+## 実装上の発見（途中で判明した事実）
+
+- **initialize で `hierarchicalDocumentSymbolSupport: true` を広告しないと
+  rust-analyzer はフラットな `SymbolInformation[]`（`location` のみ・`selectionRange`
+  なし）を返す**（実測）。広告を追加し、あわせてフラット形状を返すサーバのための
+  フォールバック（`location.range` で変換）も持つ — 広告を無視する unvetted サーバで
+  「0 件の静かな空」にならないため（T5 の教訓）。
+- **settle の単位コストは大きい**: documentSymbol の 1 往復は、rust-analyzer の再解析
+  （didOpen 切り替え含む）と「2 回連続同一」判定で数秒かかる。エージェントが同一
+  ファイルへ outline / at を連打する想定で、**outline のパスキーキャッシュ**
+  （HintCache と同型・text チェックサムで新鮮判定・FIFO 64 件）を追加した。
+  at はキャッシュヒットで LSP に触れず位置解決だけで応答する。
+- CLI の outline 出力は **compact JSON**（トークン削減が目的の経路なので pretty の
+  空白を省く。同一内容で ~40% 削減）。
+
 ## 検証（実測）
 
-「件の削減」の主張はリポジトリの流儀どおり実測する（T3 / T5）:
+`tools/verify_outline.sh`（単発計測）の実測（2026-09-01、minae 自身の
+`minae-term/src/daemon.rs` 7,981 行・382KB）:
 
-1. **単発スクリプト計測（先行）**: 実在の大ファイル 1 つで `session get`（全文）の bytes vs `session outline` + `session at` の bytes を比較。あわせて 1 タスク（「X の定義を修正する」等）の tool コール数を「全文読みアプローチ」と「outline + at アプローチ」で数える。
-2. **AB ハーネス（tools/ab）での比較（後日）**: 完成後に正式なタスクセットでトークン・コスト・成功率を比較する。
+| 経路 | bytes | 備考 |
+|---|---|---|
+| `session get`（全文スナップショット raw JSON） | 814 KB | 比較の基準 |
+| `session outline`（271 記号・compact JSON） | 54 KB | ツリー全体 |
+| `session at`（位置 → 囲む記号） | 0.2 KB | 1 往復 |
+| **outline + at 合計** | **54.5 KB** | **get 比 93% 削減** |
 
-数値が取れた時点で本 ADR に（または追記 ADR として）記録する。
+レイテンシ: outline / at の**コールド時は数秒〜10 秒**（プロジェクトロード + settle）、
+キャッシュヒット後は **~0.1 秒**（at は実測 6.5 秒 → 0.09 秒）。
+コールドコストとキャッシュの効果が対になっているので、エージェントはセッションの
+冒頭で outline を 1 回引いてから at / 範囲編集に入るのが正しい使い方になる。
+AB ハーネス（tools/ab）でのタスク比較は後日実施する（本 ADR の追記）。
 
 ## 編集系ゲートの standing rule（B1/B2 のための記録）
 
