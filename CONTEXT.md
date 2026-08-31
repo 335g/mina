@@ -116,6 +116,10 @@ _Avoid_: rename as a text operation, refactor
 A location where a symbol is used, as reported by the language server (read-only, ADR-0029). Used to learn a symbol's impact before a Rename and to audit a Rename's completeness — the "did we miss any occurrences" check that mechanical replacement fails (T5). The response is a lightweight location list (path + 0-origin line), never the full text.
 _Avoid_: usage, impact scope
 
+**Outline**:
+The hierarchical list of a Document's symbols — functions, methods, types, impls, and similar — as reported by the language server (read-only). Each entry carries the symbol's name and kind plus two ranges: its span (the whole item) and its selection range (the name token itself), which doubles as the address for position-resolved lookups. The response is a lightweight tree of these entries, never the Document text.
+_Avoid_: symbol list, document symbols, outline view
+
 **Colorscheme**:
 A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes. Built-in schemes ship with minae; user schemes are TOML files in the colorschemes directory and take precedence over built-ins of the same name. A scheme is selected by name from the config file or the `:colorscheme` command.
 _Avoid_: theme, palette
