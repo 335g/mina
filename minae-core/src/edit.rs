@@ -216,7 +216,7 @@ mod tests {
         for (start, end, text, expected) in [
             (2, 2, "XY", "heXYllo"),
             (1, 4, "", "ho"),
-            (1, 4, "minae", "hminao"),
+            (1, 4, "minae", "hminaeo"),
         ] {
             let doc = Document::from("hello");
             let (mid, tx) = insert_at(&doc, start, end, text);
