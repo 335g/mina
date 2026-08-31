@@ -69,6 +69,8 @@ pub(crate) struct ServerCapabilities {
     pub(crate) references: bool,
     /// `textDocument/definition` を提供する。
     pub(crate) definition: bool,
+    /// `textDocument/documentSymbol`（シンボルの階層ツリー）を提供する。
+    pub(crate) document_symbols: bool,
 }
 
 /// initialize 応答から能力を導出する。`renameProvider: false` 等の明示 false と
@@ -89,6 +91,7 @@ fn capabilities_of(result: &Value) -> ServerCapabilities {
         rename: cap("/renameProvider"),
         references: cap("/referencesProvider"),
         definition: cap("/definitionProvider"),
+        document_symbols: cap("/documentSymbolProvider"),
     }
 }
 
@@ -138,6 +141,10 @@ impl LspSession {
                     "publishDiagnostics": { "relatedInformation": false },
                     // inlay hint は static 登録のみ（resolve は使わない。ADR-0020）。
                     "inlayHint": { "dynamicRegistration": false },
+                    // documentSymbol は階層形（DocumentSymbol）を要求する — 広告しないと
+                    // rust-analyzer はフラットな SymbolInformation[]（location のみ・
+                    // selectionRange なし）を返し、名前トークン範囲が取れない（実測）。
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                 }
             },
             "positionEncodings": ["utf-8", "utf-16"],
@@ -313,6 +320,172 @@ impl LspSession {
         let items: Vec<LspInlayHint> = serde_json::from_value(Value::Array(items.clone())).ok()?;
         Some(convert_inlay_hints(text, self.encoding, items))
     }
+}
+
+/// `textDocument/documentSymbol` によるシンボル階層ツリーの取得（ADR-0031）。
+/// 応答は全文を運ばず、名前・種別・範囲（選択範囲含む）だけの軽いツリー。
+///
+/// 解析待ちのシグナル（null / 空配列）は rename / references と同じくリトライ
+/// し、2 回連続で同一になるまで待つ（プロジェクトロード中の部分/空応答を
+/// 取りこぼさない — ADR-0029 の規律を ADR-0031 で再利用。予算切れは最後の
+/// 結果をそのまま返し、呼び出し側が「0 件」として正直に扱う）。
+/// `Err` は恒久的な失敗（タイムアウト・サーバ死亡・変な応答形）。
+pub async fn document_symbols_at(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+) -> Result<Vec<minae_protocol::OutlineSymbol>, String> {
+    // 解析前の null / 空配列も解析待ちとしてリトライする（references と同じ）。
+    // 空のファイルが本当に「記号なし」の場合も予算だけ余分に待つ — references と
+    // 同じ許容（予算切れ後はそのまま空を返す）。
+    let is_loading = |r: &Value| r.is_null() || r.as_array().map_or(true, |a| a.is_empty());
+    let result = request_with_loading_retry(
+        session,
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": uri(path) } }),
+        is_loading,
+    )
+    .await?;
+    let Some(items) = result.as_array() else {
+        return Err("textDocument/documentSymbol の応答が配列ではありません".into());
+    };
+    let enc = {
+        let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return Err("LSP セッションのロックを取得できませんでした".into());
+        };
+        s.encoding
+    };
+    let index = LineIndex::new(text);
+    Ok(convert_symbol_list(&index, text, enc, items))
+}
+
+/// LSP の DocumentSymbol 配列 → 内部形（char インデックス）の再帰変換（ADR-0031）。
+/// `range`（記号全体）と `selectionRange`（名前トークン）の両方を LSP 座標から
+/// char インデックスへ変換する。未知の kind は [`SymbolKind::Other`] に潰す。
+fn convert_symbol_list(
+    index: &LineIndex,
+    text: &str,
+    enc: PositionEncoding,
+    items: &[Value],
+) -> Vec<minae_protocol::OutlineSymbol> {
+    // 形状の判定: DocumentSymbol（階層・selectionRange あり）か SymbolInformation
+    // （フラット・location のみ）か。一部サーバはクライアントの広告を無視して
+    // SymbolInformation[] を返す — その場合も 0 件の静かな空にしないため両形状に
+    // 対応する（実測: 広告しないと rust-analyzer もフラットを返す）。
+    if items
+        .first()
+        .is_some_and(|i| i.get("selectionRange").is_some())
+    {
+        items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?;
+                let range = symbol_range(index, text, item.get("range")?, enc)?;
+                let selection_range = symbol_range(index, text, item.get("selectionRange")?, enc)?;
+                let children = item
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .map(|c| convert_symbol_list(index, text, enc, c))
+                    .unwrap_or_default();
+                Some(minae_protocol::OutlineSymbol {
+                    name: name.to_string(),
+                    kind: lsp_symbol_kind(item.get("kind")).unwrap_or_default(),
+                    range,
+                    selection_range,
+                    children,
+                })
+            })
+            .collect()
+    } else {
+        // SymbolInformation（フラット）: location.range を範囲とし、名前トークン
+        // 範囲は遠慮なく同じ範囲で代用する（階層広告が効くサーバでは使われない）。
+        items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?;
+                let range = symbol_range(index, text, item.get("location")?.get("range")?, enc)?;
+                Some(minae_protocol::OutlineSymbol {
+                    name: name.to_string(),
+                    kind: lsp_symbol_kind(item.get("kind")).unwrap_or_default(),
+                    range,
+                    selection_range: range,
+                    children: Vec::new(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// DocumentSymbol の `range` / `selectionRange`（LSP 座標）→ char インデックス範囲。
+fn symbol_range(
+    index: &LineIndex,
+    text: &str,
+    range: &Value,
+    enc: PositionEncoding,
+) -> Option<minae_protocol::Range> {
+    let start = range.pointer("/start")?;
+    let end = range.pointer("/end")?;
+    Some(minae_protocol::Range {
+        anchor: lsp_pos_to_char_indexed(
+            index,
+            text,
+            start.get("line")?.as_u64()? as u32,
+            start.get("character")?.as_u64()? as u32,
+            enc,
+        ),
+        head: lsp_pos_to_char_indexed(
+            index,
+            text,
+            end.get("line")?.as_u64()? as u32,
+            end.get("character")?.as_u64()? as u32,
+            enc,
+        ),
+    })
+}
+
+/// LSP の SymbolKind（数値）を proto 側の小さな集合へ写像する（ADR-0031）。
+/// 未知の値・欠落は [`SymbolKind::Other`]。
+fn lsp_symbol_kind(kind: Option<&Value>) -> Option<minae_protocol::SymbolKind> {
+    use minae_protocol::SymbolKind;
+    Some(match kind?.as_u64()? {
+        2 => SymbolKind::Module,                     // Module
+        6 | 9 => SymbolKind::Method,                  // Method / Constructor
+        12 => SymbolKind::Function,                   // Function
+        5 | 11 | 23 | 3 | 4 | 26 => SymbolKind::Type, // Class / Interface / Struct / Namespace / Package / TypeParameter
+        10 | 22 => SymbolKind::Enum,                  // Enum / EnumMember
+        14 => SymbolKind::Constant,                   // Constant
+        13 | 7 | 8 => SymbolKind::Variable,           // Variable / Property / Field
+        _ => SymbolKind::Other,
+    })
+}
+
+/// エージェント入力の 1-origin 行:列（文字数単位）を char インデックスへ変換する
+/// （ADR-0031 の EnclosingSymbol 用）。行が範囲外なら最終行、列は行末へ
+/// クランプする（`session get --lines` の端クランプと同じ流儀）。
+pub fn line_col_to_char_idx(text: &str, line: u32, col: u32) -> usize {
+    let index = LineIndex::new(text);
+    let line_start = index.line_start(line.saturating_sub(1));
+    let line_len = text
+        .chars()
+        .skip(line_start)
+        .take_while(|&c| c != '\n')
+        .count();
+    line_start + (col.saturating_sub(1) as usize).min(line_len)
+}
+
+/// シンボルツリーから、char インデックスを**含む最も深い**記号を返す（ADR-0031）。
+/// 候補の範囲（`anchor..head`)を踏み外した場合、奥の children は見ない。
+/// 見つからなければ `None`（位置がどの記号にも含まれない）。
+pub fn enclosing_symbol(
+    symbols: &[minae_protocol::OutlineSymbol],
+    char_idx: usize,
+) -> Option<&minae_protocol::OutlineSymbol> {
+    for sym in symbols {
+        if char_idx >= sym.range.anchor && char_idx < sym.range.head {
+            return Some(enclosing_symbol(&sym.children, char_idx).unwrap_or(sym));
+        }
+    }
+    None
 }
 
 /// LSP 診断アイテム（LSP 座標・severity）を char インデックスに変換する。
@@ -1744,5 +1917,152 @@ fn capabilities_of_parses_initialize_response() {
         assert_eq!(hints[1].position, 14, "2行目の ( の直後: {hints:?}");
         assert_eq!(hints[1].text, "arg:");
         assert!(hints[1].padding_right, "param ヒントは右 padding: {hints:?}");
+    }
+
+    #[test]
+    fn document_symbols_converts_kinds_and_ranges() {
+        // LSP の DocumentSymbol 配列（rust-analyzer 相当の形状）→ OutlineSymbol。
+        // kind 写像: 12=Function, 6=Method, 23=Struct, 10=Enum, 14=Constant, 13=Variable、
+        // 未知（999）は Other。range と selectionRange は両方 char インデックスに。
+        let items = json!([
+            {
+                "name": "Widget",
+                "kind": 23,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 9, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 13 } },
+                "children": [
+                    {
+                        "name": "new",
+                        "kind": 6,
+                        "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 3, "character": 5 } },
+                        "selectionRange": { "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 10 } }
+                    }
+                ]
+            },
+            { "name": "MAX", "kind": 14, "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 5 } },
+              "selectionRange": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 3 } } },
+            { "name": "weird", "kind": 999, "range": { "start": { "line": 10, "character": 0 }, "end": { "line": 10, "character": 1 } },
+              "selectionRange": { "start": { "line": 10, "character": 0 }, "end": { "line": 10, "character": 1 } } }
+        ]);
+        let text = "struct Widget {}\n    fn new() {}\n\n\n\n\n\n\nconst MAX: i32 = 1;\nx";
+        let out = convert_symbol_list(
+            &LineIndex::new(text),
+            text,
+            PositionEncoding::Utf8,
+            items.as_array().unwrap(),
+        );
+        assert_eq!(out.len(), 3);
+        let widget = &out[0];
+        assert_eq!(widget.name, "Widget");
+        assert_eq!(widget.kind, minae_protocol::SymbolKind::Type);
+        assert_eq!(widget.range.anchor, 0);
+        assert_eq!(widget.range.head, text.len(), "struct 全体の範囲");
+        assert_eq!(widget.selection_range.anchor, 7, "名前トークン Widget の先頭");
+        assert_eq!(widget.selection_range.head, 13);
+        assert_eq!(widget.children.len(), 1);
+        assert_eq!(widget.children[0].name, "new");
+        assert_eq!(widget.children[0].kind, minae_protocol::SymbolKind::Method);
+        assert_eq!(widget.children[0].selection_range.anchor, 24, "fn 名 new の char 位置（17 + 4sp + fn + space + 0）");
+        assert_eq!(widget.children[0].selection_range.head, 27);
+        assert_eq!(out[1].name, "MAX");
+        assert_eq!(out[1].kind, minae_protocol::SymbolKind::Constant);
+        assert_eq!(out[2].kind, minae_protocol::SymbolKind::Other, "未知 kind は Other に潰す");
+    }
+
+    #[test]
+    fn document_symbols_converts_flat_symbol_information() {
+        // 階層広告を無視して SymbolInformation[]（location のみ）を返すサーバ向け
+        // フォールバック: 0 件の静かな空にせず、location.range で変換する。
+        let items = json!([{
+            "name": "RUNTIME",
+            "kind": 14,
+            "location": {
+                "uri": "file:///x.rs",
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } },
+            },
+        }]);
+        let text = "const RUNTIME: u32 = 1;";
+        let out = convert_symbol_list(
+            &LineIndex::new(text),
+            text,
+            PositionEncoding::Utf8,
+            items.as_array().unwrap(),
+        );
+        assert_eq!(out.len(), 1, "フラット形状でも変換する");
+        assert_eq!(out[0].name, "RUNTIME");
+        assert_eq!(out[0].kind, minae_protocol::SymbolKind::Constant);
+        assert_eq!(out[0].range.anchor, 0);
+        assert_eq!(out[0].range.head, 7);
+        assert_eq!(
+            out[0].selection_range, out[0].range,
+            "名前トークン範囲は代用（= 全体）"
+        );
+        assert!(out[0].children.is_empty());
+    }
+
+    #[test]
+    fn document_symbols_converts_utf16_cjk_ranges() {
+        // utf-16 列で応答した場合（CJK 混在テキスト）も char インデックスへ一致する。
+        // 「あ」は1 char = UTF-16 1 単位なので 2 行目「あStruct」の列 1 = char 6。
+        let items = json!([{
+            "name": "S",
+            "kind": 23,
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 7 } },
+            "selectionRange": { "start": { "line": 1, "character": 1 }, "end": { "line": 1, "character": 2 } }
+        }]);
+        let text = "ああ\nあStruct";
+        let out = convert_symbol_list(
+            &LineIndex::new(text),
+            text,
+            PositionEncoding::Utf16,
+            items.as_array().unwrap(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range.anchor, 3, "2行目先頭（ああ\n の3 char）");
+        assert_eq!(out[0].range.head, 10, "2行目の 7 char 分（文末）");
+        assert_eq!(out[0].selection_range.anchor, 4, "2行目1列目 = S");
+        assert_eq!(out[0].selection_range.head, 5);
+    }
+
+    #[test]
+    fn line_col_to_char_idx_clamps_to_line_end() {
+        let text = "ab\ncdefg";
+        assert_eq!(line_col_to_char_idx(text, 1, 1), 0);
+        assert_eq!(line_col_to_char_idx(text, 2, 3), 5, "2行目の列3 → c の次の d");
+        // 列が行末を超える → 行末にクランプ（行の終端 = 最後の文字の直後）
+        assert_eq!(line_col_to_char_idx(text, 2, 99), 8, "2行目の終端");
+        // 行が範囲外 → 最終行の先頭
+        assert_eq!(line_col_to_char_idx(text, 99, 1), 3, "最終行（2行目）の先頭");
+    }
+
+    #[test]
+    fn enclosing_symbol_finds_deepest_containing() {
+        use minae_protocol::{OutlineSymbol, Range, SymbolKind};
+        let sym = |name: &str, anchor: usize, head: usize, children: Vec<OutlineSymbol>| {
+            OutlineSymbol {
+                name: name.into(),
+                kind: SymbolKind::Function,
+                range: Range { anchor, head },
+                selection_range: Range { anchor, head },
+                children,
+            }
+        };
+        let tree = vec![sym(
+            "outer",
+            0,
+            40,
+            vec![sym("mid", 5, 25, vec![sym("inner", 10, 20, vec![])])],
+        )];
+        // 最深の記号が勝つ
+        assert_eq!(enclosing_symbol(&tree, 15).unwrap().name, "inner");
+        assert_eq!(enclosing_symbol(&tree, 6).unwrap().name, "mid");
+        assert_eq!(enclosing_symbol(&tree, 30).unwrap().name, "outer");
+        // 範囲外（head は排他）・ツリー外は None
+        assert!(enclosing_symbol(&tree, 40).is_none());
+        assert!(enclosing_symbol(&tree, 41).is_none());
+        // 子の範囲を踏み外した位置は、その子の兄弟を調べない（最も深い親で止まる）
+        let sibling = vec![sym("a", 0, 10, vec![]), sym("b", 12, 20, vec![])];
+        assert!(enclosing_symbol(&sibling, 11).is_none());
+        assert_eq!(enclosing_symbol(&sibling, 15).unwrap().name, "b");
     }
 }
