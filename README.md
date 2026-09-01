@@ -31,7 +31,7 @@ A resident **Daemon** holds all editor state — open documents, undo histories,
 - **Editing core** (UI-agnostic): documents, selections, undo groups, Normal / Insert / Select modes, search, external-change reload
 - **Language support** via LSP, per workspace root: diagnostics, inlay hints, definition peek, semantic rename and references
 - **Language servers** (embedded and verified per ADR-0030): `rust-analyzer` for Rust, `typescript-language-server` for TypeScript — with tree-sitter syntax highlighting for the same two. Any other LSP can be wired up via your `languages.toml` (user-added servers are unvetted but negotiate standard features); see the config docs.
-- **Headless agent interface**: `minae session` — bounded numbered reads (`get --lines`), one-shot verified edits (`apply`), positional edits (`edit`), state-change waiting (`wait`), hints and peek without full text, semantic rename (`rename`)
+- **Headless agent interface**: `minae session` — bounded numbered reads (`get --lines`), one-shot verified edits (`apply`), positional edits (`edit`), state-change waiting (`wait`), hints and peek without full text, semantic rename (`rename`), structure discovery (`outline`) and position resolution (`at`)
 - **Terminal UI** (optional): `minae open`
 - **Configable**: `languages.toml` for language servers (daemon-side), `config.toml` and user colorschemes (client-side), built-in `minae skill` guides for agents
 
@@ -75,7 +75,7 @@ Each command returns JSON. If an edit is rejected, re-read the affected range an
 `minae skill` ships a load-on-demand skill shelf for agents: no arguments prints a thin index (one line per topic); `minae skill <topic>` prints just that topic's guide.
 
 ```console
-$ minae skill           # index: read, edit, rename, persist, errors
+$ minae skill           # index: read, outline, at, edit, rename, references, persist, errors
 $ minae skill read      # the read contract (session get --lines, numbered output)
 ```
 

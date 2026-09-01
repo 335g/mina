@@ -2,7 +2,7 @@
 //!
 //! モード:
 //! - `minae daemon serve` — 常駐デーモン（クライアントから自動起動されることもある）
-//! - `minae session <get|exec|edit|wait|hints|peek>` — agent 用ヘッドレス CLI
+//! - `minae session <get|exec|edit|apply|wait|hints|peek|rename|references|outline|at>` — agent 用ヘッドレス CLI
 //! - `minae config <show|path|edit|set|get|init>` — ユーザー設定の確認・編集
 //! - `minae open [file]` — ファイル編集 TUI（省略時は新規バッファ）
 

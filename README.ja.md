@@ -31,7 +31,7 @@ minae は daemon/client 分割のターミナルエディタです。エージ�
 - **編集コア**（UI 非依存）: ドキュメント・セレクション・undo グループ・Normal / Insert / Select モード・検索・外部変更のリロード
 - **LSP による言語サポート**（ワークスペースルート単位）: 診断・inlay hints・定義 peek・セマンティック rename / references
 - **言語サーバ**（ADR-0030 に基づく検証済みの埋め込み）: Rust に `rust-analyzer`、TypeScript に `typescript-language-server` —— 同じ2言語分の tree-sitter 構文ハイライトも同梱。ほかの LSP はユーザーの `languages.toml` で追加可能（未検証サーバも標準機能はネゴシエーションで動作）
-- **ヘッドレスエージェントインターフェース**: `minae session` —— 有界な番号付き read（`get --lines`）、ワンショット検証付き編集（`apply`）、位置指定編集（`edit`）、状態遷移の待機（`wait`）、全文なしの hints / peek、セマンティック rename（`rename`）
+- **ヘッドレスエージェントインターフェース**: `minae session` —— 有界な番号付き read（`get --lines`）、ワンショット検証付き編集（`apply`）、位置指定編集（`edit`）、状態遷移の待機（`wait`）、全文なしの hints / peek、セマンティック rename（`rename`）、構造把握（`outline`）と位置解決（`at`）
 - **ターミナル UI**（オプション）: `minae open`
 - **設定可能**: 言語サーバの `languages.toml`（デーモン側）、`config.toml` とユーザーカラースキーム（クライアント側）、エージェント向けビルトインの `minae skill` ガイド
 
@@ -75,7 +75,7 @@ $ minae session rename src/lib.rs "USD" "JPY"
 `minae skill` はエージェント向けのオンデマンド型スキル棚です: 無引数なら薄い索引（1トピック1行）を、`minae skill <topic>` ならそのトピックの内容だけを返します。
 
 ```console
-$ minae skill           # 索引: read, edit, rename, persist, errors
+$ minae skill           # 索引: read, outline, at, edit, rename, references, persist, errors
 $ minae skill read      # read 契約（session get --lines の番号付き出力）
 ```
 
