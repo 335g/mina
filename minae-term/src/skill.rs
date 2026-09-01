@@ -11,13 +11,14 @@
 //! 英語の理由＋利用可能トピック一覧）。エージェントは $? と stderr だけで制御できる。
 //! 内容は英語（H4: エージェントがパースする出力は英語統一）。
 //!
-//! 各トピックの内容はツール判断の指針であり、tools/ab の A/B 実測（t1〜t5）に基づく。
+//! 各トピックの内容はツール判断の指針であり、tools/ab の A/B 実測（t1〜t5）と
+//! ADR-0029（rename / references）・ADR-0031（outline / at）の実測に基づく。
 
 /// トピック定義。説明は索引行に使う。内容は「行動レベル」に書く（長手順・抑制・判断表）。
 const SKILLS: &[(&str, &str, &str)] = &[
     (
         "read",
-        "read files by line range; never dump whole files",
+        "map files with outline; read only the lines you need",
         "READ — reading files without wasting tokens
 
 Use:      session get --lines <start>:<end>
@@ -26,6 +27,10 @@ Output:   numbered lines: {\"n\":1500,\"text\":\"...\"}  (1-origin, end may be e
 Rules
 - Read only the lines you need (measured: ranged read cuts task tokens by ~51% vs
   whole-file reads).
+- On an unfamiliar file, session outline FIRST (structure + exact spans for a
+  fraction of the bytes), then read only the symbol you need; session at
+  <path> <line>:<col> names the symbol enclosing a spot you are about to touch,
+  so both reads and edits happen at symbol granularity.
 - The numbered output lets you paste the exact text you saw into `session apply`
   as the <old> argument — read and edit share one contract.
 - Out-of-range start returns an explained zero result, e.g.
@@ -49,12 +54,66 @@ Rules
   (`session edit` with computed char offsets) fails 0/5 vs 3/5 for content-resolved,
   costs ~5x tokens, and can silently apply to the WRONG occurrence (a successful
   exit with the wrong spot changed). Do not compute start/end char indices.
+- Locate before you edit: session outline / session at return the exact span of
+  the symbol you are changing, so your <old> text targets the right region
+  instead of a look-alike occurrence elsewhere.
 - One invocation replaces the FIRST occurrence of <old>. Repeat for the next one,
   or batch many changes with --hunks-stdin (faster: ~3x on one connection).
 - Small targeted replacements beat one huge <old> block: a big mismatch wipes too
   much. For whole-file rewrites use --whole-stdin.
 - On rejection (exit 2) the message names the expected/found text and the range.
   Re-read that spot fresh, fix, retry — do not blind-retry.",
+    ),
+    (
+        "outline",
+        "session outline <path>: symbol tree (name/kind/span) without full text",
+        "OUTLINE — map a file's structure without reading it
+
+Use:      session outline <path>
+Output:   compact JSON tree, no file text: each symbol is
+          {\"name\", \"kind\", \"range\", \"selection_range\", \"children\"},
+          kinds: Module/Function/Method/Type/Enum/Constant/Variable/Other
+
+Rules
+- On an unfamiliar file, outline FIRST: every symbol's name, kind, and exact
+  span for a fraction of a read. Measured (7,981-line file): outline + at =
+  55 KB vs a full session get = 814 KB (~93% fewer bytes).
+- ranges are char indices (the same unit as DocumentEdit positions);
+  selection_range is only the name token. Use them to choose WHICH lines to
+  read (session get --lines) and WHICH text to target in session apply — read
+  at symbol granularity, not file granularity.
+- The tree is nested and grep-able: find the function you need by name instead
+  of scanning text.
+- The first outline on a path is cold (seconds: project load + LSP settle);
+  the daemon caches it, so pull it once at session start and reuse the ranges
+  for reads / at / edits. Warm calls are ~0.1s.
+- Exit 1 = not supported (no LSP server for this language) or bad input;
+  exit 2 = retryable LSP error (retry once later, then give up).",
+    ),
+    (
+        "at",
+        "session at <path> <line>:<col>: enclosing symbol + its exact range",
+        "AT — the symbol enclosing a position, with its exact range
+
+Use:      session at <path> <line>:<col>   (1-origin, like get --lines)
+Output:   pretty JSON, no file text: {\"name\", \"kind\", \"range\",
+          \"selection_range\", \"found\"}. found=false is a SUCCESS (exit 0):
+          the position is in no symbol — pick a different spot.
+
+Rules
+- Before touching a spot, ask what it belongs to: at names the enclosing
+  function/type and its exact span, so your read and your <old> text are
+  scoped to the right region — no full-file reads, no guessing which function
+  a matching string lives in.
+- selection_range is the substring of the symbol NAME: the address for
+  rename-style edits and for locating the token named in a rejection message.
+- Ranges are char indices: pair the span with session get --lines to see the
+  actual lines before editing inside it.
+- Warm after an outline of that path: ~0.1s (measured 6.5s -> 0.09s cold to
+  cached); the cold cost is paid by the one session-start outline, not by
+  every at.
+- Exit 1/2 as with outline/rename (1 = not supported / bad input, 2 =
+  retryable LSP error).",
     ),
     (
         "rename",
@@ -125,6 +184,12 @@ Exit codes (applies to session apply / edit / hunks):
   1  usage/CLI error — fix the arguments; do not retry the same call
   2  retryable failure — old text not found, checksum/expected_text mismatch,
      or Save failed. Re-read the file fresh, then retry.
+
+Semantic commands (rename / references / outline / at) share 0/1/2 but
+classify differently: exit 1 = not supported / invalid input (do not retry),
+exit 2 = retryable (symbol not found, LSP error — re-run once later).
+Note: session at with no enclosing symbol is exit 0 (found=false), not an
+error — only the LSP request itself can fail.
 
 Rejections are the editor telling you what changed:
 - \"document changed since read\"      -> the file moved; re-read and retry.
