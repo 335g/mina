@@ -17,9 +17,9 @@ use minae_core::{
     move_selection_lines, move_selection_to_line_first_non_whitespace,
 };
 use minae_protocol::{
-    Activity, ActivityKind, ChangeEvent, ClientKind, Command, DocumentEdit, EventKind, EventSource,
-    GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range, ServerMessage, ServerMetrics,
-    StateSnapshot, SymbolKind, fnv1a64,
+    Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, DocumentEdit,
+    EventKind, EventSource, GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range,
+    ServerMessage, ServerMetrics, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use minae_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1006,6 +1006,37 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // HoverAt / WorkspaceSymbol / CheckDiagnostics（ADR-0032）: 位置の
+                // hover（型・シグネチャ）、ワークスペース内シンボル検索、診断
+                // settle 待ち + コンパクト診断。どれも読み取り専用 —
+                // PeekDefinitionAt / Outline と同じく専用処理する。
+                if let Ok(Command::HoverAt { path, line, col }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_hover_at(&daemon, &path, line, col).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
+                if let Ok(Command::WorkspaceSymbol { path, query }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_workspace_symbols(&daemon, &path, &query).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
+                if let Ok(Command::CheckDiagnostics { path }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_check_diagnostics(&daemon, &path).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 // GetServerInfo（issue #27/D1）: daemon のビルド世代と累積メトリクスを
                 // 軽量応答（ServerMessage::ServerInfo）で返す読み取り専用コマンド。
                 // GetInlayHints と同じく専用処理する。
@@ -1635,6 +1666,253 @@ async fn serve_enclosing_symbol(
         },
     };
     record_metric(daemon, msg, false).await
+}
+
+// ---- hover・ワークスペースシンボル検索・診断 check（ADR-0032） ----
+
+/// [`Command::HoverAt`] の処理（ADR-0032）: 任意パスの指定位置（1-origin 行:列）
+/// の hover 情報（型・シグネチャ・doc）を全文なしの軽量応答
+/// （[`ServerMessage::Hover`]）で返す。読み取り専用 — 世代・push・イベントは
+/// 進めない。
+///
+/// お膳立て・復元は PeekDefinitionAt と同じ `prepare_borrowed_session` 経路
+/// （Q10-(c)）。hover なし（空白・コメント位置）は `text` 空の成功応答、
+/// 入力不正・LSP 非対応・spawn 失敗は `error: Some(…)`（exit 1、再試行不可）。
+async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32) -> ServerMessage {
+    let err = |msg: String| ServerMessage::Hover {
+        path: path.to_string(),
+        generation: 0,
+        text: String::new(),
+        error: Some(msg),
+    };
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => {
+                    b
+        }
+        Err(e) => {
+                    match e {
+                BorrowFail::CannotOpen => return err(format!("cannot open {path}")),
+                BorrowFail::NoServer(p) => {
+                    return err(format!("hover not supported for {p} (no LSP server configured)"))
+                }
+                BorrowFail::SpawnFailed(e) => return err(format!("LSP error: {e}")),
+            }
+        }
+    };
+    // サーバが hover を提供していなければ即「not supported」（exit 1）。
+    // prepare が対象を didOpen 済みのため、借用していたらフォーカス文書へ戻す
+    // （戻さないと current_uri が対象のまま — 同期スキップ・診断消失）。
+    if !borrowed.session.lock().await.caps.hover {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
+        return err(format!(
+            "hover not supported for {} (LSP server が hoverProvider を advertise していません)",
+            borrowed.path_str
+        ));
+    }
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let hovered =
+        lsp::hover_at_line_col(&borrowed.session, &borrowed.path, &borrowed.text, line, col).await;
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    // メッセージを先に組み立ててから計測する。引数式内で daemon.lock() を作ると
+    // 一時ガードがステートメント末（record_agent_metric の .await の後）まで生き、
+    // 内部の再ロックが自分自身に待たされるデッドロックになる（実測でハング）。
+    let msg = ServerMessage::Hover {
+        path: borrowed.path_str,
+        generation: daemon.lock().await.generation,
+        text: hovered.unwrap_or_default(),
+        error: None,
+    };
+    record_agent_metric(daemon, msg).await
+}
+
+/// [`Command::WorkspaceSymbol`] の処理（ADR-0032）: `path` で決まるワークスペース
+/// root の LSP セッションへ `workspace/symbol`（`query`）を投げ、ヒットした
+/// シンボル（名前・種別・パス・1-origin 行番号のみ）を全文なしの軽量応答
+/// （[`ServerMessage::WorkspaceSymbols`]）で返す。読み取り専用 — 世代・push・
+/// イベントは進めない。
+///
+/// 「どこで定義されているか」の探索を rg の代わりに 1 往復で済ませる経路。
+/// 失敗は `error: Some(…)`: 入力不正・LSP 非対応・spawn 失敗は exit 1（再試行
+/// 不可）、LSP エラーは再試行可能（exit 2）。
+async fn serve_workspace_symbols(
+    daemon: &Mutex<Daemon>,
+    path: &str,
+    query: &str,
+) -> ServerMessage {
+    let err = |msg: String| ServerMessage::WorkspaceSymbols {
+        generation: 0,
+        symbols: Vec::new(),
+        error: Some(msg),
+    };
+    if query.is_empty() {
+        return err("invalid input: query must be non-empty".into());
+    }
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err(format!(
+                "symbol search not supported for {p} (no LSP server configured)"
+            ))
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
+    };
+    // サーバが workspace/symbol を提供していなければ即「not supported」（exit 1）。
+    if !borrowed.session.lock().await.caps.workspace_symbols {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
+        return err(format!(
+            "symbol search not supported for {} (LSP server が workspaceSymbolProvider を advertise していません)",
+            borrowed.path_str
+        ));
+    }
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let fetched = lsp::workspace_symbols(&borrowed.session, query).await;
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    let (symbols, error) = match fetched {
+        Ok(items) => (
+            items
+                .into_iter()
+                .map(|(uri, kind, name, line)| WorkspaceSymbol {
+                    name,
+                    kind,
+                    path: uri.strip_prefix("file://").unwrap_or(&uri).to_string(),
+                    line: line + 1, // 0-origin → 1-origin
+                })
+                .collect(),
+            None,
+        ),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    // メッセージを先に組み立ててから計測（一時ガードのデッドロック回避 — hover と同じ）
+    let msg = ServerMessage::WorkspaceSymbols {
+        generation: daemon.lock().await.generation,
+        symbols,
+        error,
+    };
+    record_agent_metric(daemon, msg).await
+}
+
+/// [`Command::CheckDiagnostics`] の処理（ADR-0032）: 対象パスの診断が安定するまで
+/// 待ち、診断だけをコンパクトに（全文なしで）返す。読み取り専用 — 世代・push・
+/// イベントは進めない。
+///
+/// エージェントの「編集→検証」ループを 1 コマンドに圧縮する経路: 従来の
+/// 「wait → get → JSON から診断を読む」の往復と全文スナップショットをこれ 1 つで
+/// 置き換える。安定判定は settle_open_diagnostics と同じ（非空が 2 回連続で同数 /
+/// 空のまま予算切れ = クリーン扱い）。失敗は `error: Some(…)`（LSP 非対応・
+/// spawn 失敗は exit 1、LSP エラーは再試行可能な exit 2）。
+async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    let err = |msg: String| ServerMessage::Check {
+        path: path.to_string(),
+        generation: 0,
+        total: 0,
+        diagnostics: Vec::new(),
+        error: Some(msg),
+    };
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err(format!("check not supported for {p} (no LSP server configured)"))
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
+    };
+    // サーバが pull 診断を提供していなければ即「not supported」（exit 1）。
+    if !borrowed.session.lock().await.caps.pull_diagnostics {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
+        return err(format!(
+            "check not supported for {} (LSP server が diagnosticProvider を advertise していません)",
+            borrowed.path_str
+        ));
+    }
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let pulled =
+        lsp::pull_diagnostics_settled(&borrowed.session, &borrowed.path, &borrowed.text).await;
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    let Some(diags) = pulled else {
+        // 恒久的失敗（セッションロック待ち・サーバ死亡）: 空ではなく理由を返す
+        return err("LSP error: diagnostics pull failed (server dead or session lock timeout)"
+            .into());
+    };
+    // char インデックス → 1-origin 行番号（エージェントの --lines 住所）を付与
+    let diagnostics = diags
+        .iter()
+        .map(|d| CheckDiagnostic {
+            severity: d.severity,
+            line: line_of_char(&borrowed.text, d.start) + 1,
+            start: d.start,
+            end: d.end,
+            message: d.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let total = diagnostics.len();
+    let msg = ServerMessage::Check {
+        path: borrowed.path_str,
+        generation: daemon.lock().await.generation,
+        total,
+        diagnostics,
+        error: None,
+    };
+    record_agent_metric(daemon, msg).await
+}
+
+/// char インデックス → 0-origin 行番号（check 診断の行番号付与用）。
+/// `char_idx` が文末を超えていたら最終行。
+fn line_of_char(text: &str, char_idx: usize) -> u32 {
+    let mut line = 0u32;
+    for (i, ch) in text.chars().enumerate() {
+        if i >= char_idx {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+        }
+    }
+    line
+}
+
+/// ADR-0032 の計測: hover / symbol search / check の要求回数と応答シリアライズ
+/// bytes を ServerMetrics に累積する（エラー応答も配線に乗るため計上する）。
+async fn record_agent_metric(daemon: &Mutex<Daemon>, msg: ServerMessage) -> ServerMessage {
+    let mut d = daemon.lock().await;
+    let bytes = serde_json::to_vec(&msg).map(|v| v.len() as u64).unwrap_or(0);
+    match &msg {
+        ServerMessage::Hover { .. } => {
+            d.metrics.hover_total += 1;
+            d.metrics.hover_bytes += bytes;
+        }
+        ServerMessage::WorkspaceSymbols { .. } => {
+            d.metrics.symbol_search_total += 1;
+            d.metrics.symbol_search_bytes += bytes;
+        }
+        ServerMessage::Check { .. } => {
+            d.metrics.check_total += 1;
+            d.metrics.check_bytes += bytes;
+        }
+        _ => {}
+    }
+    msg
 }
 
 /// ADR-0031 の計測: Outline / EnclosingSymbol の要求回数と応答シリアライズ bytes
@@ -3223,6 +3501,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::Outline { .. } | Command::EnclosingSymbol { .. } => {
             // handle_connection で専用処理される（ServerMessage::Outline /
             // EnclosingSymbol 応答。ADR-0031）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::HoverAt { .. } | Command::WorkspaceSymbol { .. } | Command::CheckDiagnostics { .. } => {
+            // handle_connection で専用処理される（ServerMessage::Hover /
+            // WorkspaceSymbols / Check 応答。ADR-0032）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::GetServerInfo => {
@@ -5428,6 +5711,9 @@ root-markers = [".docsroot"]
                 ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
                     continue
                 }
+                ServerMessage::Hover { .. }
+                | ServerMessage::WorkspaceSymbols { .. }
+                | ServerMessage::Check { .. } => continue,
             }
         }
     }
@@ -5447,6 +5733,9 @@ root-markers = [".docsroot"]
                 ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
                     continue
                 }
+                ServerMessage::Hover { .. }
+                | ServerMessage::WorkspaceSymbols { .. }
+                | ServerMessage::Check { .. } => continue,
             }
         }
     }
@@ -6621,6 +6910,131 @@ root-markers = [".docsroot"]
     }
 
     #[tokio::test]
+    async fn hover_symbol_check_via_mock() {
+        // ADR-0032: hover / workspace symbol / check の3コマンドが軽量応答で返る。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let work = dir.join(format!("minae-hsc-work-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&work);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(work.clone());
+        let sock = dir.join(format!("minae-hsc-sock-{}.sock", std::process::id()));
+        let file = work.join("fixture.rs");
+        let _ = std::fs::remove_file(&sock);
+        // fn / struct / let が行ごとに1つ。1行目に TODO（診断）を仕込む。
+        std::fs::write(&file, "pub fn run() { TODO }\nstruct Thing;\nfn go() {}\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+
+        // HoverAt: 1行目 8文字目（run）の hover は mock が「型シグネチャ + doc」を返す。
+        let mut line = serde_json::to_string(&Command::HoverAt {
+            path: path.clone(),
+            line: 1,
+            col: 8,
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::Hover { text, error, .. } => {
+                assert_eq!(error, None, "エラーなし: {error:?}");
+                assert!(text.contains("run"), "型シグネチャにシンボル名: {text:?}");
+                assert!(text.contains("mock doc for run"), "doc も連結: {text:?}");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // WorkspaceSymbol: 1行目（run）の担当 root に対して 'Thing' を検索 →
+        // struct Thing が 2行目でヒットする。
+        let mut line = serde_json::to_string(&Command::WorkspaceSymbol {
+            path: path.clone(),
+            query: "Thing".into(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::WorkspaceSymbols { symbols, error, .. } => {
+                assert_eq!(error, None, "エラーなし: {error:?}");
+                assert_eq!(symbols.len(), 1, "Thing が1件: {symbols:?}");
+                assert_eq!(symbols[0].name, "Thing");
+                assert_eq!(symbols[0].kind, minae_protocol::SymbolKind::Type);
+                assert_eq!(symbols[0].line, 2, "1-origin 行");
+                assert!(
+                    symbols[0].path.ends_with("fixture.rs"),
+                    "file:// が剥がれて絶対パス: {}",
+                    symbols[0].path
+                );
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+        // 空クエリは入力エラー（exit 1 相当の error）
+        let mut line = serde_json::to_string(&Command::WorkspaceSymbol {
+            path: path.clone(),
+            query: "".into(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::WorkspaceSymbols { symbols, error, .. } => {
+                assert_eq!(symbols.len(), 0);
+                assert!(
+                    error.as_deref().unwrap_or("").starts_with("invalid input"),
+                    "空クエリは invalid input: {error:?}"
+                );
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // CheckDiagnostics: 1行目の TODO が error 診断として、1-origin 行 1 で返る。
+        let mut line =
+            serde_json::to_string(&Command::CheckDiagnostics { path: path.clone() }).unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::Check {
+                total,
+                diagnostics,
+                error,
+                ..
+            } => {
+                assert_eq!(error, None, "エラーなし: {error:?}");
+                assert_eq!(total, 1, "TODO 診断が1件: {diagnostics:?}");
+                assert_eq!(diagnostics[0].severity, minae_protocol::Severity::Error);
+                assert_eq!(diagnostics[0].line, 1, "1-origin 行");
+                assert_eq!(diagnostics[0].message, "mock: TODO found");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
     async fn generation_increments_on_state_changes_only() {
         // ADR-0012: 世代は状態を変える操作（Open/編集/undo）で増加し、
         // GetState（読み取り）では不変。
@@ -7649,6 +8063,9 @@ root-markers = [".docsroot"]
                 ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
                     continue
                 }
+                ServerMessage::Hover { .. }
+                | ServerMessage::WorkspaceSymbols { .. }
+                | ServerMessage::Check { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
             }
@@ -7965,6 +8382,11 @@ root-markers = [".docsroot"]
                     continue;
                 }
                 ServerMessage::Outline { .. } | ServerMessage::EnclosingSymbol { .. } => {
+                    continue;
+                }
+                ServerMessage::Hover { .. }
+                | ServerMessage::WorkspaceSymbols { .. }
+                | ServerMessage::Check { .. } => {
                     continue;
                 }
             }
