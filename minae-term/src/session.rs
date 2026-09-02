@@ -14,6 +14,9 @@
 //! - `minae session peek <path> <line>:<col>` — 指定位置（1-origin）の定義を全文なしで取得する（ADR-0025）
 //! - `minae session outline <path>` — シンボルの階層ツリー（名前・種別・範囲）を全文なしで取得する（ADR-0031）
 //! - `minae session at <path> <line>:<col>` — 指定位置を囲む記号とその正確な範囲を全文なしで取得する（ADR-0031）
+//! - `minae session hover <path> <line>:<col>` — 指定位置の hover（型・シグネチャ・doc）を全文なしで取得する（ADR-0032）
+//! - `minae session symbol <path> <query>` — ワークスペース内のシンボル検索を全文なしで取得する（ADR-0032）
+//! - `minae session check <path>` — 診断の settle を待って診断だけを返す（ADR-0032）
 //!
 //! 例: `minae session exec '{"Insert": {"text": "hello"}}'`
 //! 例: `minae session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
@@ -36,8 +39,11 @@ use std::io;
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use minae_protocol::{ClientKind, Command, DocumentEdit, InlayHint, OutlineSymbol, StateSnapshot};
-use minae_protocol::{ReferenceLocation, ServerMessage};
+use minae_protocol::{
+    CheckDiagnostic, ClientKind, Command, DocumentEdit, InlayHint, OutlineSymbol, StateSnapshot,
+    WorkspaceSymbol,
+};
+use minae_protocol::{ReferenceLocation, ServerMessage, Severity};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -155,6 +161,33 @@ pub enum SessionCmd {
         path: PathBuf,
         /// Position as `line:col` (1-origin, col is a char count)
         pos: String,
+    },
+    /// Fetch the hover info (type/signature/doc) at `<line>:<col>` without full
+    /// text (ADR-0032). Empty text = no hover at that position.
+    Hover {
+        /// Path
+        path: PathBuf,
+        /// Position as `line:col` (1-origin, col is a char count)
+        pos: String,
+    },
+    /// Search symbols across the workspace via LSP `workspace/symbol`
+    /// (ADR-0032). `<path>` anchors the workspace root; results can span the
+    /// whole root (not just that file). Use instead of `rg` to find where a
+    /// name is defined/declared.
+    Symbol {
+        /// Any file inside the workspace root (relative to the agent's cwd)
+        path: PathBuf,
+        /// Search query (fuzzy; empty is rejected with exit 1)
+        query: String,
+    },
+    /// Wait for the LSP diagnostics of `<path>` to settle and return only the
+    /// diagnostics — no full text (ADR-0032). Replaces `wait` + `get` + JSON
+    /// parsing for the edit→verify loop. Exit 2 when at least one `error`
+    /// diagnostic is present (warnings alone exit 0); exit 1 on not-supported /
+    /// bad input; other failures exit 2.
+    Check {
+        /// Path
+        path: PathBuf,
     },
 }
 
@@ -355,6 +388,62 @@ pub async fn run(cmd: SessionCmd) -> io::Result<()> {
                 std::process::exit(symbol_at_exit_code(e));
             }
             println!("{}", serde_json::to_string_pretty(&outcome)?);
+        }
+        SessionCmd::Hover { path, pos } => {
+            // 成功: 位置の hover（型・シグネチャ・doc）を JSON で出力する
+            // （全文なし — ADR-0032）。hover の無い位置は text 空の成功応答
+            // （exit 0 — Peek の空定義と同じ流儀）。失敗: stderr に理由、
+            // exit 1/2（outline / at と同じ分類）。
+            let (line, col) = parse_position(&pos)?;
+            let outcome = execute_hover(&path.to_string_lossy(), line, col).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("hover: {e}");
+                std::process::exit(hover_exit_code(e));
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "path": outcome.path,
+                    "text": outcome.text,
+                }))?
+            );
+        }
+        SessionCmd::Symbol { path, query } => {
+            // 成功: ヒットしたシンボルを compact JSON で出力する（全文なし —
+            // ADR-0032。エージェントは位置から --lines で読む）。失敗: stderr に
+            // 理由、exit 1/2（outline / at と同じ分類）。
+            let outcome = execute_symbol(&path.to_string_lossy(), &query).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("symbol: {e}");
+                std::process::exit(symbol_exit_code(e));
+            }
+            println!("{}", serde_json::to_string(&outcome.symbols)?);
+        }
+        SessionCmd::Check { path } => {
+            // 成功: 診断を compact JSON で出力する（全文なし — ADR-0032）。
+            // クリーン（エラーなし）は exit 0、error 診断が1件でもあれば exit 2
+            // （警告のみなら 0 — エージェントは $? だけで分岐できる）。失敗: stderr
+            // に理由、exit 1/2（outline / at と同じ分類）。
+            let outcome = execute_check(&path.to_string_lossy()).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("check: {e}");
+                std::process::exit(check_exit_code(e));
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "path": outcome.path,
+                    "total": outcome.total,
+                    "diagnostics": outcome.diagnostics,
+                }))?
+            );
+            if outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error)
+            {
+                std::process::exit(2);
+            }
         }
     }
     Ok(())
@@ -576,6 +665,9 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         | Ok(ServerMessage::ServerInfo { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("Rename に想定外の軽量応答が返った"))
         }
@@ -621,6 +713,9 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         | Ok(ServerMessage::ServerInfo { .. })
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("References に想定外の軽量応答が返った"))
         }
@@ -642,6 +737,37 @@ fn outline_exit_code(e: &str) -> i32 {
 /// symbol range（`session at`）の失敗の exit コード分類（outline と同型）。
 fn symbol_at_exit_code(e: &str) -> i32 {
     if e.starts_with("symbol range not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// hover の失敗の exit コード分類（ADR-0032。outline と同型）: 入力エラー
+/// （not supported / invalid）は再試行しても通らないので 1、それ以外（LSP エラー）
+/// は再試行可能なので 2。
+fn hover_exit_code(e: &str) -> i32 {
+    if e.starts_with("hover not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// symbol search（`session symbol`）の失敗の exit コード分類（hover と同型）。
+fn symbol_exit_code(e: &str) -> i32 {
+    if e.starts_with("symbol search not supported") || e.starts_with("invalid input") {
+        1
+    } else {
+        2
+    }
+}
+
+/// check の失敗の exit コード分類（ADR-0032。outline と同型）: 入力エラー
+/// （not supported / invalid）は再試行しても通らないので 1、それ以外（LSP エラー）
+/// は再試行可能なので 2。
+fn check_exit_code(e: &str) -> i32 {
+    if e.starts_with("check not supported") || e.starts_with("invalid input") {
         1
     } else {
         2
@@ -678,6 +804,9 @@ async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
         | Ok(ServerMessage::ServerInfo { .. })
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("Outline に想定外の軽量応答が返った"))
         }
@@ -735,8 +864,152 @@ async fn execute_enclosing(
         | Ok(ServerMessage::ServerInfo { .. })
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
-        | Ok(ServerMessage::Outline { .. }) => {
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. }) => {
             Err(invalid("EnclosingSymbol に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// `session hover` の結果（[`ServerMessage::Hover`] の展開形。ADR-0032）。
+struct HoverOutcome {
+    path: String,
+    text: String,
+    error: Option<String>,
+}
+
+/// `session symbol` の結果（[`ServerMessage::WorkspaceSymbols`] の展開形。ADR-0032）。
+struct SymbolOutcome {
+    symbols: Vec<WorkspaceSymbol>,
+    error: Option<String>,
+}
+
+/// `session check` の結果（[`ServerMessage::Check`] の展開形。ADR-0032）。
+struct CheckOutcome {
+    path: String,
+    total: usize,
+    diagnostics: Vec<CheckDiagnostic>,
+    error: Option<String>,
+}
+
+/// daemon に接続し、指定位置の hover を軽量応答（[`ServerMessage::Hover`]）で受け取る
+/// （ADR-0032）。全文は運ばれない。
+async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutcome> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let command = Command::HoverAt {
+        path: client::absolutize(path),
+        line,
+        col,
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::Hover { path, text, error, .. }) => Ok(HoverOutcome { path, text, error }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "Hover にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. }) => Err(invalid("Hover に想定外の軽量応答が返った")),
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// daemon に接続し、ワークスペース内のシンボル検索を軽量応答
+/// （[`ServerMessage::WorkspaceSymbols`]）で受け取る（ADR-0032）。全文は運ばれない。
+async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let command = Command::WorkspaceSymbol {
+        path: client::absolutize(path),
+        query: query.to_string(),
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::WorkspaceSymbols { symbols, error, .. }) => Ok(SymbolOutcome { symbols, error }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "WorkspaceSymbol にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::Check { .. }) => {
+            Err(invalid("WorkspaceSymbol に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// daemon に接続し、対象パスの診断を軽量応答（[`ServerMessage::Check`]）で受け取る
+/// （ADR-0032）。全文は運ばれない。
+async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
+    let socket = crate::daemon::socket_path();
+    client::ensure_daemon(&socket).await?;
+    let stream = UnixStream::connect(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    client::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let command = Command::CheckDiagnostics {
+        path: client::absolutize(path),
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::Check { path, total, diagnostics, error, .. }) => Ok(CheckOutcome {
+            path,
+            total,
+            diagnostics,
+            error,
+        }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "Check にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. }) => {
+            Err(invalid("Check に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
     }
@@ -796,6 +1069,9 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         Ok(minae_protocol::ServerMessage::Hints { .. })
         | Ok(minae_protocol::ServerMessage::Peek { .. })
         | Ok(minae_protocol::ServerMessage::Outline { .. })
+        | Ok(minae_protocol::ServerMessage::Hover { .. })
+        | Ok(minae_protocol::ServerMessage::WorkspaceSymbols { .. })
+        | Ok(minae_protocol::ServerMessage::Check { .. })
         | Ok(minae_protocol::ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
         }
