@@ -23,7 +23,11 @@ use serde::{Deserialize, Serialize};
 /// v7: `Command::Rename` / `References`（ADR-0029）。
 /// v8: `Command::Outline` / `EnclosingSymbol`（ADR-0031）。シンボルの階層リストを
 /// 全文なしで返す Outline と、位置を囲む記号の範囲を返す EnclosingSymbol。
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: `Command::HoverAt` / `WorkspaceSymbol` / `CheckDiagnostics`（ADR-0032）。
+/// 位置の hover（型・シグネチャ）、ワークスペース内シンボル検索、診断 settle 待ち +
+/// コンパクト診断返却の3コマンドを追加。追加のみで後方互換だが、古い daemon に
+/// 新コマンドを送っても動作しないため version を上げる。
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// 編集モード（wire 型。minae-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +142,32 @@ pub enum Command {
         /// 1-origin 列番号（文字数単位）。
         col: u32,
     },
+    /// 指定位置（1-origin 行:列）の hover 情報（型・シグネチャ・doc）を全文を
+    /// 読まずに取得する（読み取り専用。ADR-0032）。応答は [`ServerMessage::Hover`]
+    /// （軽量 — スナップショット＝全文は返さない）。hover の無い位置
+    /// （空白・コメント等）は空テキストで応答する。
+    HoverAt {
+        path: String,
+        /// 1-origin 行番号。
+        line: u32,
+        /// 1-origin 列番号（文字数単位）。
+        col: u32,
+    },
+    /// ワークスペース内のシンボル検索（読み取り専用。ADR-0032）。`path` で
+    /// ワークスペース root（LSP セッション）を決め、`query` を `workspace/symbol`
+    /// に投げる。応答は全文を運ばない軽量 [`ServerMessage::WorkspaceSymbols`]。
+    /// 「どこで定義されているか」の探索を rg の代わりに 1 往復で済ませる経路。
+    WorkspaceSymbol {
+        /// ワークスペース root を決めるファイル（root 内の任意のパス）。
+        path: String,
+        /// 検索クエリ（空不可。LSP は空クエリを拒否する）。
+        query: String,
+    },
+    /// 対象パスの診断が安定するまで待ち、診断だけをコンパクトに返す（読み取り
+    /// 専用。ADR-0032）。全文を運ばない軽量 [`ServerMessage::Check`] — エージェント
+    /// の「編集→検証」ループを 1 コマンドに圧縮する（wait + get + JSON パースの
+    /// 代替）。診断の反映は generation を進めないため、内部で settle を待つ。
+    CheckDiagnostics { path: String },
 }
 
 /// 移動の種類（wire 型）。
@@ -300,6 +330,47 @@ pub enum ServerMessage {
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
+    /// [`Command::HoverAt`] の応答（ADR-0032）。指定位置の hover テキスト（型・
+    /// シグネチャ・doc を連結・切り詰め）。全文スナップショットを運ばない軽量
+    /// 応答。`text` が空なら hover なし（空白・コメント位置など）。失敗は
+    /// `error: Some(…)` で表す。
+    Hover {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
+        generation: u64,
+        /// hover テキスト（空 = hover なし）。
+        text: String,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+    /// [`Command::WorkspaceSymbol`] の応答（ADR-0032）。ワークスペース内の
+    /// シンボル検索結果の軽量一覧（名前・種別・パス・1-origin 行番号のみ —
+    /// 行の内容は渡さない。エージェントは位置から範囲 read で引く）。
+    /// 失敗は `error: Some(…)` で表す（`symbols` は空）。
+    WorkspaceSymbols {
+        /// 応答時点の世代。
+        generation: u64,
+        /// ヒットしたシンボル一覧。
+        symbols: Vec<WorkspaceSymbol>,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+    /// [`Command::CheckDiagnostics`] の応答（ADR-0032）。対象パスの診断を安定まで
+    /// 待って返すコンパクト応答。全文を運ばない。失敗は `error: Some(…)` で表す
+    /// （`diagnostics` は空）。
+    Check {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 応答時点の世代。
+        generation: u64,
+        /// 診断の総数。
+        total: usize,
+        /// 診断（行番号・char 範囲・メッセージ）。クリーンなら空。
+        diagnostics: Vec<CheckDiagnostic>,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
     /// [`Command::EnclosingSymbol`] の応答（ADR-0031）。指定位置を囲む記号の
     /// 名前・種別・正確な範囲（選択範囲 = 名前トークン）を全文なしで返す軽量応答。
     /// 位置がどの記号にも含まれない・対象が読めない場合は `found: false`（
@@ -320,6 +391,32 @@ pub enum ServerMessage {
         /// 失敗理由（成功時は None。`error` が Some なら `found` は false）。
         error: Option<String>,
     },
+}
+
+/// [`Command::WorkspaceSymbol`] の応答に含まれるシンボル 1 件（ADR-0032）。
+/// パスと 1-origin 行番号のみ — 行の内容は渡さない（エージェントは位置から
+/// 範囲 read で引く。T1 の原則）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// 定義元ファイルのパス（絶対パス）。
+    pub path: String,
+    /// 1-origin 行番号（シンボルの開始位置）。
+    pub line: u32,
+}
+
+/// [`Command::CheckDiagnostics`] の応答に含まれる診断 1 件（ADR-0032）。
+/// 1-origin 行番号（`--lines` の住所）と char 範囲（apply の住所）の両方を載せる。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDiagnostic {
+    pub severity: Severity,
+    /// 1-origin 行番号（診断の開始位置）。
+    pub line: u32,
+    /// char インデックス範囲（start..end）。
+    pub start: usize,
+    pub end: usize,
+    pub message: String,
 }
 
 /// [`Command::References`] の応答に含まれる参照位置 1 件（ADR-0029）。
@@ -392,6 +489,18 @@ pub struct ServerMetrics {
     pub symbol_range_total: u64,
     /// EnclosingSymbol 応答の累積シリアライズ bytes（ADR-0031）。
     pub symbol_range_bytes: u64,
+    /// HoverAt 要求回数（ADR-0032）。
+    pub hover_total: u64,
+    /// HoverAt 応答の累積シリアライズ bytes（ADR-0032）。
+    pub hover_bytes: u64,
+    /// WorkspaceSymbol 要求回数（ADR-0032）。
+    pub symbol_search_total: u64,
+    /// WorkspaceSymbol 応答の累積シリアライズ bytes（ADR-0032）。
+    pub symbol_search_bytes: u64,
+    /// CheckDiagnostics 要求回数（ADR-0032）。
+    pub check_total: u64,
+    /// CheckDiagnostics 応答の累積シリアライズ bytes（ADR-0032）。
+    pub check_bytes: u64,
 }
 
 /// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
@@ -834,6 +943,12 @@ mod tests {
                 outline_bytes: 9,
                 symbol_range_total: 10,
                 symbol_range_bytes: 11,
+                hover_total: 12,
+                hover_bytes: 13,
+                symbol_search_total: 14,
+                symbol_search_bytes: 15,
+                check_total: 16,
+                check_bytes: 17,
             },
         };
         let json = serde_json::to_string(&msg).expect("serialize");
@@ -887,6 +1002,27 @@ mod tests {
             assert_eq!(back, cmd);
         }
 
+        // HoverAt / WorkspaceSymbol / CheckDiagnostics コマンドの round-trip
+        // （ADR-0032）
+        for cmd in [
+            Command::HoverAt {
+                path: "src/lib.rs".into(),
+                line: 12,
+                col: 5,
+            },
+            Command::WorkspaceSymbol {
+                path: "src/lib.rs".into(),
+                query: "frobnicate".into(),
+            },
+            Command::CheckDiagnostics {
+                path: "src/lib.rs".into(),
+            },
+        ] {
+            let back: Command =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
+
         // Outline 応答を phrase として round-trip する
         let msg = ServerMessage::Outline {
             path: "src/lib.rs".into(),
@@ -912,6 +1048,51 @@ mod tests {
         let back: ServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);
         assert!(json.contains("\"type\":\"enclosing_symbol\""));
+
+        // Hover / WorkspaceSymbols / Check 応答の round-trip（ADR-0032）
+        let hover = ServerMessage::Hover {
+            path: "src/lib.rs".into(),
+            generation: 3,
+            text: "fn frobnicate() -> i32".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&hover).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hover);
+        assert!(json.contains("\"type\":\"hover\""));
+
+        let ws = ServerMessage::WorkspaceSymbols {
+            generation: 3,
+            symbols: vec![WorkspaceSymbol {
+                name: "frobnicate".into(),
+                kind: SymbolKind::Function,
+                path: "/abs/src/lib.rs".into(),
+                line: 12,
+            }],
+            error: None,
+        };
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ws);
+        assert!(json.contains("\"type\":\"workspace_symbols\""));
+
+        let check = ServerMessage::Check {
+            path: "src/lib.rs".into(),
+            generation: 3,
+            total: 1,
+            diagnostics: vec![CheckDiagnostic {
+                severity: Severity::Error,
+                line: 3,
+                start: 20,
+                end: 24,
+                message: "mock: TODO found".into(),
+            }],
+            error: None,
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, check);
+        assert!(json.contains("\"type\":\"check\""));
     }
 
     #[test]
@@ -946,6 +1127,33 @@ mod tests {
         let back: DocumentEdit = serde_json::from_str(legacy).unwrap();
         assert_eq!(back.expected_text, None);
         assert_eq!(back.start, 1);
+    }
+
+    #[test]
+    fn workspace_symbol_and_check_diagnostic_round_trip() {
+        // 個別型の wire 形状（ADR-0032）
+        let sym = WorkspaceSymbol {
+            name: "run".into(),
+            kind: SymbolKind::Function,
+            path: "/abs/main.rs".into(),
+            line: 4,
+        };
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(json.contains("\"kind\":\"function\""));
+        let back: WorkspaceSymbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sym);
+
+        let diag = CheckDiagnostic {
+            severity: Severity::Error,
+            line: 2,
+            start: 10,
+            end: 14,
+            message: "mock: TODO found".into(),
+        };
+        let json = serde_json::to_string(&diag).unwrap();
+        assert!(json.contains("\"severity\":\"Error\""));
+        let back: CheckDiagnostic = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, diag);
     }
 
     #[test]
