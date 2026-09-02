@@ -215,10 +215,10 @@ impl Keymaps {
             &[plain(KeyCode::Char('i'))],
             Command::SetMode { mode: Mode::Insert },
         );
-        // Normal: 編集。x/Backspace は1文字削除（vim 流）、d は選択削除・c は
-        // 削除+Insert（Helix 流）。保存は `:` コマンドモードの :w（Helix/vim 流）。
-        // s には割り当てない。
-        normal.insert(&[plain(KeyCode::Char('x'))], Command::DeleteForward);
+        // Normal: 編集。x はカーソル行を選択（Helix 流）、d は選択削除・
+        // c は削除+Insert（Helix 流）。Backspace は1文字削除（vim 流）。
+        // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
+        normal.insert(&[plain(KeyCode::Char('x'))], Command::SelectLine);
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         normal.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         normal.insert(&[plain(KeyCode::Char('c'))], Command::Change);
@@ -530,7 +530,7 @@ mod tests {
         let mut pending = Vec::new();
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('x')),
-            Resolution::Command(Command::DeleteForward)
+            Resolution::Command(Command::SelectLine)
         ));
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('u')),
