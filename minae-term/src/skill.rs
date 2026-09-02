@@ -31,6 +31,9 @@ Rules
   fraction of the bytes), then read only the symbol you need; session at
   <path> <line>:<col> names the symbol enclosing a spot you are about to touch,
   so both reads and edits happen at symbol granularity.
+- For types, session hover <path> <line>:<col> returns the signature without
+  any read; to find where a name lives in the workspace, session symbol
+  <path> <query> replaces rg (both ADR-0032).
 - The numbered output lets you paste the exact text you saw into `session apply`
   as the <old> argument — read and edit share one contract.
 - Out-of-range start returns an explained zero result, e.g.
@@ -160,6 +163,67 @@ rename tool exists.",
 - Exit 1/2 as with rename.",
     ),
     (
+        "check",
+        "session check <path>: wait for diagnostics, returns only errors",
+        "CHECK — the edit -> verify loop in one command (ADR-0032)
+
+Use:      session check <path>
+Output:   compact JSON, no file text: {\"path\", \"total\", \"diagnostics\"} where each
+          diagnostic is {\"severity\", \"line\" (1-origin), \"start\", \"end\", \"message\"}.
+Exit:     0 = no error diagnostics (warnings alone are fine),
+          2 = at least one error diagnostic, or a retryable LSP failure,
+          1 = not supported / bad input.
+
+Rules
+- After an edit (session apply / edit), run check INSTEAD of wait + get +
+  JSON-parsing the snapshot: it waits for LSP diagnostics to settle and returns
+  only the diagnostics — the round trip and the full text are gone.
+- The 1-origin line is the address for `session get --lines <n>:<n>`; the
+  char range is the address for `session apply`.<old>.
+- It is an LSP fast path (incremental), not a compiler: for semantics beyond
+  the LSP (borrow checker etc.) still run the real build.
+- Clean files are detected by a settle budget (~10s): a cold workspace may
+  return \"clean\" before analysis finishes — re-check after a moment.",
+    ),
+    (
+        "hover",
+        "session hover <path> <line>:<col>: type & signature without full text",
+        "HOVER — type/signature lookup without reading (ADR-0032)
+
+Use:      session hover <path> <line>:<col>   (1-origin, like get --lines)
+Output:   compact JSON: {\"path\", \"text\"} — type + signature + doc, no file text.
+          Empty text is a SUCCESS (exit 0): nothing to hover at that position
+          (whitespace, comments).
+
+Rules
+- Before reading a definition to learn its type, hover the call site: the
+  server returns the signature in one round trip (token-cheap).
+- The doc comment is truncated (<=2000 chars) — the type/signature is the
+  reliable part; read the doc only when the short part is not enough.
+- Pair with session peek <path> <line>:<col> to jump to the definition.
+- Exit 1/2 as with outline/at (1 = not supported / bad input, 2 = retryable).",
+    ),
+    (
+        "symbol",
+        "session symbol <path> <query>: find where a name lives in the workspace",
+        "SYMBOL — workspace search instead of rg (ADR-0032)
+
+Use:      session symbol <path> <query>
+Output:   compact JSON array, no file text: each hit is
+          {\"name\", \"kind\", \"path\", \"line\" (1-origin)} — read the location
+          with `session get --lines`.
+
+Rules
+- <path> is any file in the workspace (it anchors the workspace root);
+  results can span the whole root, not just that file.
+- Use it INSTEAD of rg when you need to know WHERE a name is defined or
+  declared: the server returns exact symbols (no whole lines, no false
+  positive comments/strings), and the hit range is the definition.
+- Fuzzy matching varies by server; a broad query then narrowing by kind/line
+  is cheaper than many greps.
+- Exit 1 = not supported / bad input (empty query), 2 = retryable.",
+    ),
+    (
         "persist",
         "session edit leaves the buffer dirty; save explicitly",
         "PERSIST — when changes hit the disk
@@ -185,11 +249,15 @@ Exit codes (applies to session apply / edit / hunks):
   2  retryable failure — old text not found, checksum/expected_text mismatch,
      or Save failed. Re-read the file fresh, then retry.
 
-Semantic commands (rename / references / outline / at) share 0/1/2 but
-classify differently: exit 1 = not supported / invalid input (do not retry),
-exit 2 = retryable (symbol not found, LSP error — re-run once later).
-Note: session at with no enclosing symbol is exit 0 (found=false), not an
-error — only the LSP request itself can fail.
+Semantic commands (rename / references / outline / at / hover / symbol / check)
+share 0/1/2 but classify differently: exit 1 = not supported / invalid input
+(do not retry), exit 2 = retryable (symbol not found, LSP error — re-run once
+later). Exceptions:
+- session at with no enclosing symbol is exit 0 (found=false), not an error —
+  only the LSP request itself can fail.
+- session hover with nothing at the position is exit 0 (empty text), not an error.
+- session check returns exit 2 when at least one error diagnostic is present
+  (warnings alone exit 0) — branch on $? without parsing the JSON.
 
 Rejections are the editor telling you what changed:
 - \"document changed since read\"      -> the file moved; re-read and retry.
