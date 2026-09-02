@@ -61,6 +61,8 @@ fn main() {
                         caps["referencesProvider"] = json!(true);
                         caps["definitionProvider"] = json!(true);
                         caps["documentSymbolProvider"] = json!(true);
+                        caps["hoverProvider"] = json!(true);
+                        caps["workspaceSymbolProvider"] = json!(true);
                     }
                     let resp = json!({
                         "jsonrpc": "2.0",
@@ -211,6 +213,35 @@ fn main() {
                     let resp = json!({ "jsonrpc": "2.0", "id": id, "result": locs });
                     write_frame(&mut stdout, &resp);
                 }
+                "textDocument/hover" => {
+                    // hover のモック: 位置の単語を返す（無ければ null = hover なし）。
+                    // rust-analyzer と同じ配列形（先頭 = 型シグネチャの MarkedString、
+                    // 続いて doc の MarkupContent）で返す。
+                    let hover = current.as_ref().and_then(|(_, text)| {
+                        let pos = &msg["params"]["position"];
+                        let line = pos["line"].as_u64().unwrap_or(0) as u32;
+                        let character = pos["character"].as_u64().unwrap_or(0) as u32;
+                        word_at(text, line, character, utf16).map(|w| json!({
+                            "contents": [
+                                { "language": "rust", "value": format!("fn {w}() -> i32") },
+                                { "kind": "markdown", "value": format!("mock doc for {w}") },
+                            ],
+                        }))
+                    });
+                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": hover });
+                    write_frame(&mut stdout, &resp);
+                }
+                "workspace/symbol" => {
+                    // workspace/symbol のモック: 現在文書のアウトラインから名前が
+                    // クエリを含むシンボルを SymbolInformation[] で返す。
+                    let query = msg["params"]["query"].as_str().unwrap_or("");
+                    let symbols = current
+                        .as_ref()
+                        .map(|(uri, text)| workspace_symbol_info(text, uri, query, utf16))
+                        .unwrap_or_default();
+                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": symbols });
+                    write_frame(&mut stdout, &resp);
+                }
                 _ => {}
             }
         } else if let Some(method) = msg.get("method").and_then(Value::as_str) {
@@ -340,6 +371,35 @@ fn outline_symbols(text: &str, utf16: bool) -> Vec<Value> {
         }
     }
     out
+}
+
+/// workspace/symbol のモック応答（SymbolInformation[]）: 現在文書のアウトライン
+/// から、名前が `query` を部分一致で含むシンボルを `location` 付きで返す。
+fn workspace_symbol_info(text: &str, uri: &str, query: &str, utf16: bool) -> Vec<Value> {
+    outline_symbols(text, utf16)
+        .into_iter()
+        .filter(|s| {
+            let name = s.get("name").and_then(Value::as_str).unwrap_or("");
+            query.is_empty() || name.contains(query)
+        })
+        .map(|s| {
+            let name = s.get("name").cloned().unwrap_or(Value::Null);
+            let kind = s.get("kind").cloned().unwrap_or(Value::Null);
+            let line = s.pointer("/range/start/line").and_then(Value::as_u64).unwrap_or(0);
+            let end = s.pointer("/range/end/character").and_then(Value::as_u64).unwrap_or(0);
+            json!({
+                "name": name,
+                "kind": kind,
+                "location": {
+                    "uri": uri,
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": end },
+                    },
+                },
+            })
+        })
+        .collect()
 }
 
 /// 行内バイト列 → LSP の character（advertise した encoding の単位）。
