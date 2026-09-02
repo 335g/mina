@@ -12,7 +12,8 @@
 //! 内容は英語（H4: エージェントがパースする出力は英語統一）。
 //!
 //! 各トピックの内容はツール判断の指針であり、tools/ab の A/B 実測（t1〜t5）と
-//! ADR-0029（rename / references）・ADR-0031（outline / at）の実測に基づく。
+//! ADR-0029（rename / references）・ADR-0031（outline / at）・ADR-0032
+//! （hover / symbol / check）の実測・仕様に基づく。
 
 /// トピック定義。説明は索引行に使う。内容は「行動レベル」に書く（長手順・抑制・判断表）。
 const SKILLS: &[(&str, &str, &str)] = &[
@@ -57,6 +58,10 @@ Rules
   (`session edit` with computed char offsets) fails 0/5 vs 3/5 for content-resolved,
   costs ~5x tokens, and can silently apply to the WRONG occurrence (a successful
   exit with the wrong spot changed). Do not compute start/end char indices.
+- After an edit, VERIFY with `session check <path>` (ADR-0032): it waits for LSP
+  diagnostics and returns only errors — 1 round trip, no full text. Exit 2 means
+  at least one error diagnostic (warnings alone exit 0). For semantics beyond the
+  LSP (borrow checker etc.), still run the real build.
 - Locate before you edit: session outline / session at return the exact span of
   the symbol you are changing, so your <old> text targets the right region
   instead of a look-alike occurrence elsewhere.
@@ -310,6 +315,13 @@ mod tests {
         names.dedup();
         assert_eq!(before, names.len(), "トピック名は重複しない");
         assert!(before >= 3, "索引は最低3トピック");
+        // ADR-0032 の3コマンドは索引に載る（エージェントが発見できる）
+        for required in ["check", "hover", "symbol"] {
+            assert!(
+                SKILLS.iter().any(|(n, _, _)| *n == required),
+                "索引に {required} トピックが必要"
+            );
+        }
     }
 
     #[test]
