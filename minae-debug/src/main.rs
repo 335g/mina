@@ -248,7 +248,11 @@ impl Conn {
             Ok(ServerMessage::RenameResult { .. })
             | Ok(ServerMessage::ReferencesResult { .. })
             | Ok(ServerMessage::Outline { .. })
-            | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+            | Ok(ServerMessage::EnclosingSymbol { .. })
+            // ADR-0032: Hover / WorkspaceSymbols / Check 応答もこの CLI では使わない
+            | Ok(ServerMessage::Hover { .. })
+            | Ok(ServerMessage::WorkspaceSymbols { .. })
+            | Ok(ServerMessage::Check { .. }) => {
                 Err(std::io::Error::new(
                     ErrorKind::InvalidData,
                     "unexpected semantic response".to_string(),

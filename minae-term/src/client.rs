@@ -460,6 +460,9 @@ pub(crate) async fn request_hints(
         Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -517,6 +520,9 @@ pub(crate) async fn request_peek(
         Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -569,6 +575,9 @@ pub(crate) async fn request<T: serde::Serialize>(
         Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -662,7 +671,10 @@ async fn read_loop(
             | Ok(ServerMessage::RenameResult { .. })
             | Ok(ServerMessage::ReferencesResult { .. })
             | Ok(ServerMessage::Outline { .. })
-            | Ok(ServerMessage::EnclosingSymbol { .. }) => {}
+            | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {}
             Err(e) => {
                 let _ = res_tx.send(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
