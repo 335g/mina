@@ -119,6 +119,30 @@ pub fn move_selection_to_line_first_non_whitespace(
     Selection::new(ranges, selection.primary_index())
 }
 
+/// 各 Range を head の行全体（末尾改行を含む。最終行は文書末尾まで）へ広げる
+/// （Helix の `x`。行選択）。anchor は行頭（列 0）、head は末尾改行の直後 =
+/// 次の行頭に置く。空行はその改行だけを選択する。
+pub fn select_line_selection(doc: &Document, selection: &Selection) -> Selection {
+    let text = doc.text().to_string();
+    let len = text.chars().count();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| {
+            let head = r.head();
+            let start = step_line_start(&text, head);
+            let mut end = step_line_end(&text, head);
+            // 末尾改行を選択に含める（Helix の `x` と同じ。xd で行が丸ごと
+            // 消える）。改行が無い最終行は文書末尾のまま。
+            if end < len {
+                end += 1;
+            }
+            Range::new(start, end)
+        })
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
 fn move_range(text: &str, range: Range, movement: Movement, dir: Direction, extend: bool) -> Range {
     let new_pos = match movement {
         Movement::Char => step_grapheme(text, range.head(), dir),
@@ -1319,6 +1343,38 @@ mod tests {
         assert_eq!(
             word_sel("hello", 5, WordMoveTarget::NextWordStart),
             sel(vec![(5, 5)], 0)
+        );
+    }
+
+    #[test]
+    fn select_line_selects_whole_line_with_newline() {
+        let doc = Document::from("ab\ncd\nefg");
+        // 2行目（'c'）から: 行全体 + 末尾改行 = "cd\n"
+        assert_eq!(
+            select_line_selection(&doc, &Selection::point(3)),
+            sel(vec![(3, 6)], 0)
+        );
+        // 選択中でも head の行を選び直す
+        assert_eq!(
+            select_line_selection(&doc, &sel(vec![(0, 4)], 0)),
+            sel(vec![(3, 6)], 0)
+        );
+        // 空行は改行だけを選択する
+        let blank = Document::from("a\n\nb");
+        assert_eq!(
+            select_line_selection(&blank, &Selection::point(2)),
+            sel(vec![(2, 3)], 0)
+        );
+        // 末尾改行なしの最終行は行末（文書末尾）まで
+        assert_eq!(
+            select_line_selection(&doc, &Selection::point(7)),
+            sel(vec![(6, 9)], 0)
+        );
+        // 末尾に改行がある最終行は改行も含める（"efg\n"）
+        let trailing = Document::from("ab\ncd\nefg\n");
+        assert_eq!(
+            select_line_selection(&trailing, &Selection::point(7)),
+            sel(vec![(6, 10)], 0)
         );
     }
 }
