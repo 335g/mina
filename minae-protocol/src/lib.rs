@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 /// 位置の hover（型・シグネチャ）、ワークスペース内シンボル検索、診断 settle 待ち +
 /// コンパクト診断返却の3コマンドを追加。追加のみで後方互換だが、古い daemon に
 /// 新コマンドを送っても動作しないため version を上げる。
-pub const PROTOCOL_VERSION: u32 = 9;
+/// v10: `Command::SelectLine`（Normal の `x` を Helix 流のカーソル行選択へ）。
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// 編集モード（wire 型。minae-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,8 +76,11 @@ pub enum Command {
     DeleteWordBackward,
     /// 前方単語削除（Alt-d 相当）。
     DeleteWordForward,
-    /// 選択範囲を削除する。
+    /// 選択（またはカーソル位置）を削除する。
     DeleteRange,
+    /// 各 Range を head の行全体（末尾改行を含む）へ広げる（Helix の `x`。
+    /// 行選択）。Select モードへの移行はしない。
+    SelectLine,
     /// 選択（またはカーソル位置）を削除して Insert モードへ入る（Helix の `c`）。
     /// カーソル上では削除なしで Insert モードに入るだけ。削除は undo グループの外。
     Change,
