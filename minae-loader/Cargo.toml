@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Language registry for minae: tree-sitter grammars and highlight queries"
 
 [dependencies]
-minae-protocol = { path = "../minae-protocol", version = "0.0.2" }
+minae-protocol = { path = "../minae-protocol", version = "0.0.3" }
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true

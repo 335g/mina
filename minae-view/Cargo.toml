@@ -8,4 +8,4 @@ repository.workspace = true
 description = "UI-agnostic editor state for minae"
 
 [dependencies]
-minae-core = { path = "../minae-core", version = "0.0.2" }
+minae-core = { path = "../minae-core", version = "0.0.3" }

@@ -12,11 +12,11 @@ name = "minae"
 path = "src/main.rs"
 
 [dependencies]
-minae-core = { path = "../minae-core", version = "0.0.2" }
-minae-view = { path = "../minae-view", version = "0.0.2" }
-minae-protocol = { path = "../minae-protocol", version = "0.0.2" }
-minae-lsp = { path = "../minae-lsp", version = "0.0.2" }
-minae-loader = { path = "../minae-loader", version = "0.0.2" }
+minae-core = { path = "../minae-core", version = "0.0.3" }
+minae-view = { path = "../minae-view", version = "0.0.3" }
+minae-protocol = { path = "../minae-protocol", version = "0.0.3" }
+minae-lsp = { path = "../minae-lsp", version = "0.0.3" }
+minae-loader = { path = "../minae-loader", version = "0.0.3" }
 tree-sitter.workspace = true
 serde.workspace = true
 serde_json.workspace = true

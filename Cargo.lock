@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "dev01"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "dev02"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -354,7 +354,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "minae"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "clap",
  "cliclack",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "minae-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ropey",
  "smallvec",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "minae-debug"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cliclack",
  "libc",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "minae-loader"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "minae-protocol",
  "tree-sitter",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "minae-lsp"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "minae-protocol"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "minae-view"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "minae-core",
 ]
