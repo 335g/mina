@@ -71,6 +71,10 @@ pub(crate) struct ServerCapabilities {
     pub(crate) definition: bool,
     /// `textDocument/documentSymbol`（シンボルの階層ツリー）を提供する。
     pub(crate) document_symbols: bool,
+    /// `textDocument/hover` を提供する。
+    pub(crate) hover: bool,
+    /// `workspace/symbol` を提供する。
+    pub(crate) workspace_symbols: bool,
 }
 
 /// initialize 応答から能力を導出する。`renameProvider: false` 等の明示 false と
@@ -92,6 +96,8 @@ fn capabilities_of(result: &Value) -> ServerCapabilities {
         references: cap("/referencesProvider"),
         definition: cap("/definitionProvider"),
         document_symbols: cap("/documentSymbolProvider"),
+        hover: cap("/hoverProvider"),
+        workspace_symbols: cap("/workspaceSymbolProvider"),
     }
 }
 
@@ -898,6 +904,180 @@ pub async fn definition_peek_at_line_col(
     definition_peek_at(session, path, text, lsp_line, lsp_character).await
 }
 
+// ---- hover・ワークスペースシンボル検索・診断 check（ADR-0032） ----
+
+/// hover 応答のテキスト上限（ADR-0032）。rust-analyzer は型シグネチャ + doc
+/// コメントを返す — doc は長くなり得るため、エージェントが読む量を抑える
+/// （F8 の断片化と同じ方針）。超えたら末尾を `…` で切る。
+const MAX_HOVER_CHARS: usize = 2000;
+
+/// エージェント向け（ADR-0032）: 1-origin 行:列を指定して hover（型・シグネチャ・
+/// doc）を引く。`col` は文字数単位。行・列が範囲外や hover の無い位置（空白・
+/// コメント等）は `None`。LSP エラー・セッション停止も `None`（能力ゲートは
+/// daemon 側が行う）。
+pub async fn hover_at_line_col(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    line: u32,
+    col: u32,
+) -> Option<String> {
+    let (lsp_line, lsp_character) = {
+        let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return None;
+        };
+        let line_idx = line.saturating_sub(1); // 1-origin → 0-origin
+        let Some(line_text) = text.lines().nth(line_idx as usize) else {
+            return None; // 行が範囲外: hover なし
+        };
+        let char_col = col.saturating_sub(1) as usize;
+        (
+            line_idx,
+            char_col_to_lsp_character(line_text, char_col, s.encoding),
+        )
+    };
+    let result = {
+        let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return None;
+        };
+        if session.client.is_dead() {
+            return None;
+        }
+        session
+            .client
+            .request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri(path) },
+                    "position": { "line": lsp_line, "character": lsp_character },
+                }),
+            )
+            .await
+            .ok()?
+    };
+    hover_text(&result)
+}
+
+/// `textDocument/hover` の応答から表示テキストを取り出す（ADR-0032）。
+///
+/// `contents` は `string | MarkedString | MarkupContent | MarkedString[]` の
+/// どれでもよい（LSP 3.17）。rust-analyzer は配列（先頭 = 型シグネチャ、続いて
+/// doc の MarkupContent）、tsserver は MarkupContent を返す。全ての断片を連結し、
+/// 上限（[`MAX_HOVER_CHARS`]）で切り詰める。`null` / 形状不正・空は `None`。
+fn hover_text(result: &Value) -> Option<String> {
+    let contents = result.get("contents")?;
+    let mut parts = Vec::new();
+    collect_hover_parts(contents, &mut parts);
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("\n");
+    let mut out: String = joined.chars().take(MAX_HOVER_CHARS).collect();
+    if out.chars().count() < joined.chars().count() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// hover の `contents`（string / MarkedString / MarkupContent / 配列）から
+/// テキスト断片を集める。MarkedString も MarkupContent も `value` を持つため、
+/// オブジェクトは value を採用する（language / kind は表示に使わない）。
+fn collect_hover_parts(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_hover_parts(item, out);
+            }
+        }
+        Value::Object(_) => {
+            if let Some(v) = value.get("value").and_then(Value::as_str) {
+                out.push(v.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `workspace/symbol` によるシンボル検索（ADR-0032）。`query` は空不可
+/// （daemon 側が検証済み）。応答は `(uri, kind, name, 0-origin 行)` のリスト。
+/// 解析待ち（null）はリトライし、予算切れは最後の結果を返す（references と
+/// 同じ規律 — クエリに対する空配列は「該当なし」の正常応答なので null のみ
+/// 待ち対象にする）。`Err` は恒久的な失敗（タイムアウト・サーバ死亡）。
+pub async fn workspace_symbols(
+    session: &Mutex<LspSession>,
+    query: &str,
+) -> Result<Vec<(String, minae_protocol::SymbolKind, String, u32)>, String> {
+    let is_loading = |r: &Value| r.is_null();
+    let result = request_with_loading_retry(
+        session,
+        "workspace/symbol",
+        json!({ "query": query }),
+        is_loading,
+    )
+    .await?;
+    let Some(items) = result.as_array() else {
+        return Err("workspace/symbol の応答が配列ではありません".into());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("workspace/symbol の SymbolInformation に name がありません")?;
+        let kind = lsp_symbol_kind(item.get("kind")).unwrap_or_default();
+        let u = item
+            .get("location")
+            .and_then(|l| l.get("uri"))
+            .and_then(Value::as_str)
+            .ok_or("workspace/symbol の SymbolInformation に location.uri がありません")?;
+        let line = item
+            .pointer("/location/range/start/line")
+            .and_then(Value::as_u64)
+            .ok_or("workspace/symbol の SymbolInformation に location.range.start.line がありません")?;
+        out.push((u.to_string(), kind, name.to_string(), line as u32));
+    }
+    Ok(out)
+}
+
+/// `session check` 用（ADR-0032）: 診断が安定するまで pull を繰り返し、最後の
+/// 結果を返す。
+///
+/// 安定判定は settle_open_diagnostics と同じ: 非空が 2 回連続で同数 = 安定、
+/// 空のまま予算（[`SEMANTIC_RETRIES`] × [`SEMANTIC_RETRY_WAIT`] ≈ 10 秒）を
+/// 使い切ったら「クリーン」として最後の空を返す。`None` は恒久的な失敗
+/// （セッションロック待ち・サーバ死亡・対象が current でない）。
+pub async fn pull_diagnostics_settled(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+) -> Option<Vec<Diagnostic>> {
+    let mut prev: Option<usize> = None;
+    let mut last: Vec<Diagnostic> = Vec::new();
+    for _ in 0..SEMANTIC_RETRIES {
+        let pulled = {
+            let Ok(mut s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+                return None;
+            };
+            if s.client.is_dead() {
+                return None;
+            }
+            s.pull_diagnostics(path, text).await
+        };
+        let Some(diags) = pulled else {
+            return None;
+        };
+        let n = diags.len();
+        if n > 0 && prev == Some(n) {
+            return Some(diags); // 非空が2回連続で同数 = 安定
+        }
+        prev = Some(n);
+        last = diags;
+        tokio::time::sleep(SEMANTIC_RETRY_WAIT).await;
+    }
+    Some(last) // 予算切れ: 最後の結果（空ならクリーン扱い）
+}
+
 // ---- 意味リネーム・参照（ADR-0029） ----
 
 /// 1ファイル分の rename 編集（LSP 座標を char インデックスへ変換済み）。
@@ -1687,6 +1867,105 @@ fn capabilities_of_parses_initialize_response() {
         assert_eq!(lsp_pos_to_char(text, 0, 4, PositionEncoding::Utf16), 3);
         // 2行目先頭は char 5（\n の直後）
         assert_eq!(lsp_pos_to_char(text, 1, 0, PositionEncoding::Utf16), 5);
+    }
+
+    #[test]
+    fn hover_text_extracts_all_contents_shapes() {
+        // ADR-0032: string / MarkedString / MarkupContent / 配列のどれも拾う
+        // 文字列
+        assert_eq!(hover_text(&json!({ "contents": "plain" })).unwrap(), "plain");
+        // MarkupContent オブジェクト
+        assert_eq!(
+            hover_text(&json!({ "contents": { "kind": "markdown", "value": "doc" } })).unwrap(),
+            "doc"
+        );
+        // 配列（rust-analyzer 形 = 型シグネチャ + doc）
+        assert_eq!(
+            hover_text(&json!({
+                "contents": [
+                    { "language": "rust", "value": "fn f() -> i32" },
+                    { "kind": "markdown", "value": "docs here" },
+                ]
+            }))
+            .unwrap(),
+            "fn f() -> i32\ndocs here"
+        );
+        // 切り詰め: 上限を超えたら末尾に …
+        let long = "x".repeat(MAX_HOVER_CHARS + 50);
+        let out = hover_text(&json!({ "contents": long })).unwrap();
+        assert!(out.chars().count() <= MAX_HOVER_CHARS + 1, "+1 は … 分");
+        assert!(out.ends_with('…'));
+        // null（hover なし）と空
+        assert!(hover_text(&json!(null)).is_none());
+        assert!(hover_text(&json!({ "contents": [] })).is_none());
+    }
+
+    #[tokio::test]
+    async fn hover_at_line_col_returns_type_and_doc() {
+        // ADR-0032 E2E: mock は位置の単語の hover を配列形で返す
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let path = PathBuf::from("/tmp/hover.rs");
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        let text = "fn frobnicate() {}\n";
+        session.lock().await.did_open(&path, text).await;
+        // 1行目 5文字目（fn の後ろ）→ 単語 frobnicate
+        let h = hover_at_line_col(&session, &path, text, 1, 5).await.expect("hover が返る");
+        assert!(h.contains("fn frobnicate() -> i32"), "型シグネチャ: {h}");
+        assert!(h.contains("mock doc for frobnicate"), "doc: {h}");
+        // 行が範囲外 → None
+        assert!(hover_at_line_col(&session, &path, text, 99, 1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_symbols_returns_matching_locations() {
+        // ADR-0032 E2E: mock はアウトラインから名前にクエリを含む SymbolInformation
+        // を返す。パスは daemon 側で file:// を剥ぐため、lsp 層は uri をそのまま返す。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let path = PathBuf::from("/tmp/ws.rs");
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        let text = "fn run() {}\nstruct Thing;\nfn go() {}\n";
+        session.lock().await.did_open(&path, text).await;
+        let hit = workspace_symbols(&session, "run")
+            .await
+            .expect("検索が返る");
+        assert_eq!(hit.len(), 1, "run に一致: {hit:?}");
+        assert_eq!(hit[0].2, "run");
+        assert_eq!(hit[0].3, 0, "0-origin 行");
+        let all = workspace_symbols(&session, "").await.expect("検索が返る");
+        assert_eq!(all.len(), 3, "[空クエリ] は mock で全シンボルを返す（daemon は空を拒否する）");
+    }
+
+    #[tokio::test]
+    async fn pull_diagnostics_settled_waits_for_stability() {
+        // ADR-0032: TODO を持つ文書は診断が安定（非空 ×2）するまで待って返す。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let path = PathBuf::from("/tmp/check.rs");
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        let text = "fn ok() { TODO }\n";
+        session.lock().await.did_open(&path, text).await;
+        let diags = pull_diagnostics_settled(&session, &path, text)
+            .await
+            .expect("診断が返る");
+        assert_eq!(diags.len(), 1, "TODO 診断が1件: {diags:?}");
+        assert_eq!(diags[0].message, "mock: TODO found");
     }
 
     #[tokio::test]
