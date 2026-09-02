@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use minae_core::{
     Range as CoreRange, Selection, Transaction, extend_selection, insert_at, move_selection,
-    move_selection_lines, move_selection_to_line_first_non_whitespace,
+    move_selection_lines, move_selection_to_line_first_non_whitespace, select_line_selection,
 };
 use minae_protocol::{
     Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, DocumentEdit,
@@ -3682,6 +3682,16 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 extend_selection(doc, &selection, convert_movement(movement), convert_direction(direction))
             };
             daemon.editor.set_selection(extended);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), false)
+        }
+        Command::SelectLine => {
+            let selected = {
+                let doc = daemon.editor.current_document();
+                let selection = daemon.editor.selection();
+                select_line_selection(doc, &selection)
+            };
+            daemon.editor.set_selection(selected);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), false)
         }
