@@ -164,11 +164,18 @@ impl Keymaps {
                 move_or_extend(Movement::LineEnd, Direction::Forward),
             ),
         ];
-        // 文書先頭/末尾（prefix g: g g = 先頭, G = 末尾）
+        // 文書先頭/末尾（prefix g: g g = 先頭, g e = 末尾 = Helix の last_line、
+        // G = 末尾 = vim 流の文末）。Select では daemon 側が Extend 扱いする。
         out.push((
             vec![plain(KeyCode::Char('g')), plain(KeyCode::Char('g'))],
             Command::Goto {
                 target: GotoTarget::DocumentStart,
+            },
+        ));
+        out.push((
+            vec![plain(KeyCode::Char('g')), plain(KeyCode::Char('e'))],
+            Command::Goto {
+                target: GotoTarget::DocumentEnd,
             },
         ));
         out.push((
@@ -177,12 +184,21 @@ impl Keymaps {
                 target: GotoTarget::DocumentEnd,
             },
         ));
-        // ページスクロール（ページ単位、高さは daemon 側が把握）。C-u/C-d は
-        // 従来どおり1ページ（Helix は半ページだが Scroll は整数ページ単位のため
-        // 差異を許容する — ponytail: 半ページが必要になったら page を分数化）。
+        // g リーダーの行内 goto（Helix の g h / g l / g s）: Normal は Move、
+        // Select は Extend（Select の移動系は全て Extend になる方針）
+        for (key, movement) in [
+            (KeyCode::Char('h'), Movement::LineStart),
+            (KeyCode::Char('l'), Movement::LineEnd),
+            (KeyCode::Char('s'), Movement::FirstNonWhitespace),
+        ] {
+            out.push((
+                vec![plain(KeyCode::Char('g')), plain(key)],
+                move_or_extend(movement, Direction::Forward),
+            ));
+        }
+        // ページスクロール（ページ単位、高さは daemon 側が把握）。C-f/C-b/
+        // PgDn/PgUp は1ページ。C-d/C-u は半ページ（Helix と同じ — ScrollHalf）。
         for (key, pages) in [
-            (ctrl('d'), 1),
-            (ctrl('u'), -1),
             (ctrl('f'), 1),
             (ctrl('b'), -1),
             (plain(KeyCode::PageDown), 1),
@@ -190,6 +206,36 @@ impl Keymaps {
         ] {
             out.push((vec![key], Command::Scroll { pages }));
         }
+        out.push((
+            vec![ctrl('d')],
+            Command::ScrollHalf {
+                direction: Direction::Forward,
+            },
+        ));
+        out.push((
+            vec![ctrl('u')],
+            Command::ScrollHalf {
+                direction: Direction::Backward,
+            },
+        ));
+        // 検索ナビゲーション（Helix の n/N/*）。`/`/`?` はクライアント側で
+        // プロンプトを開くためキーマップにはない。
+        out.push((
+            vec![plain(KeyCode::Char('n'))],
+            Command::SearchNext {
+                direction: Direction::Forward,
+            },
+        ));
+        out.push((
+            vec![plain(KeyCode::Char('N'))],
+            Command::SearchNext {
+                direction: Direction::Backward,
+            },
+        ));
+        out.push((
+            vec![plain(KeyCode::Char('*'))],
+            Command::SearchSelection,
+        ));
         out
     }
 
@@ -215,13 +261,22 @@ impl Keymaps {
             &[plain(KeyCode::Char('i'))],
             Command::SetMode { mode: Mode::Insert },
         );
-        // Normal: 編集。x はカーソル行を選択（Helix 流）、d は選択削除・
-        // c は削除+Insert（Helix 流）。Backspace は1文字削除（vim 流）。
+        // Normal: 編集。x は選択を1行下へ拡張（Helix の x）、X はカーソル行全体を
+        // 選択（Helix の X = extend_to_line_bounds）。d は選択削除・c は削除+Insert。
+        // Backspace は1文字削除（vim 流）。
         // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
-        normal.insert(&[plain(KeyCode::Char('x'))], Command::SelectLine);
+        normal.insert(&[plain(KeyCode::Char('x'))], Command::ExtendLineBelow);
+        normal.insert(&[plain(KeyCode::Char('X'))], Command::SelectLine);
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         normal.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         normal.insert(&[plain(KeyCode::Char('c'))], Command::Change);
+        // a/o/O: append・行の下/上に空行を開いて Insert（Helix の a/o/O）。
+        // r はクライアント側で単一文字の置換プロンプトを開く（キーマップにはない）。
+        normal.insert(&[plain(KeyCode::Char('a'))], Command::Append);
+        normal.insert(&[plain(KeyCode::Char('o'))], Command::OpenBelow);
+        normal.insert(&[plain(KeyCode::Char('O'))], Command::OpenAbove);
+        // %: 文書全体を選択（Helix の select_all）
+        normal.insert(&[plain(KeyCode::Char('%'))], Command::SelectAll);
         // A/I: 行末/行頭（最初の非空白）へ移動して Insert（Helix の A/I。ADR-0023）
         normal.insert(&[plain(KeyCode::Char('A'))], Command::InsertAtLineEnd);
         normal.insert(&[plain(KeyCode::Char('I'))], Command::InsertAtLineStart);
@@ -243,10 +298,17 @@ impl Keymaps {
             &[plain(KeyCode::Escape)],
             Command::SetMode { mode: Mode::Normal },
         );
-        select.insert(&[plain(KeyCode::Char('x'))], Command::DeleteRange);
+        // Select の x/X は Normal と同じく拡張（Helix の select モードも同様）。
+        // d/c は選択の削除・変更。Backspace は DeleteRange の速記（minae 独自）。
+        select.insert(&[plain(KeyCode::Char('x'))], Command::ExtendLineBelow);
+        select.insert(&[plain(KeyCode::Char('X'))], Command::SelectLine);
         select.insert(&[plain(KeyCode::Backspace)], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
         select.insert(&[plain(KeyCode::Char('c'))], Command::Change);
+        select.insert(&[plain(KeyCode::Char('a'))], Command::Append);
+        select.insert(&[plain(KeyCode::Char('o'))], Command::OpenBelow);
+        select.insert(&[plain(KeyCode::Char('O'))], Command::OpenAbove);
+        select.insert(&[plain(KeyCode::Char('%'))], Command::SelectAll);
         // A/I: Select でも折りたたんで行末/行頭で Insert（ADR-0023）
         select.insert(&[plain(KeyCode::Char('A'))], Command::InsertAtLineEnd);
         select.insert(&[plain(KeyCode::Char('I'))], Command::InsertAtLineStart);
@@ -289,6 +351,21 @@ impl Keymaps {
             movement: Movement::LineEnd,
             direction: Direction::Forward,
         });
+        // 上下・ページスクロールも Insert で使えるようにする（Helix と同じ）。
+        // 上下は移動（モードは変わらない）、PgUp/PgDn はスクロール。
+        insert.insert(&[plain(KeyCode::Up)], Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Backward,
+        });
+        insert.insert(&[plain(KeyCode::Down)], Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        insert.insert(&[plain(KeyCode::PageUp)], Command::Scroll { pages: -1 });
+        insert.insert(&[plain(KeyCode::PageDown)], Command::Scroll { pages: 1 });
+        // C-u / C-k: 行頭/行末まで削除（Helix の Insert モード）
+        insert.insert(&[ctrl('u')], Command::KillToLineStart);
+        insert.insert(&[ctrl('k')], Command::KillToLineEnd);
 
         Self {
             normal,
@@ -459,12 +536,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_scrolls() {
+    fn ctrl_d_scrolls_half_page() {
         let km = Keymaps::new();
         let mut pending = Vec::new();
+        // Helix と同じ: C-d は半ページ下、C-u は半ページ上
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, ctrl('d')),
-            Resolution::Command(Command::Scroll { pages: 1 })
+            Resolution::Command(Command::ScrollHalf {
+                direction: Direction::Forward
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, ctrl('u')),
+            Resolution::Command(Command::ScrollHalf {
+                direction: Direction::Backward
+            })
         ));
     }
 
@@ -528,8 +614,13 @@ mod tests {
     fn edit_bindings() {
         let km = Keymaps::new();
         let mut pending = Vec::new();
+        // Helix 流: Normal の x は行下へ選択拡張、X は行全体選択
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('x')),
+            Resolution::Command(Command::ExtendLineBelow)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('X')),
             Resolution::Command(Command::SelectLine)
         ));
         assert!(matches!(
@@ -541,7 +632,7 @@ mod tests {
             Resolution::Command(Command::Redo)
         ));
         // Helix 流: Normal の d は選択削除（カーソル上では no-op — daemon 側）、
-        // c は削除+Insert
+        // c は削除+Insert、a は append、o/O は行を開く
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('d')),
             Resolution::Command(Command::DeleteRange)
@@ -549,6 +640,39 @@ mod tests {
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('c')),
             Resolution::Command(Command::Change)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('a')),
+            Resolution::Command(Command::Append)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('o')),
+            Resolution::Command(Command::OpenBelow)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('O')),
+            Resolution::Command(Command::OpenAbove)
+        ));
+        // % は全選択、n/N は検索ナビ、* は一致を全選択
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('%')),
+            Resolution::Command(Command::SelectAll)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('n')),
+            Resolution::Command(Command::SearchNext {
+                direction: Direction::Forward
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('N')),
+            Resolution::Command(Command::SearchNext {
+                direction: Direction::Backward
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Normal, &mut pending, k('*')),
+            Resolution::Command(Command::SearchSelection)
         ));
         // 保存は `:` コマンド（:w）に移行したので s は未定義
         assert!(matches!(
@@ -559,10 +683,14 @@ mod tests {
             km.resolve(Mode::Normal, &mut pending, KeyCode::Backspace.into()),
             Resolution::Command(Command::DeleteBackward)
         ));
-        // Select モードでは x / d が範囲削除
+        // Select モードでは x / X も拡張系、d / Backspace が範囲削除
         assert!(matches!(
             km.resolve(Mode::Select, &mut pending, k('x')),
-            Resolution::Command(Command::DeleteRange)
+            Resolution::Command(Command::ExtendLineBelow)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('X')),
+            Resolution::Command(Command::SelectLine)
         ));
         assert!(matches!(
             km.resolve(Mode::Select, &mut pending, k('d')),
@@ -689,6 +817,90 @@ mod tests {
     }
 
     #[test]
+    fn g_leader_line_and_document_gotos() {
+        // Helix の g リーダー: g e = 文末（last_line）、g h/l/s = 行頭/行末/非空白
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        let mut resolve_two = |first: char, second: char| {
+            km.resolve(Mode::Normal, &mut pending, k(first));
+            km.resolve(Mode::Normal, &mut pending, k(second))
+        };
+        assert!(matches!(
+            resolve_two('g', 'e'),
+            Resolution::Command(Command::Goto {
+                target: GotoTarget::DocumentEnd
+            })
+        ));
+        assert!(matches!(
+            resolve_two('g', 'h'),
+            Resolution::Command(Command::Move {
+                movement: Movement::LineStart,
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolve_two('g', 'l'),
+            Resolution::Command(Command::Move {
+                movement: Movement::LineEnd,
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolve_two('g', 's'),
+            Resolution::Command(Command::Move {
+                movement: Movement::FirstNonWhitespace,
+                ..
+            })
+        ));
+        // Select では Extend になる（移動系は全て Extend の方針）
+        km.resolve(Mode::Select, &mut pending, k('g'));
+        assert!(matches!(
+            km.resolve(Mode::Select, &mut pending, k('s')),
+            Resolution::Command(Command::Extend {
+                movement: Movement::FirstNonWhitespace,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn insert_mode_arrows_and_paging() {
+        let km = Keymaps::new();
+        let mut pending = Vec::new();
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::Up.into()),
+            Resolution::Command(Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Backward
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::Down.into()),
+            Resolution::Command(Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward
+            })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::PageUp.into()),
+            Resolution::Command(Command::Scroll { pages: -1 })
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, KeyCode::PageDown.into()),
+            Resolution::Command(Command::Scroll { pages: 1 })
+        ));
+        // C-u / C-k は行頭/行末まで削除
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, ctrl('u')),
+            Resolution::Command(Command::KillToLineStart)
+        ));
+        assert!(matches!(
+            km.resolve(Mode::Insert, &mut pending, ctrl('k')),
+            Resolution::Command(Command::KillToLineEnd)
+        ));
+    }
+
+    #[test]
     fn insert_mode_character_fallback() {
         let km = Keymaps::new();
         let mut pending = Vec::new();
@@ -709,9 +921,10 @@ mod tests {
             km.resolve_with_insert_fallback(Mode::Insert, &mut pending, ctrl_a),
             Resolution::NoMatch
         ));
-        // Normal モードではフォールバックしない
+        // Normal モードではフォールバックしない（a は Append に割り当て済み —
+        // 未割り当てキーで確認）
         assert!(matches!(
-            km.resolve_with_insert_fallback(Mode::Normal, &mut pending, k('a')),
+            km.resolve_with_insert_fallback(Mode::Normal, &mut pending, k('z')),
             Resolution::NoMatch
         ));
     }
