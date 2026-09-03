@@ -23,8 +23,13 @@ serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 libc.workspace = true
-termina.workspace = true
-futures-lite.workspace = true
-unicode-width.workspace = true
 clap.workspace = true
-cliclack.workspace = true
+# TUI のみ（tui feature）: デフォルトビルドには含めない
+termina = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
+unicode-width = { workspace = true, optional = true }
+cliclack = { workspace = true, optional = true }
+
+[features]
+default = []
+tui = ["dep:termina", "dep:futures-lite", "dep:unicode-width", "dep:cliclack"]

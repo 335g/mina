@@ -231,6 +231,7 @@ pub const TEMPLATE: &str = "# minae 設定ファイル\n\n\
 # reset_cursor_on_disconnect = true\n";
 
 /// 選択肢として提示できるスキーム名: 組み込み DEFAULT + ユーザーファイル名。
+#[cfg(feature = "tui")]
 fn available_schemes() -> Vec<String> {
     let mut names = vec!["DEFAULT".to_string()];
     if let Ok(entries) = std::fs::read_dir(schemes_dir()) {
@@ -246,6 +247,8 @@ fn available_schemes() -> Vec<String> {
 }
 
 /// 対話編集: キーを select → 値を select / カスタム入力 → 書き込み。
+/// 対話 UI は cliclack 依存のため `tui` feature ビルド限定。
+#[cfg(feature = "tui")]
 async fn edit() -> io::Result<()> {
     use cliclack::{input, outro, outro_cancel, select};
 
@@ -339,6 +342,14 @@ async fn edit() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "tui"))]
+async fn edit() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "対話編集（config edit）は --features tui でビルドした minae が必要です",
+    ))
+}
+
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.into())
 }
@@ -359,6 +370,7 @@ pub fn config_dir() -> std::path::PathBuf {
 }
 
 /// ユーザー Colorscheme ファイルのディレクトリ（`*.toml` をフラットに置く）。
+#[cfg(feature = "tui")]
 pub fn schemes_dir() -> std::path::PathBuf {
     config_dir().join("colorschemes")
 }
@@ -452,6 +464,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tui")]
     fn available_schemes_always_include_default() {
         // ユーザーファイルが無い環境でも DEFAULT は必ず選択肢に載る
         let names = available_schemes();

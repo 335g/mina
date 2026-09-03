@@ -4,20 +4,30 @@
 //! - `minae daemon serve` — 常駐デーモン（クライアントから自動起動されることもある）
 //! - `minae session <get|exec|edit|apply|wait|hints|peek|rename|references|outline|at>` — agent 用ヘッドレス CLI
 //! - `minae config <show|path|edit|set|get|init>` — ユーザー設定の確認・編集
-//! - `minae open [file]` — ファイル編集 TUI（省略時は新規バッファ）
+//! - `minae open [file]` — ファイル編集 TUI（`tui` feature を付けてビルドした場合のみ）
+//!
+//! デフォルトビルド（`cargo install minae`）はエージェント用（daemon + session + skill）で
+//! TUI を含まない。TUI を使うには `cargo install minae --features tui`（ADR-0033）。
 
+#[cfg(feature = "tui")]
 mod client;
+#[cfg(feature = "tui")]
 mod colorscheme;
 mod config;
+mod conn;
 mod daemon;
+#[cfg(feature = "tui")]
 mod keymap;
 mod languages;
 mod lsp;
+#[cfg(feature = "tui")]
 mod render;
 mod session;
 mod skill;
 
+#[cfg(feature = "tui")]
 use std::io;
+#[cfg(feature = "tui")]
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -51,7 +61,8 @@ enum Command {
         /// Topic to print (omit for the index)
         topic: Option<String>,
     },
-    /// Open the file-editing TUI
+    /// Open the file-editing TUI (built with --features tui)
+    #[cfg(feature = "tui")]
     Open {
         /// File to open (empty buffer when omitted)
         path: Option<PathBuf>,
@@ -80,6 +91,7 @@ async fn run() -> std::io::Result<()> {
         Command::Session { cmd } => session::run(cmd).await,
         Command::Config { cmd } => config::run(cmd).await,
         Command::Skill { topic } => skill::run(topic),
+        #[cfg(feature = "tui")]
         Command::Open { path } => {
             let path = path
                 .map(|p| p.into_os_string().into_string())
