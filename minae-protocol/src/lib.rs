@@ -28,7 +28,11 @@ use serde::{Deserialize, Serialize};
 /// コンパクト診断返却の3コマンドを追加。追加のみで後方互換だが、古い daemon に
 /// 新コマンドを送っても動作しないため version を上げる。
 /// v10: `Command::SelectLine`（Normal の `x` を Helix 流のカーソル行選択へ）。
-pub const PROTOCOL_VERSION: u32 = 10;
+/// v11: Helix キーマップ対応 — 検索（`Search`/`SearchNext`/`SearchSelection`）、
+/// `SelectAll`（`%`）、挿入補完（`Append`/`OpenBelow`/`OpenAbove` = `a`/`o`/`O`）、
+/// `Replace`（`r`）、`ExtendLineBelow`（`x`）、`ScrollHalf`（C-d/C-u 半ページ）、
+/// `Movement::FirstNonWhitespace`（`g s`）。追加のみだが wire を広げるため version を上げる。
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// 編集モード（wire 型。minae-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,9 +82,46 @@ pub enum Command {
     DeleteWordForward,
     /// 選択（またはカーソル位置）を削除する。
     DeleteRange,
-    /// 各 Range を head の行全体（末尾改行を含む）へ広げる（Helix の `x`。
-    /// 行選択）。Select モードへの移行はしない。
+    /// 各 Range を head の行全体（末尾改行を含む）へ広げる（Helix の `X` =
+    /// `extend_to_line_bounds`。行選択）。Select モードへの移行はしない。
     SelectLine,
+    /// 各 Range を行選択の形へ整えてから、その下の行の末尾（末尾改行含む）
+    /// まで head を拡張する（Helix の `x` = `extend_line_below`。連打で
+    /// 選択に行が追加される）。
+    ExtendLineBelow,
+    /// 選択全体を文書全体（0..len）の1 Range へ置き換える（Helix の `%` =
+    /// `select_all`）。
+    SelectAll,
+    /// ヘッドを1書記素前へ進めて Insert モードへ入る（Helix の `a` =
+    /// `append_mode`）。選択がある場合は選択の直後に挿入する。
+    Append,
+    /// ヘッドの行の下に空行を開いて Insert モードへ入る（Helix の `o`）。
+    OpenBelow,
+    /// ヘッドの行の上に空行を開いて Insert モードへ入る（Helix の `O`）。
+    OpenAbove,
+    /// 選択（カーソルの場合はその位置の1文字）を指定テキストで置換し、
+    /// Normal モードのまま置換後テキストの直後にカーソルを置く（Helix の `r`）。
+    Replace { text: String },
+    /// `query` をカーソル位置から検索し、一致を選択する（Helix の `/` `?`）。
+    /// 見つからなければ文書端を越えて折り返す。検索クエリと結果位置は
+    /// daemon に保持され、後の [`Command::SearchNext`] が前進/後退する。
+    /// クエリが前回と同一の場合は再検索（カーソル位置から）。
+    Search { query: String, direction: Direction },
+    /// 前回の検索（[`Command::Search`]）の結果から1つ進める（Helix の `n`/`N`）。
+    /// 検索履歴が無ければ no-op（status で報告）。
+    SearchNext { direction: Direction },
+    /// 選択テキスト（カーソルの場合はその位置の単語）の全一致を複数カーソル
+    /// として選択する（Helix の `*` = `search_selection`）。一致が無ければ no-op。
+    SearchSelection,
+    /// 表示範囲を半分ページ（viewport 高さの半分）スクロールする（Helix の
+    /// C-d/C-u = `page_cursor_half_down/up`）。カーソルも同じだけ動かす。
+    ScrollHalf { direction: Direction },
+    /// カーソル位置から行頭まで削除する（Helix の Insert モード C-u =
+    /// `kill_to_line_start`）。
+    KillToLineStart,
+    /// カーソル位置から行末まで削除する（Helix の Insert モード C-k =
+    /// `kill_to_line_end`）。
+    KillToLineEnd,
     /// 選択（またはカーソル位置）を削除して Insert モードへ入る（Helix の `c`）。
     /// カーソル上では削除なしで Insert モードに入るだけ。削除は undo グループの外。
     Change,
@@ -187,6 +228,8 @@ pub enum Movement {
     LineStart,
     /// 行末（改行の直前）。
     LineEnd,
+    /// 行の最初の非空白文字（空白のみの行は列 0）。`g s`。
+    FirstNonWhitespace,
 }
 
 /// 移動方向（wire 型）。
