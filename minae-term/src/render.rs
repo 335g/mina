@@ -97,14 +97,14 @@ pub fn render_text(
     no_color: bool,
     state: &StateSnapshot,
     pending: &[KeyEvent],
-    command_line: Option<&str>,
+    prompt: Option<(char, &str)>,
     flash: Option<&str>,
     width: u16,
     height: u16,
 ) -> String {
     let mut cache = LineIndexCache::default();
     render_text_with_cache(
-        scheme, capability, no_color, state, pending, command_line, flash, width, height, &mut cache,
+        scheme, capability, no_color, state, pending, prompt, flash, width, height, &mut cache,
     )
 }
 
@@ -117,7 +117,7 @@ pub(crate) fn render_text_with_cache(
     no_color: bool,
     state: &StateSnapshot,
     pending: &[KeyEvent],
-    command_line: Option<&str>,
+    prompt: Option<(char, &str)>,
     flash: Option<&str>,
     width: u16,
     height: u16,
@@ -209,7 +209,7 @@ pub(crate) fn render_text_with_cache(
         no_color,
         state,
         pending,
-        command_line,
+        prompt,
         flash,
         width,
         cursor_row,
@@ -264,7 +264,7 @@ pub(crate) fn draw_with_cache(
     no_color: bool,
     state: &StateSnapshot,
     pending: &[KeyEvent],
-    command_line: Option<&str>,
+    prompt: Option<(char, &str)>,
     flash: Option<&str>,
     width: u16,
     height: u16,
@@ -277,7 +277,7 @@ pub(crate) fn draw_with_cache(
             no_color,
             state,
             pending,
-            command_line,
+            prompt,
             flash,
             width,
             height,
@@ -399,6 +399,50 @@ pub(crate) fn draw_peek_popup(
     );
     lines.push("(any key closes)".to_string());
     // 最下の余白行: ポップアップ下端が画面端に張り付かないよう縦方向に余白を取る
+    lines.push(String::new());
+    let mut s = String::new();
+    push_popup_box(
+        &mut s,
+        &lines,
+        width as usize,
+        height.saturating_sub(1) as usize,
+        scheme,
+        capability,
+        no_color,
+    );
+    out.write_all(s.as_bytes())
+}
+
+/// 参照一覧ポップアップ（`Space h`）。参照位置は表示上限付きで中央ポップアップに
+/// 出す（行番号は 1 始まり — `ReferenceLocation.line` は 0-origin）。
+pub(crate) fn draw_refs_popup(
+    out: &mut impl Write,
+    scheme: &Colorscheme,
+    capability: ColorCapability,
+    no_color: bool,
+    path: &str,
+    total: usize,
+    locations: &[minae_protocol::ReferenceLocation],
+    width: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    let mut lines = vec![format!("references: {}", sanitize_status_data(path))];
+    lines.push(String::new());
+    if locations.is_empty() {
+        lines.push("  (no references)".into());
+    } else {
+        for loc in locations {
+            lines.push(format!(
+                "  {}:{}",
+                sanitize_status_data(&loc.path),
+                loc.line + 1
+            ));
+        }
+        if total > locations.len() {
+            lines.push(format!("  … and {} more", total - locations.len()));
+        }
+    }
+    lines.push("(any key closes)".to_string());
     lines.push(String::new());
     let mut s = String::new();
     push_popup_box(
@@ -708,7 +752,7 @@ fn draw_status(
     no_color: bool,
     state: &StateSnapshot,
     pending: &[KeyEvent],
-    command_line: Option<&str>,
+    prompt: Option<(char, &str)>,
     flash: Option<&str>,
     width: usize,
     cursor_row: usize,
@@ -717,10 +761,11 @@ fn draw_status(
     // ステータス文字列は別バッファで組み立ててから切り詰める
     // （出力全体の `s` を truncate すると画面が途中で消える）
     let mut status = String::new();
-    if let Some(buf) = command_line {
-        // コマンドモード: 行全体を反転し `:` + バッファ + カーソルを表示する
+    if let Some((prefix, buf)) = prompt {
+        // プロンプト（`:` / `/` / `?` / `r` / `R`）: 行全体を反転し
+        // プレフィックス + バッファ + カーソルを表示する
         status.push_str(&ui_sgr(scheme, capability, no_color, UiRole::CommandLine));
-        let mut line = String::from(":");
+        let mut line = String::from(prefix);
         line.push_str(&sanitize_status_data(buf));
         // カーソルは常に見えるよう 1 セル空けてから `_` を付ける
         truncate_wide(&mut line, width.saturating_sub(1));
@@ -1736,10 +1781,10 @@ mod tests {
     }
 
     #[test]
-    fn command_line_replaces_status_with_prompt() {
+    fn prompt_replaces_status_with_prompt() {
         // コマンドモード中はステータス行全体が `:` プロンプトに置き換わる
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some("w"), None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some((':', "w")), None, 40, 10);
         assert!(out.contains(":w_"), "`:` + バッファ + カーソル: {out:?}");
         assert!(!out.contains("NORMAL"), "モード表示はプロンプトに置き換わる: {out:?}");
     }
@@ -1751,18 +1796,18 @@ mod tests {
         let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], None, Some("unknown command: foo"), 120, 10);
         assert!(out.contains("unknown command: foo"), "{out:?}");
         // コマンドモード中は flash ではなくプロンプトが優先される
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some("q"), Some("unknown command: foo"), 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some((':', "q")), Some("unknown command: foo"), 40, 10);
         assert!(out.contains(":q_") && !out.contains("unknown"), "{out:?}");
     }
 
     #[test]
-    fn command_line_is_sanitized_and_truncated_with_cursor() {
+    fn prompt_is_sanitized_and_truncated_with_cursor() {
         // SEC-2: コマンドラインの制御文字は � に置換され、生の ESC が流れない
         let state = state_with("hello", vec![Range { anchor: 0, head: 0 }], 0);
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some("\x1b[31m"), None, 40, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some((':', "\x1b[31m")), None, 40, 10);
         assert!(!out.contains("\x1b[31m"), "ESC を生出力しない: {out:?}");
         // 幅5のプロンプト: カーソル `_` は常に 1 セル確保される
-        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some("abcd"), None, 5, 10);
+        let out = render_text(&crate::colorscheme::DEFAULT, ColorCapability::Ansi16, false, &state, &[], Some((':', "abcd")), None, 5, 10);
         assert!(out.contains(":abc_"), "カーソルが残る: {out:?}");
     }
 
