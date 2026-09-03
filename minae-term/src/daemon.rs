@@ -3243,7 +3243,7 @@ async fn normalize_open_path(path: PathBuf) -> PathBuf {
 
 /// 存在しないパス向けの lexical 正規化: 絶対化 + `.` / `..` の解決。
 ///
-/// 送信側（TUI / session CLI）は常に絶対化して送る（[`crate::client::absolutize`]）
+/// 送信側（TUI / session CLI）は常に絶対化して送る（[`crate::conn::absolutize`]）
 /// ため、相対パスが届くのは第三者の生クライアントだけ。その場合の解決基準は
 /// daemon の cwd（spawn 時に固定。ADR-0005）で、従来のディスク読込と同じ解釈。
 fn lexical_normalize(path: &Path) -> PathBuf {
