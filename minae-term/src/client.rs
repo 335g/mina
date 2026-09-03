@@ -15,8 +15,11 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use minae_protocol::{ClientKind, Command, Hello, InlayHint, Mode, Peek, ServerMessage, StateSnapshot};
-use termina::event::{KeyCode, KeyEvent, KeyEventKind};
+use minae_protocol::{
+    ClientKind, Command, Direction, Hello, InlayHint, Mode, Peek, ReferenceLocation,
+    ServerMessage, StateSnapshot,
+};
+use termina::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 use termina::{Event, EventStream, PlatformTerminal, Terminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedWriteHalf};
@@ -46,6 +49,75 @@ const ALT_SCREEN_ON: &str = "\x1b[?1049h";
 const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 const CURSOR_HIDE: &str = "\x1b[?25l";
 const CURSOR_SHOW: &str = "\x1b[?25h";
+
+/// ステータス行に入力バッファを出すプロンプト（Helix 流の `:` / `/` 等）。
+/// クライアントローカル — daemon には確定時だけコマンドを送る（検索は
+/// ライブで送る）。
+#[derive(Debug)]
+enum Prompt {
+    /// `:` コマンドライン。
+    Command(String),
+    /// `/`（forward=true）または `?` の検索プロンプト。キー入力のたびに
+    /// [`Command::Search`] を送る（ライブ検索 — Helix と同じ）。
+    Search { buf: String, forward: bool },
+    /// `r` 置換: 次の文字キーで選択/カーソル文字を置換する。
+    Replace,
+    /// `Space r` リネーム: カーソル位置の単語（`old`）を新しい名前に変える。
+    Rename { buf: String, old: String },
+}
+
+impl Prompt {
+    fn prefix(&self) -> char {
+        match self {
+            Prompt::Command(_) => ':',
+            Prompt::Search { forward, .. } => {
+                if *forward {
+                    '/'
+                } else {
+                    '?'
+                }
+            }
+            Prompt::Replace => 'r',
+            Prompt::Rename { .. } => 'R',
+        }
+    }
+
+    fn buf(&self) -> &str {
+        match self {
+            Prompt::Command(b) | Prompt::Search { buf: b, .. } | Prompt::Rename { buf: b, .. } => b,
+            Prompt::Replace => "",
+        }
+    }
+}
+
+/// カーソル位置の単語（`*` / rename / references の対象）をスナップショットから
+/// 取り出す。非単語文字の上・範囲外なら `None`。
+fn word_at_cursor(state: &StateSnapshot) -> Option<String> {
+    let head = state
+        .selection
+        .get(state.primary_index)
+        .map(|r| r.head)
+        .unwrap_or(0);
+    let doc = minae_core::Document::from(state.text.as_str());
+    let (s, e) = minae_core::word_at(&doc, head)?;
+    let chars: Vec<char> = state.text.chars().collect();
+    Some(chars[s..e].iter().collect())
+}
+
+/// プロンプトを開ける文字キーか（修飾キーなし / Shift のみ）。Insert では
+/// 文字入力なのでプロンプトは開かない。
+fn is_insertable(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && (key.modifiers.is_empty() || key.modifiers == Modifiers::SHIFT)
+}
+
+/// Space リーダーの途中（pending が Space 1つ）か。`Space k` はキーマップが
+/// 解決し、`Space r`/`Space h` はクライアントがリネーム/参照を開く。
+fn is_space_leader(pending: &[KeyEvent]) -> bool {
+    pending.len() == 1
+        && pending[0].code == KeyCode::Char(' ')
+        && pending[0].modifiers.is_empty()
+}
 
 /// TUI 終了時のターミナル復旧ガード（M4）。
 ///
@@ -135,9 +207,9 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
 
     let keymaps = Keymaps::new();
     let mut pending: Vec<KeyEvent> = Vec::new();
-    // コマンドモード（Helix 流の `:` プロンプト）の入力バッファ。
-    // Some の間はキー入力がプロンプト編集になり、ステータス行に `:` が表示される。
-    let mut command_line: Option<String> = None;
+    // プロンプト（`:` コマンド / `/` `?` 検索 / `r` 置換 / `Space r` リネーム）。
+    // Some の間はキー入力がプロンプト編集になり、ステータス行に表示される。
+    let mut prompt: Option<Prompt> = None;
     // クライアント側の一時メッセージ（未知コマンド等）。次のキーで消える。
     let mut flash: Option<String> = None;
     // 定義ポップアップ（Space k / PeekDefinition）の内容。次のキーで消える
@@ -145,6 +217,8 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
     // から移し替える — スナップショット自体には残さない（push との内容比較を
     // 汚さず、`state != state` の再描画判定を壊さないため）。
     let mut peek: Option<Peek> = None;
+    // 参照ポップアップ（Space h / References）の内容。次キーで消える。
+    let mut references: Option<(String, usize, Vec<ReferenceLocation>)> = None;
     // 色能力と NO_COLOR（起動時に 1 回検出 — ADR-0019）。
     let (capability, no_color) = colorscheme::detect_from_env();
     let mut events = EventStream::new(terminal.event_reader(), |_| true);
@@ -158,7 +232,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
         no_color,
         &state,
         &pending,
-        command_line.as_deref(),
+        prompt.as_ref().map(|p| (p.prefix(), p.buf())),
         flash.as_deref(),
         width,
         height,
@@ -190,71 +264,273 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                         // 任意キーで Close（空画面へ戻る）
                         flash = None; // 一時メッセージは次のキーで消える
                         peek = None; // 定義ポップアップも次のキーで消える
+                        references = None; // 参照ポップアップも同じ
                         if state.deleted.is_some() {
-                            command_line = None;
+                            prompt = None;
                             state = session.request(&Command::Close).await?;
-                        } else if let Some(buf) = &mut command_line {
-                            // コマンドモード: 文字はバッファへ、Backspace で1文字削除、
-                            // Enter で実行、Esc / Ctrl-C でキャンセル
+                        } else if let Some(p) = prompt.take() {
+                            // プロンプト編集。Enter/Esc/C-c で確定・キャンセルする。
+                            match p {
+                                Prompt::Replace => {
+                                    // r: 次の文字キーで置換確定。Esc/C-c でキャンセル。
+                                    match key.code {
+                                        KeyCode::Char(c)
+                                            if key.modifiers.is_empty()
+                                                || key.modifiers == Modifiers::SHIFT =>
+                                        {
+                                            state = session
+                                                .request(&Command::Replace {
+                                                    text: c.to_string(),
+                                                })
+                                                .await?;
+                                        }
+                                        KeyCode::Escape => {}
+                                        KeyCode::Char('c')
+                                            if key.modifiers.contains(Modifiers::CONTROL) => {}
+                                        _ => prompt = Some(Prompt::Replace),
+                                    }
+                                }
+                                Prompt::Command(mut buf) => {
+                                    match key.code {
+                                        KeyCode::Char(c)
+                                            if key.modifiers.is_empty()
+                                                || key.modifiers == Modifiers::SHIFT =>
+                                        {
+                                            buf.push(c);
+                                            prompt = Some(Prompt::Command(buf));
+                                        }
+                                        KeyCode::Char('c')
+                                            if key.modifiers.contains(Modifiers::CONTROL) => {}
+                                        KeyCode::Backspace => {
+                                            buf.pop();
+                                            prompt = Some(Prompt::Command(buf));
+                                        }
+                                        KeyCode::Escape => {}
+                                        KeyCode::Enter => {
+                                            let action = parse_command(&buf);
+                                            match action {
+                                                CommandLineAction::Save => {
+                                                    state = session.request(&Command::Save).await?;
+                                                }
+                                                CommandLineAction::Quit => break,
+                                                CommandLineAction::SaveThenQuit => {
+                                                    state = session.request(&Command::Save).await?;
+                                                    // 保存失敗・保存中の追記で dirty が残る場合は
+                                                    // 終了しない（daemon の status が理由を示す）
+                                                    if !state.dirty {
+                                                        break;
+                                                    }
+                                                }
+                                                CommandLineAction::Unknown(cmd) => {
+                                                    flash = Some(format!("unknown command: {cmd}"));
+                                                }
+                                                CommandLineAction::Colorscheme(name) => {
+                                                    if let Some(msg) = apply_colorscheme(
+                                                        &mut scheme,
+                                                        name.as_deref(),
+                                                        &schemes_dir,
+                                                    ) {
+                                                        flash = Some(msg);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => prompt = Some(Prompt::Command(buf)),
+                                    }
+                                }
+                                Prompt::Search { mut buf, forward } => {
+                                    // ライブ検索: キー入力のたびに Search を送る
+                                    let keep = match key.code {
+                                        KeyCode::Char(c)
+                                            if key.modifiers.is_empty()
+                                                || key.modifiers == Modifiers::SHIFT =>
+                                        {
+                                            buf.push(c);
+                                            true
+                                        }
+                                        KeyCode::Char('c')
+                                            if key.modifiers.contains(Modifiers::CONTROL) => false,
+                                        KeyCode::Backspace => {
+                                            buf.pop();
+                                            true
+                                        }
+                                        KeyCode::Escape | KeyCode::Enter => {
+                                            // 確定/キャンセル: 最後のライブ検索が現状
+                                            false
+                                        }
+                                        _ => true,
+                                    };
+                                    if keep {
+                                        if !buf.is_empty() {
+                                            state = session
+                                                .request(&Command::Search {
+                                                    query: buf.clone(),
+                                                    direction: if forward {
+                                                        Direction::Forward
+                                                    } else {
+                                                        Direction::Backward
+                                                    },
+                                                })
+                                                .await?;
+                                        }
+                                        prompt = Some(Prompt::Search { buf, forward });
+                                    }
+                                }
+                                Prompt::Rename { mut buf, old } => {
+                                    match key.code {
+                                        KeyCode::Char(c)
+                                            if key.modifiers.is_empty()
+                                                || key.modifiers == Modifiers::SHIFT =>
+                                        {
+                                            buf.push(c);
+                                            prompt = Some(Prompt::Rename { buf, old });
+                                        }
+                                        KeyCode::Char('c')
+                                            if key.modifiers.contains(Modifiers::CONTROL) => {}
+                                        KeyCode::Backspace => {
+                                            buf.pop();
+                                            prompt = Some(Prompt::Rename { buf, old });
+                                        }
+                                        KeyCode::Escape => {}
+                                        KeyCode::Enter => {
+                                            let new = buf.trim().to_string();
+                                            match state.path.clone() {
+                                                Some(path) if !new.is_empty() => {
+                                                    match session.request_rename(&path, &old, &new).await
+                                                    {
+                                                        Ok(result) => {
+                                                            if let Some(err) = result.error {
+                                                                flash = Some(format!(
+                                                                    "rename failed: {err}"
+                                                                ));
+                                                            } else {
+                                                                flash = Some(format!(
+                                                                    "renamed: {} files, {} edits",
+                                                                    result.files, result.edits
+                                                                ));
+                                                            }
+                                                            // リネームは全文を変える — バッファを最新化
+                                                            state = session
+                                                                .request(&Command::GetState)
+                                                                .await?;
+                                                        }
+                                                        Err(e) => {
+                                                            flash = Some(format!(
+                                                                "rename error: {e}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                Some(_) => {
+                                                    flash = Some("rename: empty name".into())
+                                                }
+                                                None => flash = Some("no file open".into()),
+                                            }
+                                        }
+                                        _ => prompt = Some(Prompt::Rename { buf, old }),
+                                    }
+                                }
+                            }
+                        } else if is_insertable(&key) && state.mode != Mode::Insert {
+                            // プロンプトを開くキー（Normal/Select）。`: ` はコマンド、
+                            // `/` `?` は検索、`r` は置換、Space リーダーの r/h は
+                            // リネーム/参照。Insert ではすべて文字入力（fallback）。
                             match key.code {
-                                KeyCode::Char(c)
-                                    if key.modifiers.is_empty()
-                                        || key.modifiers == termina::event::Modifiers::SHIFT =>
-                                {
-                                    buf.push(c);
+                                KeyCode::Char(':') => {
+                                    pending.clear();
+                                    prompt = Some(Prompt::Command(String::new()));
                                 }
-                                KeyCode::Char('c')
-                                    if key.modifiers
-                                        .contains(termina::event::Modifiers::CONTROL) =>
-                                {
-                                    command_line = None;
+                                KeyCode::Char('/') | KeyCode::Char('?') => {
+                                    pending.clear();
+                                    let forward = key.code == KeyCode::Char('/');
+                                    prompt = Some(Prompt::Search {
+                                        buf: String::new(),
+                                        forward,
+                                    });
                                 }
-                                KeyCode::Backspace => {
-                                    buf.pop();
+                                KeyCode::Char('r') if !is_space_leader(&pending) => {
+                                    pending.clear();
+                                    prompt = Some(Prompt::Replace);
                                 }
-                                KeyCode::Escape => command_line = None,
-                                KeyCode::Enter => {
-                                    let action = parse_command(buf);
-                                    command_line = None;
-                                    match action {
-                                        CommandLineAction::Save => {
-                                            state = session.request(&Command::Save).await?;
+                                KeyCode::Char('r') if is_space_leader(&pending) => {
+                                    // Space r: カーソル位置のシンボルをリネーム
+                                    pending.clear();
+                                    match word_at_cursor(&state) {
+                                        Some(old) => {
+                                            prompt = Some(Prompt::Rename {
+                                                buf: String::new(),
+                                                old,
+                                            })
                                         }
-                                        CommandLineAction::Quit => break,
-                                        CommandLineAction::SaveThenQuit => {
-                                            state = session.request(&Command::Save).await?;
-                                            // 保存失敗・保存中の追記で dirty が残る場合は
-                                            // 終了しない（daemon の status が理由を示す）
-                                            if !state.dirty {
-                                                break;
-                                            }
-                                        }
-                                        CommandLineAction::Unknown(cmd) => {
-                                            flash = Some(format!("unknown command: {cmd}"));
-                                        }
-                                        CommandLineAction::Colorscheme(name) => {
-                                            if let Some(msg) = apply_colorscheme(
-                                                &mut scheme,
-                                                name.as_deref(),
-                                                &schemes_dir,
-                                            ) {
-                                                flash = Some(msg);
-                                            }
+                                        None => {
+                                            flash = Some("no symbol under cursor".into())
                                         }
                                     }
                                 }
-                                _ => {}
+                                KeyCode::Char('h') if is_space_leader(&pending) => {
+                                    // Space h: カーソル位置のシンボルの参照を列挙
+                                    pending.clear();
+                                    match (state.path.clone(), word_at_cursor(&state)) {
+                                        (Some(path), Some(old)) => {
+                                            match session.request_references(&path, &old).await {
+                                                Ok(result) => {
+                                                    if let Some(err) = result.error {
+                                                        flash = Some(format!(
+                                                            "references failed: {err}"
+                                                        ));
+                                                    } else {
+                                                        let mut locs =
+                                                            result.locations.clone();
+                                                        locs.truncate(20);
+                                                        references = Some((
+                                                            result.path.clone(),
+                                                            result.total,
+                                                            locs,
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    flash = Some(format!(
+                                                        "references error: {e}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        (None, _) => flash = Some("no file open".into()),
+                                        (_, None) => {
+                                            flash = Some("no symbol under cursor".into())
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // その他: キーマップに委ねる（Space k の確定等）
+                                    match keymaps.resolve_with_insert_fallback(
+                                        state.mode,
+                                        &mut pending,
+                                        key,
+                                    ) {
+                                        Resolution::Command(command) => {
+                                            let is_peek =
+                                                matches!(&command, Command::PeekDefinition);
+                                            state = session.request(&command).await?;
+                                            // PeekDefinition の応答: ポップアップ内容を
+                                            // ローカルに移す（スナップショットには残さない）
+                                            if let Some(p) = state.peek.take() {
+                                                peek = Some(p);
+                                            } else if is_peek {
+                                                // 定義なし（LSP 非対応・未解析・解決不能など）
+                                                flash = Some("no definition".into());
+                                            }
+                                        }
+                                        _ => {} // pending 変化の描画は共通ループ末尾で行う
+                                    }
+                                }
                             }
-                        } else if key.code == KeyCode::Char(':')
-                            && state.mode != Mode::Insert
-                        {
-                            // `:` でコマンドモードに入る（Insert では `:` は文字入力）
-                            pending.clear();
-                            command_line = Some(String::new());
                         } else {
-                            // 終了: 全モードで Ctrl-C（保存は :w、終了は :q）
+                            // Insert モード（または修飾キー付き）: キーマップで解決
+                            // （未バインドの文字は文字入力にフォールバック）
                             let quit = key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(termina::event::Modifiers::CONTROL);
+                                && key.modifiers.contains(Modifiers::CONTROL);
                             if quit {
                                 break;
                             }
@@ -266,16 +542,13 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                                 Resolution::Command(command) => {
                                     let is_peek = matches!(&command, Command::PeekDefinition);
                                     state = session.request(&command).await?;
-                                    // PeekDefinition の応答: ポップアップ内容を
-                                    // ローカルに移す（スナップショットには残さない）
                                     if let Some(p) = state.peek.take() {
                                         peek = Some(p);
                                     } else if is_peek {
-                                        // 定義なし（LSP 非対応・未解析・解決不能など）
                                         flash = Some("no definition".into());
                                     }
                                 }
-                                _ => {} // pending 変化の描画は共通ループ末尾で行う
+                                _ => {}
                             }
                         }
                         redraw = true;
@@ -321,7 +594,7 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                 no_color,
                 &state,
                 &pending,
-                command_line.as_deref(),
+                prompt.as_ref().map(|p| (p.prefix(), p.buf())),
                 flash.as_deref(),
                 width,
                 height,
@@ -336,6 +609,20 @@ pub async fn run(file: Option<&str>) -> std::io::Result<()> {
                     capability,
                     no_color,
                     p,
+                    width,
+                    height,
+                )?;
+            }
+            // 参照ポップアップ（Space h）
+            if let Some((path, total, locs)) = &references {
+                render::draw_refs_popup(
+                    &mut *terminal,
+                    &scheme,
+                    capability,
+                    no_color,
+                    path,
+                    *total,
+                    locs,
                     width,
                     height,
                 )?;
@@ -598,6 +885,25 @@ struct Session {
     write: OwnedWriteHalf,
     responses: mpsc::UnboundedReceiver<std::io::Result<StateSnapshot>>,
     pushes: mpsc::UnboundedReceiver<StateSnapshot>,
+    /// 軽量応答（RenameResult / ReferencesResult など。スナップショットを運ばない）
+    /// の到着口。要求コマンドを送った側が専用メソッド（`request_rename` 等）で
+    /// 応答を受け取る。read_loop が種別ごとに振り分ける。
+    semantic: mpsc::UnboundedReceiver<ServerMessage>,
+}
+
+/// `Space r` のリネーム結果（クライアント表示用）。
+struct RenameOutcome {
+    files: usize,
+    edits: usize,
+    error: Option<String>,
+}
+
+/// `Space h` の参照結果（クライアント表示用）。
+struct RefsOutcome {
+    path: String,
+    locations: Vec<ReferenceLocation>,
+    total: usize,
+    error: Option<String>,
 }
 
 impl Session {
@@ -613,11 +919,13 @@ impl Session {
         send_hello(&mut write, ClientKind::Interactive, reset_cursor_on_disconnect).await?;
         let (res_tx, responses) = mpsc::unbounded_channel();
         let (push_tx, pushes) = mpsc::unbounded_channel();
-        tokio::spawn(read_loop(read_half, res_tx, push_tx));
+        let (sem_tx, semantic) = mpsc::unbounded_channel();
+        tokio::spawn(read_loop(read_half, res_tx, push_tx, sem_tx));
         Ok(Session {
             write,
             responses,
             pushes,
+            semantic,
         })
     }
 
@@ -631,6 +939,86 @@ impl Session {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "daemon との接続が切れた")
         })?
     }
+
+
+    /// シンボルの意味リネーム（ADR-0029。`Space r`）。応答は軽量な
+    /// [`ServerMessage::RenameResult`]（全文を運ばない）で、`semantic` に届く。
+    /// シンボルの意味リネーム（ADR-0029。`Space r`）。応答は軽量な
+    /// [`ServerMessage::RenameResult`]（全文を運ばない）で、`semantic` に届く。
+    async fn request_rename(
+        &mut self,
+        path: &str,
+        old: &str,
+        new: &str,
+    ) -> std::io::Result<RenameOutcome> {
+        self.send_raw(&Command::Rename {
+            path: path.to_string(),
+            old: old.to_string(),
+            new: new.to_string(),
+        })
+        .await?;
+        match self.recv_semantic().await? {
+            ServerMessage::RenameResult {
+                files, edits, error, ..
+            } => Ok(RenameOutcome {
+                files,
+                edits,
+                error,
+            }),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected response to Rename: {other:?}"),
+            )),
+        }
+    }
+
+    /// シンボルの参照位置の列挙（ADR-0029。`Space h`）。応答は軽量な
+    /// [`ServerMessage::ReferencesResult`]。
+    /// シンボルの参照位置の列挙（ADR-0029。`Space h`）。応答は軽量な
+    /// [`ServerMessage::ReferencesResult`]。
+    async fn request_references(
+        &mut self,
+        path: &str,
+        old: &str,
+    ) -> std::io::Result<RefsOutcome> {
+        self.send_raw(&Command::References {
+            path: path.to_string(),
+            old: old.to_string(),
+        })
+        .await?;
+        match self.recv_semantic().await? {
+            ServerMessage::ReferencesResult {
+                path,
+                locations,
+                total,
+                error,
+            } => Ok(RefsOutcome {
+                path,
+                locations,
+                total,
+                error,
+            }),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected response to References: {other:?}"),
+            )),
+        }
+    }
+
+    /// `semantic` チャネルの次のメッセージを待つ（TUI は同時に1つの軽量応答
+    /// しか要求しないので、順序保証された1件目をそのまま使う）。
+    async fn recv_semantic(&mut self) -> std::io::Result<ServerMessage> {
+        self.semantic.recv().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "daemon との接続が切れた")
+        })
+    }
+
+    async fn send_raw<T: serde::Serialize>(&mut self, message: &T) -> std::io::Result<()> {
+        let mut line = serde_json::to_string(message).expect("メッセージはシリアライズ可能");
+        line.push('\n');
+        self.write.write_all(line.as_bytes()).await?;
+        self.write.flush().await
+    }
 }
 
 /// 接続の読み取り側: NDJSON を [`ServerMessage`] として解釈し、応答と push を
@@ -639,6 +1027,7 @@ async fn read_loop(
     read_half: tokio::net::unix::OwnedReadHalf,
     res_tx: mpsc::UnboundedSender<std::io::Result<StateSnapshot>>,
     push_tx: mpsc::UnboundedSender<StateSnapshot>,
+    sem_tx: mpsc::UnboundedSender<ServerMessage>,
 ) {
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -663,13 +1052,20 @@ async fn read_loop(
                     return;
                 }
             }
+            // ADR-0029: Rename / References の応答はスナップショットでなく軽量な
+            // RenameResult / ReferencesResult。TUI の Space r / Space h 用に
+            // semantic チャネルへ振り分ける（応答は要求元のこの接続にだけ返る）。
+            Ok(msg @ ServerMessage::RenameResult { .. })
+            | Ok(msg @ ServerMessage::ReferencesResult { .. }) => {
+                if sem_tx.send(msg).is_err() {
+                    return;
+                }
+            }
             // TUI は GetInlayHints / PeekDefinitionAt / GetServerInfo を送らない
             // （エージェント専用経路）。万一届いても応答は無視する。
             Ok(ServerMessage::Hints { .. })
             | Ok(ServerMessage::Peek { .. })
             | Ok(ServerMessage::ServerInfo { .. })
-            | Ok(ServerMessage::RenameResult { .. })
-            | Ok(ServerMessage::ReferencesResult { .. })
             | Ok(ServerMessage::Outline { .. })
             | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
@@ -726,6 +1122,29 @@ pub(crate) async fn ensure_daemon(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minae_protocol::Range;
+
+    #[test]
+    fn word_at_cursor_extracts_identifier_at_selection_head() {
+        // `Space r` / `Space h` / `*` の対象（カーソル位置の単語）を取り出す
+        let mut state = StateSnapshot {
+            text: "let value = 42;\n".into(),
+            selection: vec![Range { anchor: 6, head: 6 }],
+            ..Default::default()
+        };
+        assert_eq!(word_at_cursor(&state).as_deref(), Some("value"));
+        // primary でない range は無視（primary_index の range を使う）
+        state.selection = vec![Range { anchor: 0, head: 0 }, Range { anchor: 6, head: 6 }];
+        state.primary_index = 1;
+        assert_eq!(word_at_cursor(&state).as_deref(), Some("value"));
+        // 空白の上は None（"let " の末尾 3 は空白）
+        state.selection = vec![Range { anchor: 3, head: 3 }];
+        state.primary_index = 0;
+        assert_eq!(word_at_cursor(&state), None);
+        // 範囲外も None
+        state.selection = vec![Range { anchor: 999, head: 999 }];
+        assert_eq!(word_at_cursor(&state), None);
+    }
 
     #[test]
     fn absolutize_keeps_absolute_path() {
