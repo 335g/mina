@@ -13,8 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use minae_core::{
-    Range as CoreRange, Selection, Transaction, extend_selection, insert_at, move_selection,
-    move_selection_lines, move_selection_to_line_first_non_whitespace, select_line_selection,
+    Range as CoreRange, Selection, Transaction, append_selection, extend_line_below, extend_selection,
+    extend_to, find_matches, find_next, find_prev, insert_at, line_end_of, line_start_of,
+    move_selection, move_selection_lines, move_selection_to_line_first_non_whitespace,
+    replace_targets, select_line_selection, word_at,
 };
 use minae_protocol::{
     Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, DocumentEdit,
@@ -122,6 +124,9 @@ pub struct Daemon {
     /// 閉じモードを戻し、非所有者の書き込みは後勝ちで奪取する（preempt）。
     /// 不変条件: mode == Insert ⟺ insert_owner == Some(_)。
     pub(crate) insert_owner: Option<u64>,
+    /// 最後の検索（`Search` / `SearchNext` 用）。`n`/`N` はここから1つずつ進める。
+    /// 検索はカーソル位置の移動と選択だけを変え、文書・世代・push には関与しない。
+    last_search: Option<SearchState>,
     /// 接続中の Interactive クライアントの conn_id（ADR-0027）。
     ///
     /// 最後の Interactive の切断判定に使う。リセットの要不要は切断した
@@ -399,6 +404,7 @@ impl Daemon {
             languages_mtime: languages_file_mtime(),
             diagnostics: Vec::new(),
             insert_owner: None,
+            last_search: None,
             interactive_clients: HashSet::new(),
             generation: 0,
             events: VecDeque::new(),
@@ -2672,6 +2678,14 @@ async fn sync_after_edit(
     }
 }
 
+/// 検索の継続状態（[`Command::Search`] の結果。`n`/`N` の前進元）。
+#[derive(Clone)]
+struct SearchState {
+    query: String,
+    /// 最後に見つけた一致の char 範囲（start..end）。
+    found: (usize, usize),
+}
+
 /// コマンド行1件を処理して応答スナップショットを返す（ADR-0013 で
 /// handle_connection から切り出し。I/O コマンドはロックを握ったまま
 /// ブロックしないよう接続ハンドラ側で async 実行する）。
@@ -3036,11 +3050,17 @@ async fn process_command(
                     Command::Insert { text } => {
                         Some((EventKind::Insert, None, Some(text.clone())))
                     }
+                    // o/O は空行（改行）の挿入として記録する
+                    Command::OpenBelow | Command::OpenAbove => {
+                        Some((EventKind::Insert, None, Some("\n".into())))
+                    }
                     Command::DeleteBackward
                     | Command::DeleteForward
                     | Command::DeleteWordBackward
                     | Command::DeleteWordForward
-                    | Command::DeleteRange => {
+                    | Command::DeleteRange
+                    | Command::KillToLineStart
+                    | Command::KillToLineEnd => {
                         // 削除範囲 = 適用前の選択（primary）
                         let r = d.editor.selection().primary();
                         Some((
@@ -3050,6 +3070,18 @@ async fn process_command(
                                 head: r.end(),
                             }),
                             None,
+                        ))
+                    }
+                    Command::Replace { text } => {
+                        // 置換範囲 = 適用前の選択（primary）
+                        let r = d.editor.selection().primary();
+                        Some((
+                            EventKind::ReplaceRange,
+                            Some(Range {
+                                anchor: r.start(),
+                                head: r.end(),
+                            }),
+                            Some(text.clone()),
                         ))
                     }
                     Command::Change => {
@@ -3068,9 +3100,10 @@ async fn process_command(
                             ))
                         }
                     }
-                    // A/I はテキストを変えない — モードが実際に変わる場合だけ
-                    // SetMode イベント（選択移動は Move 同様スナップショットに載る）
-                    Command::InsertAtLineEnd | Command::InsertAtLineStart
+                    // A/I/a はテキストを変えず、モードが実際に変わる場合だけ
+                    // SetMode イベント（選択移動は Move 同様スナップショットに載る）。
+                    // o/O は上で Insert イベント（改行）として記録済み。
+                    Command::InsertAtLineEnd | Command::InsertAtLineStart | Command::Append
                         if d.editor.mode() != minae_view::Mode::Insert =>
                     {
                         Some((EventKind::SetMode, None, None))
@@ -3176,6 +3209,11 @@ fn is_edit(command: &Command) -> bool {
             | Command::DeleteWordForward
             | Command::DeleteRange
             | Command::Change
+            | Command::OpenBelow
+            | Command::OpenAbove
+            | Command::Replace { .. }
+            | Command::KillToLineStart
+            | Command::KillToLineEnd
             | Command::Undo
             | Command::Redo
     )
@@ -3415,12 +3453,16 @@ fn preempt(daemon: &mut Daemon, conn_id: u64) {
     }
 }
 
-/// A/I（`InsertAtLineEnd` / `InsertAtLineStart`）の移動先。
+/// A/I（`InsertAtLineEnd` / `InsertAtLineStart`）の移動先と `o`/`O`（空行を開く）の向き。
 enum LinePos {
     /// 行末（改行の直前）。
     End,
     /// 最初の非空白文字（空白のみの行は列 0）。
     FirstNonWhitespace,
+    /// 現在の行の下（`o`）。
+    Below,
+    /// 現在の行の上（`O`）。
+    Above,
 }
 
 /// Insert モードへ入る（ADR-0007 のグループ管理込み）。SetMode(Insert) と
@@ -3456,6 +3498,8 @@ fn insert_at_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateS
         LinePos::FirstNonWhitespace => {
             move_selection_to_line_first_non_whitespace(daemon.editor.current_document(), &selection)
         }
+        // o/O は open_line 側で処理する（ここには来ない）
+        LinePos::Below | LinePos::Above => unreachable!(),
     };
     daemon.editor.set_selection(moved);
     // 既に Insert ならモードは変わらない（changed = false → 世代もイベントも
@@ -3464,6 +3508,177 @@ fn insert_at_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateS
     enter_insert(daemon, conn_id);
     daemon.editor.scroll_to_cursor(daemon.viewport_height);
     (snapshot(daemon, None), changed)
+}
+
+/// `o`/`O` 共通処理: ヘッド行の下/上に空行を開いて Insert モードへ入る
+/// （Helix の open_below / open_above）。改行の挿入は undo グループの外（`Change`
+/// と同じ — undo 1回で空行だけが戻り、以後のタイプが新グループになる）。
+fn open_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateSnapshot, bool) {
+    let doc = daemon.editor.current_document();
+    let selection = daemon.editor.selection();
+    let (insert_at, after) = match target {
+        LinePos::Below => (
+            move_selection(
+                doc,
+                &selection,
+                minae_core::Movement::LineEnd,
+                minae_core::Direction::Forward,
+            ),
+            true, // 改行を挟んだ先（新しい行の先頭）に立つ
+        ),
+        LinePos::Above => (
+            move_selection(
+                doc,
+                &selection,
+                minae_core::Movement::LineStart,
+                minae_core::Direction::Forward,
+            ),
+            false, // 改行の手前（新しい空行の先頭）に立つ
+        ),
+        // A/I は insert_at_line 側で処理する（ここには来ない）
+        LinePos::End | LinePos::FirstNonWhitespace => unreachable!(),
+    };
+    let tx = Transaction::insert(doc, &insert_at, "\n");
+    let changed = !tx.is_noop();
+    let selection_after = tx.map_selection(&insert_at, after);
+    daemon.editor.apply(tx, selection_after);
+    let mode_changed = daemon.editor.mode() != minae_view::Mode::Insert;
+    enter_insert(daemon, conn_id);
+    daemon.editor.scroll_to_cursor(daemon.viewport_height);
+    (snapshot(daemon, None), changed || mode_changed)
+}
+
+/// [`Command::Search`] の適用: クエリを保存し、カーソル位置から（一致が
+/// なければ文書端を越えて折り返して）最初の一致を選択する。大小文字は
+/// smart-case（クエリに大文字が含まれれば区別）。一致が無ければ状態は変えず
+/// status で報告する。
+fn search_with(
+    daemon: &mut Daemon,
+    query: &str,
+    direction: minae_protocol::Direction,
+) -> (bool, Option<String>) {
+    if query.is_empty() {
+        return (false, Some("empty search".into()));
+    }
+    let doc = daemon.editor.current_document();
+    let head = daemon.editor.selection().primary().head();
+    let len = doc.len_chars();
+    let case = minae_core::CaseSensitivity::Smart;
+    let found = match direction {
+        minae_protocol::Direction::Forward => find_next(doc, query, head, case)
+            .or_else(|| find_next(doc, query, 0, case)),
+        minae_protocol::Direction::Backward => find_prev(doc, query, head, case)
+            .or_else(|| find_prev(doc, query, len, case)),
+    };
+    match found {
+        Some(r) => {
+            daemon.last_search = Some(SearchState {
+                query: query.to_string(),
+                found: (r.start(), r.end()),
+            });
+            daemon.editor.set_selection(minae_core::Selection::new(
+                vec![CoreRange::new(r.start(), r.end())],
+                0,
+            ));
+            (true, None)
+        }
+        None => {
+            daemon.last_search = None;
+            (false, Some(format!("no match: {query}")))
+        }
+    }
+}
+
+/// [`Command::SearchNext`] の適用: 保存済みの検索結果から1つ進める（`n`/`N`）。
+/// 文書端を越えたら折り返す。検索履歴が無い・これ以上一致が無い場合は no-op
+/// で status を載せる。
+fn search_next(
+    daemon: &mut Daemon,
+    direction: minae_protocol::Direction,
+) -> (bool, Option<String>) {
+    let Some(state) = daemon.last_search.clone() else {
+        return (false, Some("no previous search".into()));
+    };
+    let doc = daemon.editor.current_document();
+    let len = doc.len_chars();
+    let case = minae_core::CaseSensitivity::Smart;
+    let (s, e) = state.found;
+    let found = match direction {
+        minae_protocol::Direction::Forward => {
+            // 現在の一致の直後から。無ければ先頭から折り返し（現在位置と同じ
+            // 一致に戻るのは避ける）
+            find_next(doc, &state.query, e, case).or_else(|| {
+                find_next(doc, &state.query, 0, case)
+                    .filter(|r| r.start() != s || r.end() != e)
+            })
+        }
+        minae_protocol::Direction::Backward => {
+            // 現在の一致の手前から（現在の一致自身は除外。無ければ末尾から
+            // 折り返し — それも現在位置と同じ一致なら進めない）
+            find_prev(doc, &state.query, s.saturating_sub(1), case)
+                .filter(|r| r.start() != s || r.end() != e)
+                .or_else(|| {
+                    find_prev(doc, &state.query, len, case)
+                        .filter(|r| r.start() != s || r.end() != e)
+                })
+        }
+    };
+    match found {
+        Some(r) => {
+            daemon.last_search = Some(SearchState {
+                query: state.query,
+                found: (r.start(), r.end()),
+            });
+            daemon.editor.set_selection(minae_core::Selection::new(
+                vec![CoreRange::new(r.start(), r.end())],
+                0,
+            ));
+            (true, None)
+        }
+        None => (false, Some(format!("no more matches: {}", state.query))),
+    }
+}
+
+/// [`Command::SearchSelection`] の適用（Helix の `*`）: 選択テキスト
+/// （カーソルならその位置の単語）の全一致を複数カーソルとして選択する。
+/// 検索対象のテキストが取れなければ no-op で status を載せる。
+fn search_selection(daemon: &mut Daemon) -> (bool, Option<String>) {
+    let doc = daemon.editor.current_document();
+    let selection = daemon.editor.selection();
+    // 選択テキスト（カーソルならカーソル位置の単語 — 複数カーソルの場合は
+    // primary のみ。ponytail: 全カーソルの単語を集めるのは必要になってから）
+    let target: String = {
+        let r = selection.primary();
+        if r.is_cursor() {
+            match word_at(doc, r.head()) {
+                Some((s, e)) => doc
+                    .text()
+                    .to_string()
+                    .chars()
+                    .skip(s)
+                    .take(e - s)
+                    .collect(),
+                None => return (false, Some("no word under cursor".into())),
+            }
+        } else {
+            doc.text().to_string().chars().skip(r.start()).take(r.end() - r.start()).collect()
+        }
+    };
+    let query = target.trim();
+    if query.is_empty() {
+        return (false, Some("no selection to search".into()));
+    }
+    match find_matches(doc, query, minae_core::CaseSensitivity::Smart) {
+        Some(matches) => {
+            daemon.last_search = Some(SearchState {
+                query: query.to_string(),
+                found: (matches.primary().start(), matches.primary().end()),
+            });
+            daemon.editor.set_selection(matches);
+            (true, None)
+        }
+        None => (false, Some(format!("no match: {query}"))),
+    }
 }
 
 /// 接続 ID 付きでコマンドを状態に適用する（接続ハンドラから呼ばれる）。
@@ -3695,12 +3910,138 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), false)
         }
+        Command::ExtendLineBelow => {
+            let extended = {
+                let doc = daemon.editor.current_document();
+                let selection = daemon.editor.selection();
+                extend_line_below(doc, &selection)
+            };
+            daemon.editor.set_selection(extended);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), false)
+        }
+        Command::SelectAll => {
+            let len = daemon.editor.current_document().len_chars();
+            daemon.editor
+                .set_selection(minae_core::Selection::new(vec![CoreRange::new(0, len)], 0));
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), false)
+        }
+        Command::Append => {
+            // `a`: 選択の末尾（カーソルは直後の1文字）へ点に潰して Insert モードへ
+            // （Helix の append_mode。InsertAtLineEnd/Start と同じグループ管理）。
+            let moved = append_selection(daemon.editor.current_document(), &daemon.editor.selection());
+            daemon.editor.set_selection(moved);
+            let changed = daemon.editor.mode() != minae_view::Mode::Insert;
+            enter_insert(daemon, conn_id);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::OpenBelow => open_line(daemon, conn_id, LinePos::Below),
+        Command::OpenAbove => open_line(daemon, conn_id, LinePos::Above),
+        Command::Replace { text } => {
+            // `r`: 選択（カーソルはその位置の1文字）を置換し Normal のまま
+            // 置換後テキストの直後にカーソルを置く。1 undo グループ（replace_ranges）。
+            preempt(daemon, conn_id);
+            if text.is_empty() {
+                return (snapshot(daemon, None), false);
+            }
+            let doc = daemon.editor.current_document();
+            let selection = daemon.editor.selection();
+            let edits: Vec<(usize, usize, String)> = replace_targets(doc, &selection)
+                .into_iter()
+                .map(|(start, end)| (start, end, text.clone()))
+                .collect();
+            let tx = Transaction::replace_ranges(doc, &edits);
+            let changed = !tx.is_noop();
+            let selection_after = tx.map_selection(&selection, true);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::KillToLineStart => {
+            preempt(daemon, conn_id);
+            let doc = daemon.editor.current_document();
+            let selection = daemon.editor.selection();
+            let text = doc.text().to_string();
+            let ranges: Vec<CoreRange> = selection
+                .ranges()
+                .iter()
+                .map(|r| CoreRange::new(line_start_of(&text, r.head()), r.end()))
+                .collect();
+            let kill = minae_core::Selection::new(ranges, selection.primary_index());
+            let tx = Transaction::delete(doc, &kill);
+            let changed = !tx.is_noop();
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::KillToLineEnd => {
+            preempt(daemon, conn_id);
+            let doc = daemon.editor.current_document();
+            let selection = daemon.editor.selection();
+            let text = doc.text().to_string();
+            let ranges: Vec<CoreRange> = selection
+                .ranges()
+                .iter()
+                .map(|r| CoreRange::new(r.start(), line_end_of(&text, r.head())))
+                .collect();
+            let kill = minae_core::Selection::new(ranges, selection.primary_index());
+            let tx = Transaction::delete(doc, &kill);
+            let changed = !tx.is_noop();
+            let selection_after = tx.map_selection(&selection, false);
+            daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::Search { query, direction } => {
+            let (changed, status) = search_with(daemon, &query, direction);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, status), changed)
+        }
+        Command::SearchNext { direction } => {
+            let (changed, status) = search_next(daemon, direction);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, status), changed)
+        }
+        Command::SearchSelection => {
+            let (changed, status) = search_selection(daemon);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, status), changed)
+        }
         Command::Goto { target } => {
             let pos = match target {
                 GotoTarget::DocumentStart => 0,
                 GotoTarget::DocumentEnd => daemon.editor.current_document().len_chars(),
             };
-            daemon.editor.set_selection(minae_core::Selection::point(pos));
+            // Select モードでは移動でなく選択の拡張（Helix の select モードは
+            // 移動系キーが extend になる — `gg`/`G` も同様）。Normal では点に潰す。
+            let moved = if daemon.editor.mode() == minae_view::Mode::Select {
+                extend_to(daemon.editor.current_document(), &daemon.editor.selection(), pos)
+            } else {
+                minae_core::Selection::point(pos)
+            };
+            daemon.editor.set_selection(moved);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), false)
+        }
+        Command::ScrollHalf { direction } => {
+            // 半ページ（Helix の C-d/C-u）: 表示とカーソルを viewport 高さの半分だけ
+            // 動かす。Scroll と同様にカーソルも連動させる（読み上げ位置が保たれる）。
+            let delta = (daemon.viewport_height as isize / 2)
+                .saturating_mul(if direction == minae_protocol::Direction::Forward { 1 } else { -1 });
+            if delta != 0 {
+                daemon.editor.scroll_lines(delta);
+                let extend = daemon.editor.mode() == minae_view::Mode::Select;
+                let moved = move_selection_lines(
+                    daemon.editor.current_document(),
+                    &daemon.editor.selection(),
+                    delta,
+                    extend,
+                );
+                daemon.editor.set_selection(moved);
+            }
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), false)
         }
@@ -3839,6 +4180,7 @@ fn convert_movement(m: minae_protocol::Movement) -> minae_core::Movement {
         minae_protocol::Movement::WordEnd => minae_core::Movement::WordEnd,
         minae_protocol::Movement::LineStart => minae_core::Movement::LineStart,
         minae_protocol::Movement::LineEnd => minae_core::Movement::LineEnd,
+        minae_protocol::Movement::FirstNonWhitespace => minae_core::Movement::FirstNonWhitespace,
     }
 }
 
@@ -4957,6 +5299,336 @@ root-markers = [".docsroot"]
         assert_eq!(s.text, "hello");
         assert!(!changed, "拒否は changed=false");
         assert!(!d.editor.can_undo(), "拒否で undo 履歴が増えない");
+    }
+
+    #[test]
+    fn search_forward_selects_match_and_next_advances() {
+        let mut d = daemon();
+        open(&mut d, "foo bar foo baz");
+        // `/foo`: カーソル位置から最初の一致を選択
+        let s = apply(&mut d, Command::Search {
+            query: "foo".into(),
+            direction: Direction::Forward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 3 }]);
+        assert_eq!(s.status, None);
+        // `n`: 次の一致へ
+        let s = apply(&mut d, Command::SearchNext {
+            direction: Direction::Forward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 8, head: 11 }]);
+        // `n`: 折り返して先頭へ（現在位置と同じ一致には戻らない）
+        let s = apply(&mut d, Command::SearchNext {
+            direction: Direction::Forward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 3 }]);
+    }
+
+    #[test]
+    fn search_backward_and_wrap_via_question() {
+        let mut d = daemon();
+        open(&mut d, "foo bar foo baz");
+        // 文末へ移動してから `?foo`: 直前の一致へ
+        apply(&mut d, Command::Goto {
+            target: GotoTarget::DocumentEnd,
+        });
+        let s = apply(&mut d, Command::Search {
+            query: "foo".into(),
+            direction: Direction::Backward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 8, head: 11 }], "?foo: 直前の一致");
+        // `N`: 前へ（折り返して末尾の一致へ）
+        let s = apply(&mut d, Command::SearchNext {
+            direction: Direction::Backward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 3 }]);
+        let s = apply(&mut d, Command::SearchNext {
+            direction: Direction::Backward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 8, head: 11 }], "折り返し");
+    }
+
+    #[test]
+    fn search_no_match_reports_status_without_changing_state() {
+        let mut d = daemon();
+        open(&mut d, "hello");
+        let s = apply(&mut d, Command::Search {
+            query: "xyz".into(),
+            direction: Direction::Forward,
+        });
+        assert!(s.status.as_deref().unwrap().contains("no match"));
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 0 }], "選択は変わらない");
+        // 検索履歴なしの n は status だけ
+        let s = apply(&mut d, Command::SearchNext {
+            direction: Direction::Forward,
+        });
+        assert!(s.status.as_deref().unwrap().contains("no previous search"));
+        // 空クエリは no-op
+        let s = apply(&mut d, Command::Search {
+            query: "".into(),
+            direction: Direction::Forward,
+        });
+        assert!(s.status.as_deref().unwrap().contains("empty search"));
+    }
+
+    #[test]
+    fn search_selection_selects_all_word_matches() {
+        let mut d = daemon();
+        open(&mut d, "foo bar foo baz foo");
+        // `*`: カーソル位置の単語の全一致を複数カーソル選択
+        apply(&mut d, Command::Move {
+            movement: Movement::Word,
+            direction: Direction::Forward,
+        }); // 先頭の foo の末尾へ
+        let s = apply(&mut d, Command::SearchSelection);
+        assert_eq!(
+            s.selection,
+            vec![
+                Range { anchor: 0, head: 3 },
+                Range { anchor: 8, head: 11 },
+                Range { anchor: 16, head: 19 },
+            ]
+        );
+        // 選択があればそのテキストで検索する
+        let mut d2 = daemon();
+        open(&mut d2, "cat dog cat");
+        apply(&mut d2, Command::Move {
+            movement: Movement::Word,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d2, Command::SearchSelection);
+        assert_eq!(s.selection.len(), 2, "cat が2箇所選択される");
+    }
+
+    #[test]
+    fn search_uses_smart_case() {
+        let mut d = daemon();
+        open(&mut d, "Hello hello");
+        let s = apply(&mut d, Command::Search {
+            query: "hello".into(),
+            direction: Direction::Forward,
+        });
+        // 小文字クエリ: 大小区別しない → 先頭の Hello に一致
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 5 }]);
+        let s = apply(&mut d, Command::Search {
+            query: "Hello".into(),
+            direction: Direction::Forward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 5 }]);
+    }
+
+    #[test]
+    fn append_o_and_O_reach_insert_and_edit() {
+        // a: カーソルの1文字後ろで Insert
+        let mut d = daemon();
+        open(&mut d, "hello");
+        let s = apply(&mut d, Command::Append);
+        assert_eq!(s.mode, Mode::Insert);
+        assert_eq!(s.selection, vec![Range { anchor: 1, head: 1 }]);
+        let s = apply(&mut d, Command::Insert { text: "X".into() });
+        assert_eq!(s.text, "hXello");
+
+        // a: 行末では動かない（改行を跨がない）
+        let mut d2 = daemon();
+        open(&mut d2, "abc");
+        apply(&mut d2, Command::Goto {
+            target: GotoTarget::DocumentEnd,
+        });
+        let s = apply(&mut d2, Command::Append);
+        assert_eq!(s.selection, vec![Range { anchor: 3, head: 3 }]);
+
+        // o: 行の下に空行を開いて Insert（undo 1回で空行だけが戻る）
+        let mut d3 = daemon();
+        open(&mut d3, "abc\ndef");
+        let s = apply(&mut d3, Command::OpenBelow);
+        assert_eq!(s.mode, Mode::Insert);
+        assert_eq!(s.text, "abc\n\ndef");
+        assert_eq!(s.selection, vec![Range { anchor: 4, head: 4 }], "新しい行の先頭");
+        apply(&mut d3, Command::Insert { text: "z".into() });
+        assert_eq!(d3.editor.current_document().text().to_string(), "abc\nz\ndef");
+        apply(&mut d3, Command::SetMode { mode: Mode::Normal });
+        // undo 1回: タイプ分（新しい undo グループ）だけが戻る
+        let s = apply(&mut d3, Command::Undo);
+        assert_eq!(s.text, "abc\n\ndef");
+        // undo 2回: 空行の挿入（自身のグループ）が戻る
+        let s = apply(&mut d3, Command::Undo);
+        assert_eq!(s.text, "abc\ndef");
+
+        // O: 行の上に空行を開いて Insert（カーソルは新しい空行）
+        let mut d4 = daemon();
+        open(&mut d4, "abc\ndef");
+        apply(&mut d4, Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d4, Command::OpenAbove);
+        assert_eq!(s.mode, Mode::Insert);
+        assert_eq!(s.text, "abc\n\ndef", "2行目の上に空行");
+        assert_eq!(s.selection, vec![Range { anchor: 4, head: 4 }]);
+    }
+
+    #[test]
+    fn replace_swaps_selection_and_cursor_char() {
+        // 選択の置換（r は複数カーソル対応: replace_ranges）
+        let mut d = daemon();
+        open(&mut d, "hello");
+        apply(&mut d, Command::Extend {
+            movement: Movement::Word,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::Replace { text: "X".into() });
+        assert_eq!(s.text, "X");
+        assert_eq!(s.mode, Mode::Normal, "r は Normal のまま");
+        assert_eq!(s.selection, vec![Range { anchor: 1, head: 1 }], "置換後テキストの直後");
+        // カーソル: その位置の1文字（改行は置換しない — 行末では no-op）
+        let mut d2 = daemon();
+        open(&mut d2, "abc\ndef");
+        apply(&mut d2, Command::Move {
+            movement: Movement::LineEnd,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d2, Command::Replace { text: "Z".into() });
+        assert_eq!(s.text, "abc\ndef", "行末（改行前）では no-op");
+        apply(&mut d2, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Backward,
+        });
+        let s = apply(&mut d2, Command::Replace { text: "Z".into() });
+        assert_eq!(s.text, "abZ\ndef");
+    }
+
+    #[test]
+    fn extend_line_below_repeats_and_select_all() {
+        // x: 現在の行 + 下の行（連打で行が追加される）
+        let mut d = daemon();
+        open(&mut d, "l0\nl1\nl2\nl3");
+        let s = apply(&mut d, Command::ExtendLineBelow); // カーソルは 0 行目先頭
+        assert_eq!(
+            s.selection,
+            vec![Range { anchor: 0, head: 6 }],
+            "l0 + l1（末尾改行含む）"
+        );
+        let s = apply(&mut d, Command::ExtendLineBelow);
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 9 }], "l2 が加わる");
+        // すべて選択（%）
+        let s = apply(&mut d, Command::SelectAll);
+        assert_eq!(
+            s.selection,
+            vec![Range { anchor: 0, head: 11 }],
+            "文書全体"
+        );
+    }
+
+    #[test]
+    fn select_mode_goto_extends_selection() {
+        // Select モードの gg / G は移動でなく選択の拡張（Helix と同じ）
+        let mut d = daemon();
+        open(&mut d, "hello\nworld");
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        apply(&mut d, Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::Goto {
+            target: GotoTarget::DocumentStart,
+        });
+        assert_eq!(
+            s.selection,
+            vec![Range { anchor: 6, head: 0 }],
+            "anchor を保って文書先頭まで拡張"
+        );
+        // Normal では点に潰れる
+        let mut d2 = daemon();
+        open(&mut d2, "hello\nworld");
+        apply(&mut d2, Command::Goto {
+            target: GotoTarget::DocumentStart,
+        });
+        assert_eq!(d2.editor.selection(), Selection::point(0));
+    }
+
+    #[test]
+    fn scroll_half_moves_by_half_viewport() {
+        // 高さ 24 の半分 = 12 行スクロール（カーソルも連動）
+        let mut d = daemon();
+        let text = (0..40).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        open(&mut d, &text);
+        let s = apply(&mut d, Command::ScrollHalf {
+            direction: Direction::Forward,
+        });
+        assert_eq!(s.first_line, 12);
+        // C-u で戻る
+        let s = apply(&mut d, Command::ScrollHalf {
+            direction: Direction::Backward,
+        });
+        assert_eq!(s.first_line, 0);
+    }
+
+    #[test]
+    fn first_non_whitespace_movement_matches_g_s() {
+        let mut d = daemon();
+        open(&mut d, "  hello\n\n\t indented");
+        apply(&mut d, Command::Move {
+            movement: Movement::FirstNonWhitespace,
+            direction: Direction::Forward,
+        });
+        assert_eq!(
+            d.editor.selection(),
+            Selection::point(2),
+            "2行目（空白のみ）は列 0"
+        );
+        // 別の行へ移動してから g s
+        apply(&mut d, Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Line,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::Move {
+            movement: Movement::FirstNonWhitespace,
+            direction: Direction::Forward,
+        });
+        let sel = &s.selection[0];
+        let line_start = 0 + "  hello\n\n".chars().count();
+        assert_eq!(sel.head, line_start + 2, "タブ1文字 + 空白1文字の後");
+        // Select モードでも拡張で使える
+        let mut d2 = daemon();
+        open(&mut d2, "  hi");
+        apply(&mut d2, Command::SetMode { mode: Mode::Select });
+        let s = apply(&mut d2, Command::Extend {
+            movement: Movement::FirstNonWhitespace,
+            direction: Direction::Forward,
+        });
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 2 }]);
+    }
+
+    #[test]
+    fn kill_to_line_bounds_in_insert_mode() {
+        // C-u: 行頭まで削除
+        let mut d = daemon();
+        open(&mut d, "hello");
+        apply(&mut d, Command::Goto {
+            target: GotoTarget::DocumentEnd,
+        });
+        let s = apply(&mut d, Command::KillToLineStart);
+        assert_eq!(s.text, "");
+        // C-k: 行末まで削除
+        let mut d2 = daemon();
+        open(&mut d2, "hello");
+        apply(&mut d2, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d2, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d2, Command::KillToLineEnd);
+        assert_eq!(s.text, "he");
+        // 行末での C-k は no-op
+        let s = apply(&mut d2, Command::KillToLineEnd);
+        assert_eq!(s.text, "he");
     }
 
     #[test]
