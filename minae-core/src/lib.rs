@@ -18,11 +18,12 @@ pub use edit::{
     delete_word_forward_transaction, insert_at, insert_text,
 };
 pub use movement::{
-    Direction, Movement, WordMoveTarget, extend_selection, move_selection,
-    move_selection_lines, move_selection_to_line_first_non_whitespace, select_line_selection,
+    Direction, Movement, WordMoveTarget, append_selection, extend_line_below, extend_selection,
+    extend_to, line_end_of, line_start_of, move_selection, move_selection_lines,
+    move_selection_to_line_first_non_whitespace, replace_targets, select_line_selection, word_at,
     word_move_selection,
 };
 pub use ropey::Rope;
-pub use search::{CaseSensitivity, find_matches, find_next};
+pub use search::{CaseSensitivity, find_matches, find_next, find_prev};
 pub use selection::{Range, Selection};
 pub use transaction::{Operation, Transaction};

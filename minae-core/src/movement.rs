@@ -44,6 +44,8 @@ pub enum Movement {
     LineStart,
     /// 行末（改行の直前）。方向は無視する。
     LineEnd,
+    /// 行の最初の非空白文字（空白のみの行は列 0）。方向は無視する。
+    FirstNonWhitespace,
 }
 
 /// 選択全体を移動する。各 Range は点（カーソル）に潰される。
@@ -143,6 +145,141 @@ pub fn select_line_selection(doc: &Document, selection: &Selection) -> Selection
     Selection::new(ranges, selection.primary_index())
 }
 
+/// 各 Range を「選択の末尾（カーソルならその直後の1文字、行末でクランプ）」へ
+/// 点に潰して返す（Helix の `a` = append の挿入位置）。選択がある場合は選択
+/// の直後（`end`）、カーソルの場合は head の次の書記素境界（改行を跨がない）。
+pub fn append_selection(doc: &Document, selection: &Selection) -> Selection {
+    let text = doc.text().to_string();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| {
+            let mut pos = r.end();
+            if r.is_cursor() {
+                let line_end = step_line_end(&text, pos);
+                pos = next_grapheme_boundary(&text, pos).min(line_end);
+            }
+            Range::point(pos)
+        })
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
+/// 各 Range を「行全体（`X` 相当）+ その下の行」まで head を拡張する
+/// （Helix の `x` = `extend_line_below`。連打で行が追加されていく）。
+/// anchor は Range の先頭（top）側の行頭（列 0）、head は bottom 行の
+/// 1つ下の行の末尾（末尾改行を含む。最終行は文書末尾）に置く。
+pub fn extend_line_below(doc: &Document, selection: &Selection) -> Selection {
+    let text = doc.text().to_string();
+    let len = text.chars().count();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| {
+            // 選択の末尾側の文字位置（カーソルは自身、選択範囲は end-1）
+            let bottom = if r.is_cursor() { r.head() } else { r.end().saturating_sub(1) };
+            let anchor = step_line_start(&text, r.start());
+            // bottom 行の末尾 → 1つ下の行の末尾（末尾改行を含む）
+            let mut end = step_line_end(&text, bottom);
+            if end < len {
+                end = step_line_end(&text, end + 1);
+            }
+            if end < len {
+                end += 1;
+            }
+            Range::new(anchor, end)
+        })
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
+/// 各 Range の head を絶対位置 `char_idx` へ移動し、anchor は保つ
+/// （選択の拡張 — Select モードの `gg`/`G` など。向きは [`put_cursor`] と同様に
+/// 反転する）。
+pub fn extend_to(doc: &Document, selection: &Selection, char_idx: usize) -> Selection {
+    let text = doc.text().to_string();
+    let ranges = selection
+        .ranges()
+        .iter()
+        .map(|r| put_cursor(&text, *r, char_idx, true))
+        .collect();
+    Selection::new(ranges, selection.primary_index())
+}
+
+/// `pos` を含む単語（英数字 + アンダースコアの連続）の char 範囲を返す。/// `pos` が空白・改行・記号の上なら `None`。`*`（全一致選択）と rename の
+/// `pos` を含む単語（英数字 + アンダースコアの連続）の char 範囲を返す。
+/// `pos` が空白・改行・記号の上なら `None`。`*`（全一致選択）と rename の
+/// 「カーソル位置のシンボル」取り出しに使う。
+///
+/// ponytail: 単語境界の定義は [`categorize`] の単語文字をそのまま使う
+/// （LSP の symbol 範囲と必ずしも一致しないが、実用上十分）。
+pub fn word_at(doc: &Document, pos: usize) -> Option<(usize, usize)> {
+    let text = doc.text().to_string();
+    let ch = text.chars().nth(pos)?;
+    if categorize(ch) != CharCategory::Word {
+        return None;
+    }
+    let start = start_of_word(&text, pos);
+    let end = end_of_word(&text, pos);
+    Some((start, end))
+}
+
+/// `pos` から始まる単語の末尾（排他）。[`word_at`] の内部ヘルパー。
+fn end_of_word(text: &str, pos: usize) -> usize {
+    (pos..text.chars().count())
+        .take_while(|&i| matches!(categorize(text.chars().nth(i).unwrap_or(' ')), CharCategory::Word))
+        .last()
+        .map(|i| i + 1)
+        .unwrap_or(pos + 1)
+}
+
+/// `pos` から遡って単語の先頭（含む）。[`word_at`] の内部ヘルパー。
+fn start_of_word(text: &str, pos: usize) -> usize {
+    (0..=pos)
+        .rev()
+        .take_while(|&i| {
+            matches!(
+                categorize(text.chars().nth(i).unwrap_or(' ')),
+                CharCategory::Word
+            )
+        })
+        .last()
+        .unwrap_or(pos)
+}
+
+/// `pos` の行頭（列 0）の char インデックス（[`Movement::LineStart`] と同じ位置）。
+pub fn line_start_of(text: &str, pos: usize) -> usize {
+    step_line_start(text, pos)
+}
+
+/// `pos` の行末（改行の直前。最終行は文書末尾）の char インデックス
+/// （[`Movement::LineEnd`] と同じ位置。行の末尾改行そのものは含まない）。
+pub fn line_end_of(text: &str, pos: usize) -> usize {
+    step_line_end(text, pos)
+}
+
+/// `r`（[`Command::Replace`]）の置換対象: カーソルならその位置の1文字
+/// （改行を跨がない — 行末は置換対象なし）、選択ならその範囲。
+/// 空範囲（カーソルが行末・文書端）はリストに含めない（`replace_ranges` に
+/// start==end を渡すと挿入扱いになり、no-op にならないため）。
+pub fn replace_targets(doc: &Document, selection: &Selection) -> Vec<(usize, usize)> {
+    let text = doc.text().to_string();
+    selection
+        .ranges()
+        .iter()
+        .filter_map(|r| {
+            if r.is_cursor() {
+                let p = r.head();
+                let line_end = step_line_end(&text, p);
+                let end = next_grapheme_boundary(&text, p).min(line_end);
+                (end > p).then_some((p, end))
+            } else {
+                Some((r.start(), r.end()))
+            }
+        })
+        .collect()
+}
+
 fn move_range(text: &str, range: Range, movement: Movement, dir: Direction, extend: bool) -> Range {
     let new_pos = match movement {
         Movement::Char => step_grapheme(text, range.head(), dir),
@@ -151,6 +288,7 @@ fn move_range(text: &str, range: Range, movement: Movement, dir: Direction, exte
         Movement::WordEnd => step_word_end(text, range.head(), dir),
         Movement::LineStart => step_line_start(text, range.head()),
         Movement::LineEnd => step_line_end(text, range.head()),
+        Movement::FirstNonWhitespace => step_line_first_non_whitespace(text, range.head()),
     };
     put_cursor(text, range, new_pos, extend)
 }
@@ -1376,5 +1514,80 @@ mod tests {
             select_line_selection(&trailing, &Selection::point(7)),
             sel(vec![(6, 10)], 0)
         );
+    }
+
+    #[test]
+    fn append_selection_moves_past_cursor_and_selection_end() {
+        // カーソル: 直後の1文字後ろ（行末でクランプ）
+        let doc = Document::from("abcd\nef");
+        assert_eq!(
+            append_selection(&doc, &Selection::point(1)),
+            sel(vec![(2, 2)], 0),
+            "カーソルは1文字後ろ"
+        );
+        // 行末ではクランプ（改行を跨がない）
+        assert_eq!(
+            append_selection(&doc, &Selection::point(4)),
+            sel(vec![(4, 4)], 0),
+            "行末では動かない"
+        );
+        // 選択: 選択の直後（`end`）
+        assert_eq!(
+            append_selection(&doc, &sel(vec![(0, 3)], 0)),
+            sel(vec![(3, 3)], 0),
+            "選択の末尾直後"
+        );
+        // 空文書は0のまま
+        assert_eq!(
+            append_selection(&Document::from(""), &Selection::point(0)),
+            sel(vec![(0, 0)], 0)
+        );
+    }
+
+
+    #[test]
+    fn extend_to_keeps_anchor() {
+        let doc = Document::from("hello world");
+        // 選択 (2..5) の head を文書末尾へ拡張
+        let extended = extend_to(&doc, &sel(vec![(2, 5)], 0), 11);
+        assert_eq!(extended, sel(vec![(2, 11)], 0));
+        // cursor では拡張される（anchor 固定ではないが点が残る）
+        let cur = extend_to(&doc, &Selection::point(3), 8);
+        assert_eq!(cur, sel(vec![(3, 8)], 0));
+    }
+
+    #[test]
+    fn extend_line_below_adds_line_on_repeat() {
+        // カーソル → 現在の行 + 下の行（末尾改行含む）
+        let doc = Document::from("l0\nl1\nl2\nl3"); // 11 chars
+        // 'l1' の先頭（char 3）
+        let once = extend_line_below(&doc, &Selection::point(3));
+        assert_eq!(once, sel(vec![(3, 9)], 0), "現在行+1つ下 = \"l1\\nl2\\n\"");
+        // 連打で1行ずつ追加
+        let twice = extend_line_below(&doc, &once);
+        assert_eq!(twice, sel(vec![(3, 11)], 0), "さらに l3 が加わる");
+        // 最終行ではそれ以上伸びない（l3 の中盤 char 9）
+        let last = extend_line_below(&doc, &Selection::point(9));
+        assert_eq!(last, sel(vec![(9, 11)], 0));
+    }
+
+    #[test]
+    fn word_at_covers_identifiers_only() {
+        let doc = Document::from("foo_bar baz\nqux = 12");
+        // foo_bar(0-6) 空白(7) baz(8-10) \n(11) qux(12-14) 空白(15) =(16) 空白(17) 12(18-19)
+        assert_eq!(word_at(&doc, 0), Some((0, 7)), "foo_bar");
+        assert_eq!(word_at(&doc, 3), Some((0, 7)));
+        assert_eq!(word_at(&doc, 10), Some((8, 11)), "baz");
+        assert_eq!(word_at(&doc, 14), Some((12, 15)), "qux");
+        assert_eq!(word_at(&doc, 18), Some((18, 20)), "数字も単語");
+        // 空白・記号の上は None
+        assert_eq!(word_at(&doc, 7), None, "空白");
+        assert_eq!(word_at(&doc, 15), None, "qux の後の空白");
+        assert_eq!(word_at(&doc, 16), None, "= の上");
+        assert_eq!(word_at(&doc, 24), None, "範囲外");
+        // 範囲外は None
+        assert_eq!(word_at(&doc, 100), None);
+        let empty = Document::from("");
+        assert_eq!(word_at(&empty, 0), None);
     }
 }

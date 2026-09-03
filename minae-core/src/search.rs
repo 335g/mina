@@ -52,6 +52,30 @@ pub fn find_next(doc: &Document, query: &str, from: usize, case: CaseSensitivity
     scan_from(&text, query, from, insensitive).map(|(s, e)| Range::new(s, e))
 }
 
+/// `from`（含む）以前で最後に一致する範囲を返す（`?` / `N` の後方検索）。
+/// 一致の開始位置が `from` 以下のうち最も後ろのものを返す。なければ `None`。
+/// 文書先頭を越えた折り返しは呼び出し側の責務。
+pub fn find_prev(doc: &Document, query: &str, from: usize, case: CaseSensitivity) -> Option<Range> {
+    let text = doc.text().to_string();
+    let insensitive = is_insensitive(query, case);
+    let text_chars: Vec<char> = text.chars().collect();
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.is_empty() {
+        return None;
+    }
+    // 前方走査で開始位置が from 以下の最後の一致を追う（後方走査の代わり。
+    // 文書が短いので O(n) で十分）。
+    let mut last = None;
+    let mut i = 0;
+    while i + query_chars.len() <= text_chars.len() {
+        if matches_at(&text_chars, &query_chars, i, insensitive) && i <= from {
+            last = Some((i, i + query_chars.len()));
+        }
+        i += 1;
+    }
+    last.map(|(s, e)| Range::new(s, e))
+}
+
 fn is_insensitive(query: &str, case: CaseSensitivity) -> bool {
     match case {
         CaseSensitivity::Sensitive => false,
@@ -175,6 +199,39 @@ mod tests {
         assert_eq!(
             find_next(&doc2, "abc", 1, CaseSensitivity::Smart),
             Some(Range::new(1, 4))
+        );
+    }
+
+    #[test]
+    fn find_prev_returns_last_match_at_or_before_from() {
+        let doc = Document::from("foo bar foo baz");
+        assert_eq!(
+            find_prev(&doc, "foo", 16, CaseSensitivity::Smart),
+            Some(Range::new(8, 11)),
+            "文末から → 最後の一致"
+        );
+        assert_eq!(
+            find_prev(&doc, "foo", 8, CaseSensitivity::Smart),
+            Some(Range::new(8, 11)),
+            "一致の開始位置 == from も含む"
+        );
+        assert_eq!(
+            find_prev(&doc, "foo", 7, CaseSensitivity::Smart),
+            Some(Range::new(0, 3)),
+            "from より前の最後の一致"
+        );
+        assert_eq!(find_prev(&doc, "foo", 0, CaseSensitivity::Smart), Some(Range::new(0, 3)));
+        assert_eq!(find_prev(&doc, "xyz", 16, CaseSensitivity::Smart), None);
+        assert_eq!(find_prev(&doc, "", 16, CaseSensitivity::Smart), None, "空クエリ");
+        // 大文字小文字を区別する場合
+        let mixed = Document::from("Foo foo");
+        assert_eq!(
+            find_prev(&mixed, "Foo", 7, CaseSensitivity::Sensitive),
+            Some(Range::new(0, 3))
+        );
+        assert_eq!(
+            find_prev(&mixed, "foo", 7, CaseSensitivity::Sensitive),
+            Some(Range::new(4, 7))
         );
     }
 
