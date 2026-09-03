@@ -38,15 +38,17 @@ minae は daemon/client 分割のターミナルエディタです。エージ�
 ## はじめに
 
 ```console
-# 公開クレート（`minae` バイナリをビルド。daemon・TUI・session CLI が1つに入っている）
+# 公開クレート: エージェント向けツールのみ（daemon・session CLI・skill。TUI なし）
 $ cargo install minae
 
-# TUI でファイルを編集（デーモンは自動起動）
-$ minae open path/to/file.rs
+# TUI も使う場合（オプション。`minae open` が使えるようになる）
+$ cargo install minae --features tui
 
 # スクリプトやエージェントからヘッドレスに
 $ minae session apply path/to/file.rs "old text" "new text"
 ```
+
+対話編集も使う場合は `tui` feature 付きでビルドする（`minae open`。デーモンは自動起動）。
 
 ソースからは `cargo build --release` でもビルドできます。言語サーバ（rust-analyzer、typescript-language-server など）は同梱されないため、LSP 機能を使う場合は別途インストールしてください。tree-sitter による構文ハイライトはそのまま動きます。
 
@@ -88,7 +90,7 @@ $ minae skill read      # read 契約（session get --lines の番号付き出�
 - **minae-protocol**: daemon/client IPC のワイヤ型
 - **minae-lsp**: LSP クライアント（起動・JSON-RPC・位置変換）
 - **minae-view** / **minae-loader**: UI 非依存のエディタ状態 / tree-sitter 文法とハイライトクエリ
-- **minae-term**: バイナリクレート —— CLI・デーモン・TUI・ヘッドレス session インターフェース
+- **minae-term**: バイナリクレート —— CLI・デーモン・ヘッドレス session インターフェース・skill（TUI は `tui` feature）
 
 ## ドキュメント
 

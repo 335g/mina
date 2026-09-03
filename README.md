@@ -32,21 +32,23 @@ A resident **Daemon** holds all editor state — open documents, undo histories,
 - **Language support** via LSP, per workspace root: diagnostics, inlay hints, definition peek, semantic rename and references
 - **Language servers** (embedded and verified per ADR-0030): `rust-analyzer` for Rust, `typescript-language-server` for TypeScript — with tree-sitter syntax highlighting for the same two. Any other LSP can be wired up via your `languages.toml` (user-added servers are unvetted but negotiate standard features); see the config docs.
 - **Headless agent interface**: `minae session` — bounded numbered reads (`get --lines`), one-shot verified edits (`apply`), positional edits (`edit`), state-change waiting (`wait`), hints and peek without full text, semantic rename (`rename`), structure discovery (`outline`) and position resolution (`at`), hover type lookup (`hover`) and workspace symbol search (`symbol`), and a diagnostics settle+report shortcut for the edit→verify loop (`check` — replaces `wait` + `get` + JSON parsing)
-- **Terminal UI** (optional): `minae open`
+- **Terminal UI** (optional): `minae open` (`cargo install minae --features tui`; the default install is agent tooling only)
 - **Configable**: `languages.toml` for language servers (daemon-side), `config.toml` and user colorschemes (client-side), built-in `minae skill` guides for agents
 
 ## Getting started
 
 ```console
-# the published crate (builds the `minae` binary; daemon, TUI, and session CLI in one)
+# the published crate: agent tooling only (daemon, session CLI, skill). No TUI.
 $ cargo install minae
 
-# start editing a file in the TUI (the daemon auto-starts)
-$ minae open path/to/file.rs
+# also install the TUI (optional, `minae open`)
+$ cargo install minae --features tui
 
 # headless, from a script or an agent
 $ minae session apply path/to/file.rs "old text" "new text"
 ```
+
+To also edit files interactively, build with the `tui` feature (`minae open`; the daemon auto-starts).
 
 Alternatively build from source with `cargo build --release`. Language servers (rust-analyzer, typescript-language-server, …) are not bundled — install them separately if you want LSP features; tree-sitter syntax highlighting works out of the box.
 
@@ -88,7 +90,7 @@ The guides cover tool choice (read / apply / rename contracts) and error recover
 - **minae-protocol**: wire types for daemon/client IPC
 - **minae-lsp**: LSP client (spawn, JSON-RPC, position conversion)
 - **minae-view** / **minae-loader**: UI-agnostic editor state; tree-sitter grammars and highlight queries
-- **minae-term**: the binary crate — CLI, daemon, TUI, and the headless session interface
+- **minae-term**: the binary crate — CLI, daemon, session interface, and skills (TUI is a `tui` feature)
 
 ## Documentation
 
