@@ -61,7 +61,12 @@ pub async fn connect(path: &Path) -> std::io::Result<UnixStream> {
     UnixStream::connect(path).await
 }
 
-/// daemon を新規セッションで起動する（端末を閉じても死なない、setsid）。
+/// daemon 実行ファイルを探す（分離バイナリ用の自動起動解決）。
+///
+/// 1. `MINAD_EXE` 環境変数（明示指定・開発/CI 用）
+/// 2. PATH 上の `minad`（通常 install は ~/.cargo/bin に 3 bin が並ぶ）
+/// 見つからなければ None — 呼び出し側は「minad が見つからない」旨の
+/// 明示エラーにする（旧「daemon が起動しなかった」より特定しやすい）。
 ///
 /// spawn は detached で、起動確認はしない（[`wait_ready`]）。競合: 同時に
 /// 2つのクライアントが spawn した場合、片方の daemon が bind に失敗して
