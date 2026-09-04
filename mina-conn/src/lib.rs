@@ -67,6 +67,21 @@ pub async fn connect(path: &Path) -> std::io::Result<UnixStream> {
 /// 2. PATH 上の `minad`（通常 install は ~/.cargo/bin に 3 bin が並ぶ）
 /// 見つからなければ None — 呼び出し側は「minad が見つからない」旨の
 /// 明示エラーにする（旧「daemon が起動しなかった」より特定しやすい）。
+pub fn daemon_exe() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::var("MINAD_EXE") {
+        if !exe.is_empty() {
+            return Some(std::path::PathBuf::from(exe));
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join("minad");
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
+/// daemon を新規セッションで起動する（端末を閉じても死なない、setsid）。
 ///
 /// spawn は detached で、起動確認はしない（[`wait_ready`]）。競合: 同時に
 /// 2つのクライアントが spawn した場合、片方の daemon が bind に失敗して
