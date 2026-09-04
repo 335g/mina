@@ -1,5 +1,5 @@
 [package]
-name = "minae-view"
+name = "mina-view"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,4 @@ repository.workspace = true
 description = "UI-agnostic editor state for minae"
 
 [dependencies]
-minae-core = { path = "../minae-core", version = "0.0.3" }
+mina-text = { path = "../mina-text", version = "0.0.4" }

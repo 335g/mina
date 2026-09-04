@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use minae_core::{Document, Selection, Transaction};
+use mina_text::{Document, Selection, Transaction};
 
 use crate::Mode;
 use crate::history::History;
@@ -194,7 +194,7 @@ impl Editor {
                 sel.ranges()
                     .iter()
                     .map(|r| {
-                        minae_core::Range::new(r.anchor().min(new_len), r.head().min(new_len))
+                        mina_text::Range::new(r.anchor().min(new_len), r.head().min(new_len))
                     })
                     .collect(),
                 sel.primary_index(),
@@ -426,8 +426,8 @@ impl Editor {
     /// 削除開始点）。redo 時にここへ戻る。例:
     ///
     /// ```
-    /// use minae_core::{Selection, Transaction};
-    /// use minae_view::Editor;
+    /// use mina_text::{Selection, Transaction};
+    /// use mina_view::Editor;
     ///
     /// let mut editor = Editor::new();
     /// let selection = Selection::point(0);
@@ -495,7 +495,7 @@ impl Editor {
                     view.selection
                         .ranges()
                         .iter()
-                        .map(|r| minae_core::Range::new(clamp(r.anchor()), clamp(r.head())))
+                        .map(|r| mina_text::Range::new(clamp(r.anchor()), clamp(r.head())))
                         .collect(),
                     view.selection.primary_index(),
                 );
@@ -636,7 +636,7 @@ impl Default for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minae_core::{CaseSensitivity, Range, find_matches};
+    use mina_text::{CaseSensitivity, Range, find_matches};
 
     #[test]
     fn new_editor_has_scratch_document_and_normal_mode() {
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn cursor_movement_followed_by_scroll_to_cursor() {
-        use minae_core::{Direction, Movement, move_selection};
+        use mina_text::{Direction, Movement, move_selection};
 
         // 移動のたびに scroll_to_cursor を呼ぶのがターミナル層の役割
         let mut editor = Editor::new();

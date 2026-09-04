@@ -1,6 +1,6 @@
 //! 履歴: undo / redo のスタック。
 
-use minae_core::{Document, Selection, Transaction};
+use mina_text::{Document, Selection, Transaction};
 
 /// 1回の編集操作（1キー入力など）を表す変更。
 ///
