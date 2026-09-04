@@ -5,32 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Terminal UI, daemon, and agent entry for minae"
+description = "Terminal UI for minae (under reconstruction; currently an empty bin crate)"
 
 [[bin]]
 name = "minae"
 path = "src/main.rs"
-
-[dependencies]
-mina-text = { path = "../mina-text", version = "0.0.4" }
-mina-view = { path = "../mina-view", version = "0.0.4" }
-mina-protocol = { path = "../mina-protocol", version = "0.0.4" }
-mina-conn = { path = "../mina-conn", version = "0.0.4" }
-mina-lsp = { path = "../mina-lsp", version = "0.0.4" }
-mina-loader = { path = "../mina-loader", version = "0.0.4" }
-tree-sitter.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
-tokio.workspace = true
-libc.workspace = true
-clap.workspace = true
-# TUI のみ（tui feature）: デフォルトビルドには含めない
-termina = { workspace = true, optional = true }
-futures-lite = { workspace = true, optional = true }
-unicode-width = { workspace = true, optional = true }
-cliclack = { workspace = true, optional = true }
-
-[features]
-default = []
-tui = ["dep:termina", "dep:futures-lite", "dep:unicode-width", "dep:cliclack"]
