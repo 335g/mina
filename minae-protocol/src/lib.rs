@@ -34,6 +34,23 @@ use serde::{Deserialize, Serialize};
 /// `Movement::FirstNonWhitespace`（`g s`）。追加のみだが wire を広げるため version を上げる。
 pub const PROTOCOL_VERSION: u32 = 11;
 
+/// daemon が bind するソケットのパス。
+///
+/// プロトコルバージョンをソケット名に埋める（`minae-{PROTOCOL_VERSION}.sock`）:
+/// プロトコルが変わると古い daemon は別ソケットに残り、新クライアントは新 daemon を
+/// 自動起動する（クライアント側の ensure と合わせて、バージョン不一致の応答を
+/// 一切受けない）。→ 上記 [`PROTOCOL_VERSION`] の doc 参照。
+///
+/// ソケット名は wire 契約の一部（ADR-0034）: daemon とクライアントの両方が
+/// この関数を使う。
+///
+/// ponytail: uid をファイル名に入れていない（単一ユーザ前提）。アクセス制御
+/// は socket の 0600 化 + 接続時の peer uid 検証で行う。複数ユーザを同時に
+/// 扱う必要が出たら `<dir>/minae-<uid>.sock` にする。
+pub fn socket_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("minae-{PROTOCOL_VERSION}.sock"))
+}
+
 /// 編集モード（wire 型。minae-view の Mode とは別に持つ — protocol は依存を持たない）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
