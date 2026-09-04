@@ -1,32 +1,32 @@
 //! agent 用のヘッドレス CLI: daemon に接続してコマンドを実行し、スナップショットを表示する。
 //!
-//! - `minae session get` — 現在の状態を取得する（JSON で出力）
-//! - `minae session info` — daemon のビルド世代・累積メトリクスを取得する（issue #27）
-//! - `minae session apply <path> <old> <new>` — 1コマンドで「Open→検証置換→Save」
+//! - `minas get` — 現在の状態を取得する（JSON で出力）
+//! - `minas info` — daemon のビルド世代・累積メトリクスを取得する（issue #27）
+//! - `minas apply <path> <old> <new>` — 1コマンドで「Open→検証置換→Save」
 //!   （issue #29 F1。minae ヘルパーの製品化。`--whole` / `--whole-stdin` /
 //!   `--old-file` / `--new-file` で argv 制限やシェル引用を回避できる。
 //!   複数編集は `--hunks-stdin`（JSON 配列を stdin から、1 接続で Save は最後に一度））
-//! - `minae session exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
-//! - `minae session edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
-//! - `minae session wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
+//! - `minas exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
+//! - `minas edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
+//! - `minas wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
 //!   （90 秒で時間切れ: 現状を返し exit code 2 = 再試行可能）
-//! - `minae session hints <path>` — 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
-//! - `minae session peek <path> <line>:<col>` — 指定位置（1-origin）の定義を全文なしで取得する（ADR-0025）
-//! - `minae session outline <path>` — シンボルの階層ツリー（名前・種別・範囲）を全文なしで取得する（ADR-0031）
-//! - `minae session at <path> <line>:<col>` — 指定位置を囲む記号とその正確な範囲を全文なしで取得する（ADR-0031）
-//! - `minae session hover <path> <line>:<col>` — 指定位置の hover（型・シグネチャ・doc）を全文なしで取得する（ADR-0032）
-//! - `minae session symbol <path> <query>` — ワークスペース内のシンボル検索を全文なしで取得する（ADR-0032）
-//! - `minae session check <path>` — 診断の settle を待って診断だけを返す（ADR-0032）
+//! - `minas hints <path>` — 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
+//! - `minas peek <path> <line>:<col>` — 指定位置（1-origin）の定義を全文なしで取得する（ADR-0025）
+//! - `minas outline <path>` — シンボルの階層ツリー（名前・種別・範囲）を全文なしで取得する（ADR-0031）
+//! - `minas at <path> <line>:<col>` — 指定位置を囲む記号とその正確な範囲を全文なしで取得する（ADR-0031）
+//! - `minas hover <path> <line>:<col>` — 指定位置の hover（型・シグネチャ・doc）を全文なしで取得する（ADR-0032）
+//! - `minas symbol <path> <query>` — ワークスペース内のシンボル検索を全文なしで取得する（ADR-0032）
+//! - `minas check <path>` — 診断の settle を待って診断だけを返す（ADR-0032）
 //!
-//! 例: `minae session exec '{"Insert": {"text": "hello"}}'`
-//! 例: `minae session edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
-//! 例: `minae session apply src/lib.rs "let x = 1" "let x = 2"`
-//! 例: `minae session apply src/lib.rs --whole-stdin < new_content.rs`
-//! 例: `minae session wait 42`
-//! 例: `minae session hints src/main.rs`
-//! 例: `minae session peek src/main.rs 12:5`
-//! 例: `minae session outline src/main.rs`
-//! 例: `minae session at src/main.rs 12:5`
+//! 例: `minas exec '{"Insert": {"text": "hello"}}'`
+//! 例: `minas edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
+//! 例: `minas apply src/lib.rs "let x = 1" "let x = 2"`
+//! 例: `minas apply src/lib.rs --whole-stdin < new_content.rs`
+//! 例: `minas wait 42`
+//! 例: `minas hints src/main.rs`
+//! 例: `minas peek src/main.rs 12:5`
+//! 例: `minas outline src/main.rs`
+//! 例: `minas at src/main.rs 12:5`
 //!
 //! daemon が動いていなければ自動起動される（TUI と同じ挙動）。終了コード:
 //! 0 = 成功（適用・no-op 含む）、1 = トランスポート/JSON エラー、
@@ -66,7 +66,7 @@ async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>
     conn::open_session(&socket, ClientKind::Headless, true).await
 }
 
-/// `minae session` のサブコマンド。引数・型は clap が検証する。
+/// `minas` のサブコマンド。引数・型は clap が検証する。
 #[derive(Subcommand)]
 pub enum SessionCmd {
     /// Fetch the current state (printed as JSON)
@@ -235,7 +235,7 @@ async fn wait_with_timeout(
     }
 }
 
-/// `minae session <subcommand>` を処理する。
+/// `minas <subcommand>` を処理する。
 pub async fn run(cmd: SessionCmd) -> io::Result<()> {
     match cmd {
         SessionCmd::Get { lines } => {

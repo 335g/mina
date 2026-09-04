@@ -1,10 +1,10 @@
-//! `minae skill` — エージェント向けの軽量スキル（判断・手順の参考書）。
+//! `minas skill` — エージェント向けの軽量スキル（判断・手順の参考書）。
 //!
 //! 設計（docs/agent-editor-ab-results.md の実測に基づく）:
-//! - `minae skill`（無引数）= **索引**。1トピック1行・約10行。薄く保ち、常時ロードしても
+//! - `minas skill`（無引数）= **索引**。1トピック1行・約10行。薄く保ち、常時ロードしても
 //!   トークン負担が小さい（T1: 範囲read vs 全文read で −51% の実測と同じ原理 —
 //!   必要になったトピックだけを読む）。
-//! - `minae skill <topic>` = **そのトピックの内容だけ**を返す。ロードオンリー・必要時のみ。
+//! - `minas skill <topic>` = **そのトピックの内容だけ**を返す。ロードオンリー・必要時のみ。
 //! - 索引と内容を分離し、モデルが「発見（安い索引）→ 必要分だけ参照（安い内容）」できるようにした。
 //!
 //! 契約（session と統一）: 成功 = exit 0（stdout に内容）、未知トピック = exit 1（stderr に
@@ -125,10 +125,10 @@ Rules
     ),
     (
         "rename",
-        "minae minas rename <path> <old> <new> (semantic); apply for a few",
+        "minas rename <path> <old> <new> (semantic); apply for a few",
         "RENAME — semantic rename vs apply (measured decision)
 
-minae has a built-in semantic rename (content-addressed, ADR-0029):
+minas has a built-in semantic rename (content-addressed, ADR-0029):
     minas rename <path> <old> <new>
 - Use it for renames with MANY occurrences or MULTIPLE files. Measured (3 files,
   21 occurrences): LSP rename 5/5 success vs apply loop 2/5 (apply kept missing
@@ -151,7 +151,7 @@ rename tool exists.",
     ),
     (
         "references",
-        "minae minas references <path> <old>: list a symbol's references",
+        "minas references <path> <old>: list a symbol's references",
         "REFERENCES — impact check before/after a rename (ADR-0029)
 
     minas references <path> <old>
@@ -238,7 +238,7 @@ Rules
 - Raw `minas edit` does NOT save: the daemon buffer changes but the disk file
   stays old (dirty=true). If you used edit, persist with:
       minas exec \"Save\"
-- When an edit succeeded but the buffer is dirty, minae prints a stderr note:
+- When an edit succeeded but the buffer is dirty, minas prints a stderr note:
   \"buffer is dirty (not saved); persist with: minas exec '\"Save\"'\".
 - Before relying on a file's on-disk content, prefer apply (which re-opens the
   file fresh) over mixing edit + assumptions.",
@@ -275,7 +275,7 @@ old/new, retry. Never blind-retry a rejected edit.",
     ),
 ];
 
-/// `minae skill [topic]` の本体。daemon は必要としない（静的コンテンツ）。
+/// `minas skill [topic]` の本体。daemon は必要としない（静的コンテンツ）。
 pub fn run(topic: Option<String>) -> std::io::Result<()> {
     match topic {
         None => {
