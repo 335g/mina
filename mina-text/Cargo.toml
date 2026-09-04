@@ -1,5 +1,5 @@
 [package]
-name = "minae-core"
+name = "mina-text"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
