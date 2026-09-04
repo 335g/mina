@@ -1,0 +1,20 @@
+[package]
+name = "minas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless agent CLI for minae: talk to the minad daemon, plus skill guides"
+
+[[bin]]
+name = "minas"
+path = "src/main.rs"
+
+[dependencies]
+mina-protocol = { path = "../mina-protocol", version = "0.0.4" }
+mina-conn = { path = "../mina-conn", version = "0.0.4" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
