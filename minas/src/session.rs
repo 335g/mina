@@ -53,14 +53,19 @@ use mina_conn as conn;
 
 /// ワンショット接続を開く（session CLI の各コマンドの共通冒頭）。
 ///
-/// daemon が動いていなければ起動してから（クライアント視点のライフサイクル。
-/// spawn 元は自身 = `minae daemon serve` を持つ bin クレート）接続し、
-/// Hello（Headless 宣言）を送って (write_half, reader) を返す。接続は
-/// 1コマンドごとに開く（永続ではない — ADR-0013）。
+/// daemon が動いていなければ `minad` を探して起動してから（クライアント視点の
+/// ライフサイクル）接続し、Hello（Headless 宣言）を送って (write_half, reader)
+/// を返す。接続は 1コマンドごとに開く（永続ではない — ADR-0013）。
 async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>)> {
     let socket = mina_protocol::socket_path();
     if conn::connect(&socket).await.is_err() {
-        conn::spawn_daemon(&std::env::current_exe()?, &["daemon", "serve"])?;
+        let exe = conn::daemon_exe().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "minad が見つかりません（cargo install minad、または MINAD_EXE で指定）",
+            )
+        })?;
+        conn::spawn_daemon(&exe, &["serve"])?;
         conn::wait_ready(&socket, 50).await?;
     }
     conn::open_session(&socket, ClientKind::Headless, true).await

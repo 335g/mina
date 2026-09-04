@@ -55,8 +55,8 @@ pub async fn send_hello(
 /// daemon のソケットへ接続を1回試みる。成功すれば stream を返す。
 ///
 /// 自動起動（spawn して socket が出るまで待つ）は呼び出し側が
-/// [`spawn_daemon`] + [`wait_ready`] で組み立てる — どの実行ファイルを
-/// spawn するか（`daemon serve` を持つ bin）はこの crate は仮定しない。
+/// [`daemon_exe`] + [`spawn_daemon`] + [`wait_ready`] で組み立てる —
+/// daemon を持つのは `minad` バイナリで、この crate は仮定しない。
 pub async fn connect(path: &Path) -> std::io::Result<UnixStream> {
     UnixStream::connect(path).await
 }
