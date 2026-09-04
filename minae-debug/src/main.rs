@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use minae_protocol::{fnv1a64, ClientKind, Command, DocumentEdit, Hello, ServerMessage, StateSnapshot};
+use mina_protocol::{fnv1a64, ClientKind, Command, DocumentEdit, Hello, ServerMessage, StateSnapshot};
 use serde::Serialize;
 
 /// daemon のソケットパス（minae-term の `daemon::socket_path()` と一致させること）。
