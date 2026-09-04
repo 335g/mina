@@ -7,7 +7,7 @@ version = "0.0.4"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-repository = "https://github.com/335g/minae"
+repository = "https://github.com/335g/mina"
 
 [workspace.dependencies]
 ropey = "1"

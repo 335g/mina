@@ -16,7 +16,7 @@
 
 ## 2. タスク
 
-**#30 「headless に Close を許可して deleted 状態から抜け出せるようにする」** (`github.com/335g/minae`)
+**#30 「headless に Close を許可して deleted 状態から抜け出せるようにする」** (`github.com/335g/mina`)
 
 - **ground truth**: マージコミット `77639c9` — `minae-term/src/daemon.rs` のみ +17/−5
   1. headless 許可リスト(`process_command` 内 `matches!`)に `Command::Close` を追加
