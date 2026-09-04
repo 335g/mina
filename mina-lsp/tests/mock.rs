@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use minae_lsp::{Client, Incoming};
+use mina_lsp::{Client, Incoming};
 use serde_json::json;
 
 async fn spawn_client(args: &[&str]) -> (Client, tokio::task::JoinHandle<()>) {
@@ -202,7 +202,7 @@ async fn notification_channel_is_bounded() {
 
     // 容量を超える didChange を送り、publishDiagnostics を flood させる
     // （一切読まないのでキューが満杯になり、以降の通知は破棄される）。
-    let flood = minae_lsp::NOTIFICATION_CAPACITY * 2;
+    let flood = mina_lsp::NOTIFICATION_CAPACITY * 2;
     for i in 0..flood {
         client
             .notify(
@@ -231,7 +231,7 @@ async fn notification_channel_is_bounded() {
         count += 1;
     }
     assert_eq!(
-        count, minae_lsp::NOTIFICATION_CAPACITY,
+        count, mina_lsp::NOTIFICATION_CAPACITY,
         "キューは容量を超えて蓄積しない（超過分は破棄される）: {count}"
     );
 
