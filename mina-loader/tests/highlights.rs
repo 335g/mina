@@ -2,8 +2,8 @@
 //!
 //! compute_highlights の不変条件（仕様書）と、クエリの coverage を検証する。
 
-use minae_loader::{compute_highlights, language_by_name};
-use minae_protocol::{HighlightGroup, HighlightRange};
+use mina_loader::{compute_highlights, language_by_name};
+use mina_protocol::{HighlightGroup, HighlightRange};
 
 fn ranges(src: &str) -> Vec<HighlightRange> {
     compute_highlights(language_by_name("rust").unwrap(), src)

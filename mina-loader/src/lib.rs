@@ -10,7 +10,7 @@
 //! 小文字名に一致させる: comment keyword string number constant function type
 //! parameter field operator punctuation attribute error。
 
-use minae_protocol::{HighlightGroup, HighlightRange};
+use mina_protocol::{HighlightGroup, HighlightRange};
 use std::ops::Range;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
