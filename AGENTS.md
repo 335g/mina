@@ -14,4 +14,4 @@ Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agent
 
 ### Development
 
-When referencing or editing rust files, if minae is installed, use the installed minae for operations. For usage instructions, refer to `minae skill`.
+When referencing or editing rust files, use the installed `minas` (headless session CLI) and `minad` (daemon) for operations. For usage instructions, refer to `minas skill`.
