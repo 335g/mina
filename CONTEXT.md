@@ -76,6 +76,10 @@ _Avoid_: server, backend
 A process that connects to the Daemon to send Commands and receive editor state: the terminal UI, a CLI invocation, or an agent.
 _Avoid_: frontend, viewer
 
+**Connection**:
+A Client's channel to the Daemon, opened by connecting to the daemon socket and sending a Hello (declaring the Client kind). One-shot connections (headless session CLI, agents) are opened per command and carry no pushes; persistent connections (the interactive TUI) subscribe to state broadcasts and live until the Client disconnects (ADR-0013). The socket path is part of the wire contract (`minae-{PROTOCOL_VERSION}.sock`, `minae_protocol::socket_path`).
+_Avoid_: link, channel, session
+
 **StateSnapshot**:
 The response to every Command: the Daemon's complete editor state — document text, selection, mode, viewport, and diagnostics — serialized for Clients to render.
 _Avoid_: frame, update
