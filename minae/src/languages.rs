@@ -168,10 +168,10 @@ impl LanguageTable {
 
     /// パスの言語が `grammar` キーで参照する grammar（minae-loader）。未登録・未指定なら
     /// `None` = ハイライト無し・tree-sitter を使わないシンボル解決（ADR-0030 Stage 4）。
-    pub(crate) fn grammar_for_path(&self, path: &Path) -> Option<&'static minae_loader::LanguageDef> {
+    pub(crate) fn grammar_for_path(&self, path: &Path) -> Option<&'static mina_loader::LanguageDef> {
         self.language_for_path(path)
             .and_then(|l| l.grammar.as_deref())
-            .and_then(minae_loader::language_by_name)
+            .and_then(mina_loader::language_by_name)
     }
 
     /// 開いたファイルを包含する最小の解析単位（WorkspaceRoot）を求める。

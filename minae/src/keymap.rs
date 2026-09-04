@@ -4,7 +4,7 @@
 //! ハッシュより速い）。
 //! ponytail: バインディングが数十を超えたら `HashMap` 化を検討する（要 Hash key）。
 
-use minae_protocol::{Command, Direction, GotoTarget, Mode, Movement};
+use mina_protocol::{Command, Direction, GotoTarget, Mode, Movement};
 use termina::event::{KeyCode, KeyEvent, Modifiers};
 
 #[derive(Default)]

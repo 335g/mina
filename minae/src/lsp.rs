@@ -7,8 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use minae_lsp::{Client, LspRange, PositionEncoding, PublishDiagnostic};
-use minae_protocol::{Diagnostic, InlayHint, Severity};
+use mina_lsp::{Client, LspRange, PositionEncoding, PublishDiagnostic};
+use mina_protocol::{Diagnostic, InlayHint, Severity};
 use serde::Deserialize;use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
@@ -340,7 +340,7 @@ pub async fn document_symbols_at(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
-) -> Result<Vec<minae_protocol::OutlineSymbol>, String> {
+) -> Result<Vec<mina_protocol::OutlineSymbol>, String> {
     // 解析前の null / 空配列も解析待ちとしてリトライする（references と同じ）。
     // 空のファイルが本当に「記号なし」の場合も予算だけ余分に待つ — references と
     // 同じ許容（予算切れ後はそのまま空を返す）。
@@ -373,7 +373,7 @@ fn convert_symbol_list(
     text: &str,
     enc: PositionEncoding,
     items: &[Value],
-) -> Vec<minae_protocol::OutlineSymbol> {
+) -> Vec<mina_protocol::OutlineSymbol> {
     // 形状の判定: DocumentSymbol（階層・selectionRange あり）か SymbolInformation
     // （フラット・location のみ）か。一部サーバはクライアントの広告を無視して
     // SymbolInformation[] を返す — その場合も 0 件の静かな空にしないため両形状に
@@ -393,7 +393,7 @@ fn convert_symbol_list(
                     .and_then(Value::as_array)
                     .map(|c| convert_symbol_list(index, text, enc, c))
                     .unwrap_or_default();
-                Some(minae_protocol::OutlineSymbol {
+                Some(mina_protocol::OutlineSymbol {
                     name: name.to_string(),
                     kind: lsp_symbol_kind(item.get("kind")).unwrap_or_default(),
                     range,
@@ -410,7 +410,7 @@ fn convert_symbol_list(
             .filter_map(|item| {
                 let name = item.get("name")?.as_str()?;
                 let range = symbol_range(index, text, item.get("location")?.get("range")?, enc)?;
-                Some(minae_protocol::OutlineSymbol {
+                Some(mina_protocol::OutlineSymbol {
                     name: name.to_string(),
                     kind: lsp_symbol_kind(item.get("kind")).unwrap_or_default(),
                     range,
@@ -428,10 +428,10 @@ fn symbol_range(
     text: &str,
     range: &Value,
     enc: PositionEncoding,
-) -> Option<minae_protocol::Range> {
+) -> Option<mina_protocol::Range> {
     let start = range.pointer("/start")?;
     let end = range.pointer("/end")?;
-    Some(minae_protocol::Range {
+    Some(mina_protocol::Range {
         anchor: lsp_pos_to_char_indexed(
             index,
             text,
@@ -451,8 +451,8 @@ fn symbol_range(
 
 /// LSP の SymbolKind（数値）を proto 側の小さな集合へ写像する（ADR-0031）。
 /// 未知の値・欠落は [`SymbolKind::Other`]。
-fn lsp_symbol_kind(kind: Option<&Value>) -> Option<minae_protocol::SymbolKind> {
-    use minae_protocol::SymbolKind;
+fn lsp_symbol_kind(kind: Option<&Value>) -> Option<mina_protocol::SymbolKind> {
+    use mina_protocol::SymbolKind;
     Some(match kind?.as_u64()? {
         2 => SymbolKind::Module,                     // Module
         6 | 9 => SymbolKind::Method,                  // Method / Constructor
@@ -483,9 +483,9 @@ pub fn line_col_to_char_idx(text: &str, line: u32, col: u32) -> usize {
 /// 候補の範囲（`anchor..head`)を踏み外した場合、奥の children は見ない。
 /// 見つからなければ `None`（位置がどの記号にも含まれない）。
 pub fn enclosing_symbol(
-    symbols: &[minae_protocol::OutlineSymbol],
+    symbols: &[mina_protocol::OutlineSymbol],
     char_idx: usize,
-) -> Option<&minae_protocol::OutlineSymbol> {
+) -> Option<&mina_protocol::OutlineSymbol> {
     for sym in symbols {
         if char_idx >= sym.range.anchor && char_idx < sym.range.head {
             return Some(enclosing_symbol(&sym.children, char_idx).unwrap_or(sym));
@@ -542,7 +542,7 @@ fn convert_diagnostics(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LspInlayHint {
-    position: minae_lsp::LspPosition,
+    position: mina_lsp::LspPosition,
     /// `string | InlayHintLabelPart[]`。
     #[serde(default)]
     label: InlayLabel,
@@ -630,7 +630,7 @@ fn doc_end_position(text: &str, enc: PositionEncoding) -> Value {
     let character = match enc {
         PositionEncoding::Utf8 => last_line.len() as u32,
         PositionEncoding::Utf16 => {
-            minae_lsp::position::char_to_utf16_col(last_line, last_line.chars().count())
+            mina_lsp::position::char_to_utf16_col(last_line, last_line.chars().count())
         }
     };
     json!({ "line": text.matches('\n').count() as u32, "character": character })
@@ -676,8 +676,8 @@ fn lsp_pos_to_char_indexed(
         .take_while(|&c| c != '\n')
         .collect();
     let col_chars = match enc {
-        PositionEncoding::Utf8 => minae_lsp::position::utf8_col_to_char(&line_text, col),
-        PositionEncoding::Utf16 => minae_lsp::position::utf16_col_to_char(&line_text, col),
+        PositionEncoding::Utf8 => mina_lsp::position::utf8_col_to_char(&line_text, col),
+        PositionEncoding::Utf16 => mina_lsp::position::utf16_col_to_char(&line_text, col),
     };
     line_start + col_chars
 }
@@ -703,7 +703,7 @@ fn char_to_lsp_pos(text: &str, char_idx: usize, enc: PositionEncoding) -> (u32, 
         PositionEncoding::Utf8 => (byte_idx - line_start) as u32,
         PositionEncoding::Utf16 => {
             let line_col = text[line_start..byte_idx].chars().count();
-            minae_lsp::position::char_to_utf16_col(&text[line_start..byte_idx], line_col)
+            mina_lsp::position::char_to_utf16_col(&text[line_start..byte_idx], line_col)
         }
     };
     (line, col)
@@ -806,7 +806,7 @@ fn char_col_to_lsp_character(line: &str, char_col: usize, enc: PositionEncoding)
         PositionEncoding::Utf8 => byte_end as u32,
         PositionEncoding::Utf16 => {
             let prefix = &line[..byte_end];
-            minae_lsp::position::char_to_utf16_col(prefix, prefix.chars().count())
+            mina_lsp::position::char_to_utf16_col(prefix, prefix.chars().count())
         }
     }
 }
@@ -825,7 +825,7 @@ pub async fn definition_peek_at(
     text: &str,
     line: u32,
     character: u32,
-) -> Option<minae_protocol::Peek> {
+) -> Option<mina_protocol::Peek> {
     let (target_uri, range) = {
         let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
             return None;
@@ -854,7 +854,7 @@ pub async fn definition_peek_at(
         read_peek_target(&target_path).await?
     };
     let (line, text) = definition_snippet(&target_text, &range)?;
-    Some(minae_protocol::Peek {
+    Some(mina_protocol::Peek {
         path: target_path.to_string_lossy().into_owned(),
         line,
         text,
@@ -868,7 +868,7 @@ pub async fn definition_peek_at_char(
     path: &Path,
     text: &str,
     head: usize,
-) -> Option<minae_protocol::Peek> {
+) -> Option<mina_protocol::Peek> {
     let (line, character) = {
         let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
             return None;
@@ -886,7 +886,7 @@ pub async fn definition_peek_at_line_col(
     text: &str,
     line: u32,
     col: u32,
-) -> Option<minae_protocol::Peek> {
+) -> Option<mina_protocol::Peek> {
     let (lsp_line, lsp_character) = {
         let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
             return None;
@@ -1007,7 +1007,7 @@ fn collect_hover_parts(value: &Value, out: &mut Vec<String>) {
 pub async fn workspace_symbols(
     session: &Mutex<LspSession>,
     query: &str,
-) -> Result<Vec<(String, minae_protocol::SymbolKind, String, u32)>, String> {
+) -> Result<Vec<(String, mina_protocol::SymbolKind, String, u32)>, String> {
     let is_loading = |r: &Value| r.is_null();
     let result = request_with_loading_retry(
         session,
@@ -1374,7 +1374,7 @@ fn char_byte_idx(text: &str, char_idx: usize) -> usize {
 /// 「誤位置への静かな適用」の事故クラスを予防）。grammar が無い言語・パース
 /// 失敗時は単語境界検索にフォールバックする。
 pub fn find_symbol_char_idx(
-    grammar: Option<&'static minae_loader::LanguageDef>,
+    grammar: Option<&'static mina_loader::LanguageDef>,
     text: &str,
     old: &str,
 ) -> Option<usize> {
@@ -1726,8 +1726,8 @@ fn capabilities_of_parses_initialize_response() {
         let text = "ab cd\nef gh";
         let raw = |l: u32, s: u32, e: u32, new: &str| RawLspEdit {
             range: LspRange {
-                start: minae_lsp::LspPosition { line: l, character: s },
-                end: minae_lsp::LspPosition { line: l, character: e },
+                start: mina_lsp::LspPosition { line: l, character: s },
+                end: mina_lsp::LspPosition { line: l, character: e },
             },
             new_text: new.into(),
         };
@@ -1780,7 +1780,7 @@ fn capabilities_of_parses_initialize_response() {
         // コメントと文字列内の出現は無視し、最初の識別子（定義）に解決する。
         // grammar は languages.toml 経由で渡される（ADR-0030 Stage 4）:
         // tree-sitter が使える場合と使えない場合（None = 単語境界 fallback）を両方検証する。
-        let grammar = minae_loader::language_by_name("rust");
+        let grammar = mina_loader::language_by_name("rust");
         let text = "// rate = 1\nlet rate = 2;\nlet s = \"rate\";\nlet t = rate * 3;\n";
         let idx = find_symbol_char_idx(grammar, text, "rate").unwrap();
         // "let rate" — 2行目の 'rate' の開始位置: "// rate = 1\n" (12 chars) + "let " (4) = 16
@@ -1799,7 +1799,7 @@ fn capabilities_of_parses_initialize_response() {
     #[test]
     fn find_symbol_char_idx_works_for_typescript() {
         // Stage 4: TS も tree-sitter で識別子に限定して解決する
-        let grammar = minae_loader::language_by_name("typescript");
+        let grammar = mina_loader::language_by_name("typescript");
         let text =
             "// foo = 1\nconst foo = 2;\nexport function bar() { return foo; }\n";
         let idx = find_symbol_char_idx(grammar, text, "foo").unwrap();
@@ -1822,30 +1822,30 @@ fn capabilities_of_parses_initialize_response() {
     fn definition_snippet_covers_range_plus_following_lines() {
         let text = "a\npub fn f(x: i32) -> i32 {\n    x * 2\n}\nnext";
         let range = LspRange {
-            start: minae_lsp::LspPosition { line: 1, character: 0 },
-            end: minae_lsp::LspPosition { line: 1, character: 9 },
+            start: mina_lsp::LspPosition { line: 1, character: 0 },
+            end: mina_lsp::LspPosition { line: 1, character: 9 },
         };
         let (line, snippet) = definition_snippet(text, &range).unwrap();
         assert_eq!(line, 2, "1 始まり");
         assert_eq!(snippet, "pub fn f(x: i32) -> i32 {\n    x * 2\n}", "定義行 + 本体 2 行");
         // 範囲が複数行に跨る場合はその行まで
         let range = LspRange {
-            start: minae_lsp::LspPosition { line: 1, character: 0 },
-            end: minae_lsp::LspPosition { line: 2, character: 4 },
+            start: mina_lsp::LspPosition { line: 1, character: 0 },
+            end: mina_lsp::LspPosition { line: 2, character: 4 },
         };
         let (_, snippet) = definition_snippet(text, &range).unwrap();
         assert!(snippet.starts_with("pub fn f"));
         // 範囲外行は最後の行に clamp
         let range = LspRange {
-            start: minae_lsp::LspPosition { line: 99, character: 0 },
-            end: minae_lsp::LspPosition { line: 99, character: 1 },
+            start: mina_lsp::LspPosition { line: 99, character: 0 },
+            end: mina_lsp::LspPosition { line: 99, character: 1 },
         };
         assert_eq!(definition_snippet(text, &range).unwrap().0, 5);
         // 1行の長い行は切り詰める
         let long = "x".repeat(500);
         let range = LspRange {
-            start: minae_lsp::LspPosition { line: 0, character: 0 },
-            end: minae_lsp::LspPosition { line: 0, character: 1 },
+            start: mina_lsp::LspPosition { line: 0, character: 0 },
+            end: mina_lsp::LspPosition { line: 0, character: 1 },
         };
         let (_, snippet) = definition_snippet(&long, &range).unwrap();
         assert_eq!(snippet.chars().count(), MAX_PEEK_LINE_LEN);
@@ -1854,8 +1854,8 @@ fn capabilities_of_parses_initialize_response() {
     #[test]
     fn definition_snippet_empty_text() {
         let range = LspRange {
-            start: minae_lsp::LspPosition { line: 0, character: 0 },
-            end: minae_lsp::LspPosition { line: 0, character: 0 },
+            start: mina_lsp::LspPosition { line: 0, character: 0 },
+            end: mina_lsp::LspPosition { line: 0, character: 0 },
         };
         assert_eq!(definition_snippet("", &range).unwrap().0, 1);
     }
@@ -2058,7 +2058,7 @@ fn capabilities_of_parses_initialize_response() {
         padding_right: bool,
     ) -> LspInlayHint {
         LspInlayHint {
-            position: minae_lsp::LspPosition { line, character },
+            position: mina_lsp::LspPosition { line, character },
             label: InlayLabel::Plain(label.into()),
             padding_left,
             padding_right,
@@ -2123,7 +2123,7 @@ fn capabilities_of_parses_initialize_response() {
     fn inlay_hint_label_parts_concatenate() {
         let text = "let x = 5";
         let items = vec![LspInlayHint {
-            position: minae_lsp::LspPosition { line: 0, character: 5 },
+            position: mina_lsp::LspPosition { line: 0, character: 5 },
             label: InlayLabel::Parts(vec![
                 InlayLabelPart { value: ": ".into() },
                 InlayLabelPart { value: "i32".into() },
@@ -2233,19 +2233,19 @@ fn capabilities_of_parses_initialize_response() {
         assert_eq!(out.len(), 3);
         let widget = &out[0];
         assert_eq!(widget.name, "Widget");
-        assert_eq!(widget.kind, minae_protocol::SymbolKind::Type);
+        assert_eq!(widget.kind, mina_protocol::SymbolKind::Type);
         assert_eq!(widget.range.anchor, 0);
         assert_eq!(widget.range.head, text.len(), "struct 全体の範囲");
         assert_eq!(widget.selection_range.anchor, 7, "名前トークン Widget の先頭");
         assert_eq!(widget.selection_range.head, 13);
         assert_eq!(widget.children.len(), 1);
         assert_eq!(widget.children[0].name, "new");
-        assert_eq!(widget.children[0].kind, minae_protocol::SymbolKind::Method);
+        assert_eq!(widget.children[0].kind, mina_protocol::SymbolKind::Method);
         assert_eq!(widget.children[0].selection_range.anchor, 24, "fn 名 new の char 位置（17 + 4sp + fn + space + 0）");
         assert_eq!(widget.children[0].selection_range.head, 27);
         assert_eq!(out[1].name, "MAX");
-        assert_eq!(out[1].kind, minae_protocol::SymbolKind::Constant);
-        assert_eq!(out[2].kind, minae_protocol::SymbolKind::Other, "未知 kind は Other に潰す");
+        assert_eq!(out[1].kind, mina_protocol::SymbolKind::Constant);
+        assert_eq!(out[2].kind, mina_protocol::SymbolKind::Other, "未知 kind は Other に潰す");
     }
 
     #[test]
@@ -2269,7 +2269,7 @@ fn capabilities_of_parses_initialize_response() {
         );
         assert_eq!(out.len(), 1, "フラット形状でも変換する");
         assert_eq!(out[0].name, "RUNTIME");
-        assert_eq!(out[0].kind, minae_protocol::SymbolKind::Constant);
+        assert_eq!(out[0].kind, mina_protocol::SymbolKind::Constant);
         assert_eq!(out[0].range.anchor, 0);
         assert_eq!(out[0].range.head, 7);
         assert_eq!(
@@ -2316,7 +2316,7 @@ fn capabilities_of_parses_initialize_response() {
 
     #[test]
     fn enclosing_symbol_finds_deepest_containing() {
-        use minae_protocol::{OutlineSymbol, Range, SymbolKind};
+        use mina_protocol::{OutlineSymbol, Range, SymbolKind};
         let sym = |name: &str, anchor: usize, head: usize, children: Vec<OutlineSymbol>| {
             OutlineSymbol {
                 name: name.into(),

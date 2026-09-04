@@ -39,17 +39,17 @@ use std::io;
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use minae_protocol::{
+use mina_protocol::{
     CheckDiagnostic, ClientKind, Command, DocumentEdit, InlayHint, OutlineSymbol, StateSnapshot,
     WorkspaceSymbol,
 };
-use minae_protocol::{ReferenceLocation, ServerMessage, Severity};
+use mina_protocol::{ReferenceLocation, ServerMessage, Severity};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{timeout, Duration};
 
-use minae_conn as conn;
+use mina_conn as conn;
 
 /// ワンショット接続を開く（session CLI の各コマンドの共通冒頭）。
 ///
@@ -58,7 +58,7 @@ use minae_conn as conn;
 /// Hello（Headless 宣言）を送って (write_half, reader) を返す。接続は
 /// 1コマンドごとに開く（永続ではない — ADR-0013）。
 async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>)> {
-    let socket = minae_protocol::socket_path();
+    let socket = mina_protocol::socket_path();
     if conn::connect(&socket).await.is_err() {
         conn::spawn_daemon(&std::env::current_exe()?, &["daemon", "serve"])?;
         conn::wait_ready(&socket, 50).await?;
@@ -995,7 +995,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
 }
 
 /// daemon に接続し、指定位置の定義を軽量応答（[`ServerMessage::Peek`]）で受け取る。
-async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<minae_protocol::Peek> {
+async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protocol::Peek> {
     let (mut write_half, mut reader) = open_one_shot().await?;
     // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る
     conn::request_peek(&mut write_half, &mut reader, &conn::absolutize(path), line, col).await
@@ -1012,8 +1012,8 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
     write_half.flush().await?;
     let mut response = String::new();
     reader.read_line(&mut response).await?;
-    match serde_json::from_str::<minae_protocol::ServerMessage>(&response) {
-        Ok(minae_protocol::ServerMessage::ServerInfo {
+    match serde_json::from_str::<mina_protocol::ServerMessage>(&response) {
+        Ok(mina_protocol::ServerMessage::ServerInfo {
             generation,
             daemon_build_ts,
             metrics,
@@ -1029,21 +1029,21 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
                 .unwrap_or(0),
             "metrics": metrics,
         })),
-        Ok(minae_protocol::ServerMessage::Response { .. })
-        | Ok(minae_protocol::ServerMessage::Push { .. }) => {
+        Ok(mina_protocol::ServerMessage::Response { .. })
+        | Ok(mina_protocol::ServerMessage::Push { .. }) => {
             Err(invalid("GetServerInfo にスナップショット応答が返った（旧 daemon: 再ビルドしてください）"))
         }
-        Ok(minae_protocol::ServerMessage::Hints { .. })
-        | Ok(minae_protocol::ServerMessage::Peek { .. })
-        | Ok(minae_protocol::ServerMessage::Outline { .. })
-        | Ok(minae_protocol::ServerMessage::Hover { .. })
-        | Ok(minae_protocol::ServerMessage::WorkspaceSymbols { .. })
-        | Ok(minae_protocol::ServerMessage::Check { .. })
-        | Ok(minae_protocol::ServerMessage::EnclosingSymbol { .. }) => {
+        Ok(mina_protocol::ServerMessage::Hints { .. })
+        | Ok(mina_protocol::ServerMessage::Peek { .. })
+        | Ok(mina_protocol::ServerMessage::Outline { .. })
+        | Ok(mina_protocol::ServerMessage::Hover { .. })
+        | Ok(mina_protocol::ServerMessage::WorkspaceSymbols { .. })
+        | Ok(mina_protocol::ServerMessage::Check { .. })
+        | Ok(mina_protocol::ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
         }
-        Ok(minae_protocol::ServerMessage::RenameResult { .. })
-        | Ok(minae_protocol::ServerMessage::ReferencesResult { .. }) => {
+        Ok(mina_protocol::ServerMessage::RenameResult { .. })
+        | Ok(mina_protocol::ServerMessage::ReferencesResult { .. }) => {
             Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
@@ -1062,7 +1062,7 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
 
 /// パスを含むコマンドのパスを絶対化する（Open / GetInlayHints。他はそのまま）。
 ///
-/// [`minae_conn::absolutize`] を共通化して使う — daemon 側の cwd は spawn 時に
+/// [`mina_conn::absolutize`] を共通化して使う — daemon 側の cwd は spawn 時に
 /// 固定されるため、解決は送信側（agent の cwd）で行う。
 fn absolutize_paths(command: Command) -> Command {
     match command {

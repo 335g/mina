@@ -6,7 +6,7 @@
 use std::io::Write;
 
 use crate::colorscheme::{adapt_color, ColorCapability, Colorscheme, Style, UiRole};
-use minae_protocol::{Diagnostic, HighlightGroup, HighlightRange, InlayHint, Mode, Range, Severity, StateSnapshot};
+use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, InlayHint, Mode, Range, Severity, StateSnapshot};
 use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthChar;
 
@@ -381,7 +381,7 @@ pub(crate) fn draw_peek_popup(
     scheme: &Colorscheme,
     capability: ColorCapability,
     no_color: bool,
-    peek: &minae_protocol::Peek,
+    peek: &mina_protocol::Peek,
     width: u16,
     height: u16,
 ) -> std::io::Result<()> {
@@ -422,7 +422,7 @@ pub(crate) fn draw_refs_popup(
     no_color: bool,
     path: &str,
     total: usize,
-    locations: &[minae_protocol::ReferenceLocation],
+    locations: &[mina_protocol::ReferenceLocation],
     width: u16,
     height: u16,
 ) -> std::io::Result<()> {
@@ -1639,10 +1639,10 @@ mod tests {
             primary_index: 0,
             mode: Mode::Normal,
             first_line: 0,
-            diagnostics: vec![minae_protocol::Diagnostic {
+            diagnostics: vec![mina_protocol::Diagnostic {
                 start: 6,
                 end: 11,
-                severity: minae_protocol::Severity::Error,
+                severity: mina_protocol::Severity::Error,
                 message: "oops".into(),
             }],
             inlay_hints: Vec::new(), // #24: 描画テストで設定する
@@ -1662,8 +1662,8 @@ mod tests {
     fn status_line_shows_activity_spinner_and_label() {
         // ADR-0028: 活動があると右端にスピナー + ラベルが表示される
         let mut state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
-        state.activities = vec![minae_protocol::Activity {
-            kind: minae_protocol::ActivityKind::DiagnosticsSettle,
+        state.activities = vec![mina_protocol::Activity {
+            kind: mina_protocol::ActivityKind::DiagnosticsSettle,
             label: "診断取得中".into(),
         }];
         let out = render_text(
@@ -1690,8 +1690,8 @@ mod tests {
     fn status_line_reserves_width_for_spinner() {
         // ADR-0028: 狭い幅でも右端のスピナー + ラベルが切れない
         let mut state = state_with("hello", vec![Range { anchor: 2, head: 3 }], 0);
-        state.activities = vec![minae_protocol::Activity {
-            kind: minae_protocol::ActivityKind::Save,
+        state.activities = vec![mina_protocol::Activity {
+            kind: mina_protocol::ActivityKind::Save,
             label: "保存中".into(),
         }];
         let out = render_text(
@@ -1737,7 +1737,7 @@ mod tests {
             &crate::colorscheme::DEFAULT,
             ColorCapability::Ansi16,
             false,
-            &minae_protocol::Peek {
+            &mina_protocol::Peek {
                 path: "/src/lib.rs".into(),
                 line: 42,
                 text: "pub fn frobnicate(x: i32) -> i32 {\n    x * 2\n}".into(),
@@ -1766,7 +1766,7 @@ mod tests {
             &crate::colorscheme::DEFAULT,
             ColorCapability::Ansi16,
             false,
-            &minae_protocol::Peek {
+            &mina_protocol::Peek {
                 path: "/x.rs".into(),
                 line: 1,
                 text: "bad\x1b[31m ESC + あいうえおかきくけこ".into(),

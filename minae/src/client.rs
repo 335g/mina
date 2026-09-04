@@ -2,7 +2,7 @@
 //!
 //! Open のパスはクライアント側で絶対化してから送る — daemon は常駐で cwd が
 //! 起動時のディレクトリのままなので、相対パスの解決を daemon に任せると
-//! 別ディレクトリから起動したクライアントの意図と食い違う（[`minae_conn::absolutize`]）。
+//! 別ディレクトリから起動したクライアントの意図と食い違う（[`mina_conn::absolutize`]）。
 //!
 //! リクエスト/レスポンスのみ（ADR-0006）。編集状態は持たない — キーイベントを
 //! キーマップで Command に解決して送り、返ってきたスナップショットを描画するだけ。
@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use minae_protocol::{
+use mina_protocol::{
     ClientKind, Command, Direction, Mode, Peek, ReferenceLocation,
     ServerMessage, StateSnapshot,
 };
@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::colorscheme::{self, Colorscheme};
 use crate::keymap::{Keymaps, Resolution};
-use minae_conn as conn;
+use mina_conn as conn;
 use crate::render;
 
 const ALT_SCREEN_ON: &str = "\x1b[?1049h";
@@ -81,8 +81,8 @@ fn word_at_cursor(state: &StateSnapshot) -> Option<String> {
         .get(state.primary_index)
         .map(|r| r.head)
         .unwrap_or(0);
-    let doc = minae_core::Document::from(state.text.as_str());
-    let (s, e) = minae_core::word_at(&doc, head)?;
+    let doc = mina_text::Document::from(state.text.as_str());
+    let (s, e) = mina_text::word_at(&doc, head)?;
     let chars: Vec<char> = state.text.chars().collect();
     Some(chars[s..e].iter().collect())
 }
@@ -132,7 +132,7 @@ impl Drop for TerminalGuard {
 
 /// TUI を起動する。`file` があればそれを開く。
 pub async fn run(file: Option<&str>) -> std::io::Result<()> {
-    let socket = minae_protocol::socket_path();
+    let socket = mina_protocol::socket_path();
     // デーモンがいなければ起動する（クライアント視点のライフサイクル。spawn 元は
     // 自身 = `minae daemon serve` を持つ bin。将来の TUI リポジトリでは別ポリシー）。
     if conn::connect(&socket).await.is_err() {
@@ -885,7 +885,7 @@ async fn read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minae_protocol::Range;
+    use mina_protocol::Range;
 
     #[test]
     fn word_at_cursor_extracts_identifier_at_selection_head() {

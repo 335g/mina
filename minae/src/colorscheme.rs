@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use minae_protocol::HighlightGroup;
+use mina_protocol::HighlightGroup;
 use serde::Deserialize;
 
 /// 色の表現。既定スキームは Ansi のみ使用 (Rgb は #20 の色能力検出で使う)。

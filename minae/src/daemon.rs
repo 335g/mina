@@ -12,18 +12,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use minae_core::{
+use mina_text::{
     Range as CoreRange, Selection, Transaction, append_selection, extend_line_below, extend_selection,
     extend_to, find_matches, find_next, find_prev, insert_at, line_end_of, line_start_of,
     move_selection, move_selection_lines, move_selection_to_line_first_non_whitespace,
     replace_targets, select_line_selection, word_at,
 };
-use minae_protocol::{
+use mina_protocol::{
     Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, DocumentEdit,
     EventKind, EventSource, GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range,
     ServerMessage, ServerMetrics, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
-use minae_view::Editor;
+use mina_view::Editor;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::{Mutex, watch};
@@ -106,7 +106,7 @@ pub struct Daemon {
     /// 最後に読んだ languages.toml の mtime（`languages_refresh` の再読込判定）。
     languages_mtime: Option<std::time::SystemTime>,
     /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
-    pub(crate) diagnostics: Vec<minae_protocol::Diagnostic>,
+    pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
     /// パスごとの inlay hint キャッシュ（ADR-0020）。`HintCache.text_checksum` が
     /// 現在のテキストと一致すれば新鮮（再取得不要）。一致しなくても表示には使う
     /// （Q7: stale ヒントは新ヒント到着まで保持）。挿入順は `hint_order` で FIFO evict。
@@ -148,7 +148,7 @@ pub struct Daemon {
     /// スナップショット生成時にテキストの checksum が変わっていれば再計算
     /// （minae-loader のクエリ経由）。破棄された文書（Open の上限 evict）の
     /// エントリは参照時に掃除する。
-    syntax: HashMap<minae_view::DocumentId, SyntaxCache>,
+    syntax: HashMap<mina_view::DocumentId, SyntaxCache>,
     /// 起動からの累積メトリクス（issue #27。GetServerInfo で開示し、headless
     /// エージェントの検証失敗率・全文再読回数などを効果検証する）。
     metrics: ServerMetrics,
@@ -294,7 +294,7 @@ impl Daemon {
         // 窓先頭 byte の char インデックスを渡す（loader は窓範囲限定の
         // byte→char 変換を使うため、文書内の絶対位置はここで解決する）。
         let window_char_start = text[..window.start].chars().count();
-        let ranges = minae_loader::highlight_ranges_in_window(
+        let ranges = mina_loader::highlight_ranges_in_window(
             &cached.query,
             text,
             &cached.tree,
@@ -496,8 +496,8 @@ impl Daemon {
         if kind == ClientKind::Interactive {
             self.interactive_clients.remove(&conn_id);
         }
-        if self.insert_owner == Some(conn_id) && self.editor.mode() == minae_view::Mode::Insert {
-            close_insert_session(self, minae_view::Mode::Normal);
+        if self.insert_owner == Some(conn_id) && self.editor.mode() == mina_view::Mode::Insert {
+            close_insert_session(self, mina_view::Mode::Normal);
         }
         // ADR-0027: 最後の Interactive クライアント切断時、そのクライアントが
         // Hello でリセットを宣言していれば全 View のカーソルを先頭へ戻す。
@@ -580,7 +580,7 @@ fn byte_point(text: &str, byte: usize) -> tree_sitter::Point {
 
 /// 常駐デーモンとして起動する（`minae daemon serve`）。
 pub async fn run() -> std::io::Result<()> {
-    serve(&minae_protocol::socket_path()).await
+    serve(&mina_protocol::socket_path()).await
 }
 
 /// 同時に処理する接続数の上限（6b: 接続の張り放題による fd/タスク枯渇対策）。
@@ -727,7 +727,7 @@ async fn watch_disk(
                 };
                 // 外部書き込みとして Insert グループを閉じる（ADR-0007 と同原則）
                 if d.insert_owner.is_some() {
-                    close_insert_session(&mut d, minae_view::Mode::Normal);
+                    close_insert_session(&mut d, mina_view::Mode::Normal);
                 }
                 if d.editor.reload_doc(doc_id, text) {
                     reloaded = true;
@@ -2016,7 +2016,7 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
             ))
             .await;
         };
-        out.push(minae_protocol::ReferenceLocation {
+        out.push(mina_protocol::ReferenceLocation {
             path: p.to_string_lossy().into_owned(),
             line,
         });
@@ -2208,7 +2208,7 @@ async fn apply_and_save_rename(
     // フェーズ1（ロック内）: 開文書への適用・記録。未開ファイルのパスを収集。
     let mut to_write: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
     let mut unopened: Vec<&lsp::RenameFile> = Vec::new();
-    let mut open_doc_ids: Vec<(PathBuf, minae_view::DocumentId)> = Vec::new();
+    let mut open_doc_ids: Vec<(PathBuf, mina_view::DocumentId)> = Vec::new();
     {
         let mut d = daemon.lock().await;
         for f in files {
@@ -2220,7 +2220,7 @@ async fn apply_and_save_rename(
                     .map(|e| (e.start, e.end, e.text.clone()))
                     .collect();
                 let old_doc = d.editor.document(doc_id).clone();
-                let tx = minae_core::Transaction::replace_ranges(&old_doc, &edits);
+                let tx = mina_text::Transaction::replace_ranges(&old_doc, &edits);
                 let selection_after = d.editor.selection(); // クランプは apply_document 側
                 d.editor.apply_document(doc_id, tx, selection_after);
                 d.record_event(
@@ -2832,7 +2832,7 @@ async fn process_command(
                             if let Some(doc_id) = d.editor.doc_id_for_path(&path_buf) {
                                 // 外部書き込みとして Insert グループを閉じる
                                 if d.insert_owner.is_some() {
-                                    close_insert_session(&mut d, minae_view::Mode::Normal);
+                                    close_insert_session(&mut d, mina_view::Mode::Normal);
                                 }
                                 if d.editor.reload_doc(doc_id, new_text) {
                                     d.record_event(
@@ -3104,7 +3104,7 @@ async fn process_command(
                     // SetMode イベント（選択移動は Move 同様スナップショットに載る）。
                     // o/O は上で Insert イベント（改行）として記録済み。
                     Command::InsertAtLineEnd | Command::InsertAtLineStart | Command::Append
-                        if d.editor.mode() != minae_view::Mode::Insert =>
+                        if d.editor.mode() != mina_view::Mode::Insert =>
                     {
                         Some((EventKind::SetMode, None, None))
                     }
@@ -3243,7 +3243,7 @@ async fn normalize_open_path(path: PathBuf) -> PathBuf {
 
 /// 存在しないパス向けの lexical 正規化: 絶対化 + `.` / `..` の解決。
 ///
-/// 送信側（TUI / session CLI）は常に絶対化して送る（[`minae_conn::absolutize`]）
+/// 送信側（TUI / session CLI）は常に絶対化して送る（[`mina_conn::absolutize`]）
 /// ため、相対パスが届くのは第三者の生クライアントだけ。その場合の解決基準は
 /// daemon の cwd（spawn 時に固定。ADR-0005）で、従来のディスク読込と同じ解釈。
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -3434,7 +3434,7 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
 /// 不変条件「mode == Insert ⟺ insert_owner == Some(_)」の解除を1箇所に持つ
 /// （切断・外部書き込み・奪取・SetMode の4経路が以前は3行を個別に再現していた）。
 /// 呼び出し側が事前に条件（所有者一致・外部書き込み・奪取）を判定する。
-fn close_insert_session(daemon: &mut Daemon, mode: minae_view::Mode) {
+fn close_insert_session(daemon: &mut Daemon, mode: mina_view::Mode) {
     daemon.editor.end_group();
     daemon.editor.set_mode(mode);
     daemon.insert_owner = None;
@@ -3447,8 +3447,8 @@ fn close_insert_session(daemon: &mut Daemon, mode: minae_view::Mode) {
 /// 所有者自身の書き込みと、グループが開いていない書き込みには影響しない。
 fn preempt(daemon: &mut Daemon, conn_id: u64) {
     if let Some(owner) = daemon.insert_owner {
-        if owner != conn_id && daemon.editor.mode() == minae_view::Mode::Insert {
-            close_insert_session(daemon, minae_view::Mode::Normal);
+        if owner != conn_id && daemon.editor.mode() == mina_view::Mode::Insert {
+            close_insert_session(daemon, mina_view::Mode::Normal);
         }
     }
 }
@@ -3470,7 +3470,7 @@ enum LinePos {
 /// 奪取する（HIGH-1）。
 fn enter_insert(daemon: &mut Daemon, conn_id: u64) {
     let current = daemon.editor.mode();
-    if current != minae_view::Mode::Insert {
+    if current != mina_view::Mode::Insert {
         daemon.editor.begin_group();
         daemon.insert_owner = Some(conn_id);
     } else if daemon.insert_owner != Some(conn_id) {
@@ -3478,7 +3478,7 @@ fn enter_insert(daemon: &mut Daemon, conn_id: u64) {
         daemon.editor.begin_group();
         daemon.insert_owner = Some(conn_id);
     }
-    daemon.editor.set_mode(minae_view::Mode::Insert);
+    daemon.editor.set_mode(mina_view::Mode::Insert);
 }
 
 /// `A`/`I` 共通処理: 選択を目標位置へ点に潰して Insert モードへ入る
@@ -3492,8 +3492,8 @@ fn insert_at_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateS
         LinePos::End => move_selection(
             daemon.editor.current_document(),
             &selection,
-            minae_core::Movement::LineEnd,
-            minae_core::Direction::Forward,
+            mina_text::Movement::LineEnd,
+            mina_text::Direction::Forward,
         ),
         LinePos::FirstNonWhitespace => {
             move_selection_to_line_first_non_whitespace(daemon.editor.current_document(), &selection)
@@ -3504,7 +3504,7 @@ fn insert_at_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateS
     daemon.editor.set_selection(moved);
     // 既に Insert ならモードは変わらない（changed = false → 世代もイベントも
     // 進まない。選択位置の移動だけがスナップショットに載る）。
-    let changed = daemon.editor.mode() != minae_view::Mode::Insert;
+    let changed = daemon.editor.mode() != mina_view::Mode::Insert;
     enter_insert(daemon, conn_id);
     daemon.editor.scroll_to_cursor(daemon.viewport_height);
     (snapshot(daemon, None), changed)
@@ -3521,8 +3521,8 @@ fn open_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateSnapsh
             move_selection(
                 doc,
                 &selection,
-                minae_core::Movement::LineEnd,
-                minae_core::Direction::Forward,
+                mina_text::Movement::LineEnd,
+                mina_text::Direction::Forward,
             ),
             true, // 改行を挟んだ先（新しい行の先頭）に立つ
         ),
@@ -3530,8 +3530,8 @@ fn open_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateSnapsh
             move_selection(
                 doc,
                 &selection,
-                minae_core::Movement::LineStart,
-                minae_core::Direction::Forward,
+                mina_text::Movement::LineStart,
+                mina_text::Direction::Forward,
             ),
             false, // 改行の手前（新しい空行の先頭）に立つ
         ),
@@ -3542,7 +3542,7 @@ fn open_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateSnapsh
     let changed = !tx.is_noop();
     let selection_after = tx.map_selection(&insert_at, after);
     daemon.editor.apply(tx, selection_after);
-    let mode_changed = daemon.editor.mode() != minae_view::Mode::Insert;
+    let mode_changed = daemon.editor.mode() != mina_view::Mode::Insert;
     enter_insert(daemon, conn_id);
     daemon.editor.scroll_to_cursor(daemon.viewport_height);
     (snapshot(daemon, None), changed || mode_changed)
@@ -3555,7 +3555,7 @@ fn open_line(daemon: &mut Daemon, conn_id: u64, target: LinePos) -> (StateSnapsh
 fn search_with(
     daemon: &mut Daemon,
     query: &str,
-    direction: minae_protocol::Direction,
+    direction: mina_protocol::Direction,
 ) -> (bool, Option<String>) {
     if query.is_empty() {
         return (false, Some("empty search".into()));
@@ -3563,11 +3563,11 @@ fn search_with(
     let doc = daemon.editor.current_document();
     let head = daemon.editor.selection().primary().head();
     let len = doc.len_chars();
-    let case = minae_core::CaseSensitivity::Smart;
+    let case = mina_text::CaseSensitivity::Smart;
     let found = match direction {
-        minae_protocol::Direction::Forward => find_next(doc, query, head, case)
+        mina_protocol::Direction::Forward => find_next(doc, query, head, case)
             .or_else(|| find_next(doc, query, 0, case)),
-        minae_protocol::Direction::Backward => find_prev(doc, query, head, case)
+        mina_protocol::Direction::Backward => find_prev(doc, query, head, case)
             .or_else(|| find_prev(doc, query, len, case)),
     };
     match found {
@@ -3576,7 +3576,7 @@ fn search_with(
                 query: query.to_string(),
                 found: (r.start(), r.end()),
             });
-            daemon.editor.set_selection(minae_core::Selection::new(
+            daemon.editor.set_selection(mina_text::Selection::new(
                 vec![CoreRange::new(r.start(), r.end())],
                 0,
             ));
@@ -3594,17 +3594,17 @@ fn search_with(
 /// で status を載せる。
 fn search_next(
     daemon: &mut Daemon,
-    direction: minae_protocol::Direction,
+    direction: mina_protocol::Direction,
 ) -> (bool, Option<String>) {
     let Some(state) = daemon.last_search.clone() else {
         return (false, Some("no previous search".into()));
     };
     let doc = daemon.editor.current_document();
     let len = doc.len_chars();
-    let case = minae_core::CaseSensitivity::Smart;
+    let case = mina_text::CaseSensitivity::Smart;
     let (s, e) = state.found;
     let found = match direction {
-        minae_protocol::Direction::Forward => {
+        mina_protocol::Direction::Forward => {
             // 現在の一致の直後から。無ければ先頭から折り返し（現在位置と同じ
             // 一致に戻るのは避ける）
             find_next(doc, &state.query, e, case).or_else(|| {
@@ -3612,7 +3612,7 @@ fn search_next(
                     .filter(|r| r.start() != s || r.end() != e)
             })
         }
-        minae_protocol::Direction::Backward => {
+        mina_protocol::Direction::Backward => {
             // 現在の一致の手前から（現在の一致自身は除外。無ければ末尾から
             // 折り返し — それも現在位置と同じ一致なら進めない）
             find_prev(doc, &state.query, s.saturating_sub(1), case)
@@ -3629,7 +3629,7 @@ fn search_next(
                 query: state.query,
                 found: (r.start(), r.end()),
             });
-            daemon.editor.set_selection(minae_core::Selection::new(
+            daemon.editor.set_selection(mina_text::Selection::new(
                 vec![CoreRange::new(r.start(), r.end())],
                 0,
             ));
@@ -3668,7 +3668,7 @@ fn search_selection(daemon: &mut Daemon) -> (bool, Option<String>) {
     if query.is_empty() {
         return (false, Some("no selection to search".into()));
     }
-    match find_matches(doc, query, minae_core::CaseSensitivity::Smart) {
+    match find_matches(doc, query, mina_text::CaseSensitivity::Smart) {
         Some(matches) => {
             daemon.last_search = Some(SearchState {
                 query: query.to_string(),
@@ -3755,7 +3755,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::DeleteBackward => {
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
-            let tx = minae_core::delete_backward_transaction(
+            let tx = mina_text::delete_backward_transaction(
                 daemon.editor.current_document(),
                 &selection,
             );
@@ -3769,7 +3769,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::DeleteWordBackward => {
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
-            let tx = minae_core::delete_word_backward_transaction(
+            let tx = mina_text::delete_word_backward_transaction(
                 daemon.editor.current_document(),
                 &selection,
             );
@@ -3783,7 +3783,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::DeleteForward => {
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
-            let tx = minae_core::delete_forward_transaction(
+            let tx = mina_text::delete_forward_transaction(
                 daemon.editor.current_document(),
                 &selection,
             );
@@ -3797,7 +3797,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::DeleteWordForward => {
             preempt(daemon, conn_id);
             let selection = daemon.editor.selection();
-            let tx = minae_core::delete_word_forward_transaction(
+            let tx = mina_text::delete_word_forward_transaction(
                 daemon.editor.current_document(),
                 &selection,
             );
@@ -3817,8 +3817,8 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             let selection_after = tx.map_selection(&selection, false);
             daemon.editor.apply(tx, selection_after);
             // 選択を消したら Select モードを抜ける（vim の d と同様）
-            if daemon.editor.mode() == minae_view::Mode::Select {
-                daemon.editor.set_mode(minae_view::Mode::Normal);
+            if daemon.editor.mode() == mina_view::Mode::Select {
+                daemon.editor.set_mode(mina_view::Mode::Normal);
             }
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), changed)
@@ -3833,12 +3833,12 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             let deleted = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
             daemon.editor.apply(tx, selection_after);
-            let was_insert = daemon.editor.mode() == minae_view::Mode::Insert;
+            let was_insert = daemon.editor.mode() == mina_view::Mode::Insert;
             if !was_insert {
                 daemon.editor.begin_group();
                 daemon.insert_owner = Some(conn_id);
             }
-            daemon.editor.set_mode(minae_view::Mode::Insert);
+            daemon.editor.set_mode(mina_view::Mode::Insert);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), deleted || !was_insert)
         }
@@ -3873,8 +3873,8 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 match convert_movement(movement) {
                     // Helix 流: 単語移動（w/b/e）は anchor を保持して「移動した分」を
                     // 選択する。h/l/j/k や矢印は従来どおり点に潰す。
-                    minae_core::Movement::Word | minae_core::Movement::WordEnd => {
-                        minae_core::word_move_selection(
+                    mina_text::Movement::Word | mina_text::Movement::WordEnd => {
+                        mina_text::word_move_selection(
                             doc,
                             &selection,
                             word_move_target(movement, direction),
@@ -3923,7 +3923,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::SelectAll => {
             let len = daemon.editor.current_document().len_chars();
             daemon.editor
-                .set_selection(minae_core::Selection::new(vec![CoreRange::new(0, len)], 0));
+                .set_selection(mina_text::Selection::new(vec![CoreRange::new(0, len)], 0));
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), false)
         }
@@ -3932,7 +3932,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // （Helix の append_mode。InsertAtLineEnd/Start と同じグループ管理）。
             let moved = append_selection(daemon.editor.current_document(), &daemon.editor.selection());
             daemon.editor.set_selection(moved);
-            let changed = daemon.editor.mode() != minae_view::Mode::Insert;
+            let changed = daemon.editor.mode() != mina_view::Mode::Insert;
             enter_insert(daemon, conn_id);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), changed)
@@ -3969,7 +3969,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 .iter()
                 .map(|r| CoreRange::new(line_start_of(&text, r.head()), r.end()))
                 .collect();
-            let kill = minae_core::Selection::new(ranges, selection.primary_index());
+            let kill = mina_text::Selection::new(ranges, selection.primary_index());
             let tx = Transaction::delete(doc, &kill);
             let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
@@ -3987,7 +3987,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
                 .iter()
                 .map(|r| CoreRange::new(r.start(), line_end_of(&text, r.head())))
                 .collect();
-            let kill = minae_core::Selection::new(ranges, selection.primary_index());
+            let kill = mina_text::Selection::new(ranges, selection.primary_index());
             let tx = Transaction::delete(doc, &kill);
             let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, false);
@@ -4017,10 +4017,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             };
             // Select モードでは移動でなく選択の拡張（Helix の select モードは
             // 移動系キーが extend になる — `gg`/`G` も同様）。Normal では点に潰す。
-            let moved = if daemon.editor.mode() == minae_view::Mode::Select {
+            let moved = if daemon.editor.mode() == mina_view::Mode::Select {
                 extend_to(daemon.editor.current_document(), &daemon.editor.selection(), pos)
             } else {
-                minae_core::Selection::point(pos)
+                mina_text::Selection::point(pos)
             };
             daemon.editor.set_selection(moved);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
@@ -4030,10 +4030,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // 半ページ（Helix の C-d/C-u）: 表示とカーソルを viewport 高さの半分だけ
             // 動かす。Scroll と同様にカーソルも連動させる（読み上げ位置が保たれる）。
             let delta = (daemon.viewport_height as isize / 2)
-                .saturating_mul(if direction == minae_protocol::Direction::Forward { 1 } else { -1 });
+                .saturating_mul(if direction == mina_protocol::Direction::Forward { 1 } else { -1 });
             if delta != 0 {
                 daemon.editor.scroll_lines(delta);
-                let extend = daemon.editor.mode() == minae_view::Mode::Select;
+                let extend = daemon.editor.mode() == mina_view::Mode::Select;
                 let moved = move_selection_lines(
                     daemon.editor.current_document(),
                     &daemon.editor.selection(),
@@ -4058,7 +4058,7 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             let delta = pages.saturating_mul(height as isize);
             if delta != 0 {
                 let selection = daemon.editor.selection();
-                let extend = daemon.editor.mode() == minae_view::Mode::Select;
+                let extend = daemon.editor.mode() == mina_view::Mode::Select;
                 let moved = move_selection_lines(
                     daemon.editor.current_document(),
                     &selection,
@@ -4084,12 +4084,12 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // する。モード自体はグローバルなので、離脱は誰が送ってもグループを
             // 閉じる（agent の SetMode は通常送られない — ponytail 参照）。
             // ponytail: ネストしたグループは考慮しない（v1 にその経路はない）。
-            if new_mode == minae_view::Mode::Insert {
+            if new_mode == mina_view::Mode::Insert {
                 // グループの開閉・所有者・奪取は enter_insert に集約
                 // （InsertAtLineEnd / InsertAtLineStart と共通）。
                 enter_insert(daemon, conn_id);
             } else {
-                if current == minae_view::Mode::Insert {
+                if current == mina_view::Mode::Insert {
                     close_insert_session(daemon, new_mode);
                 } else {
                     daemon.editor.set_mode(new_mode);
@@ -4172,64 +4172,64 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
     }
 }
 
-fn convert_movement(m: minae_protocol::Movement) -> minae_core::Movement {
+fn convert_movement(m: mina_protocol::Movement) -> mina_text::Movement {
     match m {
-        minae_protocol::Movement::Char => minae_core::Movement::Char,
-        minae_protocol::Movement::Line => minae_core::Movement::Line,
-        minae_protocol::Movement::Word => minae_core::Movement::Word,
-        minae_protocol::Movement::WordEnd => minae_core::Movement::WordEnd,
-        minae_protocol::Movement::LineStart => minae_core::Movement::LineStart,
-        minae_protocol::Movement::LineEnd => minae_core::Movement::LineEnd,
-        minae_protocol::Movement::FirstNonWhitespace => minae_core::Movement::FirstNonWhitespace,
+        mina_protocol::Movement::Char => mina_text::Movement::Char,
+        mina_protocol::Movement::Line => mina_text::Movement::Line,
+        mina_protocol::Movement::Word => mina_text::Movement::Word,
+        mina_protocol::Movement::WordEnd => mina_text::Movement::WordEnd,
+        mina_protocol::Movement::LineStart => mina_text::Movement::LineStart,
+        mina_protocol::Movement::LineEnd => mina_text::Movement::LineEnd,
+        mina_protocol::Movement::FirstNonWhitespace => mina_text::Movement::FirstNonWhitespace,
     }
 }
 
 /// 単語移動の wire 型（Movement + Direction）をコアの目標型へ変換する。
 fn word_move_target(
-    m: minae_protocol::Movement,
-    d: minae_protocol::Direction,
-) -> minae_core::WordMoveTarget {
+    m: mina_protocol::Movement,
+    d: mina_protocol::Direction,
+) -> mina_text::WordMoveTarget {
     match (m, d) {
         (
-            minae_protocol::Movement::Word,
-            minae_protocol::Direction::Forward,
-        ) => minae_core::WordMoveTarget::NextWordStart,
+            mina_protocol::Movement::Word,
+            mina_protocol::Direction::Forward,
+        ) => mina_text::WordMoveTarget::NextWordStart,
         (
-            minae_protocol::Movement::Word,
-            minae_protocol::Direction::Backward,
-        ) => minae_core::WordMoveTarget::PrevWordStart,
+            mina_protocol::Movement::Word,
+            mina_protocol::Direction::Backward,
+        ) => mina_text::WordMoveTarget::PrevWordStart,
         (
-            minae_protocol::Movement::WordEnd,
-            minae_protocol::Direction::Forward,
-        ) => minae_core::WordMoveTarget::NextWordEnd,
+            mina_protocol::Movement::WordEnd,
+            mina_protocol::Direction::Forward,
+        ) => mina_text::WordMoveTarget::NextWordEnd,
         (
-            minae_protocol::Movement::WordEnd,
-            minae_protocol::Direction::Backward,
-        ) => minae_core::WordMoveTarget::PrevWordEnd,
+            mina_protocol::Movement::WordEnd,
+            mina_protocol::Direction::Backward,
+        ) => mina_text::WordMoveTarget::PrevWordEnd,
         _ => unreachable!("単語移動以外の movement はここに来ない"),
     }
 }
 
-fn convert_direction(d: minae_protocol::Direction) -> minae_core::Direction {
+fn convert_direction(d: mina_protocol::Direction) -> mina_text::Direction {
     match d {
-        minae_protocol::Direction::Forward => minae_core::Direction::Forward,
-        minae_protocol::Direction::Backward => minae_core::Direction::Backward,
+        mina_protocol::Direction::Forward => mina_text::Direction::Forward,
+        mina_protocol::Direction::Backward => mina_text::Direction::Backward,
     }
 }
 
-fn convert_mode(m: minae_protocol::Mode) -> minae_view::Mode {
+fn convert_mode(m: mina_protocol::Mode) -> mina_view::Mode {
     match m {
-        minae_protocol::Mode::Normal => minae_view::Mode::Normal,
-        minae_protocol::Mode::Insert => minae_view::Mode::Insert,
-        minae_protocol::Mode::Select => minae_view::Mode::Select,
+        mina_protocol::Mode::Normal => mina_view::Mode::Normal,
+        mina_protocol::Mode::Insert => mina_view::Mode::Insert,
+        mina_protocol::Mode::Select => mina_view::Mode::Select,
     }
 }
 
-fn convert_mode_back(m: minae_view::Mode) -> minae_protocol::Mode {
+fn convert_mode_back(m: mina_view::Mode) -> mina_protocol::Mode {
     match m {
-        minae_view::Mode::Normal => minae_protocol::Mode::Normal,
-        minae_view::Mode::Insert => minae_protocol::Mode::Insert,
-        minae_view::Mode::Select => minae_protocol::Mode::Select,
+        mina_view::Mode::Normal => mina_protocol::Mode::Normal,
+        mina_view::Mode::Insert => mina_protocol::Mode::Insert,
+        mina_view::Mode::Select => mina_protocol::Mode::Select,
     }
 }
 
@@ -4237,7 +4237,7 @@ fn convert_mode_back(m: minae_view::Mode) -> minae_protocol::Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minae_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
+    use mina_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
 
     // lsp.rs から移設（daemon 統合の ensure / drain_into を直接検証する）
     #[tokio::test]
@@ -4927,7 +4927,7 @@ root-markers = [".docsroot"]
         // ハイライトを返す（挿入・削除・undo/redo・複数行挿入の全経路）。
         // ファイルは viewport（既定 24 行）未満なので窓 = 全文。
         let mut d = daemon();
-        let def = minae_loader::language_by_name("rust").unwrap();
+        let def = mina_loader::language_by_name("rust").unwrap();
         open_path(&mut d, "test.rs", "fn a() {}\n// note\nfn b(x: i32) -> i32 { x + 1 }\n");
 
         let assert_matches = |d: &mut Daemon| {
@@ -4935,7 +4935,7 @@ root-markers = [".docsroot"]
             assert_highlights_valid(&s.text, &s.highlights);
             assert_eq!(
                 s.highlights,
-                minae_loader::compute_highlights(def, &s.text),
+                mina_loader::compute_highlights(def, &s.text),
                 "インクリメンタル結果が全文再パースと一致: {}",
                 s.text
             );
@@ -6077,7 +6077,7 @@ root-markers = [".docsroot"]
         apply(&mut d, Command::SetMode { mode: Mode::Insert });
         apply(&mut d, Command::Insert { text: "a".into() });
         d.on_client_disconnect(0, ClientKind::Interactive, true); // 所有者の切断（修正前はグループが開いたまま漏れた）
-        assert_eq!(d.editor.mode(), minae_view::Mode::Normal, "切断で Normal に戻る");
+        assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "切断で Normal に戻る");
         // ADR-0027: 切断でカーソルも先頭へ戻る。このテストは undo グループ境界の
         // 検証が目的なので、明示的に末尾（位置 1）へ戻してから続ける。
         assert_eq!(
@@ -6085,7 +6085,7 @@ root-markers = [".docsroot"]
             0,
             "切断でカーソルは先頭に戻る"
         );
-        d.editor.set_selection(minae_core::Selection::point(1));
+        d.editor.set_selection(mina_text::Selection::point(1));
 
         // 次のクライアント: 再び Insert で入力しても別グループになる
         apply(&mut d, Command::SetMode { mode: Mode::Insert });
@@ -6104,10 +6104,10 @@ root-markers = [".docsroot"]
         // 先頭へ戻し世代とイベントを進める（修正前は完全な no-op だった）。
         let mut d = daemon();
         open(&mut d, "hello");
-        d.editor.set_selection(minae_core::Selection::point(3));
+        d.editor.set_selection(mina_text::Selection::point(3));
         let gen_before = d.generation;
         d.on_client_disconnect(0, ClientKind::Interactive, true);
-        assert_eq!(d.editor.mode(), minae_view::Mode::Normal);
+        assert_eq!(d.editor.mode(), mina_view::Mode::Normal);
         assert_eq!(d.editor.current_document().text().to_string(), "hello");
         assert_eq!(d.editor.selection().ranges()[0].anchor(), 0, "カーソルは先頭に戻る");
         assert_eq!(d.editor.first_line(), 0, "ビューポートも先頭に戻る");
@@ -6128,7 +6128,7 @@ root-markers = [".docsroot"]
         d.on_client_disconnect(9, ClientKind::Headless, true); // 非所有者（agent ワンショット）の切断
         assert_eq!(
             d.editor.mode(),
-            minae_view::Mode::Insert,
+            mina_view::Mode::Insert,
             "非所有者の切断でモードは変わらない"
         );
         // セッションは無傷: 続けて入力し、undo 1回で全体が戻る
@@ -6259,7 +6259,7 @@ root-markers = [".docsroot"]
         apply(&mut d, Command::Insert { text: "a".into() }); // グループ [a]
         let s = apply_from(&mut d, Command::Insert { text: "X".into() }, 9); // agent: 奪取
         assert_eq!(s.0.text, "aX");
-        assert_eq!(d.editor.mode(), minae_view::Mode::Normal, "奪取で Normal に戻る");
+        assert_eq!(d.editor.mode(), mina_view::Mode::Normal, "奪取で Normal に戻る");
         assert_eq!(d.insert_owner, None, "奪取後は所有者がいない");
         // undo は後勝ち順: agent の編集 [X] → 人間のセッション [a]
         let s = apply(&mut d, Command::Undo);
@@ -7511,7 +7511,7 @@ root-markers = [".docsroot"]
                 let thing = symbols.iter().find(|s| s.name == "Thing").unwrap();
                 assert_eq!(
                     thing.kind,
-                    minae_protocol::SymbolKind::Type,
+                    mina_protocol::SymbolKind::Type,
                     "struct → Type: {thing:?}"
                 );
                 assert_eq!(
@@ -7520,8 +7520,8 @@ root-markers = [".docsroot"]
                     "名前トークン Thing の char 位置: {thing:?}"
                 );
                 assert_eq!(thing.selection_range.head, 28);
-                assert!(symbols.iter().any(|s| s.kind == minae_protocol::SymbolKind::Function));
-                assert!(symbols.iter().any(|s| s.kind == minae_protocol::SymbolKind::Variable));
+                assert!(symbols.iter().any(|s| s.kind == mina_protocol::SymbolKind::Function));
+                assert!(symbols.iter().any(|s| s.kind == mina_protocol::SymbolKind::Variable));
             }
             other => panic!("想定外の応答: {other:?}"),
         }
@@ -7548,7 +7548,7 @@ root-markers = [".docsroot"]
                 assert_eq!(error, None);
                 assert!(found, "2行目は struct Thing の中: {name}");
                 assert_eq!(name, "Thing");
-                assert_eq!(kind, minae_protocol::SymbolKind::Type);
+                assert_eq!(kind, mina_protocol::SymbolKind::Type);
                 assert_eq!(range.anchor, 16, "struct 行全体: {range:?}");
                 assert_eq!(range.head, 29, "行全体（`;` まで）: {range:?}");
                 assert_eq!(selection_range.anchor, 23);
@@ -7651,7 +7651,7 @@ root-markers = [".docsroot"]
                 assert_eq!(error, None, "エラーなし: {error:?}");
                 assert_eq!(symbols.len(), 1, "Thing が1件: {symbols:?}");
                 assert_eq!(symbols[0].name, "Thing");
-                assert_eq!(symbols[0].kind, minae_protocol::SymbolKind::Type);
+                assert_eq!(symbols[0].kind, mina_protocol::SymbolKind::Type);
                 assert_eq!(symbols[0].line, 2, "1-origin 行");
                 assert!(
                     symbols[0].path.ends_with("fixture.rs"),
@@ -7694,7 +7694,7 @@ root-markers = [".docsroot"]
             } => {
                 assert_eq!(error, None, "エラーなし: {error:?}");
                 assert_eq!(total, 1, "TODO 診断が1件: {diagnostics:?}");
-                assert_eq!(diagnostics[0].severity, minae_protocol::Severity::Error);
+                assert_eq!(diagnostics[0].severity, mina_protocol::Severity::Error);
                 assert_eq!(diagnostics[0].line, 1, "1-origin 行");
                 assert_eq!(diagnostics[0].message, "mock: TODO found");
             }
