@@ -360,6 +360,7 @@ dependencies = [
  "cliclack",
  "futures-lite",
  "libc",
+ "minae-conn",
  "minae-core",
  "minae-loader",
  "minae-lsp",
@@ -372,6 +373,17 @@ dependencies = [
  "toml",
  "tree-sitter",
  "unicode-width",
+]
+
+[[package]]
+name = "minae-conn"
+version = "0.0.3"
+dependencies = [
+ "libc",
+ "minae-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

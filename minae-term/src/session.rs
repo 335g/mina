@@ -46,10 +46,25 @@ use minae_protocol::{
 use minae_protocol::{ReferenceLocation, ServerMessage, Severity};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{timeout, Duration};
 
-use crate::conn;
+use minae_conn as conn;
+
+/// ワンショット接続を開く（session CLI の各コマンドの共通冒頭）。
+///
+/// daemon が動いていなければ起動してから（クライアント視点のライフサイクル。
+/// spawn 元は自身 = `minae daemon serve` を持つ bin クレート）接続し、
+/// Hello（Headless 宣言）を送って (write_half, reader) を返す。接続は
+/// 1コマンドごとに開く（永続ではない — ADR-0013）。
+async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>)> {
+    let socket = minae_protocol::socket_path();
+    if conn::connect(&socket).await.is_err() {
+        conn::spawn_daemon(&std::env::current_exe()?, &["daemon", "serve"])?;
+        conn::wait_ready(&socket, 50).await?;
+    }
+    conn::open_session(&socket, ClientKind::Headless, true).await
+}
 
 /// `minae session` のサブコマンド。引数・型は clap が検証する。
 #[derive(Subcommand)]
@@ -625,13 +640,7 @@ fn references_exit_code(e: &str) -> i32 {
 /// daemon に接続し、内容指定の意味リネーム（[`Command::Rename`]）を実行する
 /// （ADR-0029）。応答は全文を運ばない [`ServerMessage::RenameResult`]。
 async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOutcome> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る
     let command = Command::Rename {
         path: conn::absolutize(path),
@@ -678,12 +687,7 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
 /// daemon に接続し、シンボルの参照位置列挙（[`Command::References`]）を実行する
 /// （ADR-0029）。応答は全文を運ばない [`ServerMessage::ReferencesResult`]。
 async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutcome> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::References {
         path: conn::absolutize(path),
         old: old.to_string(),
@@ -777,12 +781,7 @@ fn check_exit_code(e: &str) -> i32 {
 /// daemon に接続し、シンボルの階層ツリーを軽量応答（[`ServerMessage::Outline`]）
 /// で受け取る（ADR-0031）。全文は運ばれない。
 async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::Outline {
         path: conn::absolutize(path),
     };
@@ -821,12 +820,7 @@ async fn execute_enclosing(
     line: u32,
     col: u32,
 ) -> io::Result<serde_json::Value> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::EnclosingSymbol {
         path: conn::absolutize(path),
         line,
@@ -898,12 +892,7 @@ struct CheckOutcome {
 /// daemon に接続し、指定位置の hover を軽量応答（[`ServerMessage::Hover`]）で受け取る
 /// （ADR-0032）。全文は運ばれない。
 async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutcome> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::HoverAt {
         path: conn::absolutize(path),
         line,
@@ -936,12 +925,7 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
 /// daemon に接続し、ワークスペース内のシンボル検索を軽量応答
 /// （[`ServerMessage::WorkspaceSymbols`]）で受け取る（ADR-0032）。全文は運ばれない。
 async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::WorkspaceSymbol {
         path: conn::absolutize(path),
         query: query.to_string(),
@@ -975,12 +959,7 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
 /// daemon に接続し、対象パスの診断を軽量応答（[`ServerMessage::Check`]）で受け取る
 /// （ADR-0032）。全文は運ばれない。
 async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::CheckDiagnostics {
         path: conn::absolutize(path),
     };
@@ -1017,13 +996,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
 
 /// daemon に接続し、指定位置の定義を軽量応答（[`ServerMessage::Peek`]）で受け取る。
 async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<minae_protocol::Peek> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る
     conn::request_peek(&mut write_half, &mut reader, &conn::absolutize(path), line, col).await
 }
@@ -1032,13 +1005,7 @@ async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<minae_proto
 /// （issue #27/D1）。ビルド世代（Git hash）と起動からの累積メトリクスを返す。
 /// スナップショットを運ばず世代・push・イベントを進めない軽量応答なので専用経路。
 async fn execute_server_info() -> io::Result<serde_json::Value> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     let mut line = serde_json::to_string(&Command::GetServerInfo).expect("コマンドはシリアライズ可能");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
@@ -1085,13 +1052,7 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
 
 /// daemon に接続し、コマンドを実行してスナップショットを受け取る。
 async fn execute(command: &Command) -> io::Result<StateSnapshot> {
-    let path = crate::daemon::socket_path();
-    conn::ensure_daemon(&path).await?;
-    let stream = UnixStream::connect(&path).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     // CRITICAL C2: Open のパスは agent の cwd 基準で絶対化してから送る（TUI と
     // 同一の契約）。そのまま送ると daemon の spawn cwd 基準で解決され、意図しない
     // ファイルを開く恐れがある。
@@ -1101,7 +1062,7 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
 
 /// パスを含むコマンドのパスを絶対化する（Open / GetInlayHints。他はそのまま）。
 ///
-/// [`crate::conn::absolutize`] を共通化して使う — daemon 側の cwd は spawn 時に
+/// [`minae_conn::absolutize`] を共通化して使う — daemon 側の cwd は spawn 時に
 /// 固定されるため、解決は送信側（agent の cwd）で行う。
 fn absolutize_paths(command: Command) -> Command {
     match command {
@@ -1117,13 +1078,7 @@ fn absolutize_paths(command: Command) -> Command {
 
 /// daemon に接続し、位置指定編集（DocumentEdit）を実行してスナップショットを受け取る。
 async fn execute_edit(edit: &DocumentEdit) -> io::Result<StateSnapshot> {
-    let path = crate::daemon::socket_path();
-    conn::ensure_daemon(&path).await?;
-    let stream = UnixStream::connect(&path).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     conn::request(&mut write_half, &mut reader, edit).await
 }
 
@@ -1166,13 +1121,7 @@ async fn apply(
 
     let (old_text, new_text) = resolve_apply_args(old, new, whole, whole_stdin, old_file, new_file)?;
 
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
 
     let abs = conn::absolutize(&path.to_string_lossy());
     let mut snapshot = conn::request(&mut write_half, &mut reader, &Command::Open { path: abs.clone() }).await?;
@@ -1316,13 +1265,7 @@ fn parse_hunks(input: &str) -> io::Result<Vec<Hunk>> {
 /// →修正→再試行）。成功時は generation を JSON で返し、続く `wait <generation>`
 /// を別プロセスなしで直接呼べるようにする（ラウンドトリップ削減 — e2e-01）。
 async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
-    let stream = UnixStream::connect(&socket).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
 
     let abs = conn::absolutize(&path.to_string_lossy());
     let mut snapshot = conn::request(
@@ -1403,13 +1346,7 @@ fn short(s: &str) -> String {
 /// daemon に接続し、任意パスの inlay hint を取得する（ADR-0020）。
 /// 応答はスナップショットでなく Hints（path, generation, hints）なので専用経路。
 async fn execute_hints(path: &str) -> io::Result<(String, u64, Vec<InlayHint>)> {
-    let sock = crate::daemon::socket_path();
-    conn::ensure_daemon(&sock).await?;
-    let stream = UnixStream::connect(&sock).await?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    // ADR-0012: 接続直後に Hello（ヘッドレス宣言）を送る
-    conn::send_hello(&mut write_half, ClientKind::Headless, true).await?;
+    let (mut write_half, mut reader) = open_one_shot().await?;
     // CRITICAL C2: パスは agent の cwd 基準で絶対化してから送る（Open と同一の契約）
     conn::request_hints(&mut write_half, &mut reader, &conn::absolutize(path)).await
 }

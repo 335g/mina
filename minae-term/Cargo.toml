@@ -15,6 +15,7 @@ path = "src/main.rs"
 minae-core = { path = "../minae-core", version = "0.0.3" }
 minae-view = { path = "../minae-view", version = "0.0.3" }
 minae-protocol = { path = "../minae-protocol", version = "0.0.3" }
+minae-conn = { path = "../minae-conn", version = "0.0.3" }
 minae-lsp = { path = "../minae-lsp", version = "0.0.3" }
 minae-loader = { path = "../minae-loader", version = "0.0.3" }
 tree-sitter.workspace = true

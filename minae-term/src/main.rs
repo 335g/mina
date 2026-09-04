@@ -14,7 +14,6 @@ mod client;
 #[cfg(feature = "tui")]
 mod colorscheme;
 mod config;
-mod conn;
 mod daemon;
 #[cfg(feature = "tui")]
 mod keymap;

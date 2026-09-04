@@ -580,7 +580,7 @@ fn byte_point(text: &str, byte: usize) -> tree_sitter::Point {
 
 /// 常駐デーモンとして起動する（`minae daemon serve`）。
 pub async fn run() -> std::io::Result<()> {
-    serve(&socket_path()).await
+    serve(&minae_protocol::socket_path()).await
 }
 
 /// 同時に処理する接続数の上限（6b: 接続の張り放題による fd/タスク枯渇対策）。
@@ -3243,7 +3243,7 @@ async fn normalize_open_path(path: PathBuf) -> PathBuf {
 
 /// 存在しないパス向けの lexical 正規化: 絶対化 + `.` / `..` の解決。
 ///
-/// 送信側（TUI / session CLI）は常に絶対化して送る（[`crate::conn::absolutize`]）
+/// 送信側（TUI / session CLI）は常に絶対化して送る（[`minae_conn::absolutize`]）
 /// ため、相対パスが届くのは第三者の生クライアントだけ。その場合の解決基準は
 /// daemon の cwd（spawn 時に固定。ADR-0005）で、従来のディスク読込と同じ解釈。
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -4233,17 +4233,6 @@ fn convert_mode_back(m: minae_view::Mode) -> minae_protocol::Mode {
     }
 }
 
-/// socket パス。
-///
-/// ponytail: uid をファイル名に入れていない（単一ユーザ前提）。アクセス制御
-/// は socket の 0600 化 + 接続時の peer uid 検証（MEDIUM-3）で行う。複数ユーザ
-/// を同時に扱う必要が出たら `<dir>/minae-<uid>.sock` にする。
-pub fn socket_path() -> PathBuf {
-    // プロトコルバージョンをソケット名に埋める: プロトコルが変わると古い daemon は
-    // 別ソケットに残り、新クライアントは新 daemon を自動起動する（ADR-0019 の後、
-    // highlights 追加時に「古い daemon + 新クライアント」で起動失敗が発生した教訓）。
-    std::env::temp_dir().join(format!("minae-{}.sock", minae_protocol::PROTOCOL_VERSION))
-}
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,7 @@
 //!
 //! Open のパスはクライアント側で絶対化してから送る — daemon は常駐で cwd が
 //! 起動時のディレクトリのままなので、相対パスの解決を daemon に任せると
-//! 別ディレクトリから起動したクライアントの意図と食い違う（[`crate::conn::absolutize`]）。
+//! 別ディレクトリから起動したクライアントの意図と食い違う（[`minae_conn::absolutize`]）。
 //!
 //! リクエスト/レスポンスのみ（ADR-0006）。編集状態は持たない — キーイベントを
 //! キーマップで Command に解決して送り、返ってきたスナップショットを描画するだけ。
@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::colorscheme::{self, Colorscheme};
 use crate::keymap::{Keymaps, Resolution};
-use crate::conn;
+use minae_conn as conn;
 use crate::render;
 
 const ALT_SCREEN_ON: &str = "\x1b[?1049h";
@@ -132,8 +132,13 @@ impl Drop for TerminalGuard {
 
 /// TUI を起動する。`file` があればそれを開く。
 pub async fn run(file: Option<&str>) -> std::io::Result<()> {
-    let socket = crate::daemon::socket_path();
-    conn::ensure_daemon(&socket).await?;
+    let socket = minae_protocol::socket_path();
+    // デーモンがいなければ起動する（クライアント視点のライフサイクル。spawn 元は
+    // 自身 = `minae daemon serve` を持つ bin。将来の TUI リポジトリでは別ポリシー）。
+    if conn::connect(&socket).await.is_err() {
+        conn::spawn_daemon(&std::env::current_exe()?, &["daemon", "serve"])?;
+        conn::wait_ready(&socket, 50).await?;
+    }
     // ADR-0027: 切断時カーソルリセットの宣言を Hello に載せるため、config は
     // 接続前に読む（colorscheme 解決でも同じ値を使い回す）。
     let config = crate::config::load();
