@@ -9,14 +9,14 @@
 //! クライアント視点のライフサイクル（必要なら spawn する）とチャネルの開設・
 //! 送受信だけ。自動起動の組み立て（どの実行ファイルを spawn するか）は
 //! 呼び出し側の責務（connect + spawn_daemon + wait_ready を組み合わせる）。
-//! ソケットパスの契約は minae-protocol の [`minae_protocol::socket_path`]。
+//! ソケットパスの契約は minae-protocol の [`mina_protocol::socket_path`]。
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use minae_protocol::{ClientKind, Command, Hello, InlayHint, ServerMessage, StateSnapshot};
+use mina_protocol::{ClientKind, Command, Hello, InlayHint, ServerMessage, StateSnapshot};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 
@@ -181,7 +181,7 @@ pub async fn request_peek(
     path: &str,
     line: u32,
     col: u32,
-) -> std::io::Result<minae_protocol::Peek> {
+) -> std::io::Result<mina_protocol::Peek> {
     let message = Command::PeekDefinitionAt {
         path: path.to_string(),
         line,
@@ -194,7 +194,7 @@ pub async fn request_peek(
     let mut response = String::new();
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
-        Ok(ServerMessage::Peek { path, line, text }) => Ok(minae_protocol::Peek { path, line, text }),
+        Ok(ServerMessage::Peek { path, line, text }) => Ok(mina_protocol::Peek { path, line, text }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

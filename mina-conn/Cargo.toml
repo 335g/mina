@@ -1,5 +1,5 @@
 [package]
-name = "minae-conn"
+name = "mina-conn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Client-side daemon connection and request plumbing for minae"
 
 [dependencies]
-minae-protocol = { path = "../minae-protocol", version = "0.0.3" }
+mina-protocol = { path = "../mina-protocol", version = "0.0.4" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
