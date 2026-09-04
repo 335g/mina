@@ -512,7 +512,7 @@ impl Daemon {
 
 /// languages.toml の現在の mtime（ファイルがなければ `None`）。
 fn languages_file_mtime() -> Option<std::time::SystemTime> {
-    std::fs::metadata(crate::config::config_dir().join("languages.toml"))
+    std::fs::metadata(crate::languages::config_dir().join("languages.toml"))
         .ok()
         .and_then(|m| m.modified().ok())
 }

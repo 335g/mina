@@ -15,7 +15,20 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::config::config_dir;
+/// daemon 用の設定ディレクトリ: `$XDG_CONFIG_HOME/minae`、なければ `~/.config/minae`
+/// （旧 config.rs の同名関数を継承。既存ユーザーの languages.toml と互換のため
+/// ディレクトリ名は `minae` のまま）。
+pub(crate) fn config_dir() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("minae");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(".config").join("minae");
+    }
+    std::path::PathBuf::from(".config/minae")
+}
 
 /// 埋め込み既定テーブル（検証済みサーバのみ。ADR-0030 の規定サーバ方針）。
 pub(crate) const DEFAULT_LANGUAGES_TOML: &str = include_str!("default_languages.toml");
