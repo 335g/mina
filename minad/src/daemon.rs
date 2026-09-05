@@ -23,7 +23,7 @@ use mina_protocol::{
     EventKind, EventSource, GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range,
     ServerMessage, ServerMetrics, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
-use mina_view::Editor;
+use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream, unix::OwnedWriteHalf};
 use tokio::sync::{Mutex, watch};
@@ -132,6 +132,17 @@ pub struct Daemon {
     /// 最後の Interactive の切断判定に使う。リセットの要不要は切断した
     /// クライアントの Hello 宣言（`reset_cursor_on_disconnect`）で決まる。
     pub(crate) interactive_clients: HashSet<u64>,
+    /// 接続 → View の対応（ADR-0037）。Interactive 接続のみが View を持ち、
+    /// Headless は View を持たず共有 idle view を観測点にする。コマンド適用は
+    /// このマップで発信接続の View をフォーカスして行う。
+    pub(crate) conn_views: HashMap<u64, ClientView>,
+    /// 共有 idle view（ADR-0037）。パス無し GetState（`session get` 相当）の
+    /// 観測点で「最後に開かれた文書」。Headless の Open はここを動かし、
+    /// 最後の Interactive 切断時のカーソルリセット対象もこれ。
+    pub(crate) idle_view: ViewId,
+    /// 診断が属する文書のパス（v12: 診断は解析フォーカス文書のものだけを保持し、
+    /// その文書を見る View のスナップショットにのみ載せる。ADR-0037）。
+    pub(crate) diag_path: Option<PathBuf>,
     /// 状態を変える操作ごとに増加する世代（ADR-0012）。
     generation: u64,
     /// 直近の状態変化イベントの bounded リング（ADR-0012）。
@@ -202,6 +213,14 @@ struct DiskBaseline {
     size: u64,
 }
 
+/// 接続 1 つ分の View（ADR-0037）。doc / selection / first_line は
+/// `editor` の View が保持し、ここはその ViewId と接続が通知した表示高さを持つ。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClientView {
+    pub(crate) view_id: ViewId,
+    pub(crate) viewport: usize,
+}
+
 /// イベントリングの上限（ADR-0012）。超過分は古いものから破棄。
 const MAX_EVENTS: usize = 128;
 
@@ -214,8 +233,14 @@ impl Daemon {
     /// とクエリ再コンパイルを回避 — 計測: 214KB で 38ms + 20ms → 0.5ms）。
     /// テキストと可視窓が変わらなければ（カーソル移動等）ハイライトはキャッシュ
     /// を返すだけ（窓クエリの再計算を回避）。
-    fn syntax_highlights(&mut self, text: &str, checksum: u64) -> Vec<HighlightRange> {
-        let doc_id = self.editor.focused_doc_id();
+    fn syntax_highlights(
+        &mut self,
+        doc_id: DocumentId,
+        text: &str,
+        checksum: u64,
+        first_line: usize,
+        viewport_height: usize,
+    ) -> Vec<HighlightRange> {
         // 破棄された文書（Open の上限 evict）のキャッシュを落とす
         let live: Vec<_> = self.editor.document_ids().collect();
         self.syntax.retain(|id, _| live.contains(id));
@@ -223,13 +248,13 @@ impl Daemon {
         // 落とす（文書のパスと言語は不変なので stale は理論上ないが防御）。
         let Some(language_def) = self
             .editor
-            .focused_path()
-            .and_then(|p| self.languages.grammar_for_path(&p))
+            .path_for_doc(doc_id)
+            .and_then(|p| self.languages.grammar_for_path(p))
         else {
             self.syntax.remove(&doc_id);
             return Vec::new();
         };
-        let window = visible_window_range(text, self.editor.first_line(), self.viewport_height);
+        let window = visible_window_range(text, first_line, viewport_height);
 
         // 初回（文書ごとに1回）: フルパース + クエリコンパイル
         // （Query::new は ~20ms — 打鍵ごとに走らせない）。
@@ -285,7 +310,7 @@ impl Daemon {
         // 可視窓キャッシュ: (checksum, first_line, viewport_height) が一致する
         // 間は再計算しない。スクロール・リサイズ・編集で窓かテキストが変わった
         // ときだけ窓クエリを走らせる（カーソル移動の打鍵コストを O(1) に）。
-        let window_key = (checksum, self.editor.first_line(), self.viewport_height);
+        let window_key = (checksum, first_line, viewport_height);
         if let Some((c, fl, h, ranges)) = &cached.window {
             if (*c, *fl, *h) == window_key {
                 return ranges.clone();
@@ -406,6 +431,9 @@ impl Daemon {
             insert_owner: None,
             last_search: None,
             interactive_clients: HashSet::new(),
+            conn_views: HashMap::new(),
+            idle_view: ViewId(0),
+            diag_path: None,
             generation: 0,
             events: VecDeque::new(),
             baselines: HashMap::new(),
@@ -499,13 +527,59 @@ impl Daemon {
         if self.insert_owner == Some(conn_id) && self.editor.mode() == mina_view::Mode::Insert {
             close_insert_session(self, mina_view::Mode::Normal);
         }
-        // ADR-0027: 最後の Interactive クライアント切断時、そのクライアントが
-        // Hello でリセットを宣言していれば全 View のカーソルを先頭へ戻す。
+        // ADR-0027 を v12 で再解釈: 接続の View は切断とともに消えるため、
+        // リセット対象は共有 idle view（= パス無し GetState の観測点）のみ。
         // 状態変化なので世代とイベントを進める（WaitFor 待ちエージェントが起床）。
         // 文書・undo 履歴・LSP セッションは不変（Q1: 保持するのは Selection のみ）。
         if kind == ClientKind::Interactive && reset_cursor && self.interactive_clients.is_empty() {
-            self.editor.reset_views_to_start();
+            self.editor.reset_view_to_start(self.idle_view);
             self.record_event(EventSource::External, EventKind::SelectionReset, None, None);
+        }
+    }
+
+    /// コマンド適用前に、発信接続の View をフォーカスへ合わせる（ADR-0037）。
+    /// Interactive は自接続の View（未登録 = テスト等のフォールバックは idle view）、
+    /// Headless は共有 idle view。合わせて viewport 高さを接続の値へ切り替える。
+    fn focus_for(&mut self, conn_id: u64) {
+        let record = self.conn_views.get(&conn_id);
+        let view_id = record.map_or(self.idle_view, |r| r.view_id);
+        let viewport = record.map_or(self.viewport_height, |r| r.viewport);
+        self.editor.set_focused_view(view_id);
+        self.viewport_height = viewport;
+    }
+
+    /// Open で開かれた文書を共有 idle view にも追従させる（ADR-0037:
+    /// 「最後に開かれた文書」= パス無し GetState の観測点）。idle view の選択・
+    /// 先頭行は保持し、フォーカスは元の接続 View へ戻す（応答合成は自分の View
+    /// 基準のまま）。ヘッドレス（既に idle view がフォーカス中）は追従だけ。
+    fn open_idle_follow(&mut self, path: &Path) {
+        let conn_view = self.editor.focused_view_id();
+        if conn_view == self.idle_view {
+            self.editor.focus_open_path(path);
+            return;
+        }
+        self.editor.set_focused_view(self.idle_view);
+        self.editor.focus_open_path(path);
+        self.editor.set_focused_view(conn_view);
+    }
+
+    /// Interactive 接続に View を割り当てる（ADR-0037）。開始文書は idle view
+    /// の文書（最後に開かれた共有文書）。選択・先頭行は先頭から。
+    fn register_conn_view(&mut self, conn_id: u64) {
+        let doc = self.editor.view_by_id(self.idle_view).doc;
+        let id = self.editor.add_view(mina_view::View {
+            doc,
+            selection: mina_text::Selection::point(0),
+            first_line: 0,
+        });
+        self.conn_views
+            .insert(conn_id, ClientView { view_id: id, viewport: 24 });
+    }
+
+    /// 切断時に接続の View を破棄する（ADR-0037）。
+    fn drop_conn_view(&mut self, conn_id: u64) {
+        if let Some(r) = self.conn_views.remove(&conn_id) {
+            self.editor.remove_view(r.view_id);
         }
     }
 }
@@ -882,8 +956,12 @@ async fn handle_connection(
     };
 
     // ADR-0027: 最後の Interactive 切断判定用に登録しておく。
+    // ADR-0037: Interactive 接続には専用の View を割り当てる（Headless は
+    // 共有 idle view を使う — 接続の View は持たない）。
     if kind == ClientKind::Interactive {
-        daemon.lock().await.interactive_clients.insert(conn_id);
+        let mut d = daemon.lock().await;
+        d.register_conn_view(conn_id);
+        d.interactive_clients.insert(conn_id);
     }
 
     // ADR-0013: Interactive クライアントだけが push を購読する。Headless の
@@ -914,7 +992,7 @@ async fn handle_connection(
             // watch は最新1件を保持するので、中間世代の欠落は許容（フルスナップ
             // ショットなので必ず最新に収束する）。
             ReadNext::Push(Ok(())) => {
-                let (origin, snapshot) = push_rx
+                let (origin, payload) = push_rx
                     .as_mut()
                     .expect("push 分岐は購読時のみ")
                     .borrow_and_update()
@@ -926,6 +1004,18 @@ async fn handle_connection(
                 if origin == Some(conn_id) {
                     continue;
                 }
+                // v12（ADR-0037）: push は購読者ごとの View から合成する —
+                // ブロードキャストされる snapshot は発信元の View 基準なので、
+                // ここで自分の View のスナップショットを作り直す（状態は既に
+                // daemon に反映済み）。status は変化の性質（外部リロード等）なので
+                // 引き継ぐ。
+                let snapshot = {
+                    let mut d = daemon.lock().await;
+                    let record = d.conn_views.get(&conn_id);
+                    let view_id = record.map_or(d.idle_view, |r| r.view_id);
+                    let viewport = record.map_or(24, |r| r.viewport);
+                    snapshot_from_view(&mut d, view_id, viewport, payload.status)
+                };
                 if !write_message(&mut write_half, conn_id, ServerMessage::Push { snapshot })
                     .await
                 {
@@ -954,7 +1044,7 @@ async fn handle_connection(
                 // PeekDefinition も同様に専用処理（LSP の await はロック外で行う）。
                 // 応答はスナップショット（peek フィールド付き）で通常経路と同じ形状。
                 if let Ok(Command::PeekDefinition) = serde_json::from_str::<Command>(line.trim()) {
-                    let message = serve_peek_definition(&daemon).await;
+                    let message = serve_peek_definition(&daemon, conn_id).await;
                     if !write_message(&mut write_half, conn_id, message).await {
                         break; // 切断 or 書き込みタイムアウト
                     }
@@ -1072,13 +1162,15 @@ async fn handle_connection(
             ReadNext::Command(Ok(None)) | ReadNext::Command(Err(_)) => break, // クライアントの切断
         }
     }
-    // 切断の後始末: 所有者（グループを開いたクライアント）ならグループを閉じ
-    // モードを Normal に戻す（ADR-0007 / HIGH-1）。最後の Interactive なら
-    // Hello 宣言どおりカーソルを先頭へ戻す（ADR-0027）。
-    daemon
-        .lock()
-        .await
-        .on_client_disconnect(conn_id, kind, reset_cursor);
+    // 切断の後始末: 接続の View を破棄し（ADR-0037）、所有者（グループを開いた
+    // クライアント）ならグループを閉じモードを Normal に戻す（ADR-0007 / HIGH-1）。
+    // 最後の Interactive なら Hello 宣言どおり idle view のカーソルを先頭へ戻す
+    // （ADR-0027 の v12 再解釈）。
+    {
+        let mut d = daemon.lock().await;
+        d.drop_conn_view(conn_id);
+        d.on_client_disconnect(conn_id, kind, reset_cursor);
+    }
 }
 
 /// コマンドループの1周で読み取るもの（コマンド行 or push 通知）。
@@ -1356,9 +1448,10 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
 /// `peek` フィールドに載せる（daemon 状態には持たない — 次のコマンドで消える
 /// クライアント側の一時表示。push には載らない）。フォーカス文書を開き直すので
 /// 借用・復元は不要（serve_peek_definition_at と違い、対象は常にフォーカス文書）。
-async fn serve_peek_definition(daemon: &Mutex<Daemon>) -> ServerMessage {
+async fn serve_peek_definition(daemon: &Mutex<Daemon>, conn_id: u64) -> ServerMessage {
     let (path, head, text, lsp_supported) = {
         let mut d = daemon.lock().await;
+        d.focus_for(conn_id);
         match d.editor.focused_path().map(Path::to_path_buf) {
             Some(path) => {
                 let head = d.editor.selection().primary().head();
@@ -2329,6 +2422,7 @@ async fn restore_focus_session(
             let mut d = daemon.lock().await;
             if let Some(diags) = diags {
                 d.diagnostics = diags;
+                d.diag_path = focused.clone();
             }
             drain_into(&mut d);
         }
@@ -2522,12 +2616,14 @@ async fn read_open_capped(path: &Path) -> Option<String> {
 fn drain_into(daemon: &mut Daemon) {
     let Some(path) = daemon.editor.focused_path() else {
         daemon.diagnostics.clear();
+        daemon.diag_path = None;
         return;
     };
     let Some(session) = daemon.session_for(path) else {
         // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
         // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
         daemon.diagnostics.clear();
+        daemon.diag_path = None;
         return;
     };
     let doc_uri = lsp::uri(path);
@@ -2539,11 +2635,13 @@ fn drain_into(daemon: &mut Daemon) {
     // ヒントも同様に消す（死んだサーバの解析結果は表示・配信しない。ADR-0020）。
     if session.client.is_dead() {
         daemon.diagnostics.clear();
+        daemon.diag_path = None;
         daemon.hints.clear();
         daemon.hint_order.clear();
     } else if session.current_uri() != Some(doc_uri.as_str()) {
         // フォーカスが LSP 対象外の文書に移ったら診断は残さない
         daemon.diagnostics.clear();
+        daemon.diag_path = None;
     }
 }
 
@@ -2607,6 +2705,7 @@ async fn settle_open_diagnostics_loop(
         let n = diags.len();
         let mut d = daemon.lock().await;
         d.diagnostics = diags;
+        d.diag_path = Some(path.clone());
         if let Some(hints) = pulled.1 {
             d.cache_hints(path.clone(), &text, hints);
         }
@@ -2665,6 +2764,7 @@ async fn sync_after_edit(
         }
         if let Some(diags) = pulled_diags {
             d.diagnostics = diags;
+            d.diag_path = Some(path.clone());
         }
         if let Some(hints) = pulled_hints {
             d.cache_hints(path.clone(), text, hints);
@@ -2697,6 +2797,13 @@ async fn process_command(
     line: &str,
 ) -> StateSnapshot {
     let parsed = serde_json::from_str::<Command>(line.trim());
+    // ADR-0037: コマンド適用前にフォーカスを発信接続の View（Interactive）または
+    // 共有 idle view（Headless）へ合わせる。apply_from 側でも行う（テスト直呼びの
+    // ため）が、Open のような process_command 直轄のアームもここで確実に揃う。
+    {
+        let mut d = daemon.lock().await;
+        d.focus_for(conn_id);
+    }
     // #13: headless クライアントは DocumentEdit 系に制限する（GetState / Save /
     // WaitFor / DocumentEdit / Open / Close のみ）。選択移動・モード変更・コマンド
     // ベース編集・undo/redo は TUI の表示・モード・カーソル・履歴を奪うため拒否
@@ -2889,6 +2996,7 @@ async fn process_command(
                     drain_into(&mut d);
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
+                    d.open_idle_follow(&path_buf);
                     snapshot(&mut d, None)
                 } else {
                     // 未開パス: 従来どおりディスクから読む
@@ -2922,6 +3030,7 @@ async fn process_command(
                             let height = d.viewport_height;
                             d.editor.scroll_to_cursor(height);
                             d.diagnostics.clear();
+                            d.diag_path = None;
                             // ADR-0012/0015: ベースライン更新 + Open イベント
                             if let Ok(md) = std::fs::metadata(&path_buf) {
                                 d.baselines.insert(
@@ -2970,6 +3079,7 @@ async fn process_command(
                     }
                     let mut d = daemon.lock().await;
                     drain_into(&mut d);
+                    d.open_idle_follow(&path_buf);
                     snapshot(&mut d, open_status)
                 }
             }
@@ -3687,6 +3797,9 @@ fn search_selection(daemon: &mut Daemon) -> (bool, Option<String>) {
 /// 戻り値の `bool` は「状態を実際に変えたか」（ADR-0012: 拒否・no-op は
 /// 世代/イベントの対象外。呼び出し側はこれで record_event をゲートする）。
 fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnapshot, bool) {
+    // ADR-0037: コマンドは発信接続の View（未登録 = テスト等は idle view）に
+    // 作用させる。undo グループの所有者判定（conn_id）は従来どおり接続スコープ。
+    daemon.focus_for(conn_id);
     match command {
         Command::WaitFor { .. } => {
             // process_command の専用アームで処理される（読み取り専用）。
@@ -4099,7 +4212,13 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         }
         Command::SetViewport { height } => {
             // 壊れた/悪意ある高さでスクロール計算が overflow しないよう clamp
-            daemon.viewport_height = height.min(MAX_VIEWPORT_HEIGHT);
+            let height = height.min(MAX_VIEWPORT_HEIGHT);
+            // v12: 表示高さは接続ごとに持つ（ADR-0037）。未登録（headless・テスト
+            // 等）はグローバル側だけ更新する。
+            if let Some(r) = daemon.conn_views.get_mut(&conn_id) {
+                r.viewport = height;
+            }
+            daemon.viewport_height = height;
             (snapshot(daemon, None), false)
         }
         Command::Close => {
@@ -4122,12 +4241,41 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
     }
 }
 
+/// フォーカス中の View 基準のスナップショット（応答経路）。
+///
+/// v12 では [`snapshot_from_view`] に委譲する — コマンド適用直後はフォーカス =
+/// 発信接続の View（[`Daemon::focus_for`]）。
 pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnapshot {
-    let text = daemon.editor.current_document().text().to_string();
+    snapshot_from_view(
+        daemon,
+        daemon.editor.focused_view_id(),
+        daemon.viewport_height,
+        status,
+    )
+}
+
+/// 指定 View 基準のスナップショット（ADR-0037。接続別合成）。
+///
+/// text / checksum / diagnostics / inlay_hints / highlights / path / dirty /
+/// activities は View の文書基準、selection / first_line は View の値。
+/// 診断は解析フォーカス文書（`diag_path`）を見る View にのみ載せる。
+/// mode はデーモン共有（undo グループの所有者と一致する — ADR-0007）。
+pub(crate) fn snapshot_from_view(
+    daemon: &mut Daemon,
+    view_id: ViewId,
+    viewport_height: usize,
+    status: Option<String>,
+) -> StateSnapshot {
+    let view = daemon.editor.view_by_id(view_id).clone();
+    let doc_id = view.doc;
+    let path = daemon
+        .editor
+        .path_for_doc(doc_id)
+        .map(|p| p.to_path_buf());
+    let text = daemon.editor.document(doc_id).text().to_string();
     let checksum = fnv1a64(text.as_bytes());
-    let highlights = daemon.syntax_highlights(&text, checksum);
-    let editor = &daemon.editor;
-    let selection = editor.selection();
+    let highlights =
+        daemon.syntax_highlights(doc_id, &text, checksum, view.first_line, viewport_height);
     StateSnapshot {
         activity: Vec::new(),
         // ADR-0012 #12: 全文の FNV-1a を同梱し、エージェントが edit の
@@ -4135,7 +4283,8 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
         // するため、ハッシュ計算は相対的に無視できるコスト。
         checksum,
         text,
-        selection: selection
+        selection: view
+            .selection
             .ranges()
             .iter()
             .map(|r| Range {
@@ -4143,26 +4292,28 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
                 head: r.head(),
             })
             .collect(),
-        primary_index: selection.primary_index(),
-        mode: convert_mode_back(editor.mode()),
-        first_line: editor.first_line(),
-        diagnostics: daemon.diagnostics.clone(),
-        // ADR-0020: フォーカス文書のヒントをキャッシュから載せる。checksum 不一致
+        primary_index: view.selection.primary_index(),
+        mode: convert_mode_back(daemon.editor.mode()),
+        first_line: view.first_line,
+        // v12: 診断は解析フォーカス文書（diag_path）を表示する View だけに載せる
+        diagnostics: (path.is_some() && daemon.diag_path.as_deref() == path.as_deref())
+            .then(|| daemon.diagnostics.clone())
+            .unwrap_or_default(),
+        // ADR-0020: View の文書のヒントをキャッシュから載せる。checksum 不一致
         // （編集中）でも載せる — Q7: stale ヒントは新ヒント到着まで保持する。
-        inlay_hints: daemon
-            .editor
-            .focused_path()
+        inlay_hints: path
+            .as_deref()
             .and_then(|p| daemon.hints.get(p))
             .map(|c| c.hints.clone())
             .unwrap_or_default(),
         // 不変条件: 同じスナップショットのテキストと一致する範囲（ADR-0016）。
         highlights,
-        path: editor.focused_path().map(|p| p.to_string_lossy().into_owned()),
-        dirty: editor.is_dirty(),
+        path: path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        dirty: daemon.editor.is_doc_dirty(doc_id),
         status,
-        // ADR-0028: フォーカス文書の活動だけが載る（増減で generation を進める）。
-        activities: editor
-            .focused_path()
+        // ADR-0028: View の文書の活動だけが載る（増減で generation を進める）。
+        activities: path
+            .as_deref()
             .and_then(|p| daemon.activities.get(p))
             .cloned()
             .unwrap_or_default(),
@@ -4593,6 +4744,7 @@ root-markers = [".docsroot"]
             .await
             .expect("pull 診断が返る");
         daemon.diagnostics = diags;
+        daemon.diag_path = Some(path.clone());
         assert!(!daemon.diagnostics.is_empty(), "診断が入っている");
 
         // サーバを殺す → drain で古い診断がクリアされる
@@ -6171,13 +6323,18 @@ root-markers = [".docsroot"]
 
     #[tokio::test]
     async fn disconnect_keeps_cursor_when_flag_disabled() {
-        // ADR-0027: Hello で reset_cursor_on_disconnect=false を宣言した
-        // TUI の切断ではカーソルが保持される。
+        // ADR-0027 の v12 再解釈: カーソルリセットは共有 idle view が対象で、
+        // 接続の View は切断とともに消える。reset を宣言しない接続の切断では
+        // idle view は動かない（文書は追従する — 状態は共有のまま）。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("minae-27-nosock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-27-nofile-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, "hello\n").unwrap();
         start_server(&sock).await;
 
+        // reset 宣言なしの Interactive 接続（Hello 直書き）
         let stream = UnixStream::connect(&sock).await.expect("接続できる");
         let mut c = TestClient::new(stream);
         let mut hello = serde_json::to_string(&Hello {
@@ -6188,31 +6345,55 @@ root-markers = [".docsroot"]
         .unwrap();
         hello.push('\n');
         c.send(hello.as_bytes()).await;
-        let snap = request(&mut c, &Command::SetMode { mode: Mode::Insert }).await;
-        let snap = request(&mut c, &Command::Insert { text: "hello".into() }).await;
-        assert_eq!(snap.selection[0].anchor, 5);
-        let _ = request(&mut c, &Command::SetMode { mode: Mode::Normal }).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path }).await;
+        let snap = request(
+            &mut c,
+            &Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            },
+        )
+        .await;
+        assert_eq!(snap.selection[0].anchor, 6, "接続の View でカーソルが進む");
         drop(c);
 
+        // 別の Interactive は自分の View を持つ（文書は共有・カーソルは独立）
         let mut tui2 = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut tui2, &Command::GetState).await;
-        assert_eq!(snap.selection[0].anchor, 5, "false 宣言ではカーソルが残る");
+        assert_eq!(snap.text, "hello\n", "文書は共有");
+        assert_eq!(snap.selection[0].anchor, 0, "カーソルは接続ごとに独立（引き継がない）");
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
     async fn disconnect_does_not_reset_while_another_interactive_remains() {
-        // ADR-0027: 最後の Interactive ではない切断は他クライアントのカーソルを
-        // 踏まない（複数 TUI 構成）。
+        // ADR-0027 の v12 再解釈: 接続の View は切断とともに消えるため、リセット
+        // 対象は共有 idle view。ここでは「カーソルが接続ごとに独立」で、
+        // 他クライアントの切断が自分の View を踏まないこと（複数 TUI 構成）を
+        // 検証する。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("minae-27-two-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-27-two-file-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, "hello\nworld\n").unwrap();
         start_server(&sock).await;
 
         let mut tui_a = connect_client(&sock, ClientKind::Interactive).await;
-        let snap = request(&mut tui_a, &Command::SetMode { mode: Mode::Insert }).await;
-        let snap = request(&mut tui_a, &Command::Insert { text: "hello".into() }).await;
-        let _ = request(&mut tui_a, &Command::SetMode { mode: Mode::Normal }).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui_a, &Command::Open { path }).await;
+        // tui_a の View でカーソルを進める（idle view は動かない — 観測点）
+        let snap = request(
+            &mut tui_a,
+            &Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            },
+        )
+        .await;
+        assert_eq!(snap.selection[0].anchor, 6, "tui_a の View でカーソルが進む");
 
         let mut tui_b = connect_client(&sock, ClientKind::Interactive).await;
         // tui_b の Hello 登録が daemon に着弾してから切る（登録と切断の競合を避ける）
@@ -6222,11 +6403,14 @@ root-markers = [".docsroot"]
         let mut tui_c = connect_client(&sock, ClientKind::Interactive).await;
         let _ = request(&mut tui_c, &Command::GetState).await;
         let snap = request(&mut tui_c, &Command::GetState).await;
-        assert_eq!(snap.selection[0].anchor, 5, "他クライアントが残る間はリセットされない");
+        assert_eq!(
+            snap.selection[0].anchor, 0,
+            "カーソルは接続ごとに独立（tui_a の 6 を引き継がない）"
+        );
         drop(tui_b); // tui_c が残っている → リセットしない
         let snap = request(&mut tui_c, &Command::GetState).await;
-        assert_eq!(snap.selection[0].anchor, 5, "tui_b の切断だけでは変わらない");
-        drop(tui_c); // 最後の切断 → リセット
+        assert_eq!(snap.selection[0].anchor, 0, "tui_b の切断だけでは変わらない");
+        drop(tui_c); // 最後の切断 → idle view リセット
 
         // リセットは daemon が切断の EOF を処理してから起きる（非同期）。ここで
         // Interactive を先に接続すると「残存する Interactive」としてリセット自体を
@@ -6248,7 +6432,73 @@ root-markers = [".docsroot"]
         let mut tui_d = connect_client(&sock, ClientKind::Interactive).await;
         let snap = request(&mut tui_d, &Command::GetState).await;
         assert_eq!(snap.selection[0].anchor, 0, "最後の切断でリセットされる");
+        assert_eq!(snap.text, "hello\nworld\n", "idle view は最後に開かれた文書を見る");
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn per_client_views_are_independent_on_shared_document() {
+        // ADR-0037: 同じ文書を 2 つの Interactive クライアントが開いても、
+        // カーソルは接続ごとに独立（文書・undo・LSP は共有のまま）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-37-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-37-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, "line one\nline two\nline three\n").unwrap();
+        start_server(&sock).await;
+
+        let mut a = connect_client(&sock, ClientKind::Interactive).await;
+        let mut b = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut a, &Command::Open { path: path.clone() }).await;
+        let _ = recv_push(&mut b).await; // a の Open は b へ届く（b 側で消費）
+        let _ = request(&mut b, &Command::Open { path }).await;
+        let _ = recv_push(&mut a).await; // b の Open は a へ届く（a 側で消費）
+
+        // a: 2 行目へ移動・ビューポート設定
+        let snap = request(
+            &mut a,
+            &Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            },
+        )
+        .await;
+        assert_eq!(snap.selection[0].anchor, 9, "a のカーソルは 2 行目先頭");
+        let _ = request(&mut a, &Command::SetViewport { height: 10 }).await;
+
+        // b: カーソルは影響を受けない（文書は共有）
+        let snap = request(&mut b, &Command::GetState).await;
+        assert_eq!(snap.text, "line one\nline two\nline three\n", "文書は共有");
+        assert_eq!(snap.selection[0].anchor, 0, "b のカーソルは a の移動の影響を受けない");
+
+        // b: 3 行目へ移動（連打）
+        let _ = request(
+            &mut b,
+            &Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            },
+        )
+        .await;
+        let snap = request(
+            &mut b,
+            &Command::Move {
+                movement: Movement::Line,
+                direction: Direction::Forward,
+            },
+        )
+        .await;
+        assert_eq!(snap.selection[0].anchor, 18, "b のカーソルは 3 行目先頭");
+
+        // a: 自分のカーソル（2 行目先頭）を保持
+        let snap = request(&mut a, &Command::GetState).await;
+        assert_eq!(snap.selection[0].anchor, 9, "a のカーソルも独立（b の移動で動かない）");
+        assert_eq!(snap.text, "line one\nline two\nline three\n");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
@@ -8467,8 +8717,11 @@ root-markers = [".docsroot"]
         let mut a = connect_client(&sock, ClientKind::Interactive).await;
         let mut b = connect_client(&sock, ClientKind::Interactive).await;
         let path = file.to_string_lossy().into_owned();
-        let _ = request(&mut a, &Command::Open { path }).await;
-        let _ = recv_push(&mut b).await; // a の Open は b へ届く（b 側で消費）
+        let _ = request(&mut a, &Command::Open { path: path.clone() }).await;
+        // v12（ADR-0037）: push は購読者自身の View から合成される — 自分の View
+        // が対象文書を見ていないと編集は自分のスナップショットに現れない。
+        let _ = request(&mut b, &Command::Open { path }).await;
+        let _ = recv_push(&mut a).await; // b の Open は a へ届く（a 側で消費）
 
         let resp = request(&mut a, &Command::Insert { text: "x".into() }).await;
         // 発信元 a には自分の push が届かない（タイムアウトで確認）
