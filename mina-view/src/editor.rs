@@ -174,6 +174,11 @@ impl Editor {
             .map(|(id, _)| *id)
     }
 
+    /// 文書 ID に対応するパス（未保存のスクラッチ文書なら None）。
+    pub fn path_for_doc(&self, id: DocumentId) -> Option<&Path> {
+        self.paths.get(&id).map(|p| p.as_path())
+    }
+
     /// 指定文書のテキストをディスクの内容で置き換える（Reload — ADR-0015）。
     ///
     /// 全文置換の Transaction としてその文書の履歴に記録されるので undo で
@@ -284,6 +289,11 @@ impl Editor {
         self.dirty.contains(&self.view().doc)
     }
 
+    /// 指定文書が保存済み状態から編集されているか（snapshot 合成の接続スコープ版）。
+    pub fn is_doc_dirty(&self, id: DocumentId) -> bool {
+        self.dirty.contains(&id)
+    }
+
     /// 指定した文書への保存完了を記録する。
     ///
     /// 保存対象は「保存開始時にフォーカスしていた文書」であり、保存完了時点の
@@ -356,6 +366,43 @@ impl Editor {
     /// 現在の選択を置き換える（フォーカス中の View）。
     pub fn set_selection(&mut self, selection: Selection) {
         self.view_mut().selection = selection;
+    }
+
+    /// 接続スコープの View を 1 つ追加する（daemon の per-client 分離 — ADR-0037）。
+    ///
+    /// 分割ツリーには含めない（ツリーは UI のスプリット表示用で、daemon は
+    /// 接続ごとの View をツリー外で管理する）。文書・選択・先頭行は呼び出し側が
+    /// 指定する。ID は呼び出し側が保持し、[`Self::set_focused_view`] に渡す。
+    pub fn add_view(&mut self, view: View) -> ViewId {
+        let id = ViewId(self.next_view_id);
+        self.next_view_id += 1;
+        self.views.push(Some(view));
+        id
+    }
+
+    /// フォーカスを指定 View へ移す。存在しない ID なら `false`（状態は変えない）。
+    pub fn set_focused_view(&mut self, id: ViewId) -> bool {
+        if self.views.get(id.0).is_none_or(|slot| slot.is_none()) {
+            return false;
+        }
+        self.tree.set_focused(id);
+        true
+    }
+
+    /// 接続スコープの View を破棄する（ADR-0037）。ツリー外の View のみ対象。
+    pub fn remove_view(&mut self, id: ViewId) {
+        if let Some(slot) = self.views.get_mut(id.0) {
+            *slot = None;
+        }
+    }
+
+    /// 指定 View のカーソルを文書先頭へ戻す（ADR-0027 の接続スコープ版 —
+    /// 最後の Interactive 切断時の idle view リセットに使う）。
+    pub fn reset_view_to_start(&mut self, id: ViewId) {
+        if let Some(view) = self.views.get_mut(id.0).and_then(|slot| slot.as_mut()) {
+            view.selection = Selection::point(0);
+            view.first_line = 0;
+        }
     }
 
     /// 現在のモード。
@@ -1182,5 +1229,62 @@ mod tests {
             editor.documents.contains_key(&a),
             "dirty な文書は破棄されない"
         );
+    }
+
+    #[test]
+    fn connection_views_are_independent() {
+        // ADR-0037: add_view された接続スコープ View は分割ツリーに含まれず、
+        // フォーカス切替で選択・文書が独立に保たれる。
+        let mut editor = Editor::new();
+        editor.set_selection(Selection::point(3));
+        editor.scroll_to_cursor(24);
+        let idle = editor.focused_view_id();
+
+        let v1 = editor.add_view(View {
+            doc: editor.focused_doc_id(),
+            selection: Selection::point(1),
+            first_line: 0,
+        });
+        let v2 = editor.add_view(View {
+            doc: editor.focused_doc_id(),
+            selection: Selection::point(5),
+            first_line: 0,
+        });
+
+        // フォーカスを切り替えても各 View の選択は独立
+        editor.set_focused_view(v1);
+        assert_eq!(editor.selection(), Selection::point(1));
+        editor.set_selection(Selection::point(2));
+        editor.set_focused_view(v2);
+        assert_eq!(editor.selection(), Selection::point(5));
+        editor.set_focused_view(idle);
+        assert_eq!(editor.selection(), Selection::point(3));
+
+        // ツリーは UI 用のまま（add_view はツリーに含めない）
+        assert_eq!(editor.tree.views_in_order(), vec![idle]);
+
+        // remove_view 後は存在しない View として扱われる
+        editor.remove_view(v1);
+        assert!(!editor.set_focused_view(v1));
+    }
+
+    #[test]
+    fn reset_view_to_start_targets_one_view() {
+        // ADR-0027 再解釈: 最後の Interactive 切断時のリセットは idle view のみ
+        let mut editor = Editor::new();
+        editor.set_selection(Selection::point(4));
+        editor.scroll_to_cursor(24);
+        let idle = editor.focused_view_id();
+        let other = editor.add_view(View {
+            doc: editor.focused_doc_id(),
+            selection: Selection::point(7),
+            first_line: 2,
+        });
+        editor.reset_view_to_start(idle);
+        assert_eq!(editor.view_by_id(idle).selection, Selection::point(0));
+        assert_eq!(editor.view_by_id(idle).first_line, 0);
+        // 他の View は触らない
+        assert_eq!(editor.view_by_id(other).selection, Selection::point(7));
+        assert_eq!(editor.view_by_id(other).first_line, 2);
     }
 }
