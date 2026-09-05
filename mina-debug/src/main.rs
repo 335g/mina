@@ -207,6 +207,7 @@ impl Conn {
         let mut line = serde_json::to_string(&Hello {
             kind: ClientKind::Headless,
             reset_cursor_on_disconnect: true, // Headless には無意味（切断でリセットしない）
+            name: "debug".to_string(),
         })
         .expect("Hello はシリアライズ可能");
         line.push('\n');
