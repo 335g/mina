@@ -19,9 +19,10 @@ use mina_text::{
     replace_targets, select_line_selection, word_at,
 };
 use mina_protocol::{
-    Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, DocumentEdit,
-    EventKind, EventSource, GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range,
-    ServerMessage, ServerMetrics, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
+    Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, Diagnostic,
+    DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange, InlayHint,
+    OutlineSymbol, Range, ServerMessage, ServerMetrics, Severity, StateSnapshot, SymbolKind,
+    WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -105,8 +106,16 @@ pub struct Daemon {
     pub(crate) languages: Arc<LanguageTable>,
     /// 最後に読んだ languages.toml の mtime（`languages_refresh` の再読込判定）。
     languages_mtime: Option<std::time::SystemTime>,
-    /// 現在の文書の診断（LSP の publishDiagnostics を反映）。
-    pub(crate) diagnostics: Vec<mina_protocol::Diagnostic>,
+    /// 解析フォーカス文書ごとの診断（ADR-0037）。キー = フォーカス文書のパス。
+    /// スナップショットには「自分のセッションの解析フォーカス文書」
+    /// （下記 `analysis_focus` と一致）を見る View の分だけ載せる。
+    pub(crate) diagnostics: HashMap<PathBuf, Vec<mina_protocol::Diagnostic>>,
+    /// セッションの解析フォーカス文書（セッションキー → 文書パス。ADR-0037）。
+    ///
+    /// LSP セッションが現在解析している文書（`current_uri` の daemon 側ミラー）—
+    /// スナップショット合成（同期コンテキスト）から非ブロッキングで引くためのもの。
+    /// 更新: Open / 解析 pull（[`Daemon::set_focus_diagnostics`]）/ 復元。
+    analysis_focus: HashMap<(PathBuf, String), PathBuf>,
     /// パスごとの inlay hint キャッシュ（ADR-0020）。`HintCache.text_checksum` が
     /// 現在のテキストと一致すれば新鮮（再取得不要）。一致しなくても表示には使う
     /// （Q7: stale ヒントは新ヒント到着まで保持）。挿入順は `hint_order` で FIFO evict。
@@ -140,9 +149,6 @@ pub struct Daemon {
     /// 観測点で「最後に開かれた文書」。Headless の Open はここを動かし、
     /// 最後の Interactive 切断時のカーソルリセット対象もこれ。
     pub(crate) idle_view: ViewId,
-    /// 診断が属する文書のパス（v12: 診断は解析フォーカス文書のものだけを保持し、
-    /// その文書を見る View のスナップショットにのみ載せる。ADR-0037）。
-    pub(crate) diag_path: Option<PathBuf>,
     /// 状態を変える操作ごとに増加する世代（ADR-0012）。
     generation: u64,
     /// 直近の状態変化イベントの bounded リング（ADR-0012）。
@@ -427,13 +433,13 @@ impl Daemon {
             // 起動時の初期ロード。以後は languages_refresh が mtime 差分だけ再読込（ADR-0030）。
             languages: LanguageTable::load().into_arc(),
             languages_mtime: languages_file_mtime(),
-            diagnostics: Vec::new(),
+            diagnostics: HashMap::new(),
+            analysis_focus: HashMap::new(),
             insert_owner: None,
             last_search: None,
             interactive_clients: HashSet::new(),
             conn_views: HashMap::new(),
             idle_view: ViewId(0),
-            diag_path: None,
             generation: 0,
             events: VecDeque::new(),
             baselines: HashMap::new(),
@@ -561,6 +567,59 @@ impl Daemon {
         self.editor.set_focused_view(self.idle_view);
         self.editor.focus_open_path(path);
         self.editor.set_focused_view(conn_view);
+    }
+
+    /// `path` が自分のセッションの「解析フォーカス文書」か（= その文書が最後に
+    /// 解析された文書 — ADR-0037）。診断・inlay はこれを見る View のスナップ
+    /// ショットにのみ載せる。
+    pub(crate) fn is_analysis_focus(&self, path: &Path) -> bool {
+        self.session_key(path)
+            .and_then(|key| self.analysis_focus.get(&key))
+            .is_some_and(|f| f.as_path() == path)
+    }
+
+    /// セッションの解析フォーカスが `path` へ動いたときに更新する（Open・復元・
+    /// peek）。同セッションの旧フォーカス文書の診断は捨てる（解析されない文書の
+    /// 診断を保持しない — フォーカスはセッションごとに 1 文書）。
+    fn set_analysis_focus(&mut self, path: &Path) {
+        if let Some(key) = self.session_key(path) {
+            if let Some(prev) = self.analysis_focus.insert(key, path.to_path_buf()) {
+                if prev != path {
+                    self.diagnostics.remove(&prev);
+                }
+            }
+        }
+    }
+
+    /// 解析フォーカス文書の診断を保存する（pull が current_uri 一致で返した箇所）。
+    /// フォーカスも同時に更新する（診断はフォーカス文書のものだけを保持する）。
+    fn set_focus_diagnostics(&mut self, path: &Path, diags: Vec<mina_protocol::Diagnostic>) {
+        self.set_analysis_focus(path);
+        self.diagnostics.insert(path.to_path_buf(), diags);
+    }
+
+    /// スナップショットに載せる診断: 解析フォーカス文書を見る View の分だけ。
+    pub(crate) fn focus_diagnostics(&self, path: &Path) -> Vec<mina_protocol::Diagnostic> {
+        if !self.is_analysis_focus(path) {
+            return Vec::new();
+        }
+        self.diagnostics
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// スナップショットに載せる inlay hint: 解析フォーカス文書を見る View の分だけ
+    /// （キャッシュ自体は `GetInlayHints` の全パス応答とも共用するため、表示は
+    /// ここで解析フォーカスに絞る — ADR-0037）。
+    pub(crate) fn focus_inlay_hints(&self, path: &Path) -> Vec<mina_protocol::InlayHint> {
+        if !self.is_analysis_focus(path) {
+            return Vec::new();
+        }
+        self.hints
+            .get(path)
+            .map(|c| c.hints.clone())
+            .unwrap_or_default()
     }
 
     /// Interactive 接続に View を割り当てる（ADR-0037）。開始文書は idle view
@@ -1241,7 +1300,7 @@ struct Borrowed {
     /// 正規化後の表示用パス（空応答・応答の path フィールド用）。
     path_str: String,
     text: String,
-    /// お膳立て時点のフォーカス文書（復元用。テキストは復元時に最新を読む）。
+    /// お膳立て時点のセッション解析フォーカス文書（復元用。テキストは復元時に最新を読む）。
     focused: Option<PathBuf>,
     session: Arc<Mutex<LspSession>>,
 }
@@ -1287,10 +1346,12 @@ async fn prepare_borrowed_session(
     if !lsp_supported {
         return Err(BorrowFail::NoServer(path_str));
     }
-    // フォーカス文書（復元用。テキストは復元時に最新を読む）
+    // 解析フォーカス文書（復元用 — v12: 借りたセッションの共有解析フォーカスを
+    // 復元対象にする。per-view のフォーカス文書ではない）。テキストは復元時に最新を読む。
     let focused = {
         let d = daemon.lock().await;
-        d.editor.focused_path().map(Path::to_path_buf)
+        d.session_key(&path_buf)
+            .and_then(|key| d.analysis_focus.get(&key).cloned())
     };
     let session = match ensure(daemon, &path_buf).await {
         Ok(s) => s,
@@ -1394,10 +1455,12 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
             }
         }
     }
-    // フォーカス文書（復元用。テキストは復元時に最新を読む）
+    // 解析フォーカス文書（復元用 — v12: 借りたセッションの共有解析フォーカスを
+    // 復元対象にする。per-view のフォーカス文書ではない）。テキストは復元時に最新を読む。
     let focused = {
         let d = daemon.lock().await;
-        d.editor.focused_path().map(Path::to_path_buf)
+        d.session_key(&path_buf)
+            .and_then(|key| d.analysis_focus.get(&key).cloned())
     };
     let session = match ensure(daemon, &path_buf).await {
         Ok(s) => s,
@@ -1470,6 +1533,16 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>, conn_id: u64) -> ServerMe
                 // セッションを借りた（開き直し）ので現在のテキストで didOpen する。
                 // 既に開いている場合の再 didOpen は無害（idempotent）。
                 lsp::open_document(&session, &path, &text).await;
+                // v12: peek は自分の View の文書を解析フォーカスへ（フォーカス
+                // が動いた場合のみ診断を非表示にする — 次の pull で再載る）。
+                {
+                    let mut d = daemon.lock().await;
+                    let moved = !d.is_analysis_focus(&path);
+                    d.set_analysis_focus(&path);
+                    if moved {
+                        d.diagnostics.remove(&path);
+                    }
+                }
                 lsp::definition_peek_at_char(&session, &path, &text, head).await
             }
             Ok(_) => None, // definition 非対応サーバ: peek なし
@@ -2411,21 +2484,31 @@ async fn restore_focus_session(
     session: &Mutex<lsp::LspSession>,
     focused: &Option<PathBuf>,
 ) {
+    // v12: 復元対象はセッションの共有解析フォーカス文書（借りたセッションの
+    // 元フォーカス）。要求中に他クライアントの Open がフォーカスを動かして
+    // いたら復元しない（最後の操作が勝つ）。
+    let restorable = {
+        let d = daemon.lock().await;
+        focused.as_ref().is_some_and(|fp| d.is_analysis_focus(fp))
+    };
+    if !restorable {
+        return;
+    }
     let focused_text = {
         let d = daemon.lock().await;
-        (d.editor.focused_path() == focused.as_deref())
-            .then(|| d.editor.current_document().text().to_string())
+        focused.as_ref().and_then(|fp| {
+            d.editor
+                .doc_id_for_path(fp)
+                .map(|id| d.editor.document(id).text().to_string())
+        })
     };
-    if let Some(text) = focused_text {
-        if let Some(fp) = focused {
-            let diags = lsp::restore_focus_with_diagnostics(session, fp, &text).await;
-            let mut d = daemon.lock().await;
-            if let Some(diags) = diags {
-                d.diagnostics = diags;
-                d.diag_path = focused.clone();
-            }
-            drain_into(&mut d);
+    if let (Some(text), Some(fp)) = (focused_text, focused) {
+        let diags = lsp::restore_focus_with_diagnostics(session, fp, &text).await;
+        let mut d = daemon.lock().await;
+        if let Some(diags) = diags {
+            d.set_focus_diagnostics(fp, diags);
         }
+        drain_into(&mut d);
     }
 }
 
@@ -2614,34 +2697,39 @@ async fn read_open_capped(path: &Path) -> Option<String> {
 /// は flycheck（cargo check・ディスク基準）由来で、編集内容と食い違う stale な
 /// 診断を publish することがあり、pull の結果を上書きしないよう適用しない。
 fn drain_into(daemon: &mut Daemon) {
-    let Some(path) = daemon.editor.focused_path() else {
-        daemon.diagnostics.clear();
-        daemon.diag_path = None;
-        return;
-    };
-    let Some(session) = daemon.session_for(path) else {
-        // フォーカス文書に LSP セッションがない（.rs 以外）: 前の文書の診断を
-        // 残さない（単一セッション時代の current_uri 不一致クリアと同じ意図）。
-        daemon.diagnostics.clear();
-        daemon.diag_path = None;
-        return;
-    };
-    let doc_uri = lsp::uri(path);
-    let Ok(session) = session.try_lock() else {
-        return;
-    };
-    // MEDIUM-3: サーバが死んだら古い診断を残さない（下線・カウントが文書と
-    // 不整合のまま表示され続ける）。再 spawn は次回 .rs Open 時（ADR-0009）。
-    // ヒントも同様に消す（死んだサーバの解析結果は表示・配信しない。ADR-0020）。
-    if session.client.is_dead() {
-        daemon.diagnostics.clear();
-        daemon.diag_path = None;
-        daemon.hints.clear();
-        daemon.hint_order.clear();
-    } else if session.current_uri() != Some(doc_uri.as_str()) {
-        // フォーカスが LSP 対象外の文書に移ったら診断は残さない
-        daemon.diagnostics.clear();
-        daemon.diag_path = None;
+    // MEDIUM-3: セッションが死んだ解析フォーカス文書の診断・ヒントを残さない
+    // （下線・カウントが文書と不整合のまま表示され続ける。再 spawn は次回
+    // .rs Open 時 — ADR-0009）。フォーカス移動分は `set_analysis_focus` が
+    // 同セッションの旧診断を捨て、他セッション分は `is_analysis_focus` で
+    // 表示されない（ここでは掃除しない）。
+    let dead: Vec<PathBuf> = daemon
+        .diagnostics
+        .keys()
+        .filter(|p| {
+            daemon
+                .session_for(p)
+                .map(|s| s.try_lock().ok().is_some_and(|g| g.client.is_dead()))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    for p in dead {
+        daemon.diagnostics.remove(&p);
+    }
+    let dead_hints: Vec<PathBuf> = daemon
+        .hints
+        .keys()
+        .filter(|p| {
+            daemon
+                .session_for(p)
+                .map(|s| s.try_lock().ok().is_some_and(|g| g.client.is_dead()))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    for p in dead_hints {
+        daemon.hints.remove(&p);
+        daemon.hint_order.retain(|k| k != &p);
     }
 }
 
@@ -2677,13 +2765,19 @@ async fn settle_open_diagnostics_loop(
     let mut prev: Option<usize> = None;
     for i in 0..120 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        // 現在のテキストを掴んでから pull（フォーカス移動・編集の最中は中断）
+        // 現在のテキストを掴んでから pull（解析フォーカス移動・編集の最中は中断）
         let text = {
             let d = daemon.lock().await;
-            if d.editor.focused_path().map(Path::to_path_buf).as_deref() != Some(path.as_path()) {
+            // v12: 中断条件は「この文書が解析フォーカスでなくなった」こと
+            // （他接続のコマンドがフォーカス View を動かしても中断しない —
+            // ADR-0037 の共有解析フォーカスは View ではなくセッション基準）。
+            if !d.is_analysis_focus(&path) {
                 return;
             }
-            d.editor.current_document().text().to_string()
+            match d.editor.doc_id_for_path(&path) {
+                Some(id) => d.editor.document(id).text().to_string(),
+                None => return, // 文書が閉じられた: 中断
+            }
         };
         let pulled = {
             let Ok(mut s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
@@ -2704,8 +2798,12 @@ async fn settle_open_diagnostics_loop(
         };
         let n = diags.len();
         let mut d = daemon.lock().await;
-        d.diagnostics = diags;
-        d.diag_path = Some(path.clone());
+        // 書き込み前にフォーカスを再確認（pull 中に他コネクションの Open が
+        // フォーカスを動かしたら、最新の文書の pull に任せて中断する）。
+        if !d.is_analysis_focus(&path) {
+            return;
+        }
+        d.set_focus_diagnostics(&path, diags);
         if let Some(hints) = pulled.1 {
             d.cache_hints(path.clone(), &text, hints);
         }
@@ -2763,8 +2861,9 @@ async fn sync_after_edit(
             d.remove_activity(path, kind);
         }
         if let Some(diags) = pulled_diags {
-            d.diagnostics = diags;
-            d.diag_path = Some(path.clone());
+            // 編集は解析フォーカス文書に対してのみ pull される（current_uri 一致
+            // ゲート — lsp::sync / pull_after_edit）ため、ここでフォーカスも更新される。
+            d.set_focus_diagnostics(path, diags);
         }
         if let Some(hints) = pulled_hints {
             d.cache_hints(path.clone(), text, hints);
@@ -2997,6 +3096,8 @@ async fn process_command(
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
                     d.open_idle_follow(&path_buf);
+                    // v12: 再利用も解析フォーカスとして記録（フォーカス切替）
+                    d.set_analysis_focus(&path_buf);
                     snapshot(&mut d, None)
                 } else {
                     // 未開パス: 従来どおりディスクから読む
@@ -3029,8 +3130,11 @@ async fn process_command(
                             d.editor.open_with_path(path_buf.clone(), contents);
                             let height = d.viewport_height;
                             d.editor.scroll_to_cursor(height);
-                            d.diagnostics.clear();
-                            d.diag_path = None;
+                            // v12: Open = 解析フォーカスの切替（この文書の診断は
+                            // settle の pull が入るまで表示しない — 旧フォーカス分で
+                            // 残っているものは捨てる）。
+                            d.set_analysis_focus(&path_buf);
+                            d.diagnostics.remove(&path_buf);
                             // ADR-0012/0015: ベースライン更新 + Open イベント
                             if let Ok(md) = std::fs::metadata(&path_buf) {
                                 d.baselines.insert(
@@ -4295,16 +4399,18 @@ pub(crate) fn snapshot_from_view(
         primary_index: view.selection.primary_index(),
         mode: convert_mode_back(daemon.editor.mode()),
         first_line: view.first_line,
-        // v12: 診断は解析フォーカス文書（diag_path）を表示する View だけに載せる
-        diagnostics: (path.is_some() && daemon.diag_path.as_deref() == path.as_deref())
-            .then(|| daemon.diagnostics.clone())
+        // v12: 診断・inlay は解析フォーカス文書（= 自分のセッションが最後に
+        // 解析した文書）を見る View のスナップショットにのみ載せる（ADR-0037）。
+        diagnostics: path
+            .as_deref()
+            .map(|p| daemon.focus_diagnostics(p))
             .unwrap_or_default(),
-        // ADR-0020: View の文書のヒントをキャッシュから載せる。checksum 不一致
+        // ADR-0020 + v12: ヒントは解析フォーカス文書のキャッシュだけを載せる
+        // （キャッシュは GetInlayHints の全パス応答とも共用）。checksum 不一致
         // （編集中）でも載せる — Q7: stale ヒントは新ヒント到着まで保持する。
         inlay_hints: path
             .as_deref()
-            .and_then(|p| daemon.hints.get(p))
-            .map(|c| c.hints.clone())
+            .map(|p| daemon.focus_inlay_hints(p))
             .unwrap_or_default(),
         // 不変条件: 同じスナップショットのテキストと一致する範囲（ADR-0016）。
         highlights,
@@ -4743,9 +4849,8 @@ root-markers = [".docsroot"]
             .pull_diagnostics(&path, "fn main() { TODO }")
             .await
             .expect("pull 診断が返る");
-        daemon.diagnostics = diags;
-        daemon.diag_path = Some(path.clone());
-        assert!(!daemon.diagnostics.is_empty(), "診断が入っている");
+        daemon.set_focus_diagnostics(&path, diags);
+        assert!(!daemon.focus_diagnostics(&path).is_empty(), "診断が入っている");
 
         // サーバを殺す → drain で古い診断がクリアされる
         session.lock().await.client.kill().await;
@@ -4760,7 +4865,7 @@ root-markers = [".docsroot"]
         assert!(is_dead, "サーバを殺すと is_dead になる");
         drain_into(&mut daemon);
         assert!(
-            daemon.diagnostics.is_empty(),
+            daemon.focus_diagnostics(&path).is_empty(),
             "サーバ死亡後の古い診断は残らない"
         );
     }
@@ -9015,6 +9120,9 @@ root-markers = [".docsroot"]
         let mut d = daemon();
         open_path(&mut d, "test.rs", "let x = 5");
         let path = PathBuf::from("test.rs");
+        // v12（ADR-0037）: ヒントは解析フォーカス文書の表示にのみ載る。
+        // ここでは Open 相当としてフォーカスを設定しておく。
+        d.set_analysis_focus(&path);
         d.cache_hints(
             path.clone(),
             "let x = 5",
@@ -9029,6 +9137,77 @@ root-markers = [".docsroot"]
         d.cache_hints(path, &snap.text, Vec::new());
         let snap = snapshot(&mut d, None);
         assert!(snap.inlay_hints.is_empty(), "新ヒントで置き換わる");
+    }
+
+    #[test]
+    fn diagnostics_and_hints_follow_analysis_focus() {
+        // ADR-0037: 診断・inlay は「解析フォーカス文書（= セッションが最後に解析
+        // した文書）」を見る View のスナップショットにのみ載る。別セッションの
+        // フォーカスは独立に保持される。
+        let mut d = daemon();
+        let a = PathBuf::from("/ws1/a.rs");
+        let b = PathBuf::from("/ws2/b.rs");
+        open_path(&mut d, "/ws1/a.rs", "fn a() {}");
+        open_path(&mut d, "/ws2/b.rs", "fn b() {}");
+
+        // 各セッションのフォーカス文書に診断・ヒントを入れる
+        d.set_focus_diagnostics(
+            &a,
+            vec![Diagnostic {
+                start: 0,
+                end: 2,
+                severity: Severity::Error,
+                message: "a の診断".into(),
+            }],
+        );
+        d.cache_hints(a.clone(), "fn a() {}", vec![type_hint(3, ": i32", true)]);
+        d.set_focus_diagnostics(
+            &b,
+            vec![Diagnostic {
+                start: 0,
+                end: 2,
+                severity: Severity::Warning,
+                message: "b の診断".into(),
+            }],
+        );
+
+        // a を見る View: a の診断・ヒントだけが載る
+        d.editor.set_focused_view(d.idle_view);
+        d.editor.focus_open_path(&a);
+        let snap = snapshot(&mut d, None);
+        assert_eq!(snap.path.as_deref(), Some("/ws1/a.rs"));
+        assert_eq!(snap.diagnostics.len(), 1, "a の診断が載る");
+        assert_eq!(snap.diagnostics[0].message, "a の診断");
+        assert_eq!(snap.inlay_hints.len(), 1, "a のヒントが載る");
+
+        // b を見る View: b の診断だけが載る（a のものは混ざらない）
+        d.editor.set_focused_view(d.idle_view);
+        d.editor.focus_open_path(&b);
+        let snap = snapshot(&mut d, None);
+        assert_eq!(snap.diagnostics.len(), 1, "b の診断が載る");
+        assert_eq!(snap.diagnostics[0].message, "b の診断");
+        assert!(snap.inlay_hints.is_empty(), "b のヒントは未取得なので空");
+
+        // 共有解析フォーカス（同セッション）: focus が別文書へ動くと、旧フォーカス
+        // 文書の診断は表示されなくなる（フォーカス = セッションごとに 1 文書）。
+        let mut d2 = daemon();
+        open_path(&mut d2, "/ws1/a.rs", "fn a() {}");
+        let c = PathBuf::from("/ws1/c.rs");
+        open_path(&mut d2, "/ws1/c.rs", "fn c() {}");
+        d2.set_focus_diagnostics(
+            &a,
+            vec![Diagnostic {
+                start: 0,
+                end: 2,
+                severity: Severity::Error,
+                message: "a の診断".into(),
+            }],
+        );
+        d2.set_analysis_focus(&c); // c の Open 相当（a の診断は捨てられる）
+        d2.editor.set_focused_view(d2.idle_view);
+        d2.editor.focus_open_path(&a);
+        let snap = snapshot(&mut d2, None);
+        assert!(snap.diagnostics.is_empty(), "c がフォーカスの間 a の診断は出ない");
     }
 
     #[test]
