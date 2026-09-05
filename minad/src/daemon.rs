@@ -4129,6 +4129,7 @@ pub(crate) fn snapshot(daemon: &mut Daemon, status: Option<String>) -> StateSnap
     let editor = &daemon.editor;
     let selection = editor.selection();
     StateSnapshot {
+        activity: Vec::new(),
         // ADR-0012 #12: 全文の FNV-1a を同梱し、エージェントが edit の
         // checksum を再実装せずに済ませる。応答は既に全文をシリアライズ
         // するため、ハッシュ計算は相対的に無視できるコスト。
@@ -6182,6 +6183,7 @@ root-markers = [".docsroot"]
         let mut hello = serde_json::to_string(&Hello {
             kind: ClientKind::Interactive,
             reset_cursor_on_disconnect: false,
+            name: "test".to_string(),
         })
         .unwrap();
         hello.push('\n');
@@ -6418,6 +6420,7 @@ root-markers = [".docsroot"]
         let mut hello = serde_json::to_string(&Hello {
             kind,
             reset_cursor_on_disconnect: true,
+            name: "test".to_string(),
         })
         .unwrap();
         hello.push('\n');
