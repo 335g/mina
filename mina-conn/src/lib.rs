@@ -41,10 +41,12 @@ pub async fn send_hello(
     write_half: &mut OwnedWriteHalf,
     kind: ClientKind,
     reset_cursor_on_disconnect: bool,
+    name: &str,
 ) -> std::io::Result<()> {
     let mut line = serde_json::to_string(&Hello {
         kind,
         reset_cursor_on_disconnect,
+        name: name.to_string(),
     })
     .expect("Hello はシリアライズ可能");
     line.push('\n');
@@ -128,11 +130,12 @@ pub async fn open_session(
     path: &Path,
     kind: ClientKind,
     reset_cursor_on_disconnect: bool,
+    name: &str,
 ) -> std::io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>)> {
     let stream = connect(path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
-    send_hello(&mut write_half, kind, reset_cursor_on_disconnect).await?;
+    send_hello(&mut write_half, kind, reset_cursor_on_disconnect, name).await?;
     Ok((write_half, reader))
 }
 
