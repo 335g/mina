@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 /// `SelectAll`（`%`）、挿入補完（`Append`/`OpenBelow`/`OpenAbove` = `a`/`o`/`O`）、
 /// `Replace`（`r`）、`ExtendLineBelow`（`x`）、`ScrollHalf`（C-d/C-u 半ページ）、
 /// `Movement::FirstNonWhitespace`（`g s`）。追加のみだが wire を広げるため version を上げる。
-pub const PROTOCOL_VERSION: u32 = 11;
+/// v12: 接続別フォーカス分離 + 活動可視化（ADR-0037/0038/0039）— `Hello` に
+/// `name`（自己申告ラベル）、`StateSnapshot` に `activity`（操作試行の成功/失敗履歴）、
+/// `EventKind::Rename` を追加。bump 方式（ADR-0039）: 新旧は別ソケットで交わらない。
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -586,11 +589,21 @@ pub struct Hello {
     /// 「リセットする」として扱う。Headless には無意味（切断でリセットしない）。
     #[serde(default = "default_true")]
     pub reset_cursor_on_disconnect: bool,
+    /// 自己申告ラベル（ADR-0038。HTTP User-Agent 的・未認証 — 「誰の操作か」を
+    /// 見るための札）。`StateSnapshot.activity` の actor にスタンプされる。
+    /// TUI は "tui"、minas は --name / MINAE_CLIENT_NAME（既定 "unknown"）。
+    #[serde(default = "default_name")]
+    pub name: String,
 }
 
 /// [`Hello::reset_cursor_on_disconnect`] のデフォルト（true）。
 fn default_true() -> bool {
     true
+}
+
+/// [`Hello::name`] のデフォルト（"unknown"）。
+fn default_name() -> String {
+    "unknown".to_string()
 }
 
 /// イベントの発生源（ADR-0012）。
@@ -624,6 +637,8 @@ pub enum EventKind {
     ExternalChange,
     /// 最後の Interactive クライアント切断時のカーソルリセット（ADR-0027）。
     SelectionReset,
+    /// シンボルの意味リネーム（[`Command::Rename`]。ADR-0029）。
+    Rename,
 }
 
 /// 状態を変える操作1件の記録（ADR-0012）。bounded リングで保持され、
@@ -728,6 +743,24 @@ pub struct Activity {
     pub label: String,
 }
 
+/// 操作の試行と結果の記録（ADR-0038。`StateSnapshot.activity` に載る）。
+///
+/// Headless 由来の「状態を変えようとした操作」（Open / 編集 / Save / Rename /
+/// Close …）の成功・失敗を bounded リング（既定 100 件）で保持する。読み取り系は
+/// 記録しない。ChangeEvent（状態変更の事後記録）とは別に並存 — こちらは
+/// 「誰が・どの操作を・成功/失敗したか」の視点。更新で generation を進め push に乗る。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityRecord {
+    /// 操作を発行したクライアントの自己申告ラベル（[`Hello::name`]）。
+    pub actor: String,
+    /// 操作の種類（[`ChangeEvent`] と同じ語彙 — 状態を変えようとした意図）。
+    pub kind: EventKind,
+    /// 成功したか（失敗 = checksum / expected_text 不一致拒否・Open 失敗など）。
+    pub ok: bool,
+    /// 補足（対象パス・失敗理由など。表示用の短い文字列）。
+    pub detail: String,
+}
+
 /// daemon が返す編集状態の全体像（ADR-0006: 毎コマンドに全量を返す）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
@@ -757,6 +790,10 @@ pub struct StateSnapshot {
     /// 進行中の非同期処理の集合（ADR-0028。空 = 処理中なし）。増減は
     /// generation を進める（診断・ヒントの反映は進めない）。
     pub activities: Vec<Activity>,
+    /// 操作の試行と結果の履歴（ADR-0038。bounded・既定 100 件）。更新で
+    /// generation を進め push に乗る。Headless 由来の状態変更意図操作の
+    /// 成功・失敗（読み取り系は対象外）。ChangeEvent とは別に並存。
+    pub activity: Vec<ActivityRecord>,
     /// 状態を変える操作ごとに増加する世代（ADR-0012）。
     pub generation: u64,
     /// 直近の状態変化イベント（bounded リング。古いものから破棄）。
@@ -796,6 +833,7 @@ impl Default for StateSnapshot {
             dirty: false,
             status: None,
             activities: Vec::new(),
+            activity: Vec::new(),
             generation: 0,
             events: Vec::new(),
             deleted: None,
@@ -868,6 +906,12 @@ mod tests {
             activities: vec![Activity {
                 kind: ActivityKind::LspInit,
                 label: "LSP 初期化中".to_string(),
+            }],
+            activity: vec![ActivityRecord {
+                actor: "agent-1".to_string(),
+                kind: EventKind::Open,
+                ok: false,
+                detail: "no such file".to_string(),
             }],
             peek: Some(Peek {
                 path: "lib.rs".to_string(),
@@ -1225,5 +1269,40 @@ mod tests {
         // 実装がバージョン間で変わらないこと（クライアント/daemon 両側で一致が前提）
         assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
         assert_eq!(fnv1a64(b"hi\n"), fnv1a64("hi\n".as_bytes()));
+    }
+
+    #[test]
+    fn hello_name_defaults_to_unknown() {
+        // ADR-0038: name は自己申告ラベル。旧クライアントの無指定 Hello は "unknown"
+        let legacy = r#"{"kind":"headless","reset_cursor_on_disconnect":false}"#;
+        let hello: Hello = serde_json::from_str(legacy).unwrap();
+        assert_eq!(hello.name, "unknown");
+        // 指定すれば通る
+        let json = serde_json::to_string(&Hello {
+            kind: ClientKind::Interactive,
+            reset_cursor_on_disconnect: true,
+            name: "tui".into(),
+        })
+        .unwrap();
+        assert!(json.contains("\"name\":\"tui\""));
+        let back: Hello = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "tui");
+    }
+
+    #[test]
+    fn activity_record_round_trip() {
+        // ADR-0038: 操作試行の成功/失敗の履歴（StateSnapshot.activity）
+        let rec = ActivityRecord {
+            actor: "agent-1".into(),
+            kind: EventKind::Open,
+            ok: false,
+            detail: "no such file".into(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: ActivityRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rec);
+        assert!(json.contains("\"ok\":false"));
+        // EventKind は snake_case（rename_all 適用後の wire 形式）
+        assert!(json.contains("\"kind\":\"open\""));
     }
 }
