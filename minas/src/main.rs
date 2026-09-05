@@ -14,6 +14,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "minas", version, about = "Headless agent CLI for minae")]
 struct Cli {
+    /// 自己申告ラベル（ADR-0038。activity の actor に載る）。既定は
+    /// MINAE_CLIENT_NAME 環境変数、それも無ければ "unknown"。
+    #[arg(long, global = true)]
+    name: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -41,7 +45,7 @@ async fn main() {
 async fn run() -> std::io::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Session(cmd) => session::run(cmd).await,
+        Command::Session(cmd) => session::run(cmd, cli.name).await,
         Command::Skill { topic } => skill::run(topic),
     }
 }

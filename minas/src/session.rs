@@ -56,6 +56,10 @@ use mina_conn as conn;
 /// daemon が動いていなければ `minad` を探して起動してから（クライアント視点の
 /// ライフサイクル）接続し、Hello（Headless 宣言）を送って (write_half, reader)
 /// を返す。接続は 1コマンドごとに開く（永続ではない — ADR-0013）。
+/// 接続冒頭の Hello に載せる自己申告ラベル（ADR-0038）。[`run`] で一度だけ
+/// 解決される（--name > MINAE_CLIENT_NAME > "unknown"）。
+static CLIENT_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>)> {
     let socket = mina_protocol::socket_path();
     if conn::connect(&socket).await.is_err() {
@@ -68,7 +72,13 @@ async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>
         conn::spawn_daemon(&exe, &["serve"])?;
         conn::wait_ready(&socket, 50).await?;
     }
-    conn::open_session(&socket, ClientKind::Headless, true).await
+    conn::open_session(
+        &socket,
+        ClientKind::Headless,
+        true,
+        CLIENT_NAME.get().map(String::as_str).unwrap_or("unknown"),
+    )
+    .await
 }
 
 /// `minas` のサブコマンド。引数・型は clap が検証する。
@@ -241,7 +251,16 @@ async fn wait_with_timeout(
 }
 
 /// `minas <subcommand>` を処理する。
-pub async fn run(cmd: SessionCmd) -> io::Result<()> {
+pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
+    // ADR-0038: 自己申告ラベルを一度だけ解決する（--name > MINAE_CLIENT_NAME > "unknown"）。
+    let _ = CLIENT_NAME.set(
+        name.unwrap_or_else(|| {
+            std::env::var("MINAE_CLIENT_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        }),
+    );
     match cmd {
         SessionCmd::Get { lines } => {
             let snapshot = execute(&Command::GetState).await?;
