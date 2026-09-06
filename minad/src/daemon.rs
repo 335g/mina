@@ -579,9 +579,13 @@ impl Daemon {
         commit: String,
         source: EventSource,
     ) {
+        // #50: 基準点が変わったときだけ旧コメントを破棄する（Q9）。同一ペアの
+        // 再登録（表示切替・再接続）は保持する。
+        let same = self.base_roots.get(&root).is_some_and(|c| c == &commit);
+        if !same {
+            self.review_comments.clear();
+        }
         self.base_roots.insert(root, commit);
-        // #50: 再ピンで基準点が変わるため旧コメントは破棄する（Q9）。
-        self.review_comments.clear();
         self.record_event(source, EventKind::BaseRoot, None, None);
     }
 
@@ -10387,6 +10391,18 @@ root-markers = [".docsroot"]
         )
         .await;
         assert_eq!(snap.review_comment_count, 0, "再ピンで旧コメント破棄");
+
+        // 同一ペアの再登録（表示切替・再接続）は保持する。
+        let _ = request(&mut tui, &add(1, "zero", "保持される")).await;
+        let snap = request(
+            &mut tui,
+            &Command::RegisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+                commit: "def5678".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.review_comment_count, 1, "同一基準の再登録は保持");
 
         // 再追加 → Unregister で全消し。
         let _ = request(&mut tui, &add(1, "zero", "先頭メモ2")).await;
