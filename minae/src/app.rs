@@ -5,7 +5,7 @@
 //! 送信はコマンド直列 + ソケット常時読み。`Response` は直近コマンドの答え、
 //! `Push` は逐次適用 — どちらも全文スナップショットなので最新をそのまま状態にする。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::colors::{self, ColorCapability, Colorscheme};
 use crate::config;
+use crate::git;
 use crate::keymap::{Keymaps, Resolution};
 use crate::render;
 
@@ -155,6 +156,10 @@ pub(crate) struct TreeEntry {
     pub(crate) name: String,
     pub(crate) is_dir: bool,
     pub(crate) depth: usize,
+    /// 比較中の変更種別（ファイルのみ）。
+    pub(crate) status: Option<git::ChangeStatus>,
+    /// 配下の変更ファイル数（ディレクトリの集約マーカー用）。
+    pub(crate) subtree_changes: usize,
 }
 
 /// ファイルツリーの状態（起動時 cwd 固定・クライアント側 fs 走査）。
@@ -206,6 +211,8 @@ impl TreeState {
                 name,
                 is_dir,
                 depth,
+                status: None,
+                subtree_changes: 0,
             });
             if is_dir && expanded.contains(&path) {
                 Self::collect(&path, depth + 1, expanded, out);
@@ -242,6 +249,154 @@ impl TreeState {
             !e.is_dir && e.path.to_string_lossy() == path
         }) {
             self.selected = idx;
+        }
+    }
+
+    /// 変更セットを注釈する（比較表示用 #49）。ファイルは種別、ディレクトリは
+    /// 配下件数の集約。changed=None で全クリア。refresh() の後に呼ぶ。
+    pub(crate) fn annotate(&mut self, changed: Option<&[git::ChangedFile]>) {
+        for e in &mut self.entries {
+            e.status = None;
+            e.subtree_changes = 0;
+        }
+        let Some(changed) = changed else { return };
+        for e in &mut self.entries {
+            if e.is_dir {
+                e.subtree_changes = changed.iter().filter(|c| c.path.starts_with(&e.path)).count();
+            } else if let Some(c) = changed.iter().find(|c| c.path == e.path) {
+                e.status = Some(c.status);
+            }
+        }
+    }
+}
+
+/// 比較閲覧 Mode 1 の状態（#49）。クライアントローカル — デーモン無変更。
+/// 基準はピン留めしたコミット、現在側はスナップショットのテキスト。
+pub(crate) struct CompareState {
+    /// ピン留めした基準コミット ID。
+    base: String,
+    /// リポジトリルート（絶対パス）。
+    repo: PathBuf,
+    /// 注釈表示の ON/OFF（D で切替）。
+    show: bool,
+    /// 変更一覧（絶対パス）。files_gen 世代のもの。
+    files: Vec<git::ChangedFile>,
+    /// 一覧を作った snapshot.generation。
+    files_gen: u64,
+    /// 基準テキストのキャッシュ（基準不変なのでピン中は有効）。
+    base_texts: HashMap<String, Option<String>>,
+    /// パス → 差分キャッシュ（canvas 変化で再計算）。
+    diffs: HashMap<String, CachedDiff>,
+    /// 直近の git エラー（flash の重複抑止用）。
+    last_err: Option<String>,
+}
+
+struct CachedDiff {
+    canvas_checksum: u64,
+    diff: git::FileDiff,
+}
+
+impl CompareState {
+    /// ピン留めして初期化（初回 D / B）。基準オブジェクトの存在確認付き
+    /// （`git stash create` は無名オブジェクトのため）。
+    fn pin(repo: PathBuf) -> Result<Self, git::GitError> {
+        let base = git::pin_base(&repo)?;
+        git::verify_object(&repo, &base)?;
+        Ok(Self {
+            base,
+            repo,
+            show: true,
+            files: Vec::new(),
+            files_gen: u64::MAX,
+            base_texts: HashMap::new(),
+            diffs: HashMap::new(),
+            last_err: None,
+        })
+    }
+
+    pub(crate) fn short(&self) -> &str {
+        self.base.get(..7).unwrap_or(&self.base)
+    }
+
+    pub(crate) fn is_showing(&self) -> bool {
+        self.show
+    }
+
+    /// 変更一覧の再計算（世代が進んだら）。Dirty な注目文書は union する
+    /// （未保存編集が一覧から漏れないため）。
+    fn ensure_files(&mut self, snap: &StateSnapshot) {
+        if snap.generation == self.files_gen {
+            return;
+        }
+        self.files_gen = snap.generation;
+        let mut files = git::changed_files(&self.repo, &self.base).unwrap_or_default();
+        if snap.dirty {
+            if let Some(path) = &snap.path {
+                let p = PathBuf::from(path);
+                if !files.iter().any(|f| f.path == p) {
+                    files.push(git::ChangedFile {
+                        path: p,
+                        status: git::ChangeStatus::Modified,
+                    });
+                }
+            }
+        }
+        self.files = files;
+    }
+
+    /// 現在文書の差分配列（表示用）。show=false・対象外・エラー時は None。
+    /// エラーは内容変化時のみ flash する（毎フレームの spam 回避）。
+    fn diff_for(&mut self, snap: &StateSnapshot, flash: &mut Option<String>) -> Option<git::FileDiff> {
+        if !self.show {
+            return None;
+        }
+        let path = snap.path.as_deref()?;
+        let rel = Path::new(path).strip_prefix(&self.repo).ok()?;
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let base = match self.base_texts.get(path) {
+            Some(cached) => cached.clone(),
+            None => match git::base_text(&self.repo, &self.base, &rel) {
+                Err(e) => {
+                    self.note_err(format!("{e}"), flash);
+                    return None;
+                }
+                Ok(text) => {
+                    self.base_texts.insert(path.to_string(), text.clone());
+                    text
+                }
+            },
+        };
+        let Some(base) = base else {
+            return Some(git::FileDiff::all_added(snap.text.split('\n').count()));
+        };
+        if let Some(cached) = self.diffs.get(path) {
+            if cached.canvas_checksum == snap.checksum {
+                return Some(cached.diff.clone());
+            }
+        }
+        match git::diff_texts(&base, &snap.text) {
+            Ok(diff) => {
+                self.diffs.insert(
+                    path.to_string(),
+                    CachedDiff {
+                        canvas_checksum: snap.checksum,
+                        diff: diff.clone(),
+                    },
+                );
+                Some(diff)
+            }
+            Err(e) => {
+                self.diffs.remove(path);
+                self.note_err(format!("{e}"), flash);
+                None
+            }
+        }
+    }
+
+    fn note_err(&mut self, e: String, flash: &mut Option<String>) {
+        if self.last_err.as_deref() != Some(e.as_str()) {
+            self.last_err = Some(e.clone());
+            *flash = Some(e);
         }
     }
 }
@@ -297,6 +452,7 @@ pub(crate) struct App {
     pub(crate) prompt: Option<Prompt>,
     pub(crate) overlay: Overlay,
     pub(crate) tree: TreeState,
+    pub(crate) compare: Option<CompareState>,
     pub(crate) diag_filter: Severity,
     pub(crate) diag_index: usize,
     pub(crate) diag_key: Option<(usize, String)>,
@@ -329,6 +485,7 @@ impl App {
             prompt: None,
             overlay: Overlay::None,
             tree: TreeState::new(root),
+            compare: None,
             diag_filter: Severity::Error,
             diag_index: 0,
             diag_key: None,
@@ -436,6 +593,17 @@ impl App {
                 }
                 self.snapshot = snapshot;
                 self.reconcile_diag();
+                // 比較中: ツリー表示中だけ一覧を追随させる（毎 push の git 呼び出し回避）。
+                if self.overlay == Overlay::Tree {
+                    if let Some(cmp) = self.compare.as_mut() {
+                        if cmp.show {
+                            let snap = self.snapshot.clone();
+                            cmp.ensure_files(&snap);
+                            let files = cmp.files.clone();
+                            self.tree.annotate(Some(&files));
+                        }
+                    }
+                }
             }
             // TUI は軽量応答を送らない（使わない）ので無視する
             _ => {}
@@ -545,6 +713,7 @@ impl App {
                     self.pending.clear();
                     self.tree.refresh();
                     self.tree.select_path(self.snapshot.path.as_deref());
+                    self.annotate_tree();
                     self.overlay = Overlay::Tree;
                     return;
                 }
@@ -565,6 +734,18 @@ impl App {
                 Char('C') => {
                     self.pending.clear();
                     self.cycle_colorscheme();
+                    return;
+                }
+                // D: 比較表示の切替（初回はピン留め）。B: 基準の更新。
+                // Normal 先行キー（T/G/A/C と同列 — keymap より優先）。
+                Char('D') => {
+                    self.pending.clear();
+                    self.toggle_compare().await;
+                    return;
+                }
+                Char('B') => {
+                    self.pending.clear();
+                    self.repin_compare().await;
                     return;
                 }
                 _ => {}
@@ -637,8 +818,13 @@ impl App {
                     Char('T') if key.modifiers.is_empty() => self.overlay = Overlay::None,
                     Down | Char('j') if key.modifiers.is_empty() => self.tree.move_selection(1),
                     Up | Char('k') if key.modifiers.is_empty() => self.tree.move_selection(-1),
+                    // n/N: 次/前の変更ファイルへジャンプ（比較中のみ有効）。
+                    Char('n') => self.jump_changed(1),
+                    Char('N') => self.jump_changed(-1),
                     Enter => {
-                        if let Some(path) = self.tree.confirm() {
+                        let opened = self.tree.confirm();
+                        self.annotate_tree();
+                        if let Some(path) = opened {
                             self.overlay = Overlay::None;
                             self.send(&Command::Open {
                                 path: conn::absolutize(&path.to_string_lossy()),
@@ -910,6 +1096,113 @@ impl App {
         if let Some(scheme) = colors::resolve(next, &self.schemes_dir) {
             self.scheme = scheme;
         }
+    }
+
+    /// ツリーに比較マーカーを注釈する（非表示・未開始ならクリア）。
+    fn annotate_tree(&mut self) {
+        let files = self
+            .compare
+            .as_ref()
+            .filter(|c| c.is_showing())
+            .map(|c| c.files.clone());
+        self.tree.annotate(files.as_deref());
+    }
+
+    /// D: 比較表示の切替。初回は現在状態をピン留めする。
+    async fn toggle_compare(&mut self) {
+        if let Some(cmp) = self.compare.as_mut() {
+            cmp.show = !cmp.show;
+            if cmp.show {
+                cmp.files_gen = u64::MAX;
+                let snap = self.snapshot.clone();
+                cmp.ensure_files(&snap);
+            }
+            self.annotate_tree();
+            return;
+        }
+        let root = self.tree.root.clone();
+        let repo = match git::repo_root(&root) {
+            Ok(r) => r,
+            Err(e) => {
+                self.flash = Some(format!("比較を開始できません: {e}"));
+                return;
+            }
+        };
+        let mut cmp = match CompareState::pin(repo) {
+            Ok(c) => c,
+            Err(e) => {
+                self.flash = Some(format!("比較を開始できません: {e}"));
+                return;
+            }
+        };
+        let snap = self.snapshot.clone();
+        cmp.ensure_files(&snap);
+        self.flash = Some(format!("基準 {} にピン留め（D:表示切替 B:更新）", cmp.short()));
+        self.compare = Some(cmp);
+        self.annotate_tree();
+    }
+
+    /// B: 基準を現在状態に更新する（一覧・差分キャッシュを作り直す）。
+    async fn repin_compare(&mut self) {
+        let Some(repo) = self.compare.as_ref().map(|c| c.repo.clone()) else {
+            self.flash = Some("比較を開始してからピン留めしてください（D）".into());
+            return;
+        };
+        match CompareState::pin(repo) {
+            Ok(mut fresh) => {
+                fresh.show = self.compare.as_ref().map(|c| c.show).unwrap_or(true);
+                let snap = self.snapshot.clone();
+                fresh.ensure_files(&snap);
+                let short = fresh.short().to_string();
+                self.compare = Some(fresh);
+                self.annotate_tree();
+                self.flash = Some(format!("基準 {short} に更新"));
+            }
+            Err(e) => {
+                self.flash = Some(format!("ピン留めできません: {e}"));
+            }
+        }
+    }
+
+    /// ツリー上で次/前の変更ファイルへジャンプする（n/N）。
+    fn jump_changed(&mut self, delta: isize) {
+        let show = self.compare.as_ref().map(|c| c.show).unwrap_or(false);
+        if !show {
+            self.flash = Some("比較を開始してください（D）".into());
+            return;
+        }
+        let marked: Vec<usize> = self
+            .tree
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.is_dir && e.status.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        if marked.is_empty() {
+            self.flash = Some("変更ファイルがありません".into());
+            return;
+        }
+        let cur = self.tree.selected;
+        let next = if delta > 0 {
+            marked.iter().find(|&&i| i > cur).or(marked.first())
+        } else {
+            marked.iter().rev().find(|&&i| i < cur).or(marked.last())
+        };
+        self.tree.selected = *next.unwrap_or(&cur);
+    }
+
+    /// 現在文書の比較差分（render 毎フレーム用。checksum キーなので
+    /// git 呼び出しは変化時のみ）。
+    pub(crate) fn compare_diff_for_render(&mut self) -> Option<git::FileDiff> {
+        let snap = self.snapshot.clone();
+        let cmp = self.compare.as_mut()?;
+        let mut flash = None;
+        let d = cmp.diff_for(&snap, &mut flash);
+        if let Some(msg) = flash {
+            self.flash = Some(msg);
+        }
+        d
     }
 
     /// 再接続を試みる（バックオフ済み）。成功時は Hello + GetState + SetViewport。
@@ -1206,5 +1499,218 @@ mod tests {
             parse_command("w foo"),
             CommandLineAction::Unknown("w foo".into())
         );
+    }
+
+    fn test_app() -> App {
+        App::new(
+            crate::colors::default_scheme(),
+            PathBuf::from("/tmp"),
+            ColorCapability::TrueColor,
+            false,
+        )
+    }
+
+    fn changed(path: &str, status: git::ChangeStatus) -> git::ChangedFile {
+        git::ChangedFile {
+            path: PathBuf::from(path),
+            status,
+        }
+    }
+
+    #[test]
+    fn repin_without_compare_hints_d() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            let key = KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE);
+            app.handle_key(key).await;
+            assert!(app.compare.is_none());
+            assert!(app.flash.as_deref().unwrap_or("").contains('D'));
+        });
+    }
+
+    #[test]
+    fn tree_annotate_marks_files_and_dir_aggregates() {
+        let mut tree = TreeState {
+            root: PathBuf::from("/r"),
+            expanded: HashSet::new(),
+            selected: 0,
+            entries: vec![
+                TreeEntry {
+                    path: PathBuf::from("/r/src"),
+                    name: "src".into(),
+                    is_dir: true,
+                    depth: 0,
+                    status: None,
+                    subtree_changes: 0,
+                },
+                TreeEntry {
+                    path: PathBuf::from("/r/a.rs"),
+                    name: "a.rs".into(),
+                    is_dir: false,
+                    depth: 0,
+                    status: None,
+                    subtree_changes: 0,
+                },
+            ],
+        };
+        let changed = vec![changed("/r/a.rs", git::ChangeStatus::Modified)];
+        tree.annotate(Some(&changed));
+        assert_eq!(tree.entries[1].status, Some(git::ChangeStatus::Modified));
+        // ルート直下の src/ 配下に変更はない。/r 自体の集約は entries にない。
+        assert_eq!(tree.entries[0].subtree_changes, 0);
+        // クリア
+        tree.annotate(None);
+        assert_eq!(tree.entries[1].status, None);
+    }
+
+    #[test]
+    fn tree_annotate_dir_aggregate_counts_subtree() {
+        let mut tree = TreeState {
+            root: PathBuf::from("/r"),
+            expanded: HashSet::new(),
+            selected: 0,
+            entries: vec![TreeEntry {
+                path: PathBuf::from("/r/src"),
+                name: "src".into(),
+                is_dir: true,
+                depth: 0,
+                status: None,
+                subtree_changes: 0,
+            }],
+        };
+        let changed = vec![
+            changed("/r/src/a.rs", git::ChangeStatus::Added),
+            changed("/r/src/b.rs", git::ChangeStatus::Deleted),
+        ];
+        tree.annotate(Some(&changed));
+        assert_eq!(tree.entries[0].subtree_changes, 2);
+    }
+
+    /// 比較 E2E（headless）: 実 git でピン留め→差分→TestBackend 描画まで通す。
+    /// worktree を汚さない（canvas は worktree と独立に seed する）。
+    /// クリーンなリポジトリでは `git stash create` は何も作らない。
+    #[test]
+    fn compare_e2e_pin_diff_render() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            // D でピン留め（実 git。失敗時は環境要因なので明示する）。
+            let key = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE);
+            app.handle_key(key).await;
+            assert!(app.compare.is_some(), "pin failed: {:?}", app.flash);
+            let path = format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"));
+            let orig = include_str!("main.rs");
+
+            // 追加行あり canvas → '+' マーカー行が出る。
+            app.snapshot.text = format!("{orig}\n// e2e-marker-added");
+            app.snapshot.path = Some(path.clone());
+            app.snapshot.checksum = 111;
+            let diff = app.compare_diff_for_render();
+            assert!(diff.is_some(), "flash: {:?}", app.flash);
+            let diff = diff.unwrap();
+            assert_eq!(*diff.kinds.last().unwrap(), git::RowKind::Added);
+            draw_to_test_backend(&mut app, |rows| {
+                assert!(
+                    rows.iter().any(|r| r.starts_with('+')),
+                    "added marker missing: {rows:?}"
+                );
+            });
+
+            // 削除あり canvas → '-' の gap 行に旧テキストが出る。
+            let mut gone: Vec<&str> = orig.split('\n').collect();
+            assert!(gone.len() > 6);
+            let removed = gone.remove(5);
+            app.snapshot.text = gone.join("\n");
+            app.snapshot.checksum = 222;
+            let diff = app.compare_diff_for_render();
+            assert!(diff.is_some(), "flash: {:?}", app.flash);
+            assert_eq!(diff.unwrap().gaps.len(), 1);
+            draw_to_test_backend(&mut app, |rows| {
+                let nospace: Vec<String> =
+                    rows.iter().map(|r| r.replace(' ', "")).collect();
+                let target = removed.replace(' ', "");
+                assert!(
+                    nospace
+                        .iter()
+                        .any(|r| r.starts_with('-') && r.contains(&target)),
+                    "deleted gap missing: {rows:?}"
+                );
+            });
+        });
+    }
+
+    /// TestBackend に描画して各行の文字列を渡す。
+    fn draw_to_test_backend(app: &mut App, check: impl FnOnce(Vec<String>)) {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(100, 48);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::render::render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut rows = Vec::new();
+        for y in 0..48 {
+            let line: String = (0..100).map(|x| buf[(x, y)].symbol()).collect();
+            rows.push(line.trim_end().to_string());
+        }
+        check(rows);
+    }
+
+    #[test]
+    fn tree_jump_moves_to_marked_files() {
+        let mut app = test_app();
+        app.tree.entries = vec![
+            TreeEntry {
+                path: PathBuf::from("/r/a.rs"),
+                name: "a.rs".into(),
+                is_dir: false,
+                depth: 0,
+                status: None,
+                subtree_changes: 0,
+            },
+            TreeEntry {
+                path: PathBuf::from("/r/b.rs"),
+                name: "b.rs".into(),
+                is_dir: false,
+                depth: 0,
+                status: Some(git::ChangeStatus::Modified),
+                subtree_changes: 0,
+            },
+            TreeEntry {
+                path: PathBuf::from("/r/c.rs"),
+                name: "c.rs".into(),
+                is_dir: false,
+                depth: 0,
+                status: Some(git::ChangeStatus::Added),
+                subtree_changes: 0,
+            },
+        ];
+        app.compare = Some(CompareState {
+            base: "abc".into(),
+            repo: PathBuf::from("/r"),
+            show: true,
+            files: Vec::new(),
+            files_gen: 0,
+            base_texts: HashMap::new(),
+            diffs: HashMap::new(),
+            last_err: None,
+        });
+        app.tree.selected = 0;
+        app.jump_changed(1);
+        assert_eq!(app.tree.selected, 1);
+        app.jump_changed(1);
+        assert_eq!(app.tree.selected, 2);
+        // 末尾で循環する
+        app.jump_changed(1);
+        assert_eq!(app.tree.selected, 1);
+        app.jump_changed(-1);
+        assert_eq!(app.tree.selected, 2);
     }
 }
