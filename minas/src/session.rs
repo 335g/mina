@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use clap::Subcommand;
 use mina_protocol::{
     CheckDiagnostic, ClientKind, Command, DocumentEdit, InlayHint, OutlineSymbol, StateSnapshot,
-    WorkspaceSymbol,
+    WorkspaceSymbol, ReviewCommentView,
 };
 use mina_protocol::{ReferenceLocation, ServerMessage, Severity};
 use serde::Deserialize;
@@ -1042,7 +1042,8 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
-        | Ok(ServerMessage::WorkspaceSymbols { .. }) => {
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => {
             Err(invalid("Check に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
