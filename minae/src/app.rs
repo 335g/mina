@@ -1174,6 +1174,108 @@ impl App {
     }
 
     /// D: 比較表示の切替。初回は現在状態をピン留め＋基準登録する。
+    /// レビューコメント一覧を daemon から取り直す（#50）。比較表示中のみ送る。
+    /// 応答は on_socket_line で review_list に載る（マーカー・prefill 用）。
+    async fn refresh_reviews(&mut self) {
+        if self.compare.as_ref().is_some_and(|c| c.is_showing()) {
+            self.send(&Command::ListReviewComments).await;
+        }
+    }
+
+    /// K（現在側）: カーソル行へのコメント入力を開く（#50）。比較表示中のみ。
+    /// 2回目は既存本文を prefill し、空 Enter で削除する（トグル・Q8）。
+    fn open_review_prompt_current(&mut self) {
+        let Some(cmp) = self.compare.as_ref().filter(|c| c.is_showing()) else {
+            self.flash = Some("比較を開始してください（D）".into());
+            return;
+        };
+        let Some(path) = self.snapshot.path.clone() else {
+            self.flash = Some("no file open".into());
+            return;
+        };
+        let (line0, _) = render::cursor_line_col(&self.snapshot);
+        let line_no = (line0 + 1) as u32;
+        let snippet = self.snapshot.text.lines().nth(line0).unwrap_or("").to_string();
+        let base = cmp.base.clone();
+        // 編集: 解決行 or 保存行がカーソル行に当たる既存を prefill する。
+        // 送信は保存行で行い、snippet だけ現行に更新する（重複を作らない）。
+        let existing = self.review_list.iter().find(|e| {
+            e.side == ReviewSide::Current
+                && e.path == path
+                && (e.resolved_line == line_no || e.line == line_no)
+        });
+        let (line, buf) = match existing {
+            Some(e) => (e.line, e.body.clone()),
+            None => (line_no, String::new()),
+        };
+        self.prompt = Some(Prompt::ReviewComment {
+            buf,
+            anchor: ReviewAnchor {
+                path,
+                side: ReviewSide::Current,
+                line,
+                snippet,
+                base,
+            },
+        });
+    }
+
+    /// K（基準側・gapレビュー中）: gap 行へのコメント入力を開く（#50）。
+    fn open_review_prompt_gap(&mut self, gap_idx: usize, line_idx: usize) {
+        let (wt_path, line_no, snippet, base) = match (|| {
+            let cmp = self.compare.as_ref()?;
+            let snap_path = self.snapshot.path.as_deref()?;
+            let rel = Path::new(snap_path).strip_prefix(&cmp.repo).ok()?;
+            let diff = self.compare_diff_for_render()?;
+            let gap = diff.gaps.get(gap_idx)?;
+            let text = gap.lines.get(line_idx)?.clone();
+            Some((
+                cmp.worktree.join(rel).to_string_lossy().into_owned(),
+                (gap.old_start + line_idx) as u32,
+                text,
+                cmp.base.clone(),
+            ))
+        })() else {
+            self.flash = Some("比較差分がありません".into());
+            return;
+        };
+        let existing = self.review_list.iter().find(|e| {
+            e.side == ReviewSide::Base && e.path == wt_path && e.line == line_no
+        });
+        let (line, buf) = match existing {
+            Some(e) => (e.line, e.body.clone()),
+            None => (line_no, String::new()),
+        };
+        self.gap_review = None;
+        self.prompt = Some(Prompt::ReviewComment {
+            buf,
+            anchor: ReviewAnchor {
+                path: wt_path,
+                side: ReviewSide::Base,
+                line,
+                snippet,
+                base,
+            },
+        });
+    }
+
+    /// レビューコメント入力の確定（#50）。Add を送り、一覧を取り直す。
+    /// 空本文はそのアンカーの削除（daemon 側の upsert-delete）。
+    async fn submit_review_comment(&mut self, anchor: ReviewAnchor, body: String) {
+        let deleted = body.trim().is_empty();
+        self.send(&Command::AddReviewComment {
+            path: anchor.path,
+            side: anchor.side,
+            line: anchor.line,
+            snippet: anchor.snippet,
+            body,
+            base: anchor.base,
+        })
+        .await;
+        self.refresh_reviews().await;
+        self.flash = Some(if deleted { "コメント削除".into() } else { "コメント登録".into() });
+    }
+
     async fn toggle_compare(&mut self) {
         if self.compare.is_some() {
             let (show_now, root, commit) = {
