@@ -453,35 +453,38 @@ fn draw_cursor(
     let snap = &app.snapshot;
     // gapレビュー中: gap 行に端末カーソルを置く（デーモン選択は動かさない）。
     if let Some((gi, li, col)) = gap_cur {
-        if let Some(d) = diff {
-            if let Some(g) = d.gaps.get(gi) {
-                if g.at >= snap.first_line {
-                    if let Some(text) = g.lines.get(li) {
-                        let mut rel = g.at - snap.first_line;
-                        for (oi, og) in d.gaps.iter().enumerate() {
-                            if og.at < snap.first_line {
-                                continue;
-                            }
-                            if og.at < g.at || (og.at == g.at && oi < gi) {
-                                rel += og.lines.len();
-                            }
-                        }
-                        rel += li;
-                        if rel < area.height as usize {
-                            let gutter_w = gutter_width(snap, diff);
-                            let disp_col = UnicodeWidthStr::width(
-                                text.chars().take(col).collect::<String>().as_str(),
-                            ) as u16;
-                            let x = area
-                                .x
-                                .saturating_add(gutter_w + disp_col)
-                                .min(area.x + area.width.saturating_sub(1));
-                            f.set_cursor_position((x, area.y + rel as u16));
-                        }
-                        return;
-                    }
+        let pos: Option<(usize, u16)> = (|| {
+            let d = diff?;
+            let g = d.gaps.get(gi)?;
+            if g.at < snap.first_line {
+                return None;
+            }
+            let text = g.lines.get(li)?;
+            let mut rel = g.at - snap.first_line;
+            for (oi, og) in d.gaps.iter().enumerate() {
+                if og.at < snap.first_line {
+                    continue;
+                }
+                if og.at < g.at || (og.at == g.at && oi < gi) {
+                    rel += og.lines.len();
                 }
             }
+            rel += li;
+            if rel >= area.height as usize {
+                return None;
+            }
+            let gutter_w = gutter_width(snap, diff);
+            let disp_col = UnicodeWidthStr::width(
+                text.chars().take(col).collect::<String>().as_str(),
+            ) as u16;
+            let x = area
+                .x
+                .saturating_add(gutter_w + disp_col)
+                .min(area.x + area.width.saturating_sub(1));
+            Some((rel, x))
+        })();
+        if let Some((rel, x)) = pos {
+            f.set_cursor_position((x, area.y + rel as u16));
         }
         return;
     }
