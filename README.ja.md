@@ -32,7 +32,7 @@ minae は daemon/client 分割のターミナルエディタです。エージ�
 - **LSP による言語サポート**（ワークスペースルート単位）: 診断・inlay hints・定義 peek・セマンティック rename / references
 - **言語サーバ**（ADR-0030 に基づく検証済みの埋め込み）: Rust に `rust-analyzer`、TypeScript に `typescript-language-server` —— 同じ2言語分の tree-sitter 構文ハイライトも同梱。ほかの LSP はユーザーの `languages.toml` で追加可能（未検証サーバも標準機能はネゴシエーションで動作）
 - **ヘッドレスエージェントインターフェース**: `minas` —— 有界な番号付き read（`get --lines`）、ワンショット検証付き編集（`apply`）、位置指定編集（`edit`）、状態遷移の待機（`wait`）、全文なしの hints / peek、セマンティック rename（`rename`）、構造把握（`outline`）と位置解決（`at`）、hover 型参照（`hover`）とワークスペースシンボル検索（`symbol`）、編集→検証ループを 1 コマンドに圧縮する診断 settle+報告（`check` — `wait` + `get` + JSON パースの代替）
-- **ターミナル UI**（再構築中）: `minae` TUI は再構築中。出荷するエージェントツール（`minad` daemon・`minas` session CLI・skill）には含まれない
+- **ターミナル UI**: `minae` TUI（ratatui/crossterm、接続別 View）—— `minae [file ...]` で対話編集
 - **設定可能**: 言語サーバの `languages.toml`（デーモン側）、`config.toml` とユーザーカラースキーム（クライアント側）、エージェント向けビルトインの `minas skill` ガイド
 
 ## はじめに
@@ -45,7 +45,7 @@ $ cargo install minad minas
 $ minas apply path/to/file.rs "old text" "new text"
 ```
 
-TUI は再構築中です（`minae open` は案内メッセージを出して終了します）。出荷インターフェースは `minad` daemon と `minas` ヘッドレス CLI です。
+TUI は `minae [file ...]` で利用できます。出荷インターフェースは `minad` daemon と `minas` ヘッドレス CLI です。
 
 ソースからは `cargo build --release` でもビルドできます。言語サーバ（rust-analyzer、typescript-language-server など）は同梱されないため、LSP 機能を使う場合は別途インストールしてください。tree-sitter による構文ハイライトはそのまま動きます。
 

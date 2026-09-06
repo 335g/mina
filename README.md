@@ -32,7 +32,7 @@ A resident **Daemon** holds all editor state — open documents, undo histories,
 - **Language support** via LSP, per workspace root: diagnostics, inlay hints, definition peek, semantic rename and references
 - **Language servers** (embedded and verified per ADR-0030): `rust-analyzer` for Rust, `typescript-language-server` for TypeScript — with tree-sitter syntax highlighting for the same two. Any other LSP can be wired up via your `languages.toml` (user-added servers are unvetted but negotiate standard features); see the config docs.
 - **Headless agent interface**: `minas` — bounded numbered reads (`get --lines`), one-shot verified edits (`apply`), positional edits (`edit`), state-change waiting (`wait`), hints and peek without full text, semantic rename (`rename`), structure discovery (`outline`) and position resolution (`at`), hover type lookup (`hover`) and workspace symbol search (`symbol`), and a diagnostics settle+report shortcut for the edit→verify loop (`check` — replaces `wait` + `get` + JSON parsing)
-- **Terminal UI** (under reconstruction): the `minae` TUI is being rebuilt; the shipped agent tooling (`minad` daemon, `minas` session CLI, skills) does not include it
+- **Terminal UI**: the `minae` TUI (ratatui/crossterm, per-client views) — `minae [file ...]` to edit interactively
 - **Configable**: `languages.toml` for language servers (daemon-side), `config.toml` and user colorschemes (client-side), built-in `minas skill` guides for agents
 
 ## Getting started
@@ -45,7 +45,7 @@ $ cargo install minad minas
 $ minas apply path/to/file.rs "old text" "new text"
 ```
 
-The TUI is under reconstruction (`minae open` prints a pointer and exits); the shipped interface is the `minad` daemon and the `minas` headless CLI.
+The TUI is available as `minae [file ...]`; the agent interface is the `minad` daemon and the `minas` headless CLI.
 
 Alternatively build from source with `cargo build --release`. Language servers (rust-analyzer, typescript-language-server, …) are not bundled — install them separately if you want LSP features; tree-sitter syntax highlighting works out of the box.
 
@@ -90,7 +90,7 @@ The guides cover tool choice (read / apply / rename contracts) and error recover
 - **mina-conn**: client-side connection and request plumbing shared by the session CLI and the TUI
 - **minad**: the daemon binary
 - **minas**: the headless session CLI and skill guides
-- **minae**: the TUI (under reconstruction; currently an empty placeholder binary)
+- **minae**: the TUI (ratatui/crossterm)
 
 ## Documentation
 
