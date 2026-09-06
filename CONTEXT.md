@@ -147,3 +147,11 @@ _Avoid_: settings, preferences
 **Config file**:
 The `config.toml` file that stores the Config — `$XDG_CONFIG_HOME/minae/config.toml`, falling back to `~/.config/minae/config.toml`. Manipulated by the user directly or through the `minae config` subcommand.
 _Avoid_: config (as a file), rc file
+
+**Base**:
+The pinned snapshot that comparison annotates the current text against — fixed at pin time and never changing while pinned. Immutable: edits always target the current text, never the Base.
+_Avoid_: baseline, old version, original
+
+**BaseRoot**:
+A Base materialized as files and registered with the Daemon. Read-only and lifecycle-managed: the Daemon analyses it (definitions, references, hover) but rejects text changes under it, and tears the analysis session down on unregister.
+_Avoid_: snapshot dir, temp root
