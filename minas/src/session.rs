@@ -219,6 +219,16 @@ pub enum SessionCmd {
         /// Path
         path: PathBuf,
     },
+    /// List the daemon-held review comments for AI consumption (#50, read-only).
+    /// Prints the full list (path, side, stored/resolved lines, stale flag,
+    /// snippet, body, base) as compact JSON — the extraction path of the
+    /// compare-review → AI loop. With `--clear`, deletes all comments instead
+    /// (agent cleanup; TUI re-pin/Unregister also clears).
+    Review {
+        /// Delete all review comments instead of listing
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// `session wait` のタイムアウト。診断 settle の正常終了上限（~30–60 秒、
