@@ -494,6 +494,21 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 std::process::exit(2);
             }
         }
+        SessionCmd::Review { clear } => {
+            // #50: daemon 保持のレビューコメントを抽出する（AI への入力化経路）。
+            // 成功: 全文付き一覧を compact JSON で出力する（全文なしの他経路と
+            // 違い、コメント本文こそが成果物のため全文を出す — stale 付きで
+            // ずれた先の判断は AI が行う）。空一覧は `[]` の成功（exit 0）。
+            // --clear: 全消し（TUI の再ピン/Unregister と同じ効果）。空 Clear も
+            // 成功（exit 0 — daemon の M1: 変化なしに合わせる）。
+            if clear {
+                let snapshot = execute(&Command::ClearReviewComments).await?;
+                println!("{}", serde_json::to_string(&snapshot.review_comment_count)?);
+                return Ok(());
+            }
+            let outcome = execute_reviews().await?;
+            println!("{}", serde_json::to_string(&outcome)?);
+        }
     }
     Ok(())
 }
