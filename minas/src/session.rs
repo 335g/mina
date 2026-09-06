@@ -1129,7 +1129,8 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         | Ok(mina_protocol::ServerMessage::Hover { .. })
         | Ok(mina_protocol::ServerMessage::WorkspaceSymbols { .. })
         | Ok(mina_protocol::ServerMessage::Check { .. })
-        | Ok(mina_protocol::ServerMessage::EnclosingSymbol { .. }) => {
+        | Ok(mina_protocol::ServerMessage::EnclosingSymbol { .. })
+        | Ok(mina_protocol::ServerMessage::ReviewComments { .. }) => {
             Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
         }
         Ok(mina_protocol::ServerMessage::RenameResult { .. })
