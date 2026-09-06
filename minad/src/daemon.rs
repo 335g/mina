@@ -10314,8 +10314,11 @@ root-markers = [".docsroot"]
         start_server(&sock).await;
 
         let mut tui = connect_client(&sock, ClientKind::Interactive).await;
-        let path = file.to_string_lossy().into_owned();
-        let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        let open_path = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path: open_path }).await;
+        // daemon は Open 時に正規化するため、以降は snapshot.path（正規化済み）を
+        // 使う（実 TUI と同じ住所。/var → /private/var 問題の回避）。
+        let path = snap.path.clone().expect("open で path が載る");
         assert_eq!(snap.review_comment_count, 0);
         let gen0 = snap.generation;
 
