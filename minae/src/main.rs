@@ -8,6 +8,7 @@
 mod app;
 mod colors;
 mod config;
+mod git;
 mod keymap;
 mod render;
 
