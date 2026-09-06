@@ -77,7 +77,10 @@ pub(crate) fn verify_object(repo: &Path, id: &str) -> Result<(), GitError> {
 pub(crate) fn worktree_path(repo: &Path) -> PathBuf {
     let canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let h = mina_protocol::fnv1a64(canon.to_string_lossy().as_bytes());
-    std::env::temp_dir().join(format!("mina-base-{}-{h:016x}", std::process::id()))
+    // temp 自体も正規化する（macOS の /var→/private/var 等）。daemon 側の
+    // 正規化済みパス・応答パスと一致させ、表示マッピングを効かせるため。
+    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    tmp.join(format!("mina-base-{}-{h:016x}", std::process::id()))
 }
 
 /// worktree が使える状態か（管理ファイルの有無）。
