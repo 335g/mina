@@ -701,6 +701,7 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("Rename に想定外の軽量応答が返った"))
         }
@@ -744,6 +745,7 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("References に想定外の軽量応答が返った"))
         }
@@ -830,6 +832,7 @@ async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("Outline に想定外の軽量応答が返った"))
         }
@@ -885,7 +888,8 @@ async fn execute_enclosing(
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
-        | Ok(ServerMessage::Check { .. }) => {
+        | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => {
             Err(invalid("EnclosingSymbol に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
@@ -941,7 +945,8 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
-        | Ok(ServerMessage::Check { .. }) => Err(invalid("Hover に想定外の軽量応答が返った")),
+        | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => Err(invalid("Hover に想定外の軽量応答が返った")),
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
     }
 }
@@ -973,7 +978,8 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
-        | Ok(ServerMessage::Check { .. }) => {
+        | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => {
             Err(invalid("WorkspaceSymbol に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
