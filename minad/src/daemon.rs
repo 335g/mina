@@ -19,10 +19,10 @@ use mina_text::{
     replace_targets, select_line_selection, word_at,
 };
 use mina_protocol::{
-    Activity, ActivityKind, ChangeEvent, CheckDiagnostic, ClientKind, Command, Diagnostic,
-    DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange, InlayHint,
-    OutlineSymbol, Range, ServerMessage, ServerMetrics, Severity, StateSnapshot, SymbolKind,
-    WorkspaceSymbol, fnv1a64,
+    Activity, ActivityKind, ActivityRecord, ChangeEvent, CheckDiagnostic, ClientKind, Command,
+    Diagnostic, DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange,
+    InlayHint, OutlineSymbol, Range, ServerMessage, ServerMetrics, Severity, StateSnapshot,
+    SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -149,6 +149,12 @@ pub struct Daemon {
     /// 観測点で「最後に開かれた文書」。Headless の Open はここを動かし、
     /// 最後の Interactive 切断時のカーソルリセット対象もこれ。
     pub(crate) idle_view: ViewId,
+    /// 操作の試行と結果の履歴（ADR-0038。bounded 100 件。更新で generation を
+    /// 進め push に乗る）。Headless 由来の状態変更意図操作（Open / 編集 /
+    /// Save / Rename / Close）の成功・失敗。読み取り系は対象外。
+    pub(crate) activity_log: VecDeque<ActivityRecord>,
+    /// 接続の自己申告ラベル（Hello.name。ADR-0038 — activity の actor に使う）。
+    conn_names: HashMap<u64, String>,
     /// 状態を変える操作ごとに増加する世代（ADR-0012）。
     generation: u64,
     /// 直近の状態変化イベントの bounded リング（ADR-0012）。
@@ -229,6 +235,9 @@ pub(crate) struct ClientView {
 
 /// イベントリングの上限（ADR-0012）。超過分は古いものから破棄。
 const MAX_EVENTS: usize = 128;
+
+/// 活動リングの上限（ADR-0038。既定 100 件）。超過分は古いものから破棄。
+const MAX_ACTIVITY_LOG: usize = 100;
 
 impl Daemon {
     /// フォーカス文書の可視範囲（first_line から viewport_height 行。ADR-0021）
@@ -404,6 +413,29 @@ impl Daemon {
         }
     }
 
+    /// 接続の自己申告ラベル（ADR-0038。未登録 = テスト等は "unknown"）。
+    fn actor_for(&self, conn_id: u64) -> String {
+        self.conn_names
+            .get(&conn_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Headless 由来の状態変更意図操作の試行と結果を記録する（ADR-0038）。
+    /// 世代を進め push に乗せる（events と同じ配線）。読み取り系は記録しない。
+    fn record_activity(&mut self, actor: String, kind: EventKind, ok: bool, detail: String) {
+        self.generation += 1;
+        self.activity_log.push_back(ActivityRecord {
+            actor,
+            kind,
+            ok,
+            detail,
+        });
+        while self.activity_log.len() > MAX_ACTIVITY_LOG {
+            self.activity_log.pop_front();
+        }
+    }
+
     /// 状態を変える操作を記録する（世代を増やし、イベントをリングに積む）。
     fn record_event(
         &mut self,
@@ -440,6 +472,8 @@ impl Daemon {
             interactive_clients: HashSet::new(),
             conn_views: HashMap::new(),
             idle_view: ViewId(0),
+            activity_log: VecDeque::new(),
+            conn_names: HashMap::new(),
             generation: 0,
             events: VecDeque::new(),
             baselines: HashMap::new(),
@@ -1000,10 +1034,14 @@ async fn handle_connection(
         let mut bounded = (&mut reader).take(MAX_CMD_LINE as u64 + 1);
         timeout(FIRST_COMMAND_TIMEOUT, bounded.read_line(&mut hello_line)).await
     };
-    let (kind, reset_cursor) = match read {
+    let (kind, reset_cursor, client_name) = match read {
         Ok(Ok(0)) => return,
         Ok(Ok(_)) => match serde_json::from_str::<Hello>(hello_line.trim()) {
-            Ok(hello) => (hello.kind, hello.reset_cursor_on_disconnect),
+            Ok(hello) => (
+                hello.kind,
+                hello.reset_cursor_on_disconnect,
+                hello.name,
+            ),
             Err(_) => return, // Hello でない・不正な kind: 切断
         },
         Ok(Err(_)) => return,
@@ -1022,6 +1060,8 @@ async fn handle_connection(
         d.register_conn_view(conn_id);
         d.interactive_clients.insert(conn_id);
     }
+    // ADR-0038: 自己申告ラベルを保持する（activity の actor に使う）
+    daemon.lock().await.conn_names.insert(conn_id, client_name);
 
     // ADR-0013: Interactive クライアントだけが push を購読する。Headless の
     // ワンショット CLI は応答1行を読んで切断するので、push が混ざると壊れる。
@@ -1128,6 +1168,28 @@ async fn handle_connection(
                     serde_json::from_str::<Command>(line.trim())
                 {
                     let message = serve_rename(&daemon, &path, &old, &new).await;
+                    // ADR-0038: Headless 由来の Rename 試行を記録する（応答は
+                    // 送出済み = 世代確定前のため、記録は次の push に載る）。
+                    if source == EventSource::Headless {
+                        if let ServerMessage::RenameResult {
+                            error,
+                            files,
+                            edits,
+                            ..
+                        } = &message
+                        {
+                            let mut d = daemon.lock().await;
+                            let actor = d.actor_for(conn_id);
+                            let (ok, detail) = match error {
+                                None => (
+                                    true,
+                                    format!("{old} → {new} in {path}: {files} files, {edits} edits"),
+                                ),
+                                Some(e) => (false, e.clone()),
+                            };
+                            d.record_activity(actor, EventKind::Rename, ok, detail);
+                        }
+                    }
                     if !write_message(&mut write_half, conn_id, message).await {
                         break; // 切断 or 書き込みタイムアウト
                     }
@@ -1228,6 +1290,7 @@ async fn handle_connection(
     {
         let mut d = daemon.lock().await;
         d.drop_conn_view(conn_id);
+        d.conn_names.remove(&conn_id);
         d.on_client_disconnect(conn_id, kind, reset_cursor);
     }
 }
@@ -3098,6 +3161,11 @@ async fn process_command(
                     d.open_idle_follow(&path_buf);
                     // v12: 再利用も解析フォーカスとして記録（フォーカス切替）
                     d.set_analysis_focus(&path_buf);
+                    // ADR-0038: Headless 由来の Open 試行を記録（読み取り系は除外）
+                    if source == EventSource::Headless {
+                        let actor = d.actor_for(conn_id);
+                        d.record_activity(actor, EventKind::Open, true, path_str.clone());
+                    }
                     snapshot(&mut d, None)
                 } else {
                     // 未開パス: 従来どおりディスクから読む
@@ -3184,6 +3252,15 @@ async fn process_command(
                     let mut d = daemon.lock().await;
                     drain_into(&mut d);
                     d.open_idle_follow(&path_buf);
+                    // ADR-0038: 読み込み成否も含めて記録する（ok = 実際に文書を読めたか）
+                    if source == EventSource::Headless {
+                        let ok = contents.is_some();
+                        let detail = open_status
+                            .clone()
+                            .unwrap_or_else(|| path_str.clone());
+                        let actor = d.actor_for(conn_id);
+                        d.record_activity(actor, EventKind::Open, ok, detail);
+                    }
                     snapshot(&mut d, open_status)
                 }
             }
@@ -3250,9 +3327,30 @@ async fn process_command(
                         } else {
                             format!("saved: {shown} (edited during save, still dirty)")
                         };
+                        // ADR-0038: Headless 由来の保存の試行を記録
+                        if source == EventSource::Headless {
+                            let actor = d.actor_for(conn_id);
+                            let detail = path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "(no file)".into());
+                            d.record_activity(actor, EventKind::Save, true, detail);
+                        }
                         snapshot(&mut d, Some(status))
                     }
-                    Err(e) => snapshot(&mut d, Some(format!("save failed: {e}"))),
+                    Err(e) => {
+                        // ADR-0038: 保存失敗も記録する（失敗率評価用）
+                        if source == EventSource::Headless {
+                            let actor = d.actor_for(conn_id);
+                            d.record_activity(
+                                actor,
+                                EventKind::Save,
+                                false,
+                                format!("save failed: {e}"),
+                            );
+                        }
+                        snapshot(&mut d, Some(format!("save failed: {e}")))
+                    }
                 }
             }
             Ok(command) => {
@@ -3331,6 +3429,16 @@ async fn process_command(
                     _ => None,
                 };
                 let is_edit = is_edit(&command);
+                // ADR-0038: Headless 由来の Close の試行記録用に、閉鎖済みかと
+                // 閉鎖対象（apply 前のフォーカス文書）を確保しておく
+                let is_close = matches!(&command, Command::Close);
+                let closing = (source == EventSource::Headless && is_close)
+                    .then(|| {
+                        d.editor
+                            .focused_path()
+                            .map(|p| p.to_string_lossy().into_owned())
+                    })
+                    .flatten();
                 let (_, changed) = apply_from(&mut d, command, conn_id);
                 // ADR-0012: 実際に状態が変わった場合のみイベントを記録する。
                 // 拒否（サイズ超過等）・no-op（空削除・空挿入・履歴のない
@@ -3339,6 +3447,14 @@ async fn process_command(
                     if let Some((kind, range, text)) = event {
                         d.record_event(source, kind, range, text);
                     }
+                }
+                // ADR-0038: Headless 由来の Close の試行を記録（成功・失敗とも）。
+                // Close の changed = 実際に文書を閉じたか。応答は後段の
+                // sync_after_edit 経路に載る（世代・activity 込み）。
+                if source == EventSource::Headless && is_close {
+                    let actor = d.actor_for(conn_id);
+                    let detail = closing.unwrap_or_else(|| "(no file open)".into());
+                    d.record_activity(actor, EventKind::Close, changed, detail);
                 }
                 // M1/ADR-0009: 同期対象（セッション・パス・テキスト）をロック内で
                 // 取り出し、didChange はロック外で await する（サーバ遅延で全
@@ -3368,7 +3484,7 @@ async fn process_command(
                     Ok(edit) => {
                         let mut d = daemon.lock().await;
                         // 拒否（checksum 不一致）なら状態を変えず status を返す
-                        let rejected = apply_edit(&mut d, &edit, conn_id);
+                        let rejected = apply_edit(&mut d, &edit, conn_id, source);
                         if rejected.is_none() {
                             // ADR-0012: 適用された DocumentEdit を記録（成功時のみ）
                             d.record_event(
@@ -3564,6 +3680,17 @@ fn mismatch_snippet(s: &str) -> String {
     out
 }
 
+/// DocumentEdit の種類（activity の kind — 挿入/削除/置換。ADR-0038）。
+fn edit_kind(edit: &DocumentEdit) -> EventKind {
+    if edit.start == edit.end {
+        EventKind::Insert
+    } else if edit.text.is_empty() {
+        EventKind::Delete
+    } else {
+        EventKind::ReplaceRange
+    }
+}
+
 /// 位置指定編集（ADR-0011）を適用する。拒否・無変化時はスナップショットを返し、
 /// 状態は一切変えない（checksum 不一致・expected_text 不一致・空置換の no-op）。
 /// 成功時は `None` を返す。
@@ -3574,11 +3701,26 @@ fn mismatch_snippet(s: &str) -> String {
 /// `expected_text` が `Some` なら2段検証（#26/B2）: checksum に加えて対象範囲の
 /// 現テキストと一致することも検証し、不一致ならチェックサム不一致とは別の
 /// status（期待値・実値のスニペット付き）で拒否する（C1）。
-fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<StateSnapshot> {
+fn apply_edit(
+    daemon: &mut Daemon,
+    edit: &DocumentEdit,
+    conn_id: u64,
+    source: EventSource,
+) -> Option<StateSnapshot> {
     daemon.metrics.edits_total += 1;
     let text = daemon.editor.current_document().text().to_string();
     if fnv1a64(text.as_bytes()) != edit.checksum {
         daemon.metrics.edits_rejected_checksum += 1;
+        // ADR-0038: 拒否も記録する（応答スナップショットに載るよう先に記録）
+        if source == EventSource::Headless {
+            let actor = daemon.actor_for(conn_id);
+            daemon.record_activity(
+                actor,
+                edit_kind(edit),
+                false,
+                "document changed since read".into(),
+            );
+        }
         return Some(snapshot(
             daemon,
             Some("document changed since read".into()),
@@ -3595,6 +3737,20 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
         let actual = daemon.editor.current_document().text().slice(lo..hi).to_string();
         if actual != *expected {
             daemon.metrics.edits_rejected_expected_text += 1;
+            // ADR-0038: 局所検証の拒否も記録する
+            if source == EventSource::Headless {
+                let actor = daemon.actor_for(conn_id);
+                daemon.record_activity(
+                    actor,
+                    edit_kind(edit),
+                    false,
+                    format!(
+                        "expected text mismatch at [{lo}, {hi}): expected {:?}, found {:?}",
+                        mismatch_snippet(expected),
+                        mismatch_snippet(&actual),
+                    ),
+                );
+            }
             return Some(snapshot(
                 daemon,
                 Some(format!(
@@ -3617,7 +3773,23 @@ fn apply_edit(daemon: &mut Daemon, edit: &DocumentEdit, conn_id: u64) -> Option<
         // ADR-0012: 空範囲への空文字置換など状態を変えない編集は、拒否と同じ
         // 扱いでイベント・世代・undo 履歴を進めない（M1）。
         daemon.metrics.edits_noop += 1;
+        // ADR-0038: 空振りの編集試行も失敗として記録する（応答に載る）
+        if source == EventSource::Headless {
+            let actor = daemon.actor_for(conn_id);
+            daemon.record_activity(actor, edit_kind(edit), false, "no-op (unchanged)".into());
+        }
         return Some(snapshot(daemon, None));
+    }
+    // ADR-0038: 適用した編集を記録する（応答 = 後段の sync_after_edit 経路に載る）
+    if source == EventSource::Headless {
+        let actor = daemon.actor_for(conn_id);
+        let target = daemon
+            .editor
+            .focused_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "(scratch)".into());
+        let detail = format!("{} [{}..{}]", target, edit.start, edit.end);
+        daemon.record_activity(actor, edit_kind(edit), true, detail);
     }
     let selection_after = daemon.editor.selection();
     // CRITICAL C1: ADR-0011 の「選択を読まず・変えない」は、選択が文書の
@@ -4381,7 +4553,7 @@ pub(crate) fn snapshot_from_view(
     let highlights =
         daemon.syntax_highlights(doc_id, &text, checksum, view.first_line, viewport_height);
     StateSnapshot {
-        activity: Vec::new(),
+        activity: daemon.activity_log.iter().cloned().collect(),
         // ADR-0012 #12: 全文の FNV-1a を同梱し、エージェントが edit の
         // checksum を再実装せずに済ませる。応答は既に全文をシリアライズ
         // するため、ハッシュ計算は相対的に無視できるコスト。
@@ -5024,7 +5196,7 @@ root-markers = [".docsroot"]
             checksum: before.checksum,
             expected_text: None,
         };
-        assert!(apply_edit(&mut d, &edit, 0).is_none(), "適用に成功する");
+        assert!(apply_edit(&mut d, &edit, 0, EventSource::Interactive).is_none(), "適用に成功する");
         let s = apply(&mut d, Command::GetState);
         assert_highlights_valid(&s.text, &s.highlights);
         assert!(
@@ -5046,7 +5218,7 @@ root-markers = [".docsroot"]
             checksum: fnv1a64(b"hello world"),
             expected_text: Some("world".into()),
         };
-        assert!(apply_edit(&mut d, &edit, 0).is_none(), "一致なら適用される");
+        assert!(apply_edit(&mut d, &edit, 0, EventSource::Interactive).is_none(), "一致なら適用される");
         let s = apply(&mut d, Command::GetState);
         assert_eq!(s.text, "hello minae");
     }
@@ -5065,7 +5237,8 @@ root-markers = [".docsroot"]
             checksum: fnv1a64(b"hello world"),
             expected_text: Some("worl".into()),
         };
-        let snap = apply_edit(&mut d, &edit, 0).expect("不一致は拒否のスナップショットを返す");
+        let snap = apply_edit(&mut d, &edit, 0, EventSource::Interactive)
+            .expect("不一致は拒否のスナップショットを返す");
         let status = snap.status.as_deref().expect("status に拒否理由");
         // C1: checksum 不一致とは区別されるメッセージ
         assert!(
@@ -5090,7 +5263,7 @@ root-markers = [".docsroot"]
             checksum: fnv1a64(b"hello world"),
             expected_text: None,
         };
-        assert!(apply_edit(&mut d, &edit, 0).is_none(), "None なら適用される");
+        assert!(apply_edit(&mut d, &edit, 0, EventSource::Interactive).is_none(), "None なら適用される");
         let s = apply(&mut d, Command::GetState);
         assert_eq!(s.text, "hello minae");
     }
@@ -5108,7 +5281,7 @@ root-markers = [".docsroot"]
             checksum: fnv1a64(b"a"),
             expected_text: Some(long.clone()),
         };
-        let snap = apply_edit(&mut d, &edit, 0).expect("不一致で拒否");
+        let snap = apply_edit(&mut d, &edit, 0, EventSource::Interactive).expect("不一致で拒否");
         let status = snap.status.as_deref().unwrap();
         assert!(!status.contains(&long), "全文は含まれない");
         assert!(status.contains('…'), "切れたことを示す: {status}");
@@ -5894,6 +6067,7 @@ root-markers = [".docsroot"]
                 expected_text: None,
             },
             0,
+            EventSource::Interactive,
         )
         .expect("no-op 編集は拒否と同じ扱いでスナップショットを返す");
         assert_eq!(s.status, None, "no-op は拒否ではない（status なし）");
@@ -8844,6 +9018,170 @@ root-markers = [".docsroot"]
         );
         assert_eq!(pushed.text, "x");
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn activity_ring_is_bounded() {
+        // ADR-0038: activity リングは 100 件。超過分は古いものから破棄する。
+        let mut d = daemon();
+        for i in 0..(MAX_ACTIVITY_LOG + 5) {
+            d.record_activity("agent".into(), EventKind::Insert, true, format!("edit {i}"));
+        }
+        assert_eq!(d.activity_log.len(), MAX_ACTIVITY_LOG);
+        assert_eq!(d.activity_log.front().unwrap().detail, "edit 5");
+        assert_eq!(
+            d.activity_log.back().unwrap().detail,
+            format!("edit {}", MAX_ACTIVITY_LOG + 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_records_headless_open_success_and_failure() {
+        // ADR-0038: Headless 由来の Open の試行（成功・失敗）が activity に載る
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-act-open-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-act-open-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "base\n").unwrap();
+        start_server(&sock).await;
+
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        // daemon はパスを正規化する（macOS の /var → /private/var 等）
+        let path = std::fs::canonicalize(&file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let resp = request(&mut agent, &Command::Open { path: path.clone() }).await;
+        assert_eq!(resp.text, "base\n");
+        let rec = resp.activity.last().expect("Open 成功が記録される");
+        assert_eq!(rec.actor, "test");
+        assert_eq!(rec.kind, EventKind::Open);
+        assert!(rec.ok);
+        assert_eq!(rec.detail, path);
+
+        // 存在しないファイル: 失敗として記録される
+        let mut agent2 = connect_client(&sock, ClientKind::Headless).await;
+        let missing = "/nonexistent-xyz-123.txt".to_string();
+        let resp = request(&mut agent2, &Command::Open { path: missing }).await;
+        let rec = resp.activity.last().expect("Open 失敗が記録される");
+        assert_eq!(rec.actor, "test");
+        assert_eq!(rec.kind, EventKind::Open);
+        assert!(!rec.ok, "読み込めないファイルは失敗として記録される");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn activity_records_document_edit_success_and_reject() {
+        // ADR-0038: Headless の DocumentEdit の成功・拒否が記録される
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-act-edit-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-act-edit-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "hello world").unwrap();
+        start_server(&sock).await;
+
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut agent, &Command::Open { path: path.clone() }).await;
+
+        // 成功: 挿入
+        let resp = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 5,
+                end: 5,
+                text: "!".into(),
+                checksum: fnv1a64(b"hello world"),
+                expected_text: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.text, "hello! world");
+        let rec = resp.activity.last().expect("編集成功が記録される");
+        assert_eq!(rec.actor, "test");
+        assert_eq!(rec.kind, EventKind::Insert);
+        assert!(rec.ok);
+
+        // 拒否: チェックサム不一致
+        let resp = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 0,
+                end: 3,
+                text: "bye".into(),
+                checksum: 12345,
+                expected_text: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.text, "hello! world", "拒否で文書は変わらない");
+        let rec = resp.activity.last().expect("拒否が記録される");
+        assert!(!rec.ok);
+        assert!(rec.detail.contains("document changed since read"));
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn activity_reaches_subscribers_through_push() {
+        // ADR-0038: 記録の更新は generation を進めて push に乗る — 購読者の
+        // push スナップショットに activity が載る
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-act-push-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-act-push-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
+
+        // agent の編集 → tui へ push
+        let resp = request_edit(
+            &mut agent,
+            &DocumentEdit {
+                start: 3,
+                end: 3,
+                text: "X".into(),
+                checksum: fnv1a64(b"abc"),
+                expected_text: None,
+            },
+        )
+        .await;
+        let pushed = recv_push(&mut tui).await;
+        assert_eq!(pushed.generation, resp.generation, "push は応答と同じ世代");
+        let rec = pushed.activity.last().expect("push に活動記録が載る");
+        assert_eq!(rec.actor, "test");
+        assert!(rec.ok);
+        assert!(rec.detail.contains(&path), "編集対象パス: {}", rec.detail);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn activity_excludes_read_only_commands() {
+        // ADR-0038: 読み取り系（GetState / WaitFor / GetInlayHints）は記録しない
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-act-ro-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-act-ro-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let resp = request(&mut agent, &Command::Open { path: path.clone() }).await;
+        assert_eq!(resp.activity.len(), 1, "Open のみ記録される");
+
+        let _ = request(&mut agent, &Command::GetState).await;
+        let _ = request(&mut agent, &Command::WaitFor { generation: 0 }).await;
+        let resp = request(&mut agent, &Command::GetState).await;
+        assert_eq!(resp.activity.len(), 1, "読み取り系では増えない");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
