@@ -253,6 +253,8 @@ impl Conn {
             // ADR-0032: Hover / WorkspaceSymbols / Check 応答もこの CLI では使わない
             | Ok(ServerMessage::Hover { .. })
             | Ok(ServerMessage::WorkspaceSymbols { .. })
+            // #50: ReviewComments 応答もこの CLI では使わない
+            | Ok(ServerMessage::ReviewComments { .. })
             | Ok(ServerMessage::Check { .. }) => {
                 Err(std::io::Error::new(
                     ErrorKind::InvalidData,
