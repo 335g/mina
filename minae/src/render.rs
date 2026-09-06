@@ -886,6 +886,7 @@ mod tests {
             events: vec![],
             deleted: None,
             peek: None,
+            review_comment_count: 0,
         };
         app.width = 80;
         app.height = 24;
