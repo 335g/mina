@@ -21,8 +21,8 @@ use mina_text::{
 use mina_protocol::{
     Activity, ActivityKind, ActivityRecord, BaseRootInfo, ChangeEvent, CheckDiagnostic, ClientKind,
     Command, Diagnostic, DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange,
-    InlayHint, OutlineSymbol, Range, ServerMessage, ServerMetrics, Severity, StateSnapshot,
-    SymbolKind, WorkspaceSymbol, fnv1a64,
+    InlayHint, OutlineSymbol, Range, ReviewComment, ReviewCommentView, ReviewSide, ServerMessage,
+    ServerMetrics, Severity, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -105,6 +105,10 @@ pub struct Daemon {
     /// 配下は読取り専用（テキスト変更を拒否）・ライフサイクル管理対象
     /// （解除で LSP セッション破棄＋キャッシュ破棄）。キーは正規化済み絶対パス。
     pub(crate) base_roots: HashMap<PathBuf, String>,
+    /// レビューコメント（#50・v14）。daemon 共有（TUI の View ではなく、別接続の
+    /// `minas review` から見える必要があるため）。再ピン・Unregister・明示 Clear
+    /// でのみ全消しし、TUI 切断では保持する（Q12）。追加順。
+    pub(crate) review_comments: Vec<ReviewComment>,
     /// 言語テーブル（ADR-0030）。最新性は [`Daemon::languages_refresh`] が管理する
     /// （languages.toml の mtime が変わったときだけ再読込）。
     pub(crate) languages: Arc<LanguageTable>,
@@ -467,6 +471,7 @@ impl Daemon {
             viewport_height: 24,
             lsp_sessions: HashMap::new(),
             base_roots: HashMap::new(),
+            review_comments: Vec::new(),
             // 起動時の初期ロード。以後は languages_refresh が mtime 差分だけ再読込（ADR-0030）。
             languages: LanguageTable::load().into_arc(),
             languages_mtime: languages_file_mtime(),
