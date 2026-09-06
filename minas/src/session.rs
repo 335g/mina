@@ -1049,6 +1049,37 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
     }
 }
 
+/// daemon に接続し、レビューコメントの全文付き一覧を軽量応答
+/// （[`ServerMessage::ReviewComments`]）で受け取る（#50）。全文は運ばれない。
+async fn execute_reviews() -> io::Result<Vec<ReviewCommentView>> {
+    let (mut write_half, mut reader) = open_one_shot().await?;
+    let mut line = serde_json::to_string(&Command::ListReviewComments).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::ReviewComments { comments, .. }) => Ok(comments),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "Review にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. }) => {
+            Err(invalid("Review に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
 /// daemon に接続し、指定位置の定義を軽量応答（[`ServerMessage::Peek`]）で受け取る。
 async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protocol::Peek> {
     let (mut write_half, mut reader) = open_one_shot().await?;
