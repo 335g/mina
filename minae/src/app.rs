@@ -1280,12 +1280,12 @@ impl App {
 /// コメント編集中の既存検索（#50・純粋関数）。現在側は解決行（ずれた先）
 /// または保存行で当て、基準側は不変なので保存行で当てる。見つかれば
 /// その保存行で上書き送信する（重複を作らない）。
-fn find_existing(
-    list: &[ReviewCommentView],
+fn find_existing<'a>(
+    list: &'a [ReviewCommentView],
     side: ReviewSide,
     path: &str,
     line_no: u32,
-) -> Option<&ReviewCommentView> {
+) -> Option<&'a ReviewCommentView> {
     list.iter().find(|e| {
         e.side == side
             && e.path == path
