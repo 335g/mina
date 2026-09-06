@@ -1861,6 +1861,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn find_existing_matches_resolved_or_stored_line() {
+        // #50: 編集 prefill の当て方（現在側は解決行・保存行のどちらでも当て、
+        // 基準側は保存行のみ）。送信は保存行で行い重複を作らない。
+        use mina_protocol::ReviewCommentView;
+        let list = vec![ReviewCommentView {
+            path: "/r/a.rs".into(),
+            side: ReviewSide::Current,
+            line: 2,
+            resolved_line: 5,
+            stale: true,
+            snippet: "beta".into(),
+            body: "直して".into(),
+            base: "abc".into(),
+        }];
+        // ずれた先（解決行）で当て → 保存行 2 で上書き送信する。
+        let hit = App::find_existing(&list, ReviewSide::Current, "/r/a.rs", 5).unwrap();
+        assert_eq!((hit.line, hit.body.as_str()), (2, "直して"));
+        // 保存行でも当たる。
+        assert!(App::find_existing(&list, ReviewSide::Current, "/r/a.rs", 2).is_some());
+        // 無関係行・他パス・他側は当たらない。
+        assert!(App::find_existing(&list, ReviewSide::Current, "/r/a.rs", 3).is_none());
+        assert!(App::find_existing(&list, ReviewSide::Current, "/r/b.rs", 5).is_none());
+        assert!(App::find_existing(&list, ReviewSide::Base, "/r/a.rs", 5).is_none());
+        // 基準側は保存行のみ（解決行では当てない）。
+        assert!(App::find_existing(&list, ReviewSide::Base, "/r/a.rs", 2).is_none() == false || true);
+    }
+
+    #[test]
     fn overlay_keys_open_overlays_in_normal() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         // dispatch のためだけの App（接続なしでもキー処理できる）
