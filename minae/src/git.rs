@@ -143,6 +143,29 @@ pub(crate) fn prune_stale_worktrees() {
     }
 }
 
+/// 起動時 sweep 用: 登録済みのはずの基準 root が死んでいたら true（#49）。
+/// `mina-base-<pid>-<hash>` 形式で、自 pid でなく（dir 消失 OR pid 死亡）
+/// のとき。形式外・自 pid・不正 pid は消さない側に倒す。
+pub(crate) fn should_unregister_dead_root(root: &str) -> bool {
+    let name = Path::new(root)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let Some(rest) = name.strip_prefix("mina-base-") else {
+        return false;
+    };
+    let Some((pid_s, _)) = rest.split_once('-') else {
+        return false;
+    };
+    if pid_s.parse::<u32>().is_err() {
+        return false;
+    }
+    if pid_s == std::process::id().to_string() {
+        return false;
+    }
+    !Path::new(root).exists() || !pid_alive(pid_s)
+}
+
 /// pid の生存確認（`kill -0`。unix 前提 — daemon と同じ）。
 fn pid_alive(pid: &str) -> bool {
     if pid.parse::<u32>().is_err() {
@@ -407,7 +430,7 @@ pub(crate) fn parse_unified_zero(diff: &str, nlines: usize) -> FileDiff {
         }
         if !minus.is_empty() {
             let old_start = *hunk_old;
-            let rest: Vec<String> = minus.drain(..).collect();
+            let rest = std::mem::take(minus);
             *hunk_old += rest.len();
             gaps.push(Gap {
                 at: (*new_idx).min(kinds.len()),
@@ -599,6 +622,32 @@ mod tests {
         assert!(!dead_dir.exists(), "死 pid の残骸は消える");
         assert!(live_dir.exists(), "自 pid は残る");
         let _ = std::fs::remove_dir_all(&live_dir);
+    }
+
+    #[test]
+    fn should_unregister_dead_root_cases() {
+        // 確実に死んでいる pid。
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id().to_string();
+        child.wait().unwrap();
+        let me = std::process::id().to_string();
+        let tmp = std::env::temp_dir();
+        // dir あり・pid 死亡 → true。
+        let d = tmp.join(format!("mina-base-{dead}-h"));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(should_unregister_dead_root(d.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&d);
+        // dir なし・pid 死亡 → true。
+        assert!(should_unregister_dead_root(
+            tmp.join(format!("mina-base-{dead}-h")).to_str().unwrap()
+        ));
+        // 自 pid → false。形式外 → false。不正 pid → false。
+        assert!(!should_unregister_dead_root(
+            tmp.join(format!("mina-base-{me}-h")).to_str().unwrap()
+        ));
+        assert!(!should_unregister_dead_root("/tmp/other-dir"));
+        assert!(!should_unregister_dead_root("/tmp/mina-base-xyz-h"));
+        assert!(!should_unregister_dead_root("/tmp/mina-base-h"));
     }
 
     #[test]

@@ -334,16 +334,14 @@ impl CompareState {
         }
         self.files_gen = snap.generation;
         let mut files = git::changed_files(&self.repo, &self.base).unwrap_or_default();
-        if snap.dirty {
-            if let Some(path) = &snap.path {
-                let p = PathBuf::from(path);
-                if !files.iter().any(|f| f.path == p) {
-                    files.push(git::ChangedFile {
-                        path: p,
-                        status: git::ChangeStatus::Modified,
-                    });
-                }
-            }
+        // Dirty な注目文書を union（未保存編集が一覧から漏れないため）。
+        if let Some(p) = snap.path.as_deref().filter(|_| snap.dirty).filter(|p| {
+            !files.iter().any(|f| f.path == PathBuf::from(p))
+        }) {
+            files.push(git::ChangedFile {
+                path: PathBuf::from(p),
+                status: git::ChangeStatus::Modified,
+            });
         }
         self.files = files;
     }
@@ -373,10 +371,11 @@ impl CompareState {
         let Some(base) = base else {
             return Some(git::FileDiff::all_added(snap.text.split('\n').count()));
         };
-        if let Some(cached) = self.diffs.get(path) {
-            if cached.canvas_checksum == snap.checksum {
+        match self.diffs.get(path) {
+            Some(cached) if cached.canvas_checksum == snap.checksum => {
                 return Some(cached.diff.clone());
             }
+            _ => {}
         }
         match git::diff_texts(&base, &snap.text) {
             Ok(diff) => {
@@ -609,15 +608,14 @@ impl App {
                 self.snapshot = snapshot;
                 self.reconcile_diag();
                 // 比較中: ツリー表示中だけ一覧を追随させる（毎 push の git 呼び出し回避）。
-                if self.overlay == Overlay::Tree {
-                    if let Some(cmp) = self.compare.as_mut() {
-                        if cmp.show {
-                            let snap = self.snapshot.clone();
-                            cmp.ensure_files(&snap);
-                            let files = cmp.files.clone();
-                            self.tree.annotate(Some(&files));
-                        }
-                    }
+                if self.overlay == Overlay::Tree
+                    && self.compare.as_ref().is_some_and(|c| c.show)
+                {
+                    let snap = self.snapshot.clone();
+                    let cmp = self.compare.as_mut().expect("checked above");
+                    cmp.ensure_files(&snap);
+                    let files = cmp.files.clone();
+                    self.tree.annotate(Some(&files));
                 }
             }
             // TUI は軽量応答を送らない（使わない）ので無視する
@@ -1395,12 +1393,14 @@ impl App {
 
     /// 基準側パス（worktree 配下）の表示用変換（#49）。対象外はそのまま。
     pub(crate) fn base_display_path(&self, path: &str) -> String {
-        if let Some(cmp) = &self.compare {
-            if let Ok(rel) = Path::new(path).strip_prefix(&cmp.worktree) {
-                return format!("{} @{}", rel.display(), cmp.short());
-            }
-        }
-        path.to_string()
+        self.compare
+            .as_ref()
+            .and_then(|cmp| {
+                Path::new(path).strip_prefix(&cmp.worktree).ok().map(|rel| {
+                    format!("{} @{}", rel.display(), cmp.short())
+                })
+            })
+            .unwrap_or_else(|| path.to_string())
     }
 
     /// 終了時の後始末（best-effort）: 登録解除＋worktree 撤去。
@@ -1414,6 +1414,53 @@ impl App {
         .await;
         git::remove_worktree(&cmp.repo, &cmp.worktree);
     }
+    /// 基準の再登録（再接続時・#49 adversarial）。表示中のみ送る。
+    /// 接続なし・未開始・worktree 消失時は送らない。
+    async fn reregister_compare(&mut self) {
+        let Some((root, commit, usable)) = self.compare.as_ref().filter(|c| c.show).map(|c| {
+            (
+                c.worktree.to_string_lossy().into_owned(),
+                c.base.clone(),
+                git::worktree_usable(&c.worktree),
+            )
+        }) else {
+            return;
+        };
+        if !usable {
+            self.flash = Some("worktree が消えているため基準を再登録できません".into());
+            return;
+        }
+        self.send(&Command::RegisterBaseRoot { root, commit }).await;
+    }
+
+    /// 起動時の死に基準 sweep（#49 adversarial）: daemon 側に残る登録のうち、
+    /// worktree が消えているか所有者が死んでいるものを解除する（クラッシュ時の
+    /// 残骸セッション回収）。push との競合を避けるため ServerInfo を最大 8 行
+    /// まで探す。best-effort。
+    async fn sweep_dead_base_roots(&mut self) {
+        self.send(&Command::GetServerInfo).await;
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        for _ in 0..8 {
+            let mut line = String::new();
+            if conn.reader.read_line(&mut line).await.is_err() {
+                return;
+            }
+            let Ok(ServerMessage::ServerInfo { base_roots, .. }) =
+                serde_json::from_str::<ServerMessage>(&line)
+            else {
+                continue;
+            };
+            for b in base_roots {
+                if git::should_unregister_dead_root(&b.root) {
+                    self.send(&Command::UnregisterBaseRoot { root: b.root }).await;
+                }
+            }
+            return;
+        }
+    }
+
     /// 再接続を試みる（バックオフ済み）。成功時は Hello + GetState + SetViewport。
     async fn try_reconnect(&mut self) {
         if self.conn.is_some() {
@@ -1422,6 +1469,9 @@ impl App {
         match self.connect().await {
             Ok(()) => {
                 self.send_viewport().await;
+                // #49 adversarial: daemon 再起動でレジストリが消えるため、
+                // 比較表示中なら登録し直す（放置するとガードが効かない）。
+                self.reregister_compare().await;
             }
             Err(e) => {
                 self.flash = Some(format!("再接続に失敗しました ({e}) — リトライします"));
@@ -1562,6 +1612,8 @@ pub async fn run(files: Vec<String>) -> std::io::Result<()> {
         }
     }
     // 端末サイズを記録して SetViewport を送る
+    // 起動時: 死んだセッションの基準登録を掃除する（#49 adversarial）。
+    app.sweep_dead_base_roots().await;
     if let Ok(size) = terminal.size() {
         app.width = size.width;
         app.height = size.height;
@@ -1901,6 +1953,168 @@ mod tests {
             assert!(wt.exists(), "D で worktree 実作成");
             git::remove_worktree(&cmp.repo, &wt);
             assert!(!wt.exists());
+        });
+    }
+
+    /// #49 adversarial: git リポジトリ外では D は失敗し、状態を作らない。
+    #[test]
+    fn toggle_outside_git_repo_fails_clean() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = std::env::temp_dir().join(format!("mina-test-norepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            app.tree = TreeState::new(dir.clone());
+            let key = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE);
+            app.handle_key(key).await;
+            assert!(app.compare.is_none());
+            assert!(
+                app.flash.as_deref().unwrap_or("").contains("比較を開始できません"),
+                "{:?}",
+                app.flash
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #49 adversarial: worktree を作れない状態での再表示は注釈のみで続行する。
+    #[test]
+    fn toggle_on_with_broken_worktree_stays_graceful() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            app.compare = Some(CompareState {
+                base: "abc".into(),
+                repo: PathBuf::from("/definitely/not/a-repo-49"),
+                worktree: PathBuf::from("/definitely/not/a-repo-49-wt"),
+                show: false,
+                files: Vec::new(),
+                files_gen: 0,
+                base_texts: HashMap::new(),
+                diffs: HashMap::new(),
+                last_err: None,
+            });
+            let key = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE);
+            app.handle_key(key).await;
+            let cmp = app.compare.as_ref().expect("状態は残る");
+            assert!(cmp.show, "表示は続行する");
+            assert!(
+                app.flash.as_deref().unwrap_or("").contains("注釈のみ"),
+                "{:?}",
+                app.flash
+            );
+        });
+    }
+
+    /// #49 adversarial: 再登録は接続なしでも安全（状態不変・panic なし）。
+    #[test]
+    fn reregister_without_conn_is_noop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            app.compare = Some(CompareState {
+                base: "abc".into(),
+                repo: PathBuf::from("/r"),
+                worktree: PathBuf::from("/tmp/wt"),
+                show: true,
+                files: Vec::new(),
+                diffs: HashMap::new(),
+                base_texts: HashMap::new(),
+                files_gen: 0,
+                last_err: None,
+            });
+            app.reregister_compare().await;
+            assert!(app.compare.as_ref().unwrap().show);
+            // worktree がないため再登録できず、その旨が報知される（状態は維持）。
+            assert!(
+                app.flash.as_deref().unwrap_or("").contains("worktree"),
+                "{:?}",
+                app.flash
+            );
+            app.flash = None;
+            // 非表示では何も送らない（flash なし）。
+            app.compare.as_mut().unwrap().show = false;
+            app.reregister_compare().await;
+            assert!(app.flash.is_none());
+        });
+    }
+
+    /// #49 adversarial: 起動時 sweep が死んだ基準登録を解除する（socketpair で hermetic）。
+    #[test]
+    fn sweep_dead_base_roots_unregisters() {
+        use tokio::io::AsyncWriteExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead = child.id();
+            child.wait().unwrap();
+            let dead_root = format!("/tmp/mina-base-{dead}-abc");
+            let live_root = format!(
+                "/tmp/mina-base-{}-abc",
+                std::process::id()
+            );
+            let info = mina_protocol::ServerMessage::ServerInfo {
+                generation: "x".into(),
+                daemon_build_ts: 0,
+                metrics: mina_protocol::ServerMetrics::default(),
+                base_roots: vec![
+                    mina_protocol::BaseRootInfo {
+                        root: dead_root.clone(),
+                        commit: "abc".into(),
+                    },
+                    mina_protocol::BaseRootInfo {
+                        root: live_root,
+                        commit: "abc".into(),
+                    },
+                ],
+            };
+            let (a, mut b) = tokio::net::UnixStream::pair().unwrap();
+            let (ar, aw) = a.into_split();
+            app.conn = Some(Conn {
+                writer: aw,
+                reader: BufReader::new(ar),
+            });
+            let mut line = serde_json::to_string(&info).unwrap();
+            line.push('\n');
+            b.write_all(line.as_bytes()).await.unwrap();
+            app.sweep_dead_base_roots().await;
+            // peer 側の1行目は sweep 自身の GetServerInfo 要求。読み飛ばす。
+            let mut br = BufReader::new(b);
+            let mut out = String::new();
+            br.read_line(&mut out).await.unwrap();
+            assert!(out.contains("GetServerInfo"), "{out}");
+            // 死 root の Unregister が届く。生存分は送らない。
+            out.clear();
+            br.read_line(&mut out).await.unwrap();
+            let cmd: mina_protocol::Command = serde_json::from_str(out.trim()).unwrap();
+            match cmd {
+                mina_protocol::Command::UnregisterBaseRoot { root } => {
+                    assert_eq!(root, dead_root)
+                }
+                other => panic!("Unregister のはず: {other:?}"),
+            }
+            let second = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                br.read_line(&mut out),
+            )
+            .await;
+            assert!(second.is_err(), "生存分は送らない");
         });
     }
 
