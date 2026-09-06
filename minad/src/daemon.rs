@@ -9799,6 +9799,7 @@ root-markers = [".docsroot"]
                 ServerMessage::Hover { .. }
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
+                ServerMessage::ReviewComments { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
             }
@@ -10194,6 +10195,9 @@ root-markers = [".docsroot"]
                 ServerMessage::Hover { .. }
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => {
+                    continue;
+                }
+                ServerMessage::ReviewComments { .. } => {
                     continue;
                 }
             }
