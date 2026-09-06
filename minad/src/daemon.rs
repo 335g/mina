@@ -7262,6 +7262,7 @@ root-markers = [".docsroot"]
                 ServerMessage::Hover { .. }
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
+                ServerMessage::ReviewComments { .. } => continue,
             }
         }
     }
@@ -7284,6 +7285,22 @@ root-markers = [".docsroot"]
                 ServerMessage::Hover { .. }
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
+                ServerMessage::ReviewComments { .. } => continue,
+            }
+        }
+    }
+
+    /// ReviewComments 応答1件を読む（途中の応答・push は読み飛ばす）。#50。
+    async fn request_reviews(c: &mut TestClient) -> (u64, Vec<ReviewCommentView>) {
+        let mut line = serde_json::to_string(&Command::ListReviewComments).unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        loop {
+            match c.recv_message().await {
+                ServerMessage::ReviewComments { generation, comments } => {
+                    return (generation, comments)
+                }
+                _ => continue,
             }
         }
     }
