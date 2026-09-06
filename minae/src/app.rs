@@ -804,7 +804,7 @@ impl App {
                 // K: レビューコメント入力（比較表示中のみ。現在側カーソル行）。
                 Char('K') => {
                     self.pending.clear();
-                    self.open_review_prompt_current().await;
+                    self.open_review_prompt_current();
                     return;
                 }
                 _ => {}
@@ -1462,6 +1462,11 @@ impl App {
         match key.code {
             Esc | Tab => {
                 self.gap_review = None;
+                return;
+            }
+            // K: gap 行（基準側）へのコメント入力（#50）。
+            Char('K') if key.modifiers.is_empty() => {
+                self.open_review_prompt_gap(cur.gap_idx, cur.line_idx);
                 return;
             }
             Down | Char('j') if key.modifiers.is_empty() => {
