@@ -35,7 +35,10 @@ use serde::{Deserialize, Serialize};
 /// v12: 接続別フォーカス分離 + 活動可視化（ADR-0037/0038/0039）— `Hello` に
 /// `name`（自己申告ラベル）、`StateSnapshot` に `activity`（操作試行の成功/失敗履歴）、
 /// `EventKind::Rename` を追加。bump 方式（ADR-0039）: 新旧は別ソケットで交わらない。
-pub const PROTOCOL_VERSION: u32 = 12;
+/// v13: 基準 root の登録/解除（#49 比較閲覧 Mode 1）— `Command::RegisterBaseRoot` /
+/// `UnregisterBaseRoot`、`ServerMessage::ServerInfo` に `base_roots` を追加。
+/// 読取りコマンドの形状は不変（パス指定で基準側に効く）。bump 方式（ADR-0039）。
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -233,6 +236,23 @@ pub enum Command {
     /// の「編集→検証」ループを 1 コマンドに圧縮する（wait + get + JSON パースの
     /// 代替）。診断の反映は generation を進めないため、内部で settle を待つ。
     CheckDiagnostics { path: String },
+    /// 基準 root の登録（比較閲覧 Mode 1・#49・v13）。`root` 配下を基準側として
+    /// 管理する: LSP セッションを確保し、テキスト変更を拒否し、解除時に
+    /// セッションとキャッシュを破棄する。読取りコマンドは従来通りパス指定で
+    /// 効く（形状追加なし）。root はクライアントが git worktree で用意した
+    /// 基準コミットの実体。冪等（再登録は commit を更新する）。
+    RegisterBaseRoot {
+        /// 基準 root（絶対パス）。
+        root: String,
+        /// 基準コミット ID（表示・診断用。daemon は git を読まない）。
+        commit: String,
+    },
+    /// 基準 root の登録解除（#49・v13）。LSP セッションを破棄し、配下パスの
+    /// キャッシュ（outline/hints）を捨てる。存在しない root は無視する。
+    UnregisterBaseRoot {
+        /// 基準 root（絶対パス）。
+        root: String,
+    },
 }
 
 /// 移動の種類（wire 型）。
@@ -337,9 +357,19 @@ pub enum ServerMessage {
         daemon_build_ts: u64,
         /// daemon 起動からの累積メトリクス（効果検証用）。
         metrics: ServerMetrics,
+        /// 登録中の基準 root（#49・v13）。読取り専用・ライフサイクル管理対象。
+        base_roots: Vec<BaseRootInfo>,
     },
+    /// 登録中の基準 root 1 件（#49・v13。`ServerMessage::ServerInfo` に載る）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseRootInfo {
+    /// 基準 root（絶対パス）。
+    pub root: String,
+    /// 基準コミット ID（クライアント申告。表示・診断用）。
+    pub commit: String,
+}
     /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
-    /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
+/// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
     Hints {
         path: String,
         /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
@@ -1058,6 +1088,10 @@ mod tests {
                 check_total: 16,
                 check_bytes: 17,
             },
+            base_roots: vec![BaseRootInfo {
+                root: "/tmp/mina-base-abc".into(),
+                commit: "abc1234".into(),
+            }],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
