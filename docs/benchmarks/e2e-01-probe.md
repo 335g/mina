@@ -204,7 +204,7 @@ tmp/e2e01/wt/            ← git worktree @ 00349a7 (tmp/ は gitignore 済み)
 
 ### タスクとベース
 
-- **タスク**: minae-protocol に `ActivityKind` / `Activity` 型と `StateSnapshot.activities` を追加し、daemon が Open / Save / 外部変更 Reload / LSP 診断確定の各経路で Activity を追加・除去 (増減で generation を進め、重複追加・存在しない除去は無視、settle ループの全出口で `DiagnosticsSettle` を除去)。スナップショットにはフォーカス文書の活動だけを載せる (設計は ADR-0028)。
+- **タスク**: mina-protocol に `ActivityKind` / `Activity` 型と `StateSnapshot.activities` を追加し、daemon が Open / Save / 外部変更 Reload / LSP 診断確定の各経路で Activity を追加・除去 (増減で generation を進め、重複追加・存在しない除去は無視、settle ループの全出口で `DiagnosticsSettle` を除去)。スナップショットにはフォーカス文書の活動だけを載せる (設計は ADR-0028)。
 - **ground truth**: `2e5b152..2efecf1` (4ファイル / +170/−3: protocol +31 / daemon +124 / lsp +15 / render +3。テストはシンプルなユニット2件: `activity_add_remove_bumps_generation` と `snapshot_carries_focused_activities`)。GT での `cargo test` は 380 passed / 0 failures を確認済み (別 worktree で検証)。
 - **ベース (合成)**: `2e5b152` + `c7c45fb` (wait 90s タイムアウト) + `31d955e` (切断リセットのフレーク修正) を worktree 内で cherry-pick (wait タイムアウトはベースより後にあるため。tmp/ は gitignore のため履歴汚染なし)。
 - **手順**: 各構成を 2 段階で測定 — ①実装 (タスク文どおり) ②安定化 (「現在のツリーを維持し cargo test 全 green に収束せよ。失敗している自作テストは修正・簡素化・削除してよい」)。①だけで「完了宣言 = 実装完了」とみなすと false-done を見逃すため (後述)。

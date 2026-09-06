@@ -85,12 +85,12 @@ skill の positional 罠回避（=T8）は実施済み — ともに skill の�
 
 | 機能 | 所在 | 根拠 |
 |---|---|---|
-| `session get --lines`（範囲 read・説明付きゼロ結果・クランプ） | minae-term/src/session.rs | T1, P1/Q3 |
-| `session apply`/`--hunks-stdin`（内容指定・検証・保存・exit 三値） | minae-term/src/session.rs | T3, T5, M1/N1 |
-| 拒否理由の具体化（expected/found/範囲・40 文字） | minae-term/src/daemon.rs | C1, G2 |
-| dirty 警告（edit 後 stderr 1行） | minae-term/src/session.rs | H1 |
-| `session info`（daemon/CLI 世代・metrics） | minae-term/src/session.rs | D1/I4 |
-| `minae skill`（索引＋トピック） | minae-term/src/skill.rs | 本検証の反映（下表） |
+| `session get --lines`（範囲 read・説明付きゼロ結果・クランプ） | minas/src/session.rs | T1, P1/Q3 |
+| `session apply`/`--hunks-stdin`（内容指定・検証・保存・exit 三値） | minas/src/session.rs | T3, T5, M1/N1 |
+| 拒否理由の具体化（expected/found/範囲・40 文字） | minad/src/daemon.rs | C1, G2 |
+| dirty 警告（edit 後 stderr 1行） | minas/src/session.rs | H1 |
+| `session info`（daemon/CLI 世代・metrics） | minas/src/session.rs | D1/I4 |
+| `minae skill`（索引＋トピック） | minas/src/skill.rs | 本検証の反映（下表） |
 | 契約表（exit・read/edit・hunks・永続化・skill） | docs/adr/0026 | R2 |
 
 ---

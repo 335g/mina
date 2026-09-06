@@ -1,12 +1,12 @@
-# クライアント共通接続層(minae-conn)の抽出と socket パスの契約化
+# クライアント共通接続層(mina-conn)の抽出と socket パスの契約化
 
 TUI を別リポジトリへ切り出す下準備として（ADR-0033 の配布物分離の延長）、bin
 クレート内にあったクライアント側の接続・リクエスト配線（元 `conn` モジュール:
 absolutize / send_hello / request / request_hints / request_peek）を新規公開
-crate **minae-conn** に抽出した。TUI（別バイナリ）は minae-protocol + minae-conn への
+crate **mina-conn** に抽出した。TUI（別バイナリ）は mina-protocol + mina-conn への
 依存だけで成立する。
 
-- **socket パスは minae-protocol へ移動**（`socket_path()`）: `minae-{PROTOCOL_VERSION}.sock`
+- **socket パスは mina-protocol へ移動**（`socket_path()`）: `minae-{PROTOCOL_VERSION}.sock`
   という名前は wire 契約の一部で、protocol crate の doc が既に命名規則を宣言していた。
   daemon とクライアントの両方が参照する契約なので、単一の実体を持つ（複製しない）。
 - **`ensure_daemon` は分解した**: `connect`（接続試行） / `spawn_daemon(exe, args)`
@@ -20,7 +20,7 @@ crate **minae-conn** に抽出した。TUI（別バイナリ）は minae-protoco
 
 ## 検討した代替案
 
-- **minae-protocol に混入**: 純粋ワイヤ型の crate に I/O・プロセス管理（しかも unix 依存）
+- **mina-protocol に混入**: 純粋ワイヤ型の crate に I/O・プロセス管理（しかも unix 依存）
   が入り契約 crate を汚染するため却下。
 - **config も同じ crate に（minae-client 化）**: 接続(conn)とクライアント設定(config)は
   別関心。今回は見送り。

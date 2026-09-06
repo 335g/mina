@@ -210,7 +210,7 @@
 
 | id | 実装 | 場所 |
 |---|---|---|
-| P1 | `session get --lines start:end`（範囲 read、番号付き行出力、end 省略可） | minae-term/src/session.rs |
+| P1 | `session get --lines start:end`（範囲 read、番号付き行出力、end 省略可） | minas/src/session.rs |
 | Q3 | `--lines` 範囲外は説明付きゼロ結果 | 同上 |
 | H1 | `session edit` 成功時 dirty なら stderr に1行警告 | 同上 |
 | I4 | `session info` に `cli_generation` / `cli_build_ts` | 同上 |

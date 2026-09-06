@@ -1,10 +1,10 @@
 # 構文ハイライトは tree-sitter で実装する
 
-LSP は診断専用で semantic tokens の実装はゼロ、参照設計 (docs/helix-architecture.md item 6) は tree-sitter によるハイライト＋構造編集を計画し、ADR-0003 は grammar 管理の将来クレートとして `minae-loader` を指名済みである。構文ハイライトのトークナイズは **tree-sitter** で行う。マイルストーン1では `minae-loader` を静的レジストリとして新設し、tree-sitter と `tree-sitter-rust` を通常の Cargo 依存として持ち、ハイライトクエリ (.scm) はバイナリに同梱する。2言語目以降は依存の追加＋レジストリ1エントリで済む。
+LSP は診断専用で semantic tokens の実装はゼロ、参照設計 (docs/helix-architecture.md item 6) は tree-sitter によるハイライト＋構造編集を計画し、ADR-0003 は grammar 管理の将来クレートとして `mina-loader` を指名済みである。構文ハイライトのトークナイズは **tree-sitter** で行う。マイルストーン1では `mina-loader` を静的レジストリとして新設し、tree-sitter と `tree-sitter-rust` を通常の Cargo 依存として持ち、ハイライトクエリ (.scm) はバイナリに同梱する。2言語目以降は依存の追加＋レジストリ1エントリで済む。
 
 ## 検討した代替案
 
-- **LSP semantic tokens**: サーバ実装依存で、サーバのない言語はハイライトが消える。`minae-lsp` は診断用構造体しか持たないため実装はグリーンフィールド。編集→サーバ応答の往復レイテンシが載る。
+- **LSP semantic tokens**: サーバ実装依存で、サーバのない言語はハイライトが消える。`mina-lsp` は診断用構造体しか持たないため実装はグリーンフィールド。編集→サーバ応答の往復レイテンシが載る。
 - **regex トイトークナイザ**: 依存なし・完全オフラインだが、参照設計の構造編集計画と矛盾する。品質の限界が明らかで回収コストが高い。
 
 ## 帰結

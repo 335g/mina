@@ -1,6 +1,6 @@
 # Syntax の計算・保持は Daemon が所有し、Document への乗せは放棄する
 
-`minae-core` の `Document` (document.rs) は「テキスト以外のプロパティ（構文・診断・編集履歴）は実際に必要なステップが来た時点でここに追加する」と想定している。しかし診断は daemon のフィールド、編集履歴は minae-view の `History` に置かれる前例が既にあり、`lib.rs` は「core はターミナル・キーマップ・構文ハイライトについて何も知らない」と明言している。そこで tree-sitter のパース結果とグループ割り当て（Syntax）は LSP 解析と同じく **Daemon が DocumentId キーで所有** する。interactive / headless (`DocumentEdit`) / 外部リロード (ADR-0015) の**全編集源**でトランザクション適用のたびにインクリメンタル再パースし、結果は StateSnapshot のハイライト範囲列として配信する。
+`minae-core` の `Document` (document.rs) は「テキスト以外のプロパティ（構文・診断・編集履歴）は実際に必要なステップが来た時点でここに追加する」と想定している。しかし診断は daemon のフィールド、編集履歴は mina-view の `History` に置かれる前例が既にあり、`lib.rs` は「core はターミナル・キーマップ・構文ハイライトについて何も知らない」と明言している。そこで tree-sitter のパース結果とグループ割り当て（Syntax）は LSP 解析と同じく **Daemon が DocumentId キーで所有** する。interactive / headless (`DocumentEdit`) / 外部リロード (ADR-0015) の**全編集源**でトランザクション適用のたびにインクリメンタル再パースし、結果は StateSnapshot のハイライト範囲列として配信する。
 
 ## 動作契約
 

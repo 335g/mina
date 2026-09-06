@@ -25,7 +25,7 @@ cliclack / futures-lite / unicode-width）は `tui` feature の後ろに置き�
   同一バージョンでプロトコル（現在 v11）と常に同調を保つ。別リポジトリ/別公開
   crate にするとバージョン skew 管理が発生する。
 - 減らせる依存は termina / cliclack / futures-lite / unicode-width のみ。
-  tree-sitter（構文は daemon 所有。ADR-0016/0017）と minae-view
+  tree-sitter（構文は daemon 所有。ADR-0016/0017）と mina-view
   （ADR-0005 の Editor 状態）はデーモン側で必要なので残る。
 
 ## 代替案（却下）

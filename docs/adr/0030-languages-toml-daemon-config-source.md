@@ -19,7 +19,7 @@ name = "rust"
 file-types = ["rs"]
 language-server = "rust-analyzer"
 root-markers = []  # 明示すれば汎用集合を置換（空 = マーカーなし = 親フォールバックのみ）
-grammar = "rust"  # minae-loader の grammar 名（ハイライト・シンボル解決）
+grammar = "rust"  # mina-loader の grammar 名（ハイライト・シンボル解決）
 ```
 
 - **`[language-server.<id>]`**: サーバ起動と初期化の定義。`command` / `args` /
@@ -129,7 +129,7 @@ rename / references / definition）を導出し、機能ごとに要求を止め
 - **セッションキー**: WorkspaceRoot キー（ADR-0010）を **(WorkspaceRoot, languageId)** に拡張
   した。同一 root に複数言語が混在する場合（.rs + .ts 等）も言語ごとに別セッション
   （別サーバ）。`session_root_for` / `borrows_focus_session` も同言語キーのみを対象にする。
-- **`grammar` キー（実装済み）**: `[[language]]` の任意キー。minae-loader の静的レジストリを
+- **`grammar` キー（実装済み）**: `[[language]]` の任意キー。mina-loader の静的レジストリを
   grammar 名で引く。未登録・未指定ならハイライト無し・tree-sitter シンボル解決なし
   （単語境界フォールバック）。シンボル位置解決（rename / references の `old` 解決）も
   この grammar を使うため、TS の rename もコメント・文字列を除外した識別子に解決する。

@@ -58,7 +58,7 @@ PROTOCOL_VERSION を 8 → 9 に上げる）を追加し、それぞれ軽量応
   ファイルに弱いサーバがある — rust-analyzer はワークスペース全体を索引する。
   開いていないファイルを取りこぼすケース（tsserver 等）は将来
   open_workspace_files の併用を検討する。
-- mock サーバ（minae-lsp）に hover / workspace/symbol のハンドラを追加し、
+- mock サーバ（mina-lsp）に hover / workspace/symbol のハンドラを追加し、
   daemon 統合テストで 3 コマンドを検証した。
 
 ## 実装上の注意（デッドロックの教訓）
