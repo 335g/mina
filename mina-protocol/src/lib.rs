@@ -38,7 +38,11 @@ use serde::{Deserialize, Serialize};
 /// v13: 基準 root の登録/解除（#49 比較閲覧 Mode 1）— `Command::RegisterBaseRoot` /
 /// `UnregisterBaseRoot`、`ServerMessage::ServerInfo` に `base_roots` を追加。
 /// 読取りコマンドの形状は不変（パス指定で基準側に効く）。bump 方式（ADR-0039）。
-pub const PROTOCOL_VERSION: u32 = 13;
+/// v14: レビューコメントの daemon 保持（#50）— `Command::AddReviewComment` /
+/// `ListReviewComments` / `ClearReviewComments`、`ServerMessage::ReviewComments`、
+/// `StateSnapshot` に `review_comment_count`（件数のみ・全文は List 応答だけ）。
+/// bump 方式（ADR-0039）。
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -253,6 +257,32 @@ pub enum Command {
         /// 基準 root（絶対パス）。
         root: String,
     },
+    /// レビューコメントの追加/更新（#50・v14）。差分アンカー
+    /// （側・パス・行・行スナップショット＋コメント本文）を daemon 共有の箱に
+    /// 置く。同一アンカー（パス・側・行）は上書き（トグルの編集が重複を
+    /// 生まない）。空本文はそのアンカーの削除（per-anchor 削除はこの合体で
+    /// 賄い、専用コマンドは作らない）。追加・更新・削除いずれも世代を進める。
+    AddReviewComment {
+        /// 対象ファイル（絶対パス。基準側は worktree 配下、現在側は実ファイル）。
+        path: String,
+        /// どちらの側を指すか。
+        side: ReviewSide,
+        /// 1-origin 行番号（追加時点）。
+        line: u32,
+        /// 対象行の内容（追加時点のスナップショット。stale 判定用）。
+        snippet: String,
+        /// コメント本文（空 = 削除）。
+        body: String,
+        /// ピン留めした基準コミット ID（来歴表示用。daemon は git を読まない）。
+        base: String,
+    },
+    /// レビューコメントの一覧取得（#50・v14・読み取り専用）。応答は全文付きの
+    /// 軽量 [`ServerMessage::ReviewComments`] — 現在テキストと照合した
+    /// `stale`＋`resolved_line` を付けて返す（保存値は書き換えない）。
+    /// headless ゲートの例外（`minas review` の抽出経路）。
+    ListReviewComments,
+    /// レビューコメントの全消し（#50・v14）。世代を進める。
+    ClearReviewComments,
 }
 
 /// 移動の種類（wire 型）。
@@ -344,6 +374,58 @@ pub struct BaseRootInfo {
     pub root: String,
     /// 基準コミット ID（クライアント申告。表示・診断用）。
     pub commit: String,
+}
+
+/// レビューコメントが指す側（#50・v14）。wire 形式は小文字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSide {
+    /// 基準側（worktree 配下の不変テキスト）。
+    Base,
+    /// 現在側（実ファイル。編集でずれる）。
+    Current,
+}
+
+/// daemon が保持するレビューコメント 1 件（#50・v14）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    /// 対象ファイル（絶対パス）。
+    pub path: String,
+    /// どちらの側を指すか。
+    pub side: ReviewSide,
+    /// 1-origin 行番号（追加時点）。
+    pub line: u32,
+    /// 対象行の内容（追加時点のスナップショット。stale 判定用）。
+    pub snippet: String,
+    /// コメント本文。
+    pub body: String,
+    /// ピン留めした基準コミット ID（来歴表示用）。
+    pub base: String,
+    /// 追加時の世代（エージェントが状態と対応付けるための目印）。
+    pub generation: u64,
+}
+
+/// [`ServerMessage::ReviewComments`] に載る 1 件（#50・v14）。保存値は
+/// 書き換えず、照合結果（`stale`＋`resolved_line`）を添える — ずれた先の
+/// 判断は AI が行う。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCommentView {
+    /// 対象ファイル（絶対パス）。
+    pub path: String,
+    /// どちらの側を指すか。
+    pub side: ReviewSide,
+    /// 1-origin 行番号（追加時点のまま）。
+    pub line: u32,
+    /// 照合時点の解決行（1-origin。一致時は `line` と同じ）。
+    pub resolved_line: u32,
+    /// 解決行の内容が `snippet` と食い違っているか。
+    pub stale: bool,
+    /// 対象行の内容（追加時点のスナップショット）。
+    pub snippet: String,
+    /// コメント本文。
+    pub body: String,
+    /// ピン留めした基準コミット ID。
+    pub base: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,6 +570,15 @@ pub enum ServerMessage {
         found: bool,
         /// 失敗理由（成功時は None。`error` が Some なら `found` は false）。
         error: Option<String>,
+    },
+    /// [`Command::ListReviewComments`] の応答（#50・v14）。レビューコメントの
+    /// 全文付き軽量一覧 — 全文スナップショットは運ばない。`minas review` の
+    /// 抽出経路（AI が `stale` を見てずれた先を判断する）。
+    ReviewComments {
+        /// 応答時点の世代。
+        generation: u64,
+        /// コメント一覧（追加順）。
+        comments: Vec<ReviewCommentView>,
     },
 }
 
@@ -672,6 +763,8 @@ pub enum EventKind {
     Rename,
     /// 基準 root の登録/解除（#49 比較閲覧 Mode 1・v13）。
     BaseRoot,
+    /// レビューコメントの追加/更新/削除・全消し（#50・v14）。
+    ReviewComment,
 }
 
 /// 状態を変える操作1件の記録（ADR-0012）。bounded リングで保持され、
@@ -836,6 +929,9 @@ pub struct StateSnapshot {
     pub deleted: Option<String>,
     /// 定義の確認表示（[`Command::PeekDefinition`] の応答にのみ載る。それ以外は None）。
     pub peek: Option<Peek>,
+    /// レビューコメントの件数（#50・v14）。全文は載せない — 一覧は
+    /// [`Command::ListReviewComments`] で別取得する（push 肥大化の回避）。
+    pub review_comment_count: usize,
 }
 
 /// 定義の確認表示（[`Command::PeekDefinition`] の結果。ジャンプしない簡易確認用）。
@@ -871,6 +967,7 @@ impl Default for StateSnapshot {
             events: Vec::new(),
             deleted: None,
             peek: None,
+            review_comment_count: 0,
         }
     }
 }
@@ -936,6 +1033,7 @@ mod tests {
                 text: Some("x".to_string()),
             }],
             deleted: Some("test.rs".to_string()),
+            review_comment_count: 2,
             activities: vec![Activity {
                 kind: ActivityKind::LspInit,
                 label: "LSP 初期化中".to_string(),
@@ -1121,6 +1219,44 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
             assert_eq!(back, cmd);
         }
+    }
+
+    #[test]
+    fn review_commands_round_trip() {
+        // #50: レビューコメント系コマンドと応答の wire 形状が安定していること。
+        for cmd in [
+            Command::AddReviewComment {
+                path: "/tmp/wt/src/main.rs".into(),
+                side: ReviewSide::Base,
+                line: 12,
+                snippet: "let x = 1;".into(),
+                body: "ここは消さないで".into(),
+                base: "abc1234".into(),
+            },
+            Command::ListReviewComments,
+            Command::ClearReviewComments,
+        ] {
+            let back: Command =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
+        assert_eq!(serde_json::to_string(&ReviewSide::Current).unwrap(), "\"current\"");
+        let msg = ServerMessage::ReviewComments {
+            generation: 9,
+            comments: vec![ReviewCommentView {
+                path: "/tmp/wt/src/main.rs".into(),
+                side: ReviewSide::Current,
+                line: 12,
+                resolved_line: 14,
+                stale: true,
+                snippet: "let x = 1;".into(),
+                body: "直して".into(),
+                base: "abc1234".into(),
+            }],
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
     }
 
     #[test]
