@@ -1104,6 +1104,24 @@ impl App {
                 }
                 _ => self.prompt = Some(Prompt::Rename { buf, old }),
             },
+            // K: レビューコメント入力（#50）。Enter で Add（空は削除）、Esc で取消。
+            Prompt::ReviewComment { mut buf, anchor } => match key.code {
+                Char(c)
+                    if key.modifiers.is_empty()
+                        || key.modifiers == crossterm::event::KeyModifiers::SHIFT =>
+                {
+                    buf.push(c);
+                    self.prompt = Some(Prompt::ReviewComment { buf, anchor });
+                }
+                Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {}
+                Backspace => {
+                    buf.pop();
+                    self.prompt = Some(Prompt::ReviewComment { buf, anchor });
+                }
+                Esc => {}
+                Enter => self.submit_review_comment(anchor, buf).await,
+                _ => self.prompt = Some(Prompt::ReviewComment { buf, anchor }),
+            },
         }
     }
 
@@ -1310,6 +1328,8 @@ impl App {
                 }
             } else {
                 self.send(&Command::UnregisterBaseRoot { root }).await;
+                // #50: Unregister で daemon 側も全消しされるため捨てる。
+                self.review_list.clear();
             }
             self.annotate_tree();
             return;
