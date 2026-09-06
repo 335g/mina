@@ -1865,16 +1865,28 @@ mod tests {
         // #50: 編集 prefill の当て方（現在側は解決行・保存行のどちらでも当て、
         // 基準側は保存行のみ）。送信は保存行で行い重複を作らない。
         use mina_protocol::ReviewCommentView;
-        let list = vec![ReviewCommentView {
-            path: "/r/a.rs".into(),
-            side: ReviewSide::Current,
-            line: 2,
-            resolved_line: 5,
-            stale: true,
-            snippet: "beta".into(),
-            body: "直して".into(),
-            base: "abc".into(),
-        }];
+        let list = vec![
+            ReviewCommentView {
+                path: "/r/a.rs".into(),
+                side: ReviewSide::Current,
+                line: 2,
+                resolved_line: 5,
+                stale: true,
+                snippet: "beta".into(),
+                body: "直して".into(),
+                base: "abc".into(),
+            },
+            ReviewCommentView {
+                path: "/w/a.rs".into(),
+                side: ReviewSide::Base,
+                line: 7,
+                resolved_line: 7,
+                stale: false,
+                snippet: "old".into(),
+                body: "消さないで".into(),
+                base: "abc".into(),
+            },
+        ];
         // ずれた先（解決行）で当て → 保存行 2 で上書き送信する。
         let hit = App::find_existing(&list, ReviewSide::Current, "/r/a.rs", 5).unwrap();
         assert_eq!((hit.line, hit.body.as_str()), (2, "直して"));
@@ -1884,8 +1896,9 @@ mod tests {
         assert!(App::find_existing(&list, ReviewSide::Current, "/r/a.rs", 3).is_none());
         assert!(App::find_existing(&list, ReviewSide::Current, "/r/b.rs", 5).is_none());
         assert!(App::find_existing(&list, ReviewSide::Base, "/r/a.rs", 5).is_none());
-        // 基準側は保存行のみ（解決行では当てない）。
-        assert!(App::find_existing(&list, ReviewSide::Base, "/r/a.rs", 2).is_none() == false || true);
+        // 基準側は保存行で当たる。
+        let hit = App::find_existing(&list, ReviewSide::Base, "/w/a.rs", 7).unwrap();
+        assert_eq!(hit.body.as_str(), "消さないで");
     }
 
     #[test]
