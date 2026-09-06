@@ -181,7 +181,8 @@ pub async fn request_hints(
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
-        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected semantic response",
@@ -241,7 +242,8 @@ pub async fn request_peek(
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
-        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected semantic response",
@@ -296,7 +298,8 @@ pub async fn request<T: serde::Serialize>(
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
-        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::ReviewComments { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected semantic response",
