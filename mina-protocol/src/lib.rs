@@ -1106,6 +1106,24 @@ mod tests {
     }
 
     #[test]
+    fn base_commands_round_trip() {
+        // #49: Register/UnregisterBaseRoot の wire 形状が安定していること。
+        for cmd in [
+            Command::RegisterBaseRoot {
+                root: "/tmp/mina-base-1-abc".into(),
+                commit: "abc1234".into(),
+            },
+            Command::UnregisterBaseRoot {
+                root: "/tmp/mina-base-1-abc".into(),
+            },
+        ] {
+            let back: Command =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
+    }
+
+    #[test]
     fn outline_types_round_trip() {
         // SymbolKind の wire 形式は小文字
         assert_eq!(
