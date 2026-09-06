@@ -1,7 +1,7 @@
 //! Colorscheme: 役割 → スタイルの名前付き写像（ADR-0018）。
 //!
 //! クライアントローカル（プロトコル非関与）。組み込みスキーム
-//! （iceberg-dark / catppuccin-mocha）は実パレットの手合わせ値。ユーザー定義
+//! （iceberg-dark / catppuccin-mocha）は実パレット値（iceberg.vim / catppuccin palette と突合せ済み）。ユーザー定義
 //! スキームは `~/.config/minae/colorschemes/` の TOML ファイルで、参照された
 //! 時のみロードする（遅延ロード — ADR-0022）。解決はファイル優先。
 //!
@@ -202,7 +202,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// iceberg-dark（既定）。iceberg.vim の実パレットに手合わせ。
+/// iceberg-dark（既定）。iceberg.vim の実パレット値。グループへの割当ては mina 独自（vim の TS リンク通りではない）。
 fn iceberg_dark() -> Colorscheme {
     use HighlightGroup::*;
     use UiRole::*;
@@ -225,10 +225,10 @@ fn iceberg_dark() -> Colorscheme {
         ],
         ui: vec![
             (Cursor, Style::bg(rgb(0xC6, 0xC8, 0xD1))),
-            (Selection, Style::bg(rgb(0x1E, 0x42, 0x62))),
+            (Selection, Style::bg(rgb(0x27, 0x2C, 0x42))),
             (DiagnosticError, Style::fg_underline(rgb(0xE2, 0x78, 0x78))),
             (DiagnosticWarning, Style::fg_underline(rgb(0xE2, 0xA4, 0x78))),
-            (DiagnosticInfo, Style::fg(rgb(0x84, 0xA0, 0xC6))),
+            (DiagnosticInfo, Style::fg(rgb(0x89, 0xB8, 0xC2))),
             (DiagnosticHint, Style::fg(rgb(0x6B, 0x70, 0x89))),
             (
                 StatusLine,
@@ -293,7 +293,7 @@ fn iceberg_dark() -> Colorscheme {
     }
 }
 
-/// catppuccin-mocha。catppuccin palette の実値に手合わせ。
+/// catppuccin-mocha。catppuccin palette mocha の実値（割当ては catppuccin nvim 準拠）。
 fn catppuccin_mocha() -> Colorscheme {
     use HighlightGroup::*;
     use UiRole::*;

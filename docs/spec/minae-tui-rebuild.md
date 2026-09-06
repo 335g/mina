@@ -99,7 +99,7 @@ bump 方式で **PROTOCOL_VERSION 11 → 12**、新ソケット `minae-12.sock`�
 ## 11. カラースキーム
 
 - データモデル: 旧 `colorscheme.rs` 踏襲（TOML ファイル・組込 + ユーザーファイル優先（ADR-0022）・`Colorscheme { name, syntax: [(HighlightGroup, Style)], ui: [(UiRole, Style)] }`）。
-- **組込 2 種**: `iceberg-dark`（Default）/ `catppuccin-mocha`。**実値はプロトタイプの近似値から実物の palette に調整する（必須 TODO）**。
+- **組込 2 種**: `iceberg-dark`（Default）/ `catppuccin-mocha`。実値は実物の palette と突合せ済み（iceberg.vim / catppuccin palette。割当ては mina 独自 — `minae/src/colors.rs` のコメント参照）。
 - **変換層**: 旧 `Color`（SGR 直生成）を廃止し、`ratatui::style::Color::Rgb/Indexed/Ansi` へのマッピング層を実装（UiRole → ratatui Style）。
 - `ColorCapability` 検出（ADR-0019: `NO_COLOR` > `COLORTERM` truecolor/24bit > 256 > Ansi16）は維持し、変換に適用。
 
@@ -141,7 +141,7 @@ bump 方式で **PROTOCOL_VERSION 11 → 12**、新ソケット `minae-12.sock`�
 
 ## 16. 実装時の注意・将来事項（fog からの引き継ぎ）
 
-- **カラースキーム実値**: プロトタイプの近似値 → 実物 palette（iceberg-dark / catppuccin-mocha）へ調整必須（§11）。
+- **カラースキーム実値**: 対応済み — 実物 palette と突合せ、非公式だった Selection 1 値を修正（§11）。
 - **request_id の発火条件**: 全文 RTT 30〜50ms 超が計測されたら再検討（§3）。
 - **大ファイル帯の線形スケーリング**: 全文スナップショット + フル再構築のスケーリングは未実測 — 別目的地（#32 由来の fog）。
 - **分割・タブ・複数 View の UI**: MVP 外（mina-view の Tree 機構はデーモンが未使用のまま）。
