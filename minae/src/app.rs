@@ -1326,6 +1326,8 @@ impl App {
                     let snap = self.snapshot.clone();
                     cmp.ensure_files(&snap);
                 }
+                // #50: 同一基準の再登録はコメント保持のため取り直す。
+                self.refresh_reviews().await;
             } else {
                 self.send(&Command::UnregisterBaseRoot { root }).await;
                 // #50: Unregister で daemon 側も全消しされるため捨てる。
@@ -1362,6 +1364,8 @@ impl App {
         ));
         self.compare = Some(cmp);
         self.annotate_tree();
+        // #50: 初回ピン時は daemon 側は空のはずだが、一覧を取り直して揃える。
+        self.refresh_reviews().await;
     }
 
     /// B: 基準を現在状態に更新する（一覧・差分キャッシュを作り直す）。
@@ -1389,6 +1393,8 @@ impl App {
         let short = fresh.short().to_string();
         self.compare = Some(fresh);
         self.annotate_tree();
+        // #50: 再ピンで daemon 側は全消しされるため捨てる。
+        self.review_list.clear();
         self.flash = Some(format!("基準 {short} に更新"));
     }
 
@@ -1565,6 +1571,7 @@ impl App {
 
     /// 終了時の後始末（best-effort）: 登録解除＋worktree 撤去。
     async fn shutdown_compare(&mut self) {
+        self.review_list.clear();
         let Some(cmp) = self.compare.take() else {
             return;
         };
