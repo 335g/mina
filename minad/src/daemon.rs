@@ -10122,6 +10122,28 @@ root-markers = [".docsroot"]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #49 adversarial: 存在しない root の登録は拒否（世代不変・登録なし）。
+    /// process_command 直呼び（ソケット不要）。
+    #[tokio::test]
+    async fn base_register_missing_root_rejected() {
+        let daemon = Arc::new(Mutex::new(Daemon::new()));
+        let (tx, _rx) = watch::channel((None, StateSnapshot::default()));
+        let before = daemon.lock().await.generation;
+        let line = serde_json::to_string(&Command::RegisterBaseRoot {
+            root: "/definitely/not/here-49".into(),
+            commit: "abc".into(),
+        })
+        .unwrap();
+        let snap = process_command(&daemon, &tx, 0, EventSource::Interactive, &line).await;
+        assert!(
+            snap.status.as_deref().unwrap_or("").contains("ありません"),
+            "{:?}",
+            snap.status
+        );
+        assert_eq!(daemon.lock().await.generation, before);
+        assert!(daemon.lock().await.base_roots.is_empty());
+    }
+
     #[test]
     fn drop_conn_view_restores_idle_focus() {
         // 切断後始末の欠落回帰（#49 dogfood）: フォーカス中の View を破棄しても
