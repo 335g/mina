@@ -5,8 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Terminal UI for minae (under reconstruction; currently an empty bin crate)"
+description = "Terminal UI for minae (ratatui/crossterm)"
 
 [[bin]]
 name = "minae"
 path = "src/main.rs"
+
+[dependencies]
+mina-conn = { path = "../mina-conn" }
+mina-protocol = { path = "../mina-protocol" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+unicode-width = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
