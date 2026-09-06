@@ -328,8 +328,7 @@ fn draw_editor(
                     e.side == ReviewSide::Base && e.line == old_no as u32 && (|| {
                         let cmp = app.compare.as_ref()?;
                         let snap_path = app.snapshot.path.as_deref()?;
-                        let rel = std::path::Path::new(snap_path).strip_prefix(&cmp.repo).ok()?;
-                        Some(e.path == cmp.worktree.join(rel).to_string_lossy())
+                        Some(e.path == cmp.base_path_for(snap_path)?)
                     })()
                     .unwrap_or(false)
                 });

@@ -69,7 +69,7 @@ pub(crate) enum Prompt {
 }
 
 /// レビューコメント入力が指す差分アンカー（#50）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReviewAnchor {
     /// 対象ファイル（絶対パス。基準側は worktree 配下）。
     path: String,
@@ -339,6 +339,12 @@ impl CompareState {
 
     pub(crate) fn short(&self) -> &str {
         self.base.get(..7).unwrap_or(&self.base)
+    }
+
+    /// 注目文書の基準側絶対パス（worktree 配下・#50）。repo 外は None。
+    pub(crate) fn base_path_for(&self, snap_path: &str) -> Option<String> {
+        let rel = Path::new(snap_path).strip_prefix(&self.repo).ok()?;
+        Some(self.worktree.join(rel).to_string_lossy().into_owned())
     }
 
     pub(crate) fn is_showing(&self) -> bool {
@@ -1240,15 +1246,15 @@ impl App {
 
     /// K（基準側・gapレビュー中）: gap 行へのコメント入力を開く（#50）。
     fn open_review_prompt_gap(&mut self, gap_idx: usize, line_idx: usize) {
-        let (wt_path, line_no, snippet, base) = match (|| {
+        let (wt_path, line_no, snippet, base) = (|| {
             let cmp = self.compare.as_ref()?;
             let snap_path = self.snapshot.path.as_deref()?;
-            let rel = Path::new(snap_path).strip_prefix(&cmp.repo).ok()?;
+            let wt = cmp.base_path_for(snap_path)?;
             let diff = self.compare_diff_for_render()?;
             let gap = diff.gaps.get(gap_idx)?;
             let text = gap.lines.get(line_idx)?.clone();
             Some((
-                cmp.worktree.join(rel).to_string_lossy().into_owned(),
+                wt,
                 (gap.old_start + line_idx) as u32,
                 text,
                 cmp.base.clone(),
