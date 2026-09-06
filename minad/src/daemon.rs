@@ -748,10 +748,16 @@ impl Daemon {
             .insert(conn_id, ClientView { view_id: id, viewport: 24 });
     }
 
-    /// 切断時に接続の View を破棄する（ADR-0037）。
+    /// 切断時に接続の View を破棄する（ADR-0037）。破棄した View に
+    /// フォーカスが残っていたら idle へ戻す — 戻さないと watch_disk 等の
+    /// focused_path() が死んだ slot を掴んで panic する（#49 dogfood で発覚）。
     fn drop_conn_view(&mut self, conn_id: u64) {
         if let Some(r) = self.conn_views.remove(&conn_id) {
+            let was_focused = self.editor.focused_view_id() == r.view_id;
             self.editor.remove_view(r.view_id);
+            if was_focused {
+                self.editor.set_focused_view(self.idle_view);
+            }
         }
     }
 }
@@ -10113,6 +10119,19 @@ root-markers = [".docsroot"]
 
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_conn_view_restores_idle_focus() {
+        // 切断後始末の欠落回帰（#49 dogfood）: フォーカス中の View を破棄しても
+        // idle に戻るため、watch_disk 経路の focused_path() が panic しない。
+        let mut d = Daemon::new();
+        d.register_conn_view(7);
+        let vid = d.conn_views.get(&7).expect("登録").view_id;
+        assert!(d.editor.set_focused_view(vid));
+        d.drop_conn_view(7);
+        assert_eq!(d.editor.focused_view_id(), d.idle_view);
+        let _ = d.editor.focused_path();
     }
 
     #[test]
