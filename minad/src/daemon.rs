@@ -3206,13 +3206,16 @@ async fn process_command(
                     | Command::Open { .. }
                     | Command::Close
                     // #50: コメント抽出は headless の読み取り経路（`minas review`）。
+                    // 全消しも headless に許可する（TUI 死後の掃除用。編集状態
+                    // ではなくレビュー状態の管理のため #13 の趣旨と衝突しない）。
                     | Command::ListReviewComments
+                    | Command::ClearReviewComments
             ) {
                 let mut d = daemon.lock().await;
                 return snapshot(
                     &mut d,
                     Some(
-                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, Close, and ListReviewComments"
+                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, Close, ListReviewComments, and ClearReviewComments"
                             .into(),
                     ),
                 );
