@@ -3481,7 +3481,7 @@ async fn process_command(
                 };
                 let mut d = daemon.lock().await;
                 d.register_base_root(canon, commit, source);
-                return snapshot(&mut d, None);
+                snapshot(&mut d, None)
             }
             // #49: 基準 root の登録解除。セッション破棄＋キャッシュ破棄。
             // 不在は無視（M1: 変化なし・世代不変）。worktree 削除後の順序にも
@@ -3499,7 +3499,7 @@ async fn process_command(
                     s.lock().await.client.kill().await;
                 }
                 let mut d = daemon.lock().await;
-                return snapshot(&mut d, None);
+                snapshot(&mut d, None)
             }
             Ok(command) => {
                 let mut d = daemon.lock().await;
@@ -3591,22 +3591,23 @@ async fn process_command(
                 // 分類済み種別で判定する（新規書込みコマンドはイベント分類への
                 // 追加が必須のため追随するだけ）。拒否は状態を変えず status で
                 // 報告する（M1 の拒否と同型）。
-                if let Some((kind, _, _)) = &event {
-                    let is_text = matches!(
-                        kind,
-                        EventKind::Insert
-                            | EventKind::Delete
-                            | EventKind::ReplaceRange
-                            | EventKind::Undo
-                            | EventKind::Redo
-                    );
-                    if is_text {
-                        if let Some(msg) =
-                            d.editor.focused_path().and_then(|p| d.base_reject(p))
-                        {
-                            return snapshot(&mut d, Some(msg));
-                        }
+                let blocked: Option<String> = match &event {
+                    Some((kind, _, _))
+                        if matches!(
+                            kind,
+                            EventKind::Insert
+                                | EventKind::Delete
+                                | EventKind::ReplaceRange
+                                | EventKind::Undo
+                                | EventKind::Redo
+                        ) =>
+                    {
+                        d.editor.focused_path().and_then(|p| d.base_reject(p))
                     }
+                    _ => None,
+                };
+                if let Some(msg) = blocked {
+                    return snapshot(&mut d, Some(msg));
                 }
                 let (_, changed) = apply_from(&mut d, command, conn_id);
                 // ADR-0012: 実際に状態が変わった場合のみイベントを記録する。
