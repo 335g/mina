@@ -3,7 +3,7 @@
 //! 見た目は P1 プロトタイプで確定（配色の実値は colors.rs の実パレット）。
 //! フレーム毎に全画面再構築する（`Buffer::diff` が差分を吸収する）。
 
-use mina_protocol::{HighlightGroup, Mode, Severity, StateSnapshot};
+use mina_protocol::{HighlightGroup, Mode, ReviewSide, Severity, StateSnapshot};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
@@ -323,7 +323,17 @@ fn draw_editor(
                 let dim = tint(base(app), comment_fg);
                 let active =
                     matches!(gap_active, Some((gi, li, _)) if gi == gap_idx && li == line_idx);
-                let spans = vec![
+                // #50: 基準側コメントのマーカー（`"`）。
+                let commented = app.review_list.iter().any(|e| {
+                    e.side == ReviewSide::Base && e.line == old_no as u32 && (|| {
+                        let cmp = app.compare.as_ref()?;
+                        let snap_path = app.snapshot.path.as_deref()?;
+                        let rel = std::path::Path::new(snap_path).strip_prefix(&cmp.repo).ok()?;
+                        Some(e.path == cmp.worktree.join(rel).to_string_lossy())
+                    })()
+                    .unwrap_or(false)
+                });
+                let mut spans = vec![
                     Span::styled("-", dim),
                     Span::raw("  "),
                     Span::styled(
@@ -332,6 +342,9 @@ fn draw_editor(
                     ),
                     Span::styled(gap.lines[line_idx].clone(), dim),
                 ];
+                if commented {
+                    spans.push(Span::styled(" \"", syn(app, HighlightGroup::String)));
+                }
                 let spans = if active {
                     spans
                         .into_iter()
@@ -434,6 +447,14 @@ fn draw_editor(
                 line_chars[pos - ls..].iter().collect::<String>(),
                 base_style,
             ));
+        }
+        // #50: 現在側コメントのマーカー（`"`。解決行で照合）。
+        if app.review_list.iter().any(|e| {
+            e.side == ReviewSide::Current
+                && Some(e.path.as_str()) == snap.path.as_deref()
+                && e.resolved_line == line_no as u32
+        }) {
+            spans.push(Span::styled(" \"", syn(app, HighlightGroup::String)));
         }
         rendered.push(Line::from(spans));
             }
@@ -562,7 +583,19 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         .compare
         .as_ref()
         .filter(|c| c.is_showing())
-        .map(|c| format!(" ◈{}", c.short()))
+        .map(|c| {
+            // #50: レビューコメント件数（有るときのみ）。
+            let n = app
+                .review_list
+                .iter()
+                .filter(|e| Some(e.path.as_str()) == app.snapshot.path.as_deref())
+                .count();
+            if n > 0 {
+                format!(" ◈{} \"{}", c.short(), n)
+            } else {
+                format!(" ◈{}", c.short())
+            }
+        })
         .unwrap_or_default();
     let left = format!("{mode_txt}  {path}{dirty}{cmp_mark}{gap_mark}");
 
@@ -589,7 +622,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         right.push_str("[未接続]   ");
     }
     if app.gap_review.is_some() {
-        right.push_str("j/k:移動 h/l:列 Enter:定義 Esc:戻る");
+        right.push_str("j/k:移動 h/l:列 Enter:定義 K:コメント Esc:戻る");
+    } else if app.compare.as_ref().is_some_and(|c| c.is_showing()) {
+        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較 K:コメント");
     } else {
         right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較");
     }
