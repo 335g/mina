@@ -277,6 +277,8 @@ pub(crate) struct CompareState {
     base: String,
     /// リポジトリルート（絶対パス）。
     repo: PathBuf,
+    /// 基準コミットの実体（固定パス worktree）。
+    worktree: PathBuf,
     /// 注釈表示の ON/OFF（D で切替）。
     show: bool,
     /// 変更一覧（絶対パス）。files_gen 世代のもの。
@@ -297,14 +299,16 @@ struct CachedDiff {
 }
 
 impl CompareState {
-    /// ピン留めして初期化（初回 D / B）。基準オブジェクトの存在確認付き
-    /// （`git stash create` は無名オブジェクトのため）。
+    /// ピン留めして初期化（初回 D / B）。基準オブジェクトの存在確認＋
+    /// worktree 用意付き（`git stash create` は無名オブジェクトのため）。
     fn pin(repo: PathBuf) -> Result<Self, git::GitError> {
         let base = git::pin_base(&repo)?;
         git::verify_object(&repo, &base)?;
+        let worktree = git::ensure_worktree(&repo, &base)?;
         Ok(Self {
             base,
             repo,
+            worktree,
             show: true,
             files: Vec::new(),
             files_gen: u64::MAX,
@@ -443,6 +447,15 @@ impl ActivityFilter {
     }
 }
 
+/// gapレビュー中のカーソル（#49）。デーモン選択とは独立（読取り専用モード）。
+/// 削除 gap 行の上を移動し、Enter でその位置の過去側定義を peek する。
+#[derive(Clone, Copy)]
+pub(crate) struct GapCursor {
+    pub(crate) gap_idx: usize,
+    pub(crate) line_idx: usize,
+    pub(crate) col: usize,
+}
+
 /// アプリケーション状態。
 pub(crate) struct App {
     pub(crate) conn: Option<Conn>,
@@ -453,6 +466,7 @@ pub(crate) struct App {
     pub(crate) overlay: Overlay,
     pub(crate) tree: TreeState,
     pub(crate) compare: Option<CompareState>,
+    pub(crate) gap_review: Option<GapCursor>,
     pub(crate) diag_filter: Severity,
     pub(crate) diag_index: usize,
     pub(crate) diag_key: Option<(usize, String)>,
@@ -486,6 +500,7 @@ impl App {
             overlay: Overlay::None,
             tree: TreeState::new(root),
             compare: None,
+            gap_review: None,
             diag_filter: Severity::Error,
             diag_index: 0,
             diag_key: None,
@@ -686,6 +701,19 @@ impl App {
     /// キー入力の振り分け: プロンプト > オーバーレイ > エディタ。
     async fn handle_key(&mut self, key: KeyEvent) {
         self.flash = None;
+        // gapレビュー中は専用処理（Ctrl-C の終了だけは共通）。
+        if self.gap_review.is_some() {
+            if key.code == crossterm::event::KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                self.quit = true;
+                return;
+            }
+            self.handle_gap_key(key).await;
+            return;
+        }
         if self.prompt.is_some() {
             self.handle_prompt_key(key).await;
             return;
@@ -750,6 +778,12 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        // Tab: gapレビュー開始（Normal のみ。keymap より優先）。
+        if mode == Mode::Normal && key.code == KeyCode::Tab && key.modifiers.is_empty() {
+            self.pending.clear();
+            self.enter_gap_review();
+            return;
         }
         // プロンプトを開くキー（Normal/Select。Insert では文字入力）
         if mode != Mode::Insert
@@ -1108,14 +1142,41 @@ impl App {
         self.tree.annotate(files.as_deref());
     }
 
-    /// D: 比較表示の切替。初回は現在状態をピン留めする。
+    /// D: 比較表示の切替。初回は現在状態をピン留め＋基準登録する。
     async fn toggle_compare(&mut self) {
-        if let Some(cmp) = self.compare.as_mut() {
-            cmp.show = !cmp.show;
-            if cmp.show {
-                cmp.files_gen = u64::MAX;
-                let snap = self.snapshot.clone();
-                cmp.ensure_files(&snap);
+        if self.compare.is_some() {
+            let (show_now, root, commit) = {
+                let cmp = self.compare.as_mut().expect("is_some で確認済み");
+                cmp.show = !cmp.show;
+                (
+                    cmp.show,
+                    cmp.worktree.to_string_lossy().into_owned(),
+                    cmp.base.clone(),
+                )
+            };
+            if show_now {
+                // worktree 検証（消えていたら作り直す。失敗時は注釈のみで続行）。
+                let usable = {
+                    let cmp = self.compare.as_ref().expect("is_some で確認済み");
+                    if git::worktree_usable(&cmp.worktree) {
+                        true
+                    } else {
+                        git::ensure_worktree(&cmp.repo, &cmp.base).is_ok()
+                    }
+                };
+                if usable {
+                    self.send(&Command::RegisterBaseRoot { root, commit }).await;
+                } else {
+                    self.flash =
+                        Some("worktree を作り直せませんでした（注釈のみ表示）".into());
+                }
+                if let Some(cmp) = self.compare.as_mut() {
+                    cmp.files_gen = u64::MAX;
+                    let snap = self.snapshot.clone();
+                    cmp.ensure_files(&snap);
+                }
+            } else {
+                self.send(&Command::UnregisterBaseRoot { root }).await;
             }
             self.annotate_tree();
             return;
@@ -1135,33 +1196,47 @@ impl App {
                 return;
             }
         };
+        self.send(&Command::RegisterBaseRoot {
+            root: cmp.worktree.to_string_lossy().into_owned(),
+            commit: cmp.base.clone(),
+        })
+        .await;
         let snap = self.snapshot.clone();
         cmp.ensure_files(&snap);
-        self.flash = Some(format!("基準 {} にピン留め（D:表示切替 B:更新）", cmp.short()));
+        self.flash = Some(format!(
+            "基準 {} にピン留め（D:表示切替 B:更新 Tab:削除レビュー）",
+            cmp.short()
+        ));
         self.compare = Some(cmp);
         self.annotate_tree();
     }
 
     /// B: 基準を現在状態に更新する（一覧・差分キャッシュを作り直す）。
+    /// 失敗時は旧状態を維持する。
     async fn repin_compare(&mut self) {
-        let Some(repo) = self.compare.as_ref().map(|c| c.repo.clone()) else {
+        let Some((repo, show)) = self.compare.as_ref().map(|c| (c.repo.clone(), c.show)) else {
             self.flash = Some("比較を開始してからピン留めしてください（D）".into());
             return;
         };
-        match CompareState::pin(repo) {
-            Ok(mut fresh) => {
-                fresh.show = self.compare.as_ref().map(|c| c.show).unwrap_or(true);
-                let snap = self.snapshot.clone();
-                fresh.ensure_files(&snap);
-                let short = fresh.short().to_string();
-                self.compare = Some(fresh);
-                self.annotate_tree();
-                self.flash = Some(format!("基準 {short} に更新"));
-            }
+        let mut fresh = match CompareState::pin(repo) {
+            Ok(f) => f,
             Err(e) => {
-                self.flash = Some(format!("ピン留めできません: {e}"));
+                self.flash = Some(format!("ピン留めできません（旧基準を維持）: {e}"));
+                return;
             }
-        }
+        };
+        fresh.show = show;
+        let snap = self.snapshot.clone();
+        fresh.ensure_files(&snap);
+        self.send(&Command::RegisterBaseRoot {
+            root: fresh.worktree.to_string_lossy().into_owned(),
+            commit: fresh.base.clone(),
+        })
+        .await;
+        let short = fresh.short().to_string();
+        self.compare = Some(fresh);
+        self.annotate_tree();
+        self.flash = Some(format!("基準 {short} に更新"));
     }
 
     /// ツリー上で次/前の変更ファイルへジャンプする（n/N）。
@@ -1205,6 +1280,140 @@ impl App {
         d
     }
 
+    /// Tab: gapレビュー開始（削除行があるときのみ）。
+    fn enter_gap_review(&mut self) {
+        let show = self.compare.as_ref().map(|c| c.is_showing()).unwrap_or(false);
+        if !show {
+            self.flash = Some("比較を開始してください（D）".into());
+            return;
+        }
+        match self.compare_diff_for_render() {
+            Some(d) if !d.gaps.is_empty() => {
+                self.gap_review = Some(GapCursor {
+                    gap_idx: 0,
+                    line_idx: 0,
+                    col: 0,
+                });
+            }
+            _ => {
+                self.flash = Some("削除行がありません".into());
+            }
+        }
+    }
+
+    /// gapレビュー中のキー処理（#49）。移動・決定・終了のみ。編集不可。
+    /// デーモン選択には触らないため、表示と daemon 状態の乖離は起きない。
+    async fn handle_gap_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyCode::*;
+        let Some(diff) = self.compare_diff_for_render() else {
+            self.gap_review = None;
+            self.flash = Some("比較差分がありません".into());
+            return;
+        };
+        if diff.gaps.is_empty() {
+            self.gap_review = None;
+            self.flash = Some("削除行がありません".into());
+            return;
+        }
+        let mut cur = self.gap_review.unwrap_or(GapCursor {
+            gap_idx: 0,
+            line_idx: 0,
+            col: 0,
+        });
+        // canvas 変化で dangling したらクランプする。
+        cur.gap_idx = cur.gap_idx.min(diff.gaps.len() - 1);
+        let max_line = diff.gaps[cur.gap_idx].lines.len().saturating_sub(1);
+        cur.line_idx = cur.line_idx.min(max_line);
+        let max_col = diff.gaps[cur.gap_idx].lines[cur.line_idx].chars().count();
+        cur.col = cur.col.min(max_col);
+        match key.code {
+            Esc | Tab => {
+                self.gap_review = None;
+                return;
+            }
+            Down | Char('j') if key.modifiers.is_empty() => {
+                if cur.line_idx + 1 < diff.gaps[cur.gap_idx].lines.len() {
+                    cur.line_idx += 1;
+                } else if cur.gap_idx + 1 < diff.gaps.len() {
+                    cur.gap_idx += 1;
+                    cur.line_idx = 0;
+                }
+                cur.col = cur
+                    .col
+                    .min(diff.gaps[cur.gap_idx].lines[cur.line_idx].chars().count());
+            }
+            Up | Char('k') if key.modifiers.is_empty() => {
+                if cur.line_idx > 0 {
+                    cur.line_idx -= 1;
+                } else if cur.gap_idx > 0 {
+                    cur.gap_idx -= 1;
+                    cur.line_idx = diff.gaps[cur.gap_idx].lines.len() - 1;
+                }
+                cur.col = cur
+                    .col
+                    .min(diff.gaps[cur.gap_idx].lines[cur.line_idx].chars().count());
+            }
+            Left | Char('h') if key.modifiers.is_empty() => {
+                cur.col = cur.col.saturating_sub(1);
+            }
+            Right | Char('l') if key.modifiers.is_empty() => {
+                cur.col = (cur.col + 1)
+                    .min(diff.gaps[cur.gap_idx].lines[cur.line_idx].chars().count());
+            }
+            Enter => {
+                let gap = &diff.gaps[cur.gap_idx];
+                let line_no = (gap.old_start + cur.line_idx) as u32;
+                let col_no = (cur.col + 1) as u32; // 1-origin
+                let jump = (|| {
+                    let cmp = self.compare.as_ref()?;
+                    let snap_path = self.snapshot.path.as_deref()?;
+                    let rel = Path::new(snap_path).strip_prefix(&cmp.repo).ok()?;
+                    Some((cmp.worktree.join(rel), line_no, col_no))
+                })();
+                match jump {
+                    Some((tp, ln, co)) => {
+                        self.send(&Command::PeekDefinitionAt {
+                            path: tp.to_string_lossy().into_owned(),
+                            line: ln,
+                            col: co,
+                        })
+                        .await;
+                    }
+                    None => {
+                        self.gap_review = None;
+                    }
+                }
+                return;
+            }
+            _ => {
+                self.flash = Some("gapレビュー中です（Escで戻る）".into());
+                return;
+            }
+        }
+        self.gap_review = Some(cur);
+    }
+
+    /// 基準側パス（worktree 配下）の表示用変換（#49）。対象外はそのまま。
+    pub(crate) fn base_display_path(&self, path: &str) -> String {
+        if let Some(cmp) = &self.compare {
+            if let Ok(rel) = Path::new(path).strip_prefix(&cmp.worktree) {
+                return format!("{} @{}", rel.display(), cmp.short());
+            }
+        }
+        path.to_string()
+    }
+
+    /// 終了時の後始末（best-effort）: 登録解除＋worktree 撤去。
+    async fn shutdown_compare(&mut self) {
+        let Some(cmp) = self.compare.take() else {
+            return;
+        };
+        self.send(&Command::UnregisterBaseRoot {
+            root: cmp.worktree.to_string_lossy().into_owned(),
+        })
+        .await;
+        git::remove_worktree(&cmp.repo, &cmp.worktree);
+    }
     /// 再接続を試みる（バックオフ済み）。成功時は Hello + GetState + SetViewport。
     async fn try_reconnect(&mut self) {
         if self.conn.is_some() {
@@ -1326,6 +1535,8 @@ pub async fn run(files: Vec<String>) -> std::io::Result<()> {
     terminal.clear()?;
 
     let mut app = App::new(scheme, schemes_dir, capability, no_color);
+    // 起動時: 死んだセッションの比較 worktree 残骸を掃除する（best-effort）。
+    git::prune_stale_worktrees();
     // 起動: daemon へ接続（失敗は明示エラーで終了）
     app.connect().await.map_err(|e| {
         std::io::Error::new(
@@ -1404,6 +1615,8 @@ pub async fn run(files: Vec<String>) -> std::io::Result<()> {
             }
         }
     }
+    // 終了時: 基準登録の解除＋worktree 撤去（best-effort）。
+    app.shutdown_compare().await;
     Ok(())
 }
 
@@ -1625,19 +1838,23 @@ mod tests {
                 );
             });
 
-            // 削除あり canvas → '-' の gap 行に旧テキストが出る。
+            // 削除あり canvas → '-' の gap 行に旧テキストが出る（3行ブロック）。
             let mut gone: Vec<&str> = orig.split('\n').collect();
-            assert!(gone.len() > 6);
-            let removed = gone.remove(5);
+            assert!(gone.len() > 8);
+            let removed: Vec<&str> = gone.drain(5..8).collect();
             app.snapshot.text = gone.join("\n");
             app.snapshot.checksum = 222;
             let diff = app.compare_diff_for_render();
             assert!(diff.is_some(), "flash: {:?}", app.flash);
-            assert_eq!(diff.unwrap().gaps.len(), 1);
+            {
+                let d = diff.unwrap();
+                assert_eq!(d.gaps.len(), 1);
+                assert_eq!(d.gaps[0].lines.len(), 3);
+            }
             draw_to_test_backend(&mut app, |rows| {
                 let nospace: Vec<String> =
                     rows.iter().map(|r| r.replace(' ', "")).collect();
-                let target = removed.replace(' ', "");
+                let target = removed[0].replace(' ', "");
                 assert!(
                     nospace
                         .iter()
@@ -1645,7 +1862,67 @@ mod tests {
                     "deleted gap missing: {rows:?}"
                 );
             });
+
+            // Tab で gapレビュー開始 → j/k/h/l 移動 → Enter(jump送信) → Esc 終了。
+            // worktree は D 時に実作成されている（後で撤去する）。
+            let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+            app.handle_key(tab).await;
+            assert!(app.gap_review.is_some(), "gap mode: {:?}", app.flash);
+            let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+            app.handle_key(j).await;
+            app.handle_key(j).await;
+            assert_eq!(app.gap_review.unwrap().line_idx, 2);
+            let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+            app.handle_key(k).await;
+            assert_eq!(app.gap_review.unwrap().line_idx, 1);
+            // 編集キーはブロックされる（daemon 選択は不変）。
+            let before = app.snapshot.text.clone();
+            let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+            app.handle_key(x).await;
+            assert!(app.gap_review.is_some(), "gap mode 維持");
+            assert_eq!(app.snapshot.text, before, "daemon 側は不変");
+            assert!(
+                app.flash.as_deref().unwrap_or("").contains("gapレビュー"),
+                "block flash: {:?}",
+                app.flash
+            );
+            // Enter は jump 送信（接続なしでも落ちない）。
+            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            app.handle_key(enter).await;
+            assert!(app.gap_review.is_some());
+            // Esc で終了。
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            app.handle_key(esc).await;
+            assert!(app.gap_review.is_none());
+
+            // 後始末: worktree 撤去（除去パス自体の検証も兼ねる）。
+            let cmp = app.compare.as_ref().expect("compare");
+            let wt = cmp.worktree.clone();
+            assert!(wt.exists(), "D で worktree 実作成");
+            git::remove_worktree(&cmp.repo, &wt);
+            assert!(!wt.exists());
         });
+    }
+
+    #[test]
+    fn base_display_path_maps_worktree() {
+        let mut app = test_app();
+        app.compare = Some(CompareState {
+            base: "abcdef123456".into(),
+            repo: PathBuf::from("/r"),
+            worktree: PathBuf::from("/tmp/wt"),
+            show: true,
+            files: Vec::new(),
+            files_gen: 0,
+            base_texts: HashMap::new(),
+            diffs: HashMap::new(),
+            last_err: None,
+        });
+        assert_eq!(
+            app.base_display_path("/tmp/wt/src/a.rs"),
+            "src/a.rs @abcdef1"
+        );
+        assert_eq!(app.base_display_path("/other/b.rs"), "/other/b.rs");
     }
 
     /// TestBackend に描画して各行の文字列を渡す。
@@ -1695,6 +1972,7 @@ mod tests {
         app.compare = Some(CompareState {
             base: "abc".into(),
             repo: PathBuf::from("/r"),
+            worktree: PathBuf::from("/tmp/mina-base-test"),
             show: true,
             files: Vec::new(),
             files_gen: 0,

@@ -258,6 +258,32 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_treats_git_file_as_marker() {
+        // git worktree の .git はファイル（gitdir 参照）。exists() 判定のため
+        // ディレクトリでなくても root マーカーになる（#49 基準 worktree 用）。
+        let dir =
+            std::env::temp_dir().join(format!("mina-test-wtroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let wt = dir.join("wt");
+        let proj = wt.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        let table = LanguageTable::from_strings(DEFAULT_LANGUAGES_TOML, None);
+        assert_eq!(
+            table.workspace_root(&proj.join("src").join("main.rs")),
+            wt,
+            ".git ファイルを持つ worktree が root になる"
+        );
+        // 対照: マーカーなし → worktree ではない祖先へ上がる。
+        let _ = std::fs::remove_file(wt.join(".git"));
+        assert_ne!(
+            table.workspace_root(&proj.join("src").join("main.rs")),
+            wt
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn user_file_overrides_and_appends_by_name() {
         let table = LanguageTable::from_strings(
             DEFAULT_LANGUAGES_TOML,

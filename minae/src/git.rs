@@ -71,6 +71,87 @@ pub(crate) fn verify_object(repo: &Path, id: &str) -> Result<(), GitError> {
     }
 }
 
+/// 比較用 worktree のパス（#49・v13(a1)）。`<tmp>/mina-base-<pid>-<repohash>/`。
+/// pid 付きで並行 TUI と衝突しない。repohash でリポジトリを区別する。
+/// daemon 側の登録キーと一致させるため正規化してから hash する。
+pub(crate) fn worktree_path(repo: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let h = mina_protocol::fnv1a64(canon.to_string_lossy().as_bytes());
+    std::env::temp_dir().join(format!("mina-base-{}-{h:016x}", std::process::id()))
+}
+
+/// worktree が使える状態か（管理ファイルの有無）。
+pub(crate) fn worktree_usable(wt: &Path) -> bool {
+    wt.join(".git").exists()
+}
+
+/// worktree を用意する（#49）。既存は捨てて作り直す（clean 前提にしない）。
+/// pin ごと（初回 D・B 更新時）の低頻度操作のため確実性を優先する。
+/// 残骸 admin があっても `prune` で掃除してから作る。
+pub(crate) fn ensure_worktree(repo: &Path, base: &str) -> Result<PathBuf, GitError> {
+    let wt = worktree_path(repo);
+    let _ = std::fs::remove_dir_all(&wt);
+    let _ = run(repo, &["worktree", "prune"]);
+    run(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &wt.to_string_lossy(),
+            base,
+        ],
+    )
+    .map_err(|e| GitError(format!("worktree 作成失敗: {e}")))?;
+    Ok(wt)
+}
+
+/// worktree を撤去する（best-effort）。
+pub(crate) fn remove_worktree(repo: &Path, wt: &Path) {
+    let _ = run(
+        repo,
+        &["worktree", "remove", "--force", &wt.to_string_lossy()],
+    );
+    let _ = std::fs::remove_dir_all(wt);
+}
+
+/// 死んだセッションの worktree 残骸を掃除する（起動時・best-effort）。
+/// `mina-base-<pid>-<hash>` の pid が存在しなければディレクトリを消す。
+/// repo 側 admin は各リポジトリの `prune` に任せる（ここでは触らない）。
+/// 不正な名前・自 pid・生存 pid は消さない側に倒す。
+pub(crate) fn prune_stale_worktrees() {
+    let tmp = std::env::temp_dir();
+    let Ok(rd) = std::fs::read_dir(&tmp) else {
+        return;
+    };
+    let me = std::process::id().to_string();
+    for e in rd.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("mina-base-") else {
+            continue;
+        };
+        let Some((pid_s, _)) = rest.split_once('-') else {
+            continue;
+        };
+        if pid_s == me || pid_alive(pid_s) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
+/// pid の生存確認（`kill -0`。unix 前提 — daemon と同じ）。
+fn pid_alive(pid: &str) -> bool {
+    if pid.parse::<u32>().is_err() {
+        return true;
+    }
+    Command::new("kill")
+        .args(["-0", pid])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true)
+}
+
 /// 基準コミット中のファイル内容（`git show <base>:<rel>`）。
 /// 基準側に存在しない（新規ファイル等）は `None`。
 pub(crate) fn base_text(repo: &Path, base: &str, rel: &str) -> Result<Option<String>, GitError> {
@@ -437,6 +518,84 @@ mod tests {
             FileDiff::all_added(1).kinds,
             vec![RowKind::Added]
         );
+    }
+
+    /// temp git リポジトリを用意する（hermetic）。
+    fn init_repo(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mina-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let g = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        root
+    }
+
+    #[test]
+    fn worktree_lifecycle_in_temp_repo() {
+        let root = init_repo("wt");
+        std::fs::write(root.join("a.txt"), "v1\n").unwrap();
+        let g = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap()
+        };
+        assert!(g(&["add", "."]).status.success());
+        assert!(g(&["commit", "-qm", "c1"]).status.success());
+        // pin → worktree。パスは repo 固定で安定する。
+        let base = pin_base(&root).unwrap();
+        assert!(!base.is_empty());
+        verify_object(&root, &base).unwrap();
+        let wt1 = ensure_worktree(&root, &base).unwrap();
+        let wt2 = ensure_worktree(&root, &base).unwrap();
+        assert_eq!(wt1, wt2, "同一 repo は同一パス");
+        assert!(worktree_usable(&wt1));
+        assert_eq!(std::fs::read_to_string(wt1.join("a.txt")).unwrap(), "v1\n");
+        // base_text 経由でも読める。
+        assert_eq!(
+            base_text(&root, &base, "a.txt").unwrap().as_deref(),
+            Some("v1\n")
+        );
+        // 撤去。
+        remove_worktree(&root, &wt1);
+        assert!(!wt1.exists());
+        assert!(!worktree_usable(&wt1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_removes_only_dead_sessions() {
+        // 確実に死んでいる pid（spawn 直後に wait した子）。
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let tmp = std::env::temp_dir();
+        let dead_dir = tmp.join(format!("mina-base-{dead_pid}-abc"));
+        let live_dir = tmp.join(format!("mina-base-{}-abc", std::process::id()));
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        std::fs::create_dir_all(&live_dir).unwrap();
+        prune_stale_worktrees();
+        assert!(!dead_dir.exists(), "死 pid の残骸は消える");
+        assert!(live_dir.exists(), "自 pid は残る");
+        let _ = std::fs::remove_dir_all(&live_dir);
     }
 
     #[test]

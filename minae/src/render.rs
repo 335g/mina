@@ -193,7 +193,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // 比較差分（表示用キャッシュ付き。checksum キーなので変化時のみ git 呼び出し）。
     let cmp_diff = app.compare_diff_for_render();
     let cmp_ref = cmp_diff.as_ref();
-    draw_editor(f, app, editor_area, cmp_ref);
+    let gap_cur = app.gap_review.map(|g| (g.gap_idx, g.line_idx, g.col));
+    draw_editor(f, app, editor_area, cmp_ref, gap_cur);
     if let Some(area) = overlay_area {
         match app.overlay {
             Overlay::Diagnostics => draw_diag_view(f, app, area),
@@ -209,14 +210,18 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
 
     // カーソル（エディタ可視時のみ。ツリー全画面時は置かない）
     if app.overlay != Overlay::Tree {
-        draw_cursor(f, app, editor_area, cmp_ref);
+        draw_cursor(f, app, editor_area, cmp_ref, gap_cur);
     }
 }
 
 /// 仮想表示行（比較の削除 gap 挿入後）。
 enum VRow<'a> {
     Real(usize),
-    Gap { gap: &'a git::Gap, line_idx: usize },
+    Gap {
+        gap_idx: usize,
+        gap: &'a git::Gap,
+        line_idx: usize,
+    },
 }
 
 /// スタイルの fg だけ差し替える（None なら据え置き）。
@@ -250,7 +255,13 @@ fn status_style(app: &App, st: git::ChangeStatus) -> Style {
 }
 
 /// エディタ本文の描画（ガター + インライン診断マーカー + ハイライト + 比較注釈）。
-fn draw_editor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff>) {
+fn draw_editor(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    diff: Option<&git::FileDiff>,
+    gap_active: Option<(usize, usize, usize)>,
+) {
     let snap = &app.snapshot;
     if area.height == 0 {
         return;
@@ -272,13 +283,17 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff
             break;
         }
         if let Some(d) = diff {
-            for g in d.gaps.iter() {
+            for (gi, g) in d.gaps.iter().enumerate() {
                 if g.at == r {
                     for (li, _) in g.lines.iter().enumerate() {
                         if vrows.len() >= h {
                             break;
                         }
-                        vrows.push(VRow::Gap { gap: g, line_idx: li });
+                        vrows.push(VRow::Gap {
+                            gap_idx: gi,
+                            gap: g,
+                            line_idx: li,
+                        });
                     }
                 }
             }
@@ -296,12 +311,19 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff
     let mut rendered = Vec::new();
     for vrow in vrows {
         match vrow {
-            VRow::Gap { gap, line_idx } => {
+            VRow::Gap {
+                gap_idx,
+                gap,
+                line_idx,
+            } => {
                 // 旧側のみの行: 旧行番号つきで控えめ色。カーソル対象外。
+                // gapレビュー中は対象行を反転強調する。
                 let old_no = gap.old_start + line_idx;
                 let comment_fg = syn(app, HighlightGroup::Comment).fg;
                 let dim = tint(base(app), comment_fg);
-                rendered.push(Line::from(vec![
+                let active =
+                    matches!(gap_active, Some((gi, li, _)) if gi == gap_idx && li == line_idx);
+                let spans = vec![
                     Span::styled("-", dim),
                     Span::raw("  "),
                     Span::styled(
@@ -309,7 +331,24 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff
                         tint(ui(app, UiRole::LineNumber), comment_fg),
                     ),
                     Span::styled(gap.lines[line_idx].clone(), dim),
-                ]));
+                ];
+                let spans = if active {
+                    spans
+                        .into_iter()
+                        .map(|s| {
+                            Span::styled(
+                                s.content,
+                                s.style.patch(
+                                    Style::default()
+                                        .add_modifier(ratatui::style::Modifier::REVERSED),
+                                ),
+                            )
+                        })
+                        .collect()
+                } else {
+                    spans
+                };
+                rendered.push(Line::from(spans));
             }
             VRow::Real(row) => {
         let line_no = row + 1;
@@ -404,8 +443,48 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff
 }
 
 /// カーソル描画（プライマリカーソルを自色で — 端末カーソルを使う）。
-fn draw_cursor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff>) {
+fn draw_cursor(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    diff: Option<&git::FileDiff>,
+    gap_cur: Option<(usize, usize, usize)>,
+) {
     let snap = &app.snapshot;
+    // gapレビュー中: gap 行に端末カーソルを置く（デーモン選択は動かさない）。
+    if let Some((gi, li, col)) = gap_cur {
+        if let Some(d) = diff {
+            if let Some(g) = d.gaps.get(gi) {
+                if g.at >= snap.first_line {
+                    if let Some(text) = g.lines.get(li) {
+                        let mut rel = g.at - snap.first_line;
+                        for (oi, og) in d.gaps.iter().enumerate() {
+                            if og.at < snap.first_line {
+                                continue;
+                            }
+                            if og.at < g.at || (og.at == g.at && oi < gi) {
+                                rel += og.lines.len();
+                            }
+                        }
+                        rel += li;
+                        if rel < area.height as usize {
+                            let gutter_w = gutter_width(snap, diff);
+                            let disp_col = UnicodeWidthStr::width(
+                                text.chars().take(col).collect::<String>().as_str(),
+                            ) as u16;
+                            let x = area
+                                .x
+                                .saturating_add(gutter_w + disp_col)
+                                .min(area.x + area.width.saturating_sub(1));
+                            f.set_cursor_position((x, area.y + rel as u16));
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        return;
+    }
     let (line, col) = cursor_line_col(snap);
     if line < snap.first_line {
         return;
@@ -469,15 +548,20 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Insert => ("INSERT", UiRole::ModeInsert),
         Mode::Select => ("SELECT", UiRole::ModeSelect),
     };
-    let path = snap.path.as_deref().unwrap_or("[No Name]");
+    let path = snap
+        .path
+        .as_deref()
+        .map(|p| app.base_display_path(p))
+        .unwrap_or_else(|| "[No Name]".to_string());
     let dirty = if snap.dirty { " [+]" } else { "" };
+    let gap_mark = if app.gap_review.is_some() { " GAP" } else { "" };
     let cmp_mark = app
         .compare
         .as_ref()
         .filter(|c| c.is_showing())
         .map(|c| format!(" ◈{}", c.short()))
         .unwrap_or_default();
-    let left = format!("{mode_txt}  {path}{dirty}{cmp_mark}");
+    let left = format!("{mode_txt}  {path}{dirty}{cmp_mark}{gap_mark}");
 
     // 右: 報知エリア（スピナー + 今の活動）+ キーヒント
     let mut right = String::new();
@@ -501,7 +585,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if app.conn.is_none() {
         right.push_str("[未接続]   ");
     }
-    right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較");
+    if app.gap_review.is_some() {
+        right.push_str("j/k:移動 h/l:列 Enter:定義 Esc:戻る");
+    } else {
+        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較");
+    }
 
     let status_style = ui(app, UiRole::StatusLine);
     let left_w = UnicodeWidthStr::width(left.as_str());
@@ -725,7 +813,7 @@ fn draw_peek_view(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     if let Some(peek) = &app.peek {
         lines.push(Line::from(vec![Span::styled(
-            format!("{}:{}", peek.path, peek.line),
+            format!("{}:{}", app.base_display_path(&peek.path), peek.line),
             ui(app, UiRole::PopupBorder),
         )]));
         for pline in peek.text.lines() {
