@@ -3,7 +3,7 @@
 //! 見た目は P1 プロトタイプで確定（配色の実値は colors.rs の実パレット）。
 //! フレーム毎に全画面再構築する（`Buffer::diff` が差分を吸収する）。
 
-use mina_protocol::{Mode, Severity, StateSnapshot};
+use mina_protocol::{HighlightGroup, Mode, Severity, StateSnapshot};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Overlay};
 use crate::colors::{ColorCapability, UiRole};
+use crate::git;
 
 /// テキストの各行の開始 char オフセット。
 pub(crate) fn line_starts(text: &str) -> Vec<usize> {
@@ -189,7 +190,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         _ => (body, None),
     };
 
-    draw_editor(f, app, editor_area);
+    // 比較差分（表示用キャッシュ付き。checksum キーなので変化時のみ git 呼び出し）。
+    let cmp_diff = app.compare_diff_for_render();
+    let cmp_ref = cmp_diff.as_ref();
+    draw_editor(f, app, editor_area, cmp_ref);
     if let Some(area) = overlay_area {
         match app.overlay {
             Overlay::Diagnostics => draw_diag_view(f, app, area),
@@ -205,38 +209,132 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
 
     // カーソル（エディタ可視時のみ。ツリー全画面時は置かない）
     if app.overlay != Overlay::Tree {
-        draw_cursor(f, app, editor_area);
+        draw_cursor(f, app, editor_area, cmp_ref);
     }
 }
 
-/// エディタ本文の描画（ガター + インライン診断マーカー + ハイライト）。
-fn draw_editor(f: &mut Frame, app: &App, area: Rect) {
+/// 仮想表示行（比較の削除 gap 挿入後）。
+enum VRow<'a> {
+    Real(usize),
+    Gap { gap: &'a git::Gap, line_idx: usize },
+}
+
+/// スタイルの fg だけ差し替える（None なら据え置き）。
+fn tint(base: Style, fg: Option<ratatui::style::Color>) -> Style {
+    match fg {
+        Some(c) => base.patch(Style::default().fg(c)),
+        None => base,
+    }
+}
+
+/// 削除 gap の旧番号の最大値（ガター幅用）。
+fn max_old_no(diff: Option<&git::FileDiff>) -> usize {
+    diff.map(|d| {
+        d.gaps
+            .iter()
+            .map(|g| g.old_start + g.lines.len())
+            .max()
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
+/// 変更種別の表示色（ツリーの M/A/D・注釈マーカー用）。
+fn status_style(app: &App, st: git::ChangeStatus) -> Style {
+    let g = match st {
+        git::ChangeStatus::Added => HighlightGroup::String,
+        git::ChangeStatus::Modified => HighlightGroup::Number,
+        git::ChangeStatus::Deleted => HighlightGroup::Error,
+    };
+    syn(app, g)
+}
+
+/// エディタ本文の描画（ガター + インライン診断マーカー + ハイライト + 比較注釈）。
+fn draw_editor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff>) {
     let snap = &app.snapshot;
     if area.height == 0 {
         return;
     }
     let lines: Vec<&str> = snap.text.split('\n').collect();
     let total = lines.len();
-    let num_w = digits(total).max(3);
+    // ガター幅: 実テキスト行数と削除行の旧番号の大きい方に合わせる。
+    let num_w = digits(total.max(max_old_no(diff))).max(3);
     let highlights = &snap.highlights;
     let starts = line_starts(&snap.text);
     let (cur_line, _) = cursor_line_col(snap);
 
-    let mut rendered = Vec::new();
-    for r in 0..area.height as usize {
-        let row = snap.first_line + r;
-        if row >= total {
-            rendered.push(Line::from(Span::styled("", base(app))));
-            continue;
+    // 可視の仮想行列（実テキスト行 + 削除 gap 行）。first_line は実テキスト行基準。
+    let h = area.height as usize;
+    let mut vrows: Vec<VRow> = Vec::new();
+    let mut r = snap.first_line;
+    loop {
+        if vrows.len() >= h {
+            break;
         }
+        if let Some(d) = diff {
+            for g in d.gaps.iter() {
+                if g.at == r {
+                    for (li, _) in g.lines.iter().enumerate() {
+                        if vrows.len() >= h {
+                            break;
+                        }
+                        vrows.push(VRow::Gap { gap: g, line_idx: li });
+                    }
+                }
+            }
+            if vrows.len() >= h {
+                break;
+            }
+        }
+        if r >= total {
+            break;
+        }
+        vrows.push(VRow::Real(r));
+        r += 1;
+    }
+
+    let mut rendered = Vec::new();
+    for vrow in vrows {
+        match vrow {
+            VRow::Gap { gap, line_idx } => {
+                // 旧側のみの行: 旧行番号つきで控えめ色。カーソル対象外。
+                let old_no = gap.old_start + line_idx;
+                let comment_fg = syn(app, HighlightGroup::Comment).fg;
+                let dim = tint(base(app), comment_fg);
+                rendered.push(Line::from(vec![
+                    Span::styled("-", dim),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{old_no:>num_w$} "),
+                        tint(ui(app, UiRole::LineNumber), comment_fg),
+                    ),
+                    Span::styled(gap.lines[line_idx].clone(), dim),
+                ]));
+            }
+            VRow::Real(row) => {
         let line_no = row + 1;
         let line = lines[row];
         let line_chars: Vec<char> = line.chars().collect();
         let ls = starts[row];
         let le = ls + line_chars.len();
+        let kind = diff.and_then(|d| d.kinds.get(row).copied());
+        let delta_fg = match kind {
+            Some(git::RowKind::Modified) => syn(app, HighlightGroup::Number).fg,
+            Some(git::RowKind::Added) => syn(app, HighlightGroup::String).fg,
+            _ => None,
+        };
 
-        // 診断インラインマーカーは行番号より左の固定列（1 文字幅）
-        let mut spans = vec![if let Some(sev) = snap
+        // 診断インラインマーカーは行番号より左の固定列（1 文字幅）。
+        // 比較中は差分マーカー（+/~/−）が優先する。
+        let mut spans = vec![match kind.and_then(|k| k.marker()) {
+            Some(m) => {
+                let mg = match kind {
+                    Some(git::RowKind::Modified) => HighlightGroup::Number,
+                    _ => HighlightGroup::String,
+                };
+                Span::styled(m.to_string(), syn(app, mg))
+            }
+            None => if let Some(sev) = snap
             .diagnostics
             .iter()
             .filter(|d| {
@@ -257,7 +355,7 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(severity_marker(sev), ui(app, severity_role(sev)))
         } else {
             Span::raw(" ")
-        }];
+        }}];
         spans.push(Span::raw("  "));
 
         // ガター: 行番号（1 始まり・右詰め固定幅）。カーソル行は明るく。
@@ -272,7 +370,7 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect) {
         ));
 
         // 本文: ハイライト範囲で区切ってスタイル付け
-        let base_style = base(app);
+        let base_style = tint(base(app), delta_fg);
         let mut pos = ls;
         // 当該行に掛かる範囲だけを走査する（highlights は昇順・非重複）
         for hl in highlights.iter().filter(|h| h.start < le && h.end > ls) {
@@ -288,7 +386,7 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect) {
                 line_chars[seg_start - ls..seg_end - ls]
                     .iter()
                     .collect::<String>(),
-                base_style.patch(syn(app, hl.group)),
+                tint(base_style.patch(syn(app, hl.group)), delta_fg),
             ));
             pos = seg_end;
         }
@@ -299,22 +397,34 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
         rendered.push(Line::from(spans));
+            }
+        }
     }
     f.render_widget(Paragraph::new(rendered).style(base(app)), area);
 }
 
 /// カーソル描画（プライマリカーソルを自色で — 端末カーソルを使う）。
-fn draw_cursor(f: &mut Frame, app: &App, area: Rect) {
+fn draw_cursor(f: &mut Frame, app: &App, area: Rect, diff: Option<&git::FileDiff>) {
     let snap = &app.snapshot;
     let (line, col) = cursor_line_col(snap);
     if line < snap.first_line {
         return;
     }
-    let rel = line - snap.first_line;
+    // 削除 gap 行の挿入分だけ表示位置が下がる。
+    let extra: usize = diff
+        .map(|d| {
+            d.gaps
+                .iter()
+                .filter(|g| g.at >= snap.first_line && g.at <= line)
+                .map(|g| g.lines.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    let rel = line - snap.first_line + extra;
     if rel >= area.height as usize {
         return;
     }
-    let gutter_w = gutter_width(snap);
+    let gutter_w = gutter_width(snap, diff);
     let line_text: String = snap
         .text
         .split('\n')
@@ -331,10 +441,10 @@ fn draw_cursor(f: &mut Frame, app: &App, area: Rect) {
     f.set_cursor_position((x, area.y + rel as u16));
 }
 
-/// ガター幅（マーカー 1 + 空白 2 + 行番号 + 空白 1）。
-fn gutter_width(snap: &StateSnapshot) -> u16 {
+/// ガター幅（マーカー 1 + 空白 2 + 行番号 + 空白 1）。削除行の旧番号も収める。
+fn gutter_width(snap: &StateSnapshot, diff: Option<&git::FileDiff>) -> u16 {
     let total = snap.text.split('\n').count();
-    (1 + 2 + digits(total).max(3) + 1) as u16
+    (1 + 2 + digits(total.max(max_old_no(diff))).max(3) + 1) as u16
 }
 
 /// ステータス行（左: モード + パス / 右: 報知 + キーヒント）。プロンプト中は入力行。
@@ -361,7 +471,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     };
     let path = snap.path.as_deref().unwrap_or("[No Name]");
     let dirty = if snap.dirty { " [+]" } else { "" };
-    let left = format!("{mode_txt}  {path}{dirty}");
+    let cmp_mark = app
+        .compare
+        .as_ref()
+        .filter(|c| c.is_showing())
+        .map(|c| format!(" ◈{}", c.short()))
+        .unwrap_or_default();
+    let left = format!("{mode_txt}  {path}{dirty}{cmp_mark}");
 
     // 右: 報知エリア（スピナー + 今の活動）+ キーヒント
     let mut right = String::new();
@@ -385,7 +501,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if app.conn.is_none() {
         right.push_str("[未接続]   ");
     }
-    right.push_str("T:ツリー G:診断 A:履歴 C:配色");
+    right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較");
 
     let status_style = ui(app, UiRole::StatusLine);
     let left_w = UnicodeWidthStr::width(left.as_str());
@@ -431,6 +547,17 @@ fn draw_tree(f: &mut Frame, app: &App, body: Rect) {
             } else {
                 " "
             };
+            // 比較マーカー: ファイルは M/A/D（+/~/−）、畳みディレクトリは配下件数。
+            let (dmark, dstyle) = match e.status {
+                Some(st) => (format!("{} ", st.marker()), status_style(app, st)),
+                None => (String::new(), base(app)),
+            };
+            let aggr = if e.is_dir && e.subtree_changes > 0 && !app.tree.expanded.contains(&e.path)
+            {
+                format!(" +{}", e.subtree_changes)
+            } else {
+                String::new()
+            };
             let indent = "  ".repeat(e.depth);
             let style = if idx == app.tree.selected {
                 base(app).patch(ui(app, UiRole::Selection).bg(ratatui::style::Color::Reset))
@@ -443,10 +570,17 @@ fn draw_tree(f: &mut Frame, app: &App, body: Rect) {
             } else {
                 style
             };
-            ListItem::new(Line::from(vec![Span::styled(
-                format!("{mark} {indent}{icon} {}", e.name),
-                style,
-            )]))
+            let dstyle = if idx == app.tree.selected {
+                dstyle.patch(Style::default().add_modifier(ratatui::style::Modifier::REVERSED))
+            } else {
+                dstyle
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} {indent}{icon} "), style),
+                Span::styled(dmark, dstyle),
+                Span::styled(e.name.clone(), style),
+                Span::styled(aggr, style),
+            ]))
         })
         .collect();
     let block = Block::bordered()
