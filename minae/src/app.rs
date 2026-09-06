@@ -13,8 +13,8 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use futures_util::StreamExt;
 use mina_conn as conn;
 use mina_protocol::{
-    ActivityRecord, ClientKind, Command, Direction, Mode, Peek, ServerMessage, Severity,
-    StateSnapshot,
+    ActivityRecord, ClientKind, Command, Direction, Mode, Peek, ReviewCommentView, ReviewSide,
+    ServerMessage, Severity, StateSnapshot,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -63,6 +63,24 @@ pub(crate) enum Prompt {
     Replace,
     /// `R` リネーム: カーソル位置の単語（`old`）を新しい名前に変える。
     Rename { buf: String, old: String },
+    /// `K` レビューコメント（#50）: 比較表示中のカーソル行（現在側）または
+    /// gap 行（基準側）へのコメント入力。Enter で Add（空は削除）、Esc で取消。
+    ReviewComment { buf: String, anchor: ReviewAnchor },
+}
+
+/// レビューコメント入力が指す差分アンカー（#50）。
+#[derive(Clone)]
+pub(crate) struct ReviewAnchor {
+    /// 対象ファイル（絶対パス。基準側は worktree 配下）。
+    path: String,
+    /// どちらの側を指すか。
+    side: ReviewSide,
+    /// 送信する行番号（1-origin。新規はカーソル行、編集は既存の保存行）。
+    line: u32,
+    /// 対象行の内容（送信時点）。
+    snippet: String,
+    /// ピン留めした基準コミット ID。
+    base: String,
 }
 
 impl Prompt {
@@ -78,12 +96,13 @@ impl Prompt {
             }
             Prompt::Replace => 'r',
             Prompt::Rename { .. } => 'R',
+            Prompt::ReviewComment { .. } => '"',
         }
     }
 
     pub(crate) fn buf(&self) -> &str {
         match self {
-            Prompt::Command(b) | Prompt::Search { buf: b, .. } | Prompt::Rename { buf: b, .. } => b,
+            Prompt::Command(b) | Prompt::Search { buf: b, .. } | Prompt::Rename { buf: b, .. } | Prompt::ReviewComment { buf: b, .. } => b,
             Prompt::Replace => "",
         }
     }
@@ -466,6 +485,9 @@ pub(crate) struct App {
     pub(crate) tree: TreeState,
     pub(crate) compare: Option<CompareState>,
     pub(crate) gap_review: Option<GapCursor>,
+    /// daemon 保持のレビューコメント一覧のキャッシュ（#50）。マーカー表示と
+    /// 編集 prefill 用。List 応答で更新し、比較終了・再ピンで捨てる。
+    pub(crate) review_list: Vec<ReviewCommentView>,
     pub(crate) diag_filter: Severity,
     pub(crate) diag_index: usize,
     pub(crate) diag_key: Option<(usize, String)>,
@@ -500,6 +522,7 @@ impl App {
             tree: TreeState::new(root),
             compare: None,
             gap_review: None,
+            review_list: Vec::new(),
             diag_filter: Severity::Error,
             diag_index: 0,
             diag_key: None,
@@ -618,7 +641,11 @@ impl App {
                     self.tree.annotate(Some(&files));
                 }
             }
-            // TUI は軽量応答を送らない（使わない）ので無視する
+            // #50: レビューコメント一覧（マーカー・編集 prefill 用キャッシュ）。
+            ServerMessage::ReviewComments { comments, .. } => {
+                self.review_list = comments;
+            }
+            // TUI は他の軽量応答を送らない（使わない）ので無視する
             _ => {}
         }
     }
@@ -772,6 +799,12 @@ impl App {
                 Char('B') => {
                     self.pending.clear();
                     self.repin_compare().await;
+                    return;
+                }
+                // K: レビューコメント入力（比較表示中のみ。現在側カーソル行）。
+                Char('K') => {
+                    self.pending.clear();
+                    self.open_review_prompt_current().await;
                     return;
                 }
                 _ => {}
