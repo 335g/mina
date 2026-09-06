@@ -1,14 +1,14 @@
-# minae
+# mina
 
 > エージェントのためのターミナルエディタ。常駐デーモンがエディタ状態を保持し、すべてのフロントエンド —— ヘッドレス session CLI・エージェント・オプションの TUI —— はただのクライアントです。
 
-**minae** = **min**(imize)（コスト最小化）+ **A**gent + **E**ditor —— コストを最小化するエージェントエディタ。
+**mina** = **min**imize cost for AI **a**gent（AI エージェントのためのコスト最小化）—— コストを最小化するエージェントエディタ。サフィックスで: mina**e** = editor（TUI）、mina**d** = daemon、mina**s** = session（ヘッドレス CLI）。
 
 [English](./README.md) · 日本語
 
-## minae を使う効果
+## mina を使う効果
 
-エージェント駆動の編集において、minae の session 契約は素朴なファイルツールより良い計測結果を示します。実用的な2ファイル機能追加タスク（~600行の Rust クレートにフィールドを1つ追加、編集5箇所、`cargo check` で検証、タスク途中に外部ファイル変更を注入）での A/B テスト結果:
+エージェント駆動の編集において、mina の session 契約は素朴なファイルツールより良い計測結果を示します。実用的な2ファイル機能追加タスク（~600行の Rust クレートにフィールドを1つ追加、編集5箇所、`cargo check` で検証、タスク途中に外部ファイル変更を注入）での A/B テスト結果:
 
 | | 素朴なツール（全文 read・無検証の置換） | minas session 契約（範囲 read・検証付き apply） |
 |---|---|---|
@@ -20,9 +20,9 @@
 
 方法論・run 単位のデータ・詳細な考察: [docs/benchmarks/agent-editor-ab-results.md](docs/benchmarks/agent-editor-ab-results.md)（T11/M3）。ハーネス: [`tools/ab/`](tools/ab/README.md)。
 
-## minae とは
+## mina とは
 
-minae は daemon/client 分割のターミナルエディタです。エージェント駆動の編集を第一に、対話利用はそれに次ぐ位置づけです。
+mina は daemon/client 分割のターミナルエディタです。エージェント駆動の編集を第一に、対話利用はそれに次ぐ位置づけです。
 
 常駐する **Daemon** がすべてのエディタ状態を保持します —— 開いているドキュメント、undo 履歴、セレクション、LSP セッション。**Client**（ヘッドレス `session` CLI・エージェント・オプションの TUI）はローカルソケットで接続し、コマンドを送って状態スナップショットを描画します。クライアントは出入りしても、デーモンとその状態は残ります。すべてのフロントエンドが同じプロトコルを話すため、エージェントがスクリプトで使うツールは TUI が対話で使うツールと同じであり、TUI はなくても構いません。
 
@@ -100,7 +100,7 @@ $ minas skill read      # read 契約（session get --lines の番号付き出�
 - [docs/adr/](docs/adr/) — 意思決定記録
 - [docs/spec/](docs/spec/) — ワイヤプロトコル仕様
 
-minae は開発中です。荒い部分がある前提でお願いします。
+mina は開発中です。荒い部分がある前提でお願いします。
 
 ## ライセンス
 

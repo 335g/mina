@@ -1,14 +1,14 @@
-# minae
+# mina
 
 > A terminal editor for agents. A resident daemon owns the editor state; every frontend — the headless session CLI, an agent, or the optional TUI — is just a client.
 
-**minae** = **min**(imize) + **A**gent + **E**ditor — a cost-minimizing agent editor.
+**mina** = **min**imize cost for AI **a**gent — a cost-minimizing agent editor. By suffix: mina**e** = editor (the TUI), mina**d** = daemon, mina**s** = session (the headless CLI).
 
 [English] · [日本語](./README.ja.md)
 
-## Why minae
+## Why mina
 
-For agent-driven editing, minae's session contract measures better than generic file tooling. In a controlled A/B test on a realistic two-file feature task (adding a field across a ~600-line Rust crate, five edits, verified by `cargo check`, with an external file change injected mid-task):
+For agent-driven editing, mina's session contract measures better than generic file tooling. In a controlled A/B test on a realistic two-file feature task (adding a field across a ~600-line Rust crate, five edits, verified by `cargo check`, with an external file change injected mid-task):
 
 | | Naive tools (full-file reads, unverified replaces) | minas session contract (range reads, verified applies) |
 |---|---|---|
@@ -20,9 +20,9 @@ The contract that produces this: numbered range reads instead of full-file reads
 
 Methodology, per-run data, and the full discussion: [docs/benchmarks/agent-editor-ab-results.md](docs/benchmarks/agent-editor-ab-results.md) (T11/M3). Harness: [`tools/ab/`](tools/ab/README.md).
 
-## What is minae
+## What is mina
 
-minae is a terminal editor with a daemon/client split, built for agent-driven editing first and interactive use second.
+mina is a terminal editor with a daemon/client split, built for agent-driven editing first and interactive use second.
 
 A resident **Daemon** holds all editor state — open documents, undo histories, selections, LSP sessions. **Clients** (the headless `session` CLI, an agent, or the optional TUI) connect over a local socket, send commands, and render state snapshots. Clients can come and go; the daemon and its state remain. Because every frontend speaks the same protocol, the tools an agent uses in a script are the same tools the TUI uses interactively — and the TUI is optional.
 
@@ -100,7 +100,7 @@ The guides cover tool choice (read / apply / rename contracts) and error recover
 - [docs/adr/](docs/adr/) — decision records
 - [docs/spec/](docs/spec/) — wire protocol specification
 
-minae is under active construction; expect rough edges.
+mina is under active construction; expect rough edges.
 
 ## License
 

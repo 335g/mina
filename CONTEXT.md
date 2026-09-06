@@ -1,6 +1,6 @@
-# minae Context
+# mina Context
 
-minae is a terminal editor/viewer under construction: a UI-agnostic text-editing core, with a resident Daemon owning editor state. The terminal UI (minae-term) and the headless session CLI for agents are both Clients of that Daemon.
+mina is a terminal editor/viewer under construction: a UI-agnostic text-editing core, with a resident Daemon owning editor state. The terminal UI (minae) and the headless session CLI for agents are both Clients of that Daemon.
 
 ## Language
 
@@ -49,7 +49,7 @@ The smallest analysis unit containing an opened file — the nearest directory t
 _Avoid_: project root, crate root
 
 **LanguageServer**:
-A language analysis process (rust-analyzer, …) spawned by the Daemon per WorkspaceRoot and served over LSP — the provider of Diagnostics, InlayHints, definitions, and Rename/References. Configured by the Languages config; minae ships vetted defaults in its embedded table and treats user-added servers as unvetted (LSP-standard features still work, negotiated via capabilities).
+A language analysis process (rust-analyzer, …) spawned by the Daemon per WorkspaceRoot and served over LSP — the provider of Diagnostics, InlayHints, definitions, and Rename/References. Configured by the Languages config; mina ships vetted defaults in its embedded table and treats user-added servers as unvetted (LSP-standard features still work, negotiated via capabilities).
 _Avoid_: linter, analyzer, server (when LSP-specific)
 
 **Languages config**:
@@ -69,7 +69,7 @@ A mapping from key sequences to Commands, scoped per Mode and structured as a pr
 _Avoid_: keybindings, keymap table
 
 **Daemon**:
-The persistent minae process that owns the editor state — documents, histories, selections, and LSP clients — and serves Clients over a local channel. Clients may come and go; the Daemon and its state remain. The Selection and viewport position are connection-scoped: while an Interactive client is connected they follow that client's navigation, and when the last Interactive client disconnects every View returns to the idle default (a single cursor at the start of the Document, viewport at the first line) unless that client declared `reset_cursor_on_disconnect = false` in its Hello (ADR-0027). Documents, undo histories, and LSP sessions are unaffected by Client disconnects.
+The persistent mina process that owns the editor state — documents, histories, selections, and LSP clients — and serves Clients over a local channel. Clients may come and go; the Daemon and its state remain. The Selection and viewport position are connection-scoped: while an Interactive client is connected they follow that client's navigation, and when the last Interactive client disconnects every View returns to the idle default (a single cursor at the start of the Document, viewport at the first line) unless that client declared `reset_cursor_on_disconnect = false` in its Hello (ADR-0027). Documents, undo histories, and LSP sessions are unaffected by Client disconnects.
 _Avoid_: server, backend
 
 **Client**:
@@ -125,7 +125,7 @@ The hierarchical list of a Document's symbols — functions, methods, types, imp
 _Avoid_: symbol list, document symbols, outline view
 
 **Colorscheme**:
-A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes. Built-in schemes ship with minae; user schemes are TOML files in the colorschemes directory and take precedence over built-ins of the same name. A scheme is selected by name from the config file or the `:colorscheme` command.
+A named mapping from semantic roles — HighlightGroups and UI elements such as the cursor or status line — to terminal colors and attributes. Built-in schemes ship with mina; user schemes are TOML files in the colorschemes directory and take precedence over built-ins of the same name. A scheme is selected by name from the config file or the `:colorscheme` command.
 _Avoid_: theme, palette
 
 **Syntax**:
