@@ -10297,6 +10297,127 @@ root-markers = [".docsroot"]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #50: レビューコメントの追加・上書き・stale 解決・削除・再ピン消去・
+    /// Unregister 消去・切断保持・Clear・headless 拒否の E2E（ソケット経由・v14）。
+    #[tokio::test]
+    async fn review_comments_add_list_stale_clear_e2e() {
+        let dir = std::env::temp_dir().join(format!("minae-review-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.review_comment_count, 0);
+        let gen0 = snap.generation;
+
+        // 追加: 世代が進み、件数に載り、イベントに載る。
+        let add = |line: u32, snippet: &str, body: &str| Command::AddReviewComment {
+            path: path.clone(),
+            side: ReviewSide::Current,
+            line,
+            snippet: snippet.into(),
+            body: body.into(),
+            base: "abc1234".into(),
+        };
+        let snap = request(&mut tui, &add(2, "beta", "直して")).await;
+        assert_eq!(snap.generation, gen0 + 1);
+        assert_eq!(snap.review_comment_count, 1);
+        assert!(
+            snap.events.iter().any(|e| e.kind == EventKind::ReviewComment),
+            "ReviewComment イベント"
+        );
+
+        // 同一アンカーは上書き（件数不変・本文更新）。
+        let snap = request(&mut tui, &add(2, "beta", "やっぱり直さないで")).await;
+        assert_eq!(snap.review_comment_count, 1, "上書きで重複しない");
+
+        // headless（minas 想定）から List: 全文付き・非 stale・解決行一致。
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let (_, comments) = request_reviews(&mut agent).await;
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "やっぱり直さないで");
+        assert!(!comments[0].stale);
+        assert_eq!((comments[0].line, comments[0].resolved_line), (2, 2));
+
+        // 先頭に1行挿入 → 2行目の beta は3行目へずれる（stale 解決）。
+        let edit = DocumentEdit {
+            start: 0,
+            end: 0,
+            text: "zero\n".into(),
+            checksum: fnv1a64("alpha\nbeta\ngamma\n".as_bytes()),
+            expected_text: None,
+        };
+        let snap = request_edit(&mut tui, &edit).await;
+        assert_eq!(snap.text, "zero\nalpha\nbeta\ngamma\n");
+        let (_, comments) = request_reviews(&mut agent).await;
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].stale, "ずれたら stale");
+        assert_eq!(comments[0].resolved_line, 3, "snippet 追跡で解決");
+        assert_eq!(comments[0].line, 2, "保存値は書き換えない");
+
+        // 空本文の追加 = そのアンカーの削除。
+        let snap = request(&mut tui, &add(2, "beta", "   ")).await;
+        assert_eq!(snap.review_comment_count, 0);
+        let (_, comments) = request_reviews(&mut agent).await;
+        assert!(comments.is_empty());
+
+        // 再追加 → 再ピン（Register）で全消し。
+        let _ = request(&mut tui, &add(1, "zero", "先頭メモ")).await;
+        let snap = request(
+            &mut tui,
+            &Command::RegisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+                commit: "def5678".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.review_comment_count, 0, "再ピンで旧コメント破棄");
+
+        // 再追加 → Unregister で全消し。
+        let _ = request(&mut tui, &add(1, "zero", "先頭メモ2")).await;
+        let snap = request(
+            &mut tui,
+            &Command::UnregisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert_eq!(snap.review_comment_count, 0, "Unregister で全消し");
+
+        // 再追加 → TUI 切断後も headless から読める（Q12: 切断保持）。
+        let _ = request(&mut tui, &add(1, "zero", "切断後も残る")).await;
+        drop(tui);
+        let (_, comments) = request_reviews(&mut agent).await;
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "切断後も残る");
+
+        // 明示 Clear で全消し。
+        let mut tui2 = connect_client(&sock, ClientKind::Interactive).await;
+        let snap = request(&mut tui2, &Command::ClearReviewComments).await;
+        assert_eq!(snap.review_comment_count, 0);
+        let snap2 = request(&mut tui2, &Command::ClearReviewComments).await;
+        assert_eq!(snap2.generation, snap.generation, "空 Clear は世代不変");
+        let (_, comments) = request_reviews(&mut agent).await;
+        assert!(comments.is_empty());
+
+        // headless からの Add は拒否（TUI 駆動のみ・#49 と同型）。
+        let snap = request(&mut agent, &add(1, "zero", "agent書込み")).await;
+        assert!(
+            snap.status.as_deref().unwrap_or("").contains("headless clients can only use"),
+            "headless の Add は拒否: {:?}",
+            snap.status
+        );
+        assert_eq!(snap.review_comment_count, 0);
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #49 adversarial: 存在しない root の登録は拒否（世代不変・登録なし）。
     /// process_command 直呼び（ソケット不要）。
     #[tokio::test]
