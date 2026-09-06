@@ -580,6 +580,8 @@ impl Daemon {
         source: EventSource,
     ) {
         self.base_roots.insert(root, commit);
+        // #50: 再ピンで基準点が変わるため旧コメントは破棄する（Q9）。
+        self.review_comments.clear();
         self.record_event(source, EventKind::BaseRoot, None, None);
     }
 
@@ -595,6 +597,8 @@ impl Daemon {
         if self.base_roots.remove(root).is_none() {
             return Vec::new();
         }
+        // #50: Unregister で基準点が消えるためコメントも全消しする（Q12）。
+        self.review_comments.clear();
         let dead_keys: Vec<_> = self
             .lsp_sessions
             .keys()
@@ -633,6 +637,83 @@ impl Daemon {
             "基準 {short} 配下は読取り専用です: {}",
             path.display()
         ))
+    }
+
+    /// レビューコメントの追加/更新/削除（#50）。同一アンカー（パス・側・行）は
+    /// 上書きし、空本文はそのアンカーの削除（専用 Delete コマンドなし）。
+    /// いずれも世代を進めイベントに積む（TUI の件数追従・push 配信用）。
+    pub(crate) fn add_review_comment(&mut self, c: ReviewComment, source: EventSource) {
+        if c.body.trim().is_empty() {
+            self.review_comments
+                .retain(|e| !(e.path == c.path && e.side == c.side && e.line == c.line));
+        } else if let Some(e) = self
+            .review_comments
+            .iter_mut()
+            .find(|e| e.path == c.path && e.side == c.side && e.line == c.line)
+        {
+            *e = c;
+        } else {
+            self.review_comments.push(c);
+        }
+        self.record_event(source, EventKind::ReviewComment, None, None);
+    }
+
+    /// レビューコメントの全消し（#50）。空のときは何もしない（M1: 変化なし）。
+    pub(crate) fn clear_review_comments(&mut self, source: EventSource) {
+        if self.review_comments.is_empty() {
+            return;
+        }
+        self.review_comments.clear();
+        self.record_event(source, EventKind::ReviewComment, None, None);
+    }
+
+    /// レビューコメント一覧の照合付き解決（#50・読み取り専用）。保存値は
+    /// 書き換えず、`stale`＋`resolved_line` を添える（判断は AI 側）。
+    /// 現在側は現テキスト（開いていれば editor、未開はディスク）と突き合わせ、
+    /// 基準側は不変なので存在確認だけする。
+    pub(crate) fn resolve_review_comments(&self) -> Vec<ReviewCommentView> {
+        self.review_comments
+            .iter()
+            .map(|c| {
+                let (resolved_line, stale) = match c.side {
+                    ReviewSide::Base => (c.line, !Path::new(&c.path).exists()),
+                    ReviewSide::Current => self.resolve_current_line(&c.path, c.line, &c.snippet),
+                };
+                ReviewCommentView {
+                    path: c.path.clone(),
+                    side: c.side,
+                    line: c.line,
+                    resolved_line,
+                    stale,
+                    snippet: c.snippet.clone(),
+                    body: c.body.clone(),
+                    base: c.base.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// 現在側コメントの行解決（#50）。`line` 行（1-origin）の内容が `snippet` と
+    /// 一致すれば ok、ずれていれば全文から `snippet` の初出を探す。見つかれば
+    /// その行を stale 付きで返し、なければ追加時の行を stale 付きで返す。
+    fn resolve_current_line(&self, path: &str, line: u32, snippet: &str) -> (u32, bool) {
+        let text: Option<String> = self
+            .editor
+            .doc_id_for_path(Path::new(path))
+            .map(|id| self.editor.document(id).text().to_string())
+            .or_else(|| std::fs::read_to_string(path).ok());
+        let Some(text) = text else {
+            return (line, true);
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let idx = line.saturating_sub(1) as usize;
+        if lines.get(idx).is_some_and(|l| *l == snippet) {
+            return (line, false);
+        }
+        match lines.iter().position(|l| *l == snippet) {
+            Some(found) => (found as u32 + 1, true),
+            None => (line, true),
+        }
     }
 
     /// クライアント切断時の後始末: Insert モードで開いたままの undo グループを
@@ -1354,6 +1435,19 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // ListReviewComments（#50）: レビューコメントの全文付き軽量応答
+                // （ServerMessage::ReviewComments）で返す読み取り専用コマンド。
+                // headless ゲートの例外（`minas review` の抽出経路）。TUI も
+                // マーカー・編集prefill 用に同じ経路で取得する。
+                if let Ok(Command::ListReviewComments) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_review_comments(&daemon).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 let snapshot = process_command(&daemon, &push_tx, conn_id, source, &line).await;
                 // ADR-0013: 状態が変わったときだけ全購読者へ配る。watch の send は
                 // 値の等価性でなく送信ごとに受信側を起こすため、世代が進んでいない
@@ -1389,6 +1483,18 @@ async fn handle_connection(
 enum ReadNext {
     Command(io::Result<Option<String>>),
     Push(Result<(), watch::error::RecvError>),
+}
+
+/// `Command::ListReviewComments` の処理（#50）: レビューコメントの全文付き
+/// 軽量応答（[`ServerMessage::ReviewComments`]）で返す。読み取り専用:
+/// 世代・push・イベントは進めない。照合（stale 判定）は解決時点の読み取りで、
+/// 保存値は書き換えない。
+async fn serve_review_comments(daemon: &Mutex<Daemon>) -> ServerMessage {
+    let d = daemon.lock().await;
+    ServerMessage::ReviewComments {
+        generation: d.generation,
+        comments: d.resolve_review_comments(),
+    }
 }
 
 /// `Command::GetServerInfo` の処理（issue #27/D1）: daemon のビルド世代と
@@ -3099,12 +3205,14 @@ async fn process_command(
                     | Command::WaitFor { .. }
                     | Command::Open { .. }
                     | Command::Close
+                    // #50: コメント抽出は headless の読み取り経路（`minas review`）。
+                    | Command::ListReviewComments
             ) {
                 let mut d = daemon.lock().await;
                 return snapshot(
                     &mut d,
                     Some(
-                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, and Close"
+                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, Close, and ListReviewComments"
                             .into(),
                     ),
                 );
@@ -3504,6 +3612,40 @@ async fn process_command(
                     s.lock().await.client.kill().await;
                 }
                 let mut d = daemon.lock().await;
+                snapshot(&mut d, None)
+            }
+            // #50: レビューコメントの追加/更新/削除。TUI 駆動のみ（headless は
+            // #13 ゲートで拒否 — #49 の基準登録と同型）。同一アンカーは上書き、
+            // 空本文は削除。世代を進め push に載せる。
+            Ok(Command::AddReviewComment {
+                path,
+                side,
+                line,
+                snippet,
+                body,
+                base,
+            }) => {
+                let mut d = daemon.lock().await;
+                let generation = d.generation + 1;
+                d.add_review_comment(
+                    ReviewComment {
+                        path,
+                        side,
+                        line,
+                        snippet,
+                        body,
+                        base,
+                        generation,
+                    },
+                    source,
+                );
+                snapshot(&mut d, None)
+            }
+            // #50: レビューコメントの全消し。TUI 駆動のみ（同上）。
+            // 空のときは変化なし（M1: 世代不変）。
+            Ok(Command::ClearReviewComments) => {
+                let mut d = daemon.lock().await;
+                d.clear_review_comments(source);
                 snapshot(&mut d, None)
             }
             Ok(command) => {
@@ -4295,6 +4437,15 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // process_command で専用処理される（#49）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
+        Command::AddReviewComment { .. } | Command::ClearReviewComments => {
+            // process_command で専用処理される（#50）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::ListReviewComments => {
+            // handle_connection で専用処理される（ServerMessage::ReviewComments
+            // 応答。#50）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
         Command::Outline { .. } | Command::EnclosingSymbol { .. } => {
             // handle_connection で専用処理される（ServerMessage::Outline /
             // EnclosingSymbol 応答。ADR-0031）。ここに来ることはないが網羅性のため。
@@ -4792,6 +4943,8 @@ pub(crate) fn snapshot_from_view(
         events: daemon.events.iter().cloned().collect(),
         deleted: daemon.deleted.clone(),
         peek: None, // PeekDefinition 応答は serve_peek_definition が上書きする
+        // #50: 件数のみ（全文は ListReviewComments で別取得）。
+        review_comment_count: daemon.review_comments.len(),
     }
 }
 
