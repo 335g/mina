@@ -1223,11 +1223,7 @@ impl App {
         let base = cmp.base.clone();
         // 編集: 解決行 or 保存行がカーソル行に当たる既存を prefill する。
         // 送信は保存行で行い、snippet だけ現行に更新する（重複を作らない）。
-        let existing = self.review_list.iter().find(|e| {
-            e.side == ReviewSide::Current
-                && e.path == path
-                && (e.resolved_line == line_no || e.line == line_no)
-        });
+        let existing = Self::find_existing(&self.review_list, ReviewSide::Current, &path, line_no);
         let (line, buf) = match existing {
             Some(e) => (e.line, e.body.clone()),
             None => (line_no, String::new()),
@@ -1246,10 +1242,10 @@ impl App {
 
     /// K（基準側・gapレビュー中）: gap 行へのコメント入力を開く（#50）。
     fn open_review_prompt_gap(&mut self, gap_idx: usize, line_idx: usize) {
-        let (wt_path, line_no, snippet, base) = (|| {
-            let cmp = self.compare.as_ref()?;
-            let snap_path = self.snapshot.path.as_deref()?;
-            let wt = cmp.base_path_for(snap_path)?;
+        let Some((wt_path, line_no, snippet, base)) = (|| -> Option<(String, u32, String, String)> {
+            let snap_path = self.snapshot.path.clone()?;
+            let base = self.compare.as_ref()?.base.clone();
+            let wt = self.compare.as_ref()?.base_path_for(&snap_path)?;
             let diff = self.compare_diff_for_render()?;
             let gap = diff.gaps.get(gap_idx)?;
             let text = gap.lines.get(line_idx)?.clone();
@@ -1257,15 +1253,13 @@ impl App {
                 wt,
                 (gap.old_start + line_idx) as u32,
                 text,
-                cmp.base.clone(),
+                base,
             ))
         })() else {
             self.flash = Some("比較差分がありません".into());
             return;
         };
-        let existing = self.review_list.iter().find(|e| {
-            e.side == ReviewSide::Base && e.path == wt_path && e.line == line_no
-        });
+        let existing = Self::find_existing(&self.review_list, ReviewSide::Base, &wt_path, line_no);
         let (line, buf) = match existing {
             Some(e) => (e.line, e.body.clone()),
             None => (line_no, String::new()),
@@ -1282,6 +1276,23 @@ impl App {
             },
         });
     }
+
+/// コメント編集中の既存検索（#50・純粋関数）。現在側は解決行（ずれた先）
+/// または保存行で当て、基準側は不変なので保存行で当てる。見つかれば
+/// その保存行で上書き送信する（重複を作らない）。
+fn find_existing(
+    list: &[ReviewCommentView],
+    side: ReviewSide,
+    path: &str,
+    line_no: u32,
+) -> Option<&ReviewCommentView> {
+    list.iter().find(|e| {
+        e.side == side
+            && e.path == path
+            && (e.line == line_no
+                || (side == ReviewSide::Current && e.resolved_line == line_no))
+    })
+}
 
     /// レビューコメント入力の確定（#50）。Add を送り、一覧を取り直す。
     /// 空本文はそのアンカーの削除（daemon 側の upsert-delete）。
