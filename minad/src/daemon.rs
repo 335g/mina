@@ -19,8 +19,8 @@ use mina_text::{
     replace_targets, select_line_selection, word_at,
 };
 use mina_protocol::{
-    Activity, ActivityKind, ActivityRecord, ChangeEvent, CheckDiagnostic, ClientKind, Command,
-    Diagnostic, DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange,
+    Activity, ActivityKind, ActivityRecord, BaseRootInfo, ChangeEvent, CheckDiagnostic, ClientKind,
+    Command, Diagnostic, DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange,
     InlayHint, OutlineSymbol, Range, ServerMessage, ServerMetrics, Severity, StateSnapshot,
     SymbolKind, WorkspaceSymbol, fnv1a64,
 };
@@ -101,6 +101,10 @@ pub struct Daemon {
     /// 温かいまま保持・reap なし）。各セッションは独立した Mutex で保護し、
     /// LSP の await は daemon ロック外で行う（ADR-0009/ADR-0010）。
     pub(crate) lsp_sessions: HashMap<(PathBuf, String), Arc<Mutex<LspSession>>>,
+    /// 登録中の基準 root → 基準コミット ID（#49 比較閲覧 Mode 1・v13）。
+    /// 配下は読取り専用（テキスト変更を拒否）・ライフサイクル管理対象
+    /// （解除で LSP セッション破棄＋キャッシュ破棄）。キーは正規化済み絶対パス。
+    pub(crate) base_roots: HashMap<PathBuf, String>,
     /// 言語テーブル（ADR-0030）。最新性は [`Daemon::languages_refresh`] が管理する
     /// （languages.toml の mtime が変わったときだけ再読込）。
     pub(crate) languages: Arc<LanguageTable>,
@@ -462,6 +466,7 @@ impl Daemon {
             editor: Editor::new(),
             viewport_height: 24,
             lsp_sessions: HashMap::new(),
+            base_roots: HashMap::new(),
             // 起動時の初期ロード。以後は languages_refresh が mtime 差分だけ再読込（ADR-0030）。
             languages: LanguageTable::load().into_arc(),
             languages_mtime: languages_file_mtime(),
@@ -549,6 +554,80 @@ impl Daemon {
             .filter(|(root, lang)| *lang == fresh.1 && path.starts_with(root))
             .max_by_key(|(root, _)| root.components().count())
             .cloned()
+    }
+
+    /// パスが登録中の基準 root 配下か（#49）。空登録時は即 false（無コスト）。
+    /// 比較はコンポーネント単位（Path::starts_with）。呼び出し側で正規化済み
+    /// パスを渡すこと（登録キーは正規化済み）。
+    pub(crate) fn is_base_path(&self, path: &Path) -> bool {
+        if self.base_roots.is_empty() {
+            return false;
+        }
+        self.base_roots.keys().any(|r| path.starts_with(r))
+    }
+
+    /// 基準 root の登録（#49）。冪等（再登録は commit を更新）。
+    /// root は正規化済みであること。世代を進めイベントに積む。
+    pub(crate) fn register_base_root(
+        &mut self,
+        root: PathBuf,
+        commit: String,
+        source: EventSource,
+    ) {
+        self.base_roots.insert(root, commit);
+        self.record_event(source, EventKind::BaseRoot, None, None);
+    }
+
+    /// 基準 root の登録解除（#49）。存在しなければ何もしない（M1: 変化なし）。
+    /// 破棄すべき LSP セッションを返す（呼び出し側で daemon ロック外で kill）。
+    /// 配下パスのキャッシュ（outline/hints/diagnostics/解析フォーカス）を捨てる。
+    /// activities は bounded・自己消去のため残す。
+    pub(crate) fn unregister_base_root(
+        &mut self,
+        root: &Path,
+        source: EventSource,
+    ) -> Vec<Arc<Mutex<LspSession>>> {
+        if self.base_roots.remove(root).is_none() {
+            return Vec::new();
+        }
+        let dead_keys: Vec<_> = self
+            .lsp_sessions
+            .keys()
+            .filter(|(r, _)| r.starts_with(root))
+            .cloned()
+            .collect();
+        let mut sessions = Vec::new();
+        for k in dead_keys {
+            if let Some(s) = self.lsp_sessions.remove(&k) {
+                sessions.push(s);
+            }
+        }
+        self.outlines.retain(|p, _| !p.starts_with(root));
+        self.outline_order.retain(|p| !p.starts_with(root));
+        self.hints.retain(|p, _| !p.starts_with(root));
+        self.hint_order.retain(|p| !p.starts_with(root));
+        self.diagnostics.retain(|p, _| !p.starts_with(root));
+        self.analysis_focus.retain(|(r, _), _| !r.starts_with(root));
+        self.record_event(source, EventKind::BaseRoot, None, None);
+        sessions
+    }
+
+    /// 基準配下への書込み拒否メッセージ（#49）。対象外なら None。
+    /// status 報告用（DocumentEdit の checksum 拒否と同型）。
+    pub(crate) fn base_reject(&self, path: &Path) -> Option<String> {
+        if !self.is_base_path(path) {
+            return None;
+        }
+        let short = self
+            .base_roots
+            .iter()
+            .find(|(r, _)| path.starts_with(r))
+            .map(|(_, c)| c.get(..7).unwrap_or(c))
+            .unwrap_or("?");
+        Some(format!(
+            "基準 {short} 配下は読取り専用です: {}",
+            path.display()
+        ))
     }
 
     /// クライアント切断時の後始末: Insert モードで開いたままの undo グループを
@@ -1317,6 +1396,19 @@ async fn serve_server_info(daemon: &Mutex<Daemon>) -> ServerMessage {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
         metrics: d.metrics,
+        // #49: 登録中の基準 root（表示用に root 順で安定化）。
+        base_roots: {
+            let mut v: Vec<BaseRootInfo> = d
+                .base_roots
+                .iter()
+                .map(|(r, c)| BaseRootInfo {
+                    root: r.to_string_lossy().into_owned(),
+                    commit: c.clone(),
+                })
+                .collect();
+            v.sort_by(|a, b| a.root.cmp(&b.root));
+            v
+        },
     }
 }
 
@@ -2290,6 +2382,15 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     };
     if old.is_empty() || new.is_empty() {
         return err_input("invalid input: old and new must be non-empty".into());
+    }
+    // #49: 基準配下を起点とするリネームを拒否する（書込み先は同一セッション
+    // ＝同一 root に閉じるため起点検査で十分）。正規化失敗は既存経路に任せる。
+    if !daemon.lock().await.base_roots.is_empty() {
+        if let Ok(canon) = tokio::fs::canonicalize(path).await {
+            if let Some(msg) = daemon.lock().await.base_reject(&canon) {
+                return err_input(msg);
+            }
+        }
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
@@ -3265,6 +3366,15 @@ async fn process_command(
                 }
             }
             Ok(Command::Save) => {
+                // #49: 基準配下への保存を拒否する。
+                let blocked = {
+                    let d = daemon.lock().await;
+                    d.editor.focused_path().and_then(|p| d.base_reject(p))
+                };
+                if let Some(msg) = blocked {
+                    let mut d = daemon.lock().await;
+                    return snapshot(&mut d, Some(msg));
+                }
                 // 保存対象（テキスト・パス・文書 ID）を取り出してから、ロック外で書き込む
                 {
                     let mut d = daemon.lock().await;
@@ -3353,6 +3463,38 @@ async fn process_command(
                     }
                 }
             }
+            Ok(Command::RegisterBaseRoot { root, commit }) => {
+                // #49: 基準 root の登録。LSP セッションは初回読取り時に lazy 確保
+                // （borrowed ensure）。冪等（再登録は commit 更新）。
+                let canon = match tokio::fs::canonicalize(&root).await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let mut d = daemon.lock().await;
+                        return snapshot(&mut d, Some(format!("基準 root がありません: {root}")));
+                    }
+                };
+                let mut d = daemon.lock().await;
+                d.register_base_root(canon, commit, source);
+                return snapshot(&mut d, None);
+            }
+            // #49: 基準 root の登録解除。セッション破棄＋キャッシュ破棄。
+            // 不在は無視（M1: 変化なし・世代不変）。worktree 削除後の順序にも
+            // 対応するため、正規化失敗時は生パスで照合する。
+            Ok(Command::UnregisterBaseRoot { root }) => {
+                let canon = tokio::fs::canonicalize(&root)
+                    .await
+                    .unwrap_or_else(|_| PathBuf::from(&root));
+                let sessions = {
+                    let mut d = daemon.lock().await;
+                    d.unregister_base_root(&canon, source)
+                };
+                // daemon ロック外で LSP プロセスを kill する。
+                for s in sessions {
+                    s.lock().await.client.kill().await;
+                }
+                let mut d = daemon.lock().await;
+                return snapshot(&mut d, None);
+            }
             Ok(command) => {
                 let mut d = daemon.lock().await;
                 // ADR-0012: 状態を変える操作（編集・undo/redo・モード変更）だけを
@@ -3439,6 +3581,27 @@ async fn process_command(
                             .map(|p| p.to_string_lossy().into_owned())
                     })
                     .flatten();
+                // #49: テキスト系イベント && フォーカス文書が基準配下 → 拒否。
+                // 分類済み種別で判定する（新規書込みコマンドはイベント分類への
+                // 追加が必須のため追随するだけ）。拒否は状態を変えず status で
+                // 報告する（M1 の拒否と同型）。
+                if let Some((kind, _, _)) = &event {
+                    let is_text = matches!(
+                        kind,
+                        EventKind::Insert
+                            | EventKind::Delete
+                            | EventKind::ReplaceRange
+                            | EventKind::Undo
+                            | EventKind::Redo
+                    );
+                    if is_text {
+                        if let Some(msg) =
+                            d.editor.focused_path().and_then(|p| d.base_reject(p))
+                        {
+                            return snapshot(&mut d, Some(msg));
+                        }
+                    }
+                }
                 let (_, changed) = apply_from(&mut d, command, conn_id);
                 // ADR-0012: 実際に状態が変わった場合のみイベントを記録する。
                 // 拒否（サイズ超過等）・no-op（空削除・空挿入・履歴のない
@@ -3707,6 +3870,20 @@ fn apply_edit(
     conn_id: u64,
     source: EventSource,
 ) -> Option<StateSnapshot> {
+    // #49: 基準配下への位置指定編集を拒否する（全経路の集約点）。
+    // 拒否は状態を変えず status で報告する（既存の checksum 拒否と同型）。
+    let blocked: Option<String> = daemon
+        .editor
+        .focused_path()
+        .and_then(|p| daemon.base_reject(p));
+    if let Some(msg) = blocked {
+        daemon.metrics.edits_total += 1;
+        if source == EventSource::Headless {
+            let actor = daemon.actor_for(conn_id);
+            daemon.record_activity(actor, edit_kind(edit), false, msg.clone());
+        }
+        return Some(snapshot(daemon, Some(msg)));
+    }
     daemon.metrics.edits_total += 1;
     let text = daemon.editor.current_document().text().to_string();
     if fnv1a64(text.as_bytes()) != edit.checksum {
@@ -4100,6 +4277,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::Rename { .. } | Command::References { .. } => {
             // handle_connection で専用処理される（ServerMessage::RenameResult /
             // ReferencesResult 応答。ADR-0029）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::RegisterBaseRoot { .. } | Command::UnregisterBaseRoot { .. } => {
+            // process_command で専用処理される（#49）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::Outline { .. } | Command::EnclosingSymbol { .. } => {
@@ -9843,5 +10024,157 @@ root-markers = [".docsroot"]
         );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// #49: 基準 root の登録・書込み拒否・解除の E2E（ソケット経由・v13）。
+    #[tokio::test]
+    async fn base_root_register_guard_unregister_e2e() {
+        let dir = std::env::temp_dir().join(format!("minae-base-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello\nworld\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut c, &Command::Open { path: path.clone() }).await;
+        assert_eq!(snap.generation, 1);
+
+        // 登録: 世代が進み、イベントに載る。
+        let snap = request(
+            &mut c,
+            &Command::RegisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+                commit: "abc1234".into(),
+            },
+        )
+        .await;
+        assert_eq!(snap.generation, 2);
+        assert!(
+            snap.events.iter().any(|e| e.kind == EventKind::BaseRoot),
+            "BaseRoot イベント"
+        );
+
+        // 位置指定編集は拒否（状態不変・世代不変・理由つき）。
+        let edit = DocumentEdit {
+            start: 0,
+            end: 0,
+            text: "X".into(),
+            checksum: fnv1a64("hello\nworld\n".as_bytes()),
+            expected_text: None,
+        };
+        let snap = request_edit(&mut c, &edit).await;
+        assert_eq!(snap.text, "hello\nworld\n", "基準への編集は効かない");
+        assert_eq!(snap.generation, 2, "拒否で世代は進まない");
+        assert!(
+            snap.status.as_deref().unwrap_or("").contains("読取り専用"),
+            "拒否理由: {:?}",
+            snap.status
+        );
+
+        // Save も拒否（ファイル不変）。
+        let snap = request(&mut c, &Command::Save).await;
+        assert_eq!(snap.generation, 2);
+        assert!(
+            snap.status.as_deref().unwrap_or("").contains("読取り専用"),
+            "拒否理由: {:?}",
+            snap.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "hello\nworld\n",
+            "ファイルは書かれない"
+        );
+
+        // 解除: 世代が進む。解除後は編集が通る。
+        let snap = request(
+            &mut c,
+            &Command::UnregisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert_eq!(snap.generation, 3);
+        let snap = request_edit(&mut c, &edit).await;
+        assert_eq!(snap.text, "Xhello\nworld\n", "解除後は編集できる");
+        assert_eq!(snap.generation, 4);
+
+        // 不在の解除は無視（世代不変）。
+        let snap = request(
+            &mut c,
+            &Command::UnregisterBaseRoot {
+                root: dir.join("nope").to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert_eq!(snap.generation, 4, "不在解除で世代は進まない");
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base_registry_prefix_caches_and_generation() {
+        use std::path::{Path, PathBuf};
+        let mut d = Daemon::new();
+        assert!(!d.is_base_path(Path::new("/r/a.rs")));
+        d.register_base_root(PathBuf::from("/r"), "abc1234".into(), EventSource::Interactive);
+        assert_eq!(d.generation, 1, "登録で世代が進む");
+        assert!(d.is_base_path(Path::new("/r/a.rs")));
+        assert!(d.is_base_path(Path::new("/r")));
+        assert!(!d.is_base_path(Path::new("/other/a.rs")));
+        // コンポーネント単位: /r2 は /r の配下ではない。
+        assert!(!d.is_base_path(Path::new("/r2/a.rs")));
+        let msg = d.base_reject(Path::new("/r/a.rs")).unwrap();
+        assert!(msg.contains("abc1234") && msg.contains("読取り専用"), "{msg}");
+        assert!(d.base_reject(Path::new("/o/b.rs")).is_none());
+        // キャッシュは prefix で捨てる（対象外は残る）。
+        d.diagnostics.insert(PathBuf::from("/r/a.rs"), Vec::new());
+        d.diagnostics.insert(PathBuf::from("/o/b.rs"), Vec::new());
+        let before = d.generation;
+        let sessions = d.unregister_base_root(Path::new("/r"), EventSource::Interactive);
+        assert!(sessions.is_empty());
+        assert!(!d.is_base_path(Path::new("/r/a.rs")));
+        assert!(d.diagnostics.contains_key(Path::new("/o/b.rs")));
+        assert!(!d.diagnostics.contains_key(Path::new("/r/a.rs")));
+        assert_eq!(d.generation, before + 1, "解除で世代が進む");
+        // 不在の解除は無視（世代不変）。
+        let before2 = d.generation;
+        assert!(
+            d.unregister_base_root(Path::new("/nope"), EventSource::Interactive)
+                .is_empty()
+        );
+        assert_eq!(d.generation, before2);
+    }
+
+    /// #49: 基準配下を起点とするリネームは内容前に拒否する（LSP 不要）。
+    #[tokio::test]
+    async fn base_rename_anchor_rejected() {
+        use std::path::PathBuf;
+        let dir = std::env::temp_dir().join(format!("minae-base-rn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn old_fn() {}\n").unwrap();
+        let daemon = Mutex::new(Daemon::new());
+        let canon = tokio::fs::canonicalize(&dir).await.unwrap();
+        {
+            let mut d = daemon.lock().await;
+            d.register_base_root(canon, "abc1234".into(), EventSource::Interactive);
+        }
+        // 非正規パスで渡しても拒否できること（ガード側で正規化する）。
+        let msg = serve_rename(&daemon, &file.to_string_lossy(), "old_fn", "new_fn").await;
+        match msg {
+            ServerMessage::RenameResult {
+                error: Some(e),
+                files: 0,
+                edits: 0,
+                ..
+            } => assert!(e.contains("読取り専用"), "{e}"),
+            other => panic!("拒否のはず: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

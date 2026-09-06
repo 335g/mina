@@ -1041,9 +1041,12 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
             generation,
             daemon_build_ts,
             metrics,
+            base_roots,
         }) => Ok(serde_json::json!({
             "generation": generation,
             "daemon_build_ts": daemon_build_ts,
+            // #49: 登録中の基準 root（表示用）。
+            "base_roots": base_roots,
             // I4: CLI 側のビルド世代も開示する（D1 のクライアント側バリアント —
             // 再ビルド後に release バイナリが古いまま、という事故の検知）。build.rs が
             // 注入した MINA_GIT_HASH / MINA_BUILD_TS を読む。

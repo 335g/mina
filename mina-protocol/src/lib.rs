@@ -337,6 +337,15 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
 /// よるサーバー発の状態通知（[`ServerMessage::Push`]）をタグで区別する。
 /// 従来の応答（タグなしの素の StateSnapshot）を置き換える（CLI の互換性は
 /// 考慮しない決定 — シリアライズ形状が単一で仕様が単純になる）。
+/// 登録中の基準 root 1 件（#49・v13。`ServerMessage::ServerInfo` に載る）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseRootInfo {
+    /// 基準 root（絶対パス）。
+    pub root: String,
+    /// 基準コミット ID（クライアント申告。表示・診断用）。
+    pub commit: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -360,14 +369,6 @@ pub enum ServerMessage {
         /// 登録中の基準 root（#49・v13）。読取り専用・ライフサイクル管理対象。
         base_roots: Vec<BaseRootInfo>,
     },
-    /// 登録中の基準 root 1 件（#49・v13。`ServerMessage::ServerInfo` に載る）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseRootInfo {
-    /// 基準 root（絶対パス）。
-    pub root: String,
-    /// 基準コミット ID（クライアント申告。表示・診断用）。
-    pub commit: String,
-}
     /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
 /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
     Hints {
@@ -669,6 +670,8 @@ pub enum EventKind {
     SelectionReset,
     /// シンボルの意味リネーム（[`Command::Rename`]。ADR-0029）。
     Rename,
+    /// 基準 root の登録/解除（#49 比較閲覧 Mode 1・v13）。
+    BaseRoot,
 }
 
 /// 状態を変える操作1件の記録（ADR-0012）。bounded リングで保持され、
