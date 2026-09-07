@@ -42,7 +42,10 @@ use serde::{Deserialize, Serialize};
 /// `ListReviewComments` / `ClearReviewComments`、`ServerMessage::ReviewComments`、
 /// `StateSnapshot` に `review_comment_count`（件数のみ・全文は List 応答だけ）。
 /// bump 方式（ADR-0039）。
-pub const PROTOCOL_VERSION: u32 = 14;
+/// v15: 基準診断の常駐（#52・a2）— `StateSnapshot` に `base_diagnostics`
+/// （注目文書の基準側対応物の診断）、`Command::RegisterBaseRoot` に `repo`
+/// （対応付け用・省略可）。bump 方式（ADR-0039）。
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -245,11 +248,16 @@ pub enum Command {
     /// セッションとキャッシュを破棄する。読取りコマンドは従来通りパス指定で
     /// 効く（形状追加なし）。root はクライアントが git worktree で用意した
     /// 基準コミットの実体。冪等（再登録は commit を更新する）。
+    /// v15: `repo`（対応する live リポジトリ）があれば基準診断の対応付けに
+    /// 使う（#52・a2。無ければ基準診断は付かない）。
     RegisterBaseRoot {
         /// 基準 root（絶対パス）。
         root: String,
         /// 基準コミット ID（表示・診断用。daemon は git を読まない）。
         commit: String,
+        /// 対応する live リポジトリルート（絶対パス・#52・省略可）。
+        #[serde(default)]
+        repo: Option<String>,
     },
     /// 基準 root の登録解除（#49・v13）。LSP セッションを破棄し、配下パスの
     /// キャッシュ（outline/hints）を捨てる。存在しない root は無視する。
@@ -932,6 +940,19 @@ pub struct StateSnapshot {
     /// レビューコメントの件数（#50・v14）。全文は載せない — 一覧は
     /// [`Command::ListReviewComments`] で別取得する（push 肥大化の回避）。
     pub review_comment_count: usize,
+    /// 注目文書の基準側対応物の診断（#52・a2・v15）。基準は不変のため
+    /// ピン中は有効（再取得しない）。未取得・対象外は空。取得は daemon が
+    /// 后台で行い、到着は push で届く（generation は進めない — ADR-0028）。
+    pub base_diagnostics: Vec<BaseDiagnostic>,
+}
+
+/// 基準側ファイル1件分の診断（#52・a2・v15）。`path` は基準側の絶対パス。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseDiagnostic {
+    /// 基準側ファイルの絶対パス（worktree 配下）。
+    pub path: String,
+    /// そのファイルの診断（live の [`StateSnapshot::diagnostics`] と同型）。
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// 定義の確認表示（[`Command::PeekDefinition`] の結果。ジャンプしない簡易確認用）。
@@ -968,6 +989,7 @@ impl Default for StateSnapshot {
             deleted: None,
             peek: None,
             review_comment_count: 0,
+            base_diagnostics: Vec::new(),
         }
     }
 }
@@ -1034,6 +1056,15 @@ mod tests {
             }],
             deleted: Some("test.rs".to_string()),
             review_comment_count: 2,
+            base_diagnostics: vec![BaseDiagnostic {
+                path: "/tmp/mina-base-1-abc/a.rs".to_string(),
+                diagnostics: vec![Diagnostic {
+                    start: 0,
+                    end: 5,
+                    severity: Severity::Error,
+                    message: "base".to_string(),
+                }],
+            }],
             activities: vec![Activity {
                 kind: ActivityKind::LspInit,
                 label: "LSP 初期化中".to_string(),
@@ -1210,6 +1241,7 @@ mod tests {
             Command::RegisterBaseRoot {
                 root: "/tmp/mina-base-1-abc".into(),
                 commit: "abc1234".into(),
+                repo: Some("/repo".into()),
             },
             Command::UnregisterBaseRoot {
                 root: "/tmp/mina-base-1-abc".into(),
@@ -1219,6 +1251,17 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
             assert_eq!(back, cmd);
         }
+        // v15: repo 省略の旧形状も読める（デフォルト None）。
+        let back: Command =
+            serde_json::from_str(r#"{"RegisterBaseRoot":{"root":"/r","commit":"c"}}"#).unwrap();
+        assert_eq!(
+            back,
+            Command::RegisterBaseRoot {
+                root: "/r".into(),
+                commit: "c".into(),
+                repo: None,
+            }
+        );
     }
 
     #[test]

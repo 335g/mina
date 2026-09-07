@@ -50,6 +50,8 @@ pub(crate) enum Overlay {
     Peek,
     /// コミット選択（#51・Mode 2）。o=旧側・n=新側に設定する。
     Commits,
+    /// 基準全文ブラウズ（#52・a2）。フォーカスを動かさない読取り専用表示。
+    BaseBrowse,
 }
 
 /// コマンドライン系プロンプトの種類（Helix 流の `:` / `/` 等）。
@@ -667,8 +669,16 @@ pub(crate) struct GapCursor {
     pub(crate) col: usize,
 }
 
-/// Mode 2 の表示位置（render へ渡す値オブジェクト・#51）。
+/// 基準全文ブラウズの状態（#52・a2）。テキストは開いた時点の snapshot。
+#[derive(Clone, Default)]
+pub(crate) struct BaseBrowse {
+    pub(crate) title: String,
+    pub(crate) lines: Vec<String>,
+    pub(crate) line: usize,
+    pub(crate) first: usize,
+}
 /// 自前カーソル行とビューポート先頭（どちらも canvas 基準・0-origin）。
+/// Mode 2 の表示位置（render へ渡す値オブジェクト・#51）。
 #[derive(Clone, Copy)]
 pub(crate) struct V2View {
     pub(crate) line: usize,
@@ -696,6 +706,8 @@ pub(crate) struct App {
     pub(crate) commits: Vec<(String, String)>,
     /// コミット一覧の選択位置。
     pub(crate) commit_sel: usize,
+    /// 基準全文ブラウズ（#52・a2）。None 以外のときだけ描く。
+    pub(crate) base_browse: Option<BaseBrowse>,
     /// daemon 保持のレビューコメント一覧のキャッシュ（#50）。マーカー表示と
     /// 編集 prefill 用。List 応答で更新し、比較終了・再ピンで捨てる。
     pub(crate) review_list: Vec<ReviewCommentView>,
@@ -738,6 +750,7 @@ impl App {
             v2_path: None,
             commits: Vec::new(),
             commit_sel: 0,
+            base_browse: None,
             review_list: Vec::new(),
             diag_filter: Severity::Error,
             diag_index: 0,
@@ -1036,9 +1049,15 @@ impl App {
                     }
                     return;
                 }
-                Char('M') => {
+            Char('M') => {
                     self.pending.clear();
                     self.toggle_mode2().await;
+                    return;
+                }
+                // P: 基準全文ブラウズ（注目文書の旧側・フォーカス不動）。
+                Char('P') => {
+                    self.pending.clear();
+                    self.open_base_browse();
                     return;
                 }
                 // K: レビューコメント入力（比較表示中のみ。現在側カーソル行）。
@@ -1166,6 +1185,22 @@ impl App {
                             self.set_mode2_side(false, hash).await;
                         }
                     }
+                    _ => {}
+                }
+            }
+            Overlay::BaseBrowse => {
+                // #52・a2: 基準全文ブラウズ（j/k 移動・Esc/P で復帰）。
+                match key.code {
+                    Esc => {
+                        self.overlay = Overlay::None;
+                        self.base_browse = None;
+                    }
+                    Char('P') if key.modifiers.is_empty() => {
+                        self.overlay = Overlay::None;
+                        self.base_browse = None;
+                    }
+                    Down | Char('j') if key.modifiers.is_empty() => self.move_browse(1),
+                    Up | Char('k') if key.modifiers.is_empty() => self.move_browse(-1),
                     _ => {}
                 }
             }
@@ -1585,13 +1620,14 @@ fn find_existing<'a>(
 
     async fn toggle_compare(&mut self) {
         if self.compare.is_some() {
-            let (show_now, root, commit) = {
+            let (show_now, root, commit, repo) = {
                 let cmp = self.compare.as_mut().expect("is_some で確認済み");
                 cmp.show = !cmp.show;
                 (
                     cmp.show,
                     cmp.worktree.to_string_lossy().into_owned(),
                     cmp.base.clone(),
+                    cmp.repo.to_string_lossy().into_owned(),
                 )
             };
             if show_now {
@@ -1605,7 +1641,12 @@ fn find_existing<'a>(
                     }
                 };
                 if usable {
-                    self.send(&Command::RegisterBaseRoot { root, commit }).await;
+                    self.send(&Command::RegisterBaseRoot {
+                        root,
+                        commit,
+                        repo: Some(repo),
+                    })
+                    .await;
                 } else {
                     self.flash =
                         Some("worktree を作り直せませんでした（注釈のみ表示）".into());
@@ -1643,6 +1684,7 @@ fn find_existing<'a>(
         self.send(&Command::RegisterBaseRoot {
             root: cmp.worktree.to_string_lossy().into_owned(),
             commit: cmp.base.clone(),
+            repo: Some(cmp.repo.to_string_lossy().into_owned()),
         })
         .await;
         let snap = self.snapshot.clone();
@@ -1677,6 +1719,7 @@ fn find_existing<'a>(
         self.send(&Command::RegisterBaseRoot {
             root: fresh.worktree.to_string_lossy().into_owned(),
             commit: fresh.base.clone(),
+            repo: Some(fresh.repo.to_string_lossy().into_owned()),
         })
         .await;
         let short = fresh.short().to_string();
@@ -1921,15 +1964,18 @@ fn find_existing<'a>(
         };
         // 先に旧状態（Mode 1 の場合あり）を捨ててから両側を登録する。
         self.drop_compare().await;
+        let repo_str = cmp.repo.to_string_lossy().into_owned();
         self.send(&Command::RegisterBaseRoot {
             root: cmp.worktree.to_string_lossy().into_owned(),
             commit: cmp.base.clone(),
+            repo: Some(repo_str.clone()),
         })
         .await;
         if let (Some(nb), Some(nwt)) = (cmp.new_base.clone(), cmp.new_worktree.clone()) {
             self.send(&Command::RegisterBaseRoot {
                 root: nwt.to_string_lossy().into_owned(),
                 commit: nb,
+                repo: Some(repo_str),
             })
             .await;
         }
@@ -2039,6 +2085,7 @@ fn find_existing<'a>(
         self.send(&Command::RegisterBaseRoot {
             root: wt.to_string_lossy().into_owned(),
             commit: commit.clone(),
+            repo: Some(repo.to_string_lossy().into_owned()),
         })
         .await;
         let short = commit.get(..7).unwrap_or(&commit).to_string();
@@ -2070,6 +2117,58 @@ fn find_existing<'a>(
         ));
     }
 
+    /// P: 基準全文ブラウズを開く（#52・a2）。注目文書の旧側テキストを
+    /// フォーカスを動かさずに読む（復帰は Esc/P）。Mode 2 では旧側を見る。
+    fn open_base_browse(&mut self) {
+        let Some((repo, base, short, rel)) = (|| {
+            let cmp = self.compare.as_ref().filter(|c| c.is_showing())?;
+            let path = self.snapshot.path.as_deref()?;
+            let rel = Path::new(path).strip_prefix(&cmp.repo).ok()?;
+            Some((
+                cmp.repo.clone(),
+                cmp.base.clone(),
+                cmp.short().to_string(),
+                rel.to_string_lossy().replace('\\', "/"),
+            ))
+        })() else {
+            self.flash = Some("比較を開始してください（D/M）".into());
+            return;
+        };
+        match git::base_text(&repo, &base, &rel) {
+            Err(e) => {
+                self.flash = Some(format!("基準テキストを取得できません: {e}"));
+            }
+            Ok(None) => {
+                self.flash = Some(format!("基準側に存在しません: {rel}"));
+            }
+            Ok(Some(text)) => {
+                self.base_browse = Some(BaseBrowse {
+                    title: format!("{rel} @{short}"),
+                    lines: text.split('\n').map(str::to_string).collect(),
+                    line: 0,
+                    first: 0,
+                });
+                self.overlay = Overlay::BaseBrowse;
+            }
+        }
+    }
+
+    /// 基準ブラウズ内の移動（j/k）。body 高で追従する。
+    fn move_browse(&mut self, delta: isize) {
+        let Some(b) = self.base_browse.as_mut() else {
+            return;
+        };
+        let len = b.lines.len().max(1);
+        b.line = (b.line as isize + delta).clamp(0, len as isize - 1) as usize;
+        let h = self.body_h.max(1);
+        if b.line < b.first {
+            b.first = b.line;
+        }
+        if b.line >= b.first + h {
+            b.first = b.line - h + 1;
+        }
+    }
+
     /// Mode 2 のキー処理（#51）。移動・ジャンプ・終了のみ。編集不可。
     /// オーバーレイ系（T/G/A/C）は live 文書の表示として許可する。
     async fn handle_mode2_key(&mut self, key: KeyEvent) {
@@ -2094,6 +2193,11 @@ fn find_existing<'a>(
             Char('B') if key.modifiers.is_empty() => {
                 self.pending.clear();
                 self.open_commit_picker();
+                return;
+            }
+            Char('P') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.open_base_browse();
                 return;
             }
             Down | Char('j') if key.modifiers.is_empty() => {
@@ -2140,6 +2244,7 @@ fn find_existing<'a>(
         let Some(cmp) = self.compare.as_ref().filter(|c| c.show) else {
             return;
         };
+        let repo_str = cmp.repo.to_string_lossy().into_owned();
         let sides: Vec<(String, String, bool)> = {
             let mut v = vec![(
                 cmp.worktree.to_string_lossy().into_owned(),
@@ -2160,7 +2265,12 @@ fn find_existing<'a>(
                 self.flash = Some("worktree が消えているため基準を再登録できません".into());
                 return;
             }
-            self.send(&Command::RegisterBaseRoot { root, commit }).await;
+            self.send(&Command::RegisterBaseRoot {
+                root,
+                commit,
+                repo: Some(repo_str.clone()),
+            })
+            .await;
         }
     }
 
@@ -2942,6 +3052,60 @@ mod tests {
             // 100 桁 backend では長いパスでラベルが切れるため記号だけ見る。
             assert!(rows.iter().any(|r| r.contains("◈") && r.contains("..")), "label: {rows:?}");
             assert!(rows.iter().any(|r| r.contains("new")), "canvas は新側: {rows:?}");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #52・a2: 基準ブラウズの開閉・移動（フォーカス不動）。
+    #[test]
+    fn base_browse_open_move_close() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = git::init_repo("m2browse");
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        std::fs::write(root.join("a.txt"), "b1\nb2\nb3\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        std::fs::write(root.join("a.txt"), "c1\n").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            app.tree = TreeState::new(root.clone());
+            // D で Mode 1 に入る（stash create で dirty を含めてピン）。
+            let d = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE);
+            app.handle_key(d).await;
+            assert!(app.compare.is_some(), "pin: {:?}", app.flash);
+            let canon = std::fs::canonicalize(&root).unwrap();
+            app.snapshot.path = Some(canon.join("a.txt").to_string_lossy().into_owned());
+            app.snapshot.text = "c1\n".to_string();
+            // P で開く（D ピンは dirty 込みのため旧側も c1・フォーカス文書は不変）。
+            let p = KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE);
+            app.handle_key(p).await;
+            assert_eq!(app.overlay, Overlay::BaseBrowse);
+            let b = app.base_browse.as_ref().unwrap();
+            assert_eq!(b.lines[0], "c1");
+            assert!(b.title.contains("a.txt"));
+            assert_eq!(app.snapshot.text, "c1\n", "live 文書は不変");
+            // j で移動・Esc で復帰。
+            let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+            app.handle_key(j).await;
+            assert_eq!(app.base_browse.as_ref().unwrap().line, 1);
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            app.handle_key(esc).await;
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(app.base_browse.is_none());
+            app.drop_compare().await;
         });
         let _ = std::fs::remove_dir_all(&root);
     }

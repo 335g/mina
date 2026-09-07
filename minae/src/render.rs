@@ -225,6 +225,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     if app.overlay == Overlay::Commits {
         draw_commits(f, app, body);
     }
+    if app.overlay == Overlay::BaseBrowse {
+        draw_base_browse(f, app, body);
+    }
     draw_status(f, app, status_area);
 
     // カーソル（エディタ可視時のみ。ツリー全画面時は置かない）
@@ -802,6 +805,50 @@ fn draw_commits(f: &mut Frame, app: &App, body: Rect) {
     f.render_widget(Clear, overlay);
     f.render_widget(List::new(items).block(block), overlay);
 }
+
+/// 基準全文ブラウズ（#52・a2）。旧側テキストの素朴なスクロール表示。
+/// 状態なし（開き直し）は何も描かない。選択行は反転で強調する。
+fn draw_base_browse(f: &mut Frame, app: &App, body: Rect) {
+    let Some(b) = app.base_browse.as_ref() else {
+        return;
+    };
+    let overlay = Rect {
+        x: body.x + 2,
+        y: body.y + 1,
+        width: body.width.saturating_sub(4),
+        height: body.height.saturating_sub(3),
+    };
+    if overlay.width < 10 || overlay.height < 5 {
+        return;
+    }
+    let h = overlay.height as usize;
+    let num_w = b.lines.len().max(1).to_string().len().max(3);
+    let items: Vec<ListItem> = b
+        .lines
+        .iter()
+        .skip(b.first)
+        .take(h)
+        .enumerate()
+        .map(|(i, line)| {
+            let no = b.first + i + 1;
+            let style = if b.first + i == b.line {
+                base(app).patch(Style::default().add_modifier(ratatui::style::Modifier::REVERSED))
+            } else {
+                base(app)
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{no:>num_w$} {line}"),
+                style,
+            )]))
+        })
+        .collect();
+    let block = Block::bordered()
+        .title(format!(" 基準 {} (j/k移動 P/Esc:閉じる) ", b.title))
+        .border_style(ui(app, UiRole::PopupBorder))
+        .style(base(app));
+    f.render_widget(Clear, overlay);
+    f.render_widget(List::new(items).block(block), overlay);
+}
 fn draw_diag_view(f: &mut Frame, app: &App, area: Rect) {
     // 重要度マーカーエリア（左上）: 存在する重要度にマーカー、アクティブのみ強調
     let mut markers = String::from(" ");
@@ -1006,6 +1053,7 @@ mod tests {
             deleted: None,
             peek: None,
             review_comment_count: 0,
+            base_diagnostics: vec![],
         };
         app.width = 80;
         app.height = 24;
@@ -1054,6 +1102,7 @@ mod tests {
             Overlay::Activity,
             Overlay::Peek,
             Overlay::Commits,
+            Overlay::BaseBrowse,
         ] {
             let mut app = test_app();
             app.overlay = overlay;
@@ -1062,6 +1111,14 @@ mod tests {
                     path: "src/main.rs".into(),
                     line: 2,
                     text: "let x = 1;".into(),
+                });
+            }
+            if overlay == Overlay::BaseBrowse {
+                app.base_browse = Some(crate::app::BaseBrowse {
+                    title: "a.txt @abc1234".into(),
+                    lines: vec!["one".into(), "two".into()],
+                    line: 0,
+                    first: 0,
                 });
             }
             let backend = ratatui::backend::TestBackend::new(80, 24);
@@ -1074,6 +1131,7 @@ mod tests {
                 Overlay::Activity => assert!(text.contains("活動履歴")),
                 Overlay::Peek => assert!(text.contains("定義")),
                 Overlay::Commits => assert!(text.contains("コミット選択")),
+                Overlay::BaseBrowse => assert!(text.contains("基準")),
                 Overlay::None => {}
             }
         }

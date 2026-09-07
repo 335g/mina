@@ -19,10 +19,11 @@ use mina_text::{
     replace_targets, select_line_selection, word_at,
 };
 use mina_protocol::{
-    Activity, ActivityKind, ActivityRecord, BaseRootInfo, ChangeEvent, CheckDiagnostic, ClientKind,
-    Command, Diagnostic, DocumentEdit, EventKind, EventSource, GotoTarget, Hello, HighlightRange,
-    InlayHint, OutlineSymbol, Range, ReviewComment, ReviewCommentView, ReviewSide, ServerMessage,
-    ServerMetrics, Severity, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
+    Activity, ActivityKind, ActivityRecord, BaseDiagnostic, BaseRootInfo, ChangeEvent,
+    CheckDiagnostic, ClientKind, Command, Diagnostic, DocumentEdit, EventKind, EventSource,
+    GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range, ReviewComment,
+    ReviewCommentView, ReviewSide, ServerMessage, ServerMetrics, Severity, StateSnapshot,
+    SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -101,10 +102,17 @@ pub struct Daemon {
     /// 温かいまま保持・reap なし）。各セッションは独立した Mutex で保護し、
     /// LSP の await は daemon ロック外で行う（ADR-0009/ADR-0010）。
     pub(crate) lsp_sessions: HashMap<(PathBuf, String), Arc<Mutex<LspSession>>>,
-    /// 登録中の基準 root → 基準コミット ID（#49 比較閲覧 Mode 1・v13）。
+    /// 登録中の基準 root → 登録情報（#49 比較閲覧 Mode 1・v13、v15 で repo 追加）。
     /// 配下は読取り専用（テキスト変更を拒否）・ライフサイクル管理対象
     /// （解除で LSP セッション破棄＋キャッシュ破棄）。キーは正規化済み絶対パス。
-    pub(crate) base_roots: HashMap<PathBuf, String>,
+    pub(crate) base_roots: HashMap<PathBuf, BaseRootReg>,
+    /// 基準側ファイルの診断キャッシュ（#52・a2）。キー = 基準側の絶対パス。
+    /// 基準は不変のためピン中は有効（再取得しない）。Unregister で配下を捨てる。
+    /// 挿入順は `base_diag_order` で FIFO evict（上限つき）。
+    pub(crate) base_diagnostics: HashMap<PathBuf, Vec<mina_protocol::Diagnostic>>,
+    pub(crate) base_diag_order: VecDeque<PathBuf>,
+    /// 充填中の基準診断（重複 pull 抑止）。完了・解除で消える。
+    pub(crate) base_diag_inflight: HashSet<PathBuf>,
     /// レビューコメント（#50・v14）。daemon 共有（TUI の View ではなく、別接続の
     /// `minas review` から見える必要があるため）。再ピン・Unregister・明示 Clear
     /// でのみ全消しし、TUI 切断では保持する（Q12）。追加順。
@@ -208,6 +216,15 @@ struct SyntaxCache {
     window: Option<(u64, usize, usize, Vec<HighlightRange>)>,
 }
 
+/// 基準 root 1 件の登録情報（#49・v15 で repo 追加）。
+/// `repo` は対応する live リポジトリルート（基準診断の対応付け用。
+/// 無い root には基準診断が付かない）。
+#[derive(Clone, Debug)]
+pub(crate) struct BaseRootReg {
+    pub(crate) commit: String,
+    pub(crate) repo: Option<PathBuf>,
+}
+
 /// 1パス分の inlay hint キャッシュ（ADR-0020）。`text_checksum` は pull 時点の
 /// テキストの FNV-1a 64（一致 = 「このテキストに対して取得済み」）。
 pub(crate) struct HintCache {
@@ -222,6 +239,9 @@ pub(crate) struct OutlineCache {
     pub(crate) text_checksum: u64,
     pub(crate) symbols: Vec<OutlineSymbol>,
 }
+
+/// 基準診断キャッシュの上限（#52）。hints と同値（64）。超過は挿入順の最古から除去する。
+const MAX_BASE_DIAG_CACHE: usize = 64;
 
 /// ヒントキャッシュの上限（ADR-0020）。超過は挿入順の最古から除去する。
 const MAX_HINT_CACHE: usize = 64;
@@ -471,6 +491,9 @@ impl Daemon {
             viewport_height: 24,
             lsp_sessions: HashMap::new(),
             base_roots: HashMap::new(),
+            base_diagnostics: HashMap::new(),
+            base_diag_order: VecDeque::new(),
+            base_diag_inflight: HashSet::new(),
             review_comments: Vec::new(),
             // 起動時の初期ロード。以後は languages_refresh が mtime 差分だけ再読込（ADR-0030）。
             languages: LanguageTable::load().into_arc(),
@@ -572,20 +595,23 @@ impl Daemon {
     }
 
     /// 基準 root の登録（#49）。冪等（再登録は commit を更新）。
-    /// root は正規化済みであること。世代を進めイベントに積む。
+    /// root・repo は正規化済みであること。世代を進めイベントに積む。
     pub(crate) fn register_base_root(
         &mut self,
         root: PathBuf,
         commit: String,
+        repo: Option<PathBuf>,
         source: EventSource,
     ) {
         // #50: 基準点が変わったときだけ旧コメントを破棄する（Q9）。同一ペアの
         // 再登録（表示切替・再接続）は保持する。
-        let same = self.base_roots.get(&root).is_some_and(|c| c == &commit);
+        let same = self.base_roots.get(&root).is_some_and(|r| {
+            r.commit == commit && r.repo == repo
+        });
         if !same {
             self.review_comments.clear();
         }
-        self.base_roots.insert(root, commit);
+        self.base_roots.insert(root, BaseRootReg { commit, repo });
         self.record_event(source, EventKind::BaseRoot, None, None);
     }
 
@@ -620,6 +646,10 @@ impl Daemon {
         self.hints.retain(|p, _| !p.starts_with(root));
         self.hint_order.retain(|p| !p.starts_with(root));
         self.diagnostics.retain(|p, _| !p.starts_with(root));
+        // #52: 基準診断のキャッシュ・充填中も配下で捨てる。
+        self.base_diagnostics.retain(|p, _| !p.starts_with(root));
+        self.base_diag_order.retain(|p| !p.starts_with(root));
+        self.base_diag_inflight.retain(|p| !p.starts_with(root));
         self.analysis_focus.retain(|(r, _), _| !r.starts_with(root));
         self.record_event(source, EventKind::BaseRoot, None, None);
         sessions
@@ -635,7 +665,7 @@ impl Daemon {
             .base_roots
             .iter()
             .find(|(r, _)| path.starts_with(r))
-            .map(|(_, c)| c.get(..7).unwrap_or(c))
+            .map(|(_, c)| c.commit.get(..7).unwrap_or(&c.commit))
             .unwrap_or("?");
         Some(format!(
             "基準 {short} 配下は読取り専用です: {}",
@@ -823,6 +853,77 @@ impl Daemon {
             .get(path)
             .map(|c| c.hints.clone())
             .unwrap_or_default()
+    }
+
+    /// 注目文書の基準側対応物（#52・a2）。登録 root のうち repo 対応が
+    /// 分かるものについて、live 側パス → 基準側パスへ写す。注目文書自体が
+    /// 基準配下なら自分自身（開いて読んでいる基準の診断）。重複除去済み。
+    pub(crate) fn base_counterparts(&self, focused: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for (root, reg) in &self.base_roots {
+            let counterpart = if focused.starts_with(root) {
+                focused.to_path_buf()
+            } else if let Some(repo) = reg.repo.as_ref() {
+                match focused.strip_prefix(repo) {
+                    Ok(rel) => root.join(rel),
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
+            };
+            if !out.contains(&counterpart) {
+                out.push(counterpart);
+            }
+        }
+        out
+    }
+
+    /// スナップショットに載せる基準診断（#52・a2）。キャッシュ済みの
+    /// 対応物だけを載せる（未取得は后台充填に任せ、ここでは待たない）。
+    pub(crate) fn snapshot_base_diagnostics(&self, focused: Option<&Path>) -> Vec<BaseDiagnostic> {
+        let Some(focused) = focused else {
+            return Vec::new();
+        };
+        self.base_counterparts(focused)
+            .into_iter()
+            .filter_map(|p| {
+                self.base_diagnostics.get(&p).map(|diags| BaseDiagnostic {
+                    path: p.to_string_lossy().into_owned(),
+                    diagnostics: diags.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// 未キャッシュの対応物を1件だけ引き当て、充填中印を付ける（#52・a2）。
+    /// 呼び出し側（非同期）が后台 pull を起動する。無ければ None。
+    pub(crate) fn take_base_pull(&mut self, focused: Option<&Path>) -> Option<PathBuf> {
+        let Some(focused) = focused else {
+            return None;
+        };
+        self.base_counterparts(focused).into_iter().find(|p| {
+            !self.base_diagnostics.contains_key(p) && !self.base_diag_inflight.contains(p)
+        }).map(|p| {
+            self.base_diag_inflight.insert(p.clone());
+            p
+        })
+    }
+
+    /// 基準診断を格納する（#52・a2）。上限超過は挿入順の最古から除去する。
+    /// 充填中印は外す。呼び出し側で世代は進めない（ADR-0028）。
+    pub(crate) fn store_base_diagnostics(&mut self, path: PathBuf, diags: Vec<Diagnostic>) {
+        self.base_diag_inflight.remove(&path);
+        if !self.base_diagnostics.contains_key(&path) {
+            self.base_diag_order.push_back(path.clone());
+        }
+        self.base_diagnostics.insert(path, diags);
+        while self.base_diagnostics.len() > MAX_BASE_DIAG_CACHE {
+            if let Some(old) = self.base_diag_order.pop_front() {
+                self.base_diagnostics.remove(&old);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Interactive 接続に View を割り当てる（ADR-0037）。開始文書は idle view
@@ -1462,10 +1563,24 @@ async fn handle_connection(
                 if changed {
                     let _ = push_tx.send((Some(conn_id), snapshot.clone()));
                 }
+                // #52: 基準診断の遅延充填。注目文書の対応物が未キャッシュなら
+                // 后台 pull を1件だけ起動する（重複抑止つき。世代は進めない —
+                // 到着は push で届く）。応答より先に引き当てだけ済ませる。
+                let base_pull = {
+                    let mut d = daemon.lock().await;
+                    d.take_base_pull(snapshot.path.as_deref().map(Path::new))
+                };
                 if !write_message(&mut write_half, conn_id, ServerMessage::Response { snapshot })
                     .await
                 {
                     break; // 切断 or 書き込みタイムアウト
+                }
+                if let Some(bp) = base_pull {
+                    let dc = daemon.clone();
+                    let pc = push_tx.clone();
+                    tokio::spawn(async move {
+                        fill_base_diagnostics(&dc, &pc, bp).await;
+                    });
                 }
             }
             ReadNext::Command(Ok(None)) | ReadNext::Command(Err(_)) => break, // クライアントの切断
@@ -1524,7 +1639,7 @@ async fn serve_server_info(daemon: &Mutex<Daemon>) -> ServerMessage {
                 .iter()
                 .map(|(r, c)| BaseRootInfo {
                     root: r.to_string_lossy().into_owned(),
-                    commit: c.clone(),
+                    commit: c.commit.clone(),
                 })
                 .collect();
             v.sort_by(|a, b| a.root.cmp(&b.root));
@@ -2323,6 +2438,57 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         error: None,
     };
     record_agent_metric(daemon, msg).await
+}
+
+/// 基準診断の后台充填（#52・a2）。借用セッションで pull し、キャッシュに
+/// 載せて push で届ける（generation は進めない — ADR-0028）。基準は不変の
+/// ため settle 1 回で確定する。LSP 非対応・読取不可は空で確定させて
+/// 再試行の嵐を避け、spawn 失敗など一時的要因は未確定のまま残す。
+async fn fill_base_diagnostics(
+    daemon: &Mutex<Daemon>,
+    push_tx: &watch::Sender<(Option<u64>, StateSnapshot)>,
+    base_path: PathBuf,
+) {
+    let path_str = base_path.to_string_lossy().into_owned();
+    let borrowed = match prepare_borrowed_session(daemon, &path_str).await {
+        Ok(b) => b,
+        Err(BorrowFail::SpawnFailed(_)) => {
+            // 一時的要因: 充填中印だけ外して次回に委ねる。
+            daemon.lock().await.base_diag_inflight.remove(&base_path);
+            return;
+        }
+        Err(_) => {
+            // 恒久的要因（非対応・読取不可）: 空で確定させる。
+            daemon
+                .lock()
+                .await
+                .store_base_diagnostics(base_path.clone(), Vec::new());
+            let snap = snapshot(&mut *daemon.lock().await, None);
+            let _ = push_tx.send((None, snap));
+            return;
+        }
+    };
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let pulled =
+        lsp::pull_diagnostics_settled(&borrowed.session, &borrowed.path, &borrowed.text).await;
+    if borrows {
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    let diags = pulled.unwrap_or_default();
+    {
+        let mut d = daemon.lock().await;
+        // Unregister で先に消えていたら捨てる（古い基準の残骸を載せない）。
+        if !d.base_diag_inflight.contains(&base_path) {
+            return;
+        }
+        d.store_base_diagnostics(base_path, diags);
+        let snap = snapshot(&mut d, None);
+        drop(d);
+        let _ = push_tx.send((None, snap));
+    }
 }
 
 /// char インデックス → 0-origin 行番号（check 診断の行番号付与用）。
@@ -3596,9 +3762,11 @@ async fn process_command(
                     }
                 }
             }
-            Ok(Command::RegisterBaseRoot { root, commit }) => {
+            Ok(Command::RegisterBaseRoot { root, commit, repo }) => {
                 // #49: 基準 root の登録。LSP セッションは初回読取り時に lazy 確保
                 // （borrowed ensure）。冪等（再登録は commit 更新）。
+                // #52: repo（対応 live リポジトリ）があれば正規化して保持し、
+                // 基準診断の対応付けに使う。無い場合は診断が付かない。
                 let canon = match tokio::fs::canonicalize(&root).await {
                     Ok(p) => p,
                     Err(_) => {
@@ -3606,8 +3774,21 @@ async fn process_command(
                         return snapshot(&mut d, Some(format!("基準 root がありません: {root}")));
                     }
                 };
+                let canon_repo = match repo {
+                    None => None,
+                    Some(r) => match tokio::fs::canonicalize(&r).await {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            let mut d = daemon.lock().await;
+                            return snapshot(
+                                &mut d,
+                                Some(format!("対応リポジトリがありません: {r}")),
+                            );
+                        }
+                    },
+                };
                 let mut d = daemon.lock().await;
-                d.register_base_root(canon, commit, source);
+                d.register_base_root(canon, commit, canon_repo, source);
                 snapshot(&mut d, None)
             }
             // #49: 基準 root の登録解除。セッション破棄＋キャッシュ破棄。
@@ -4960,6 +5141,12 @@ pub(crate) fn snapshot_from_view(
         peek: None, // PeekDefinition 応答は serve_peek_definition が上書きする
         // #50: 件数のみ（全文は ListReviewComments で別取得）。
         review_comment_count: daemon.review_comments.len(),
+        // #52: 基準診断（キャッシュ済み対応物のみ。未取得は后台充填が
+        // push で届ける — generation は進めない）。
+        base_diagnostics: path
+            .as_deref()
+            .map(|p| daemon.snapshot_base_diagnostics(Some(p)))
+            .unwrap_or_default(),
     }
 }
 
@@ -10249,6 +10436,7 @@ root-markers = [".docsroot"]
             &Command::RegisterBaseRoot {
                 root: dir.to_string_lossy().into_owned(),
                 commit: "abc1234".into(),
+                repo: None,
             },
         )
         .await;
@@ -10340,6 +10528,7 @@ root-markers = [".docsroot"]
             &Command::RegisterBaseRoot {
                 root: dir.to_string_lossy().into_owned(),
                 commit: "abc1234".into(),
+                repo: None,
             },
         )
         .await;
@@ -10374,6 +10563,140 @@ root-markers = [".docsroot"]
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #52: 基準診断の対応付け・常駐・解除消去（LSP なし単体）。
+    #[tokio::test]
+    async fn base_diagnostics_mapping_cache_and_clear() {
+        use std::path::{Path, PathBuf};
+        let mut d = Daemon::new();
+        // repo 対応あり・なしの 2 root。
+        d.register_base_root(
+            PathBuf::from("/base"),
+            "abc1234".into(),
+            Some(PathBuf::from("/repo")),
+            EventSource::Interactive,
+        );
+        d.register_base_root(
+            PathBuf::from("/other"),
+            "def5678".into(),
+            None,
+            EventSource::Interactive,
+        );
+        // 対応物: live → base。repo なし root は写さない。
+        assert_eq!(
+            d.base_counterparts(Path::new("/repo/a.rs")),
+            vec![PathBuf::from("/base/a.rs")]
+        );
+        // 未充填は空（待たない）。
+        assert!(d.snapshot_base_diagnostics(Some(Path::new("/repo/a.rs"))).is_empty());
+        assert!(d.snapshot_base_diagnostics(None).is_empty());
+        // 格納すると載る。
+        d.store_base_diagnostics(
+            PathBuf::from("/base/a.rs"),
+            vec![Diagnostic {
+                start: 0,
+                end: 1,
+                severity: Severity::Error,
+                message: "e".into(),
+            }],
+        );
+        let got = d.snapshot_base_diagnostics(Some(Path::new("/repo/a.rs")));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/base/a.rs");
+        assert_eq!(got[0].diagnostics.len(), 1);
+        // take は未キャッシュのみ・充填中は重複しない。
+        assert!(d.take_base_pull(Some(Path::new("/repo/a.rs"))).is_none());
+        assert_eq!(
+            d.take_base_pull(Some(Path::new("/repo/b.rs"))),
+            Some(PathBuf::from("/base/b.rs"))
+        );
+        assert!(d.take_base_pull(Some(Path::new("/repo/b.rs"))).is_none());
+        assert!(d.take_base_pull(None).is_none());
+        // 解除で対応物・キャッシュ・充填中が消える。
+        d.unregister_base_root(Path::new("/base"), EventSource::Interactive);
+        assert!(d.snapshot_base_diagnostics(Some(Path::new("/repo/a.rs"))).is_empty());
+        assert!(d.base_counterparts(Path::new("/repo/a.rs")).is_empty());
+        assert!(d.base_diag_inflight.is_empty());
+    }
+
+    /// #52: 基準診断の后台充填 E2E（mock LSP）。Open→Register(repo付き）→
+    /// GetState を回すと基準対応物の診断がスナップショットに載る。世代不変。
+    #[tokio::test]
+    async fn base_diagnostics_fill_e2e_via_mock() {
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+        let dir = std::env::temp_dir().join(format!("mina-test-basediag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = dir.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(dir.join("live.rs"), "fn f() { TODO }\n").unwrap();
+        std::fs::write(base.join("live.rs"), "fn f() { TODO }\n").unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let live = dir.join("live.rs").to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path: live }).await;
+        assert!(snap.status.is_none(), "open: {:?}", snap.status);
+        // repo 付きで基準登録（TUI と同型）。
+        let snap = request(
+            &mut tui,
+            &Command::RegisterBaseRoot {
+                root: base.to_string_lossy().into_owned(),
+                commit: "abc1234".into(),
+                repo: Some(dir.to_string_lossy().into_owned()),
+            },
+        )
+        .await;
+        assert!(snap.status.is_none(), "register: {:?}", snap.status);
+        assert!(snap.base_diagnostics.is_empty(), "充填前は空");
+        let gen0 = snap.generation;
+        // 后台充填の到着を待つ（push で届く・世代は進まない）。
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| !s.base_diagnostics.is_empty(),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(snap.generation, gen0, "基準診断の到着で世代は進まない");
+        assert_eq!(snap.base_diagnostics.len(), 1);
+        assert!(
+            snap.base_diagnostics[0].path.ends_with("base/live.rs"),
+            "{:?}",
+            snap.base_diagnostics[0].path
+        );
+        assert!(
+            snap.base_diagnostics[0].diagnostics.iter().any(|d| d.message == "mock: TODO found"),
+            "{:?}",
+            snap.base_diagnostics[0].diagnostics
+        );
+        // 解除で消える。
+        let snap = request(
+            &mut tui,
+            &Command::UnregisterBaseRoot {
+                root: base.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert!(snap.base_diagnostics.is_empty());
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Unregister 消去・切断保持・Clear・headless 拒否の E2E（ソケット経由・v14）。
     #[tokio::test]
     async fn review_comments_add_list_stale_clear_e2e() {
@@ -10452,6 +10775,7 @@ root-markers = [".docsroot"]
             &Command::RegisterBaseRoot {
                 root: dir.to_string_lossy().into_owned(),
                 commit: "def5678".into(),
+                repo: None,
             },
         )
         .await;
@@ -10464,6 +10788,7 @@ root-markers = [".docsroot"]
             &Command::RegisterBaseRoot {
                 root: dir.to_string_lossy().into_owned(),
                 commit: "def5678".into(),
+                repo: None,
             },
         )
         .await;
@@ -10519,6 +10844,7 @@ root-markers = [".docsroot"]
         let line = serde_json::to_string(&Command::RegisterBaseRoot {
             root: "/definitely/not/here-49".into(),
             commit: "abc".into(),
+            repo: None,
         })
         .unwrap();
         let snap = process_command(&daemon, &tx, 0, EventSource::Interactive, &line).await;
@@ -10549,7 +10875,7 @@ root-markers = [".docsroot"]
         use std::path::{Path, PathBuf};
         let mut d = Daemon::new();
         assert!(!d.is_base_path(Path::new("/r/a.rs")));
-        d.register_base_root(PathBuf::from("/r"), "abc1234".into(), EventSource::Interactive);
+        d.register_base_root(PathBuf::from("/r"), "abc1234".into(), None, EventSource::Interactive);
         assert_eq!(d.generation, 1, "登録で世代が進む");
         assert!(d.is_base_path(Path::new("/r/a.rs")));
         assert!(d.is_base_path(Path::new("/r")));
@@ -10591,7 +10917,7 @@ root-markers = [".docsroot"]
         let canon = tokio::fs::canonicalize(&dir).await.unwrap();
         {
             let mut d = daemon.lock().await;
-            d.register_base_root(canon, "abc1234".into(), EventSource::Interactive);
+            d.register_base_root(canon, "abc1234".into(), None, EventSource::Interactive);
         }
         // 非正規パスで渡しても拒否できること（ガード側で正規化する）。
         let msg = serve_rename(&daemon, &file.to_string_lossy(), "old_fn", "new_fn").await;
