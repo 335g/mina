@@ -421,23 +421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dev01"
-version = "0.0.4"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dev02"
-version = "0.0.4"
-dependencies = [
- "anyhow",
- "serde_json",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
