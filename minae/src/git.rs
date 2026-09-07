@@ -33,7 +33,8 @@ fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
         .map_err(|e| GitError(format!("spawn failed: {e}")))
 }
 
-fn run(repo: &Path, args: &[&str]) -> Result<String, GitError> {
+/// コマンド実行（成功時のみ stdout）。
+pub(crate) fn run(repo: &Path, args: &[&str]) -> Result<String, GitError> {
     let out = git(repo, args)?;
     if !out.status.success() {
         return Err(GitError(
@@ -74,13 +75,25 @@ pub(crate) fn verify_object(repo: &Path, id: &str) -> Result<(), GitError> {
 /// 比較用 worktree のパス（#49・v13(a1)）。`<tmp>/mina-base-<pid>-<repohash>/`。
 /// pid 付きで並行 TUI と衝突しない。repohash でリポジトリを区別する。
 /// daemon 側の登録キーと一致させるため正規化してから hash する。
+/// #51: 2 基準用に tag 付き変種あり（"old" / "new" → 末尾サフィックス）。
+/// prune/sweep の `mina-base-<pid>-` 前方一致と互換のため tag は末尾に置く。
 pub(crate) fn worktree_path(repo: &Path) -> PathBuf {
+    worktree_path_tagged(repo, "")
+}
+
+/// tag 付き worktree パス（#51）。tag が空なら `worktree_path` と同一。
+pub(crate) fn worktree_path_tagged(repo: &Path, tag: &str) -> PathBuf {
     let canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let h = mina_protocol::fnv1a64(canon.to_string_lossy().as_bytes());
     // temp 自体も正規化する（macOS の /var→/private/var 等）。daemon 側の
     // 正規化済みパス・応答パスと一致させ、表示マッピングを効かせるため。
     let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
-    tmp.join(format!("mina-base-{}-{h:016x}", std::process::id()))
+    let suffix = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("-{tag}")
+    };
+    tmp.join(format!("mina-base-{}-{h:016x}{suffix}", std::process::id()))
 }
 
 /// worktree が使える状態か（管理ファイルの有無）。
@@ -93,7 +106,17 @@ pub(crate) fn worktree_usable(wt: &Path) -> bool {
 /// 残骸 admin があっても `prune` で掃除してから作る。
 pub(crate) fn ensure_worktree(repo: &Path, base: &str) -> Result<PathBuf, GitError> {
     let wt = worktree_path(repo);
-    let _ = std::fs::remove_dir_all(&wt);
+    ensure_worktree_tagged(repo, base, &wt)?;
+    Ok(wt)
+}
+
+/// 指定パスに worktree を用意する（#51・2 基準用）。既存は捨てて作り直す。
+pub(crate) fn ensure_worktree_tagged(
+    repo: &Path,
+    base: &str,
+    wt: &Path,
+) -> Result<(), GitError> {
+    let _ = std::fs::remove_dir_all(wt);
     let _ = run(repo, &["worktree", "prune"]);
     run(
         repo,
@@ -106,7 +129,7 @@ pub(crate) fn ensure_worktree(repo: &Path, base: &str) -> Result<PathBuf, GitErr
         ],
     )
     .map_err(|e| GitError(format!("worktree 作成失敗: {e}")))?;
-    Ok(wt)
+    Ok(())
 }
 
 /// worktree を撤去する（best-effort）。
@@ -223,9 +246,60 @@ pub(crate) fn changed_files(repo: &Path, base: &str) -> Result<Vec<ChangedFile>,
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
         ));
     }
+    let mut files = parse_name_status(repo, &out.stdout);
+    // 未追跡は Added。
+    let out = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if out.status.success() {
+        for p in out.stdout.split(|b| *b == 0) {
+            if p.is_empty() {
+                continue;
+            }
+            files.push(ChangedFile {
+                path: repo.join(String::from_utf8_lossy(p).into_owned()),
+                status: ChangeStatus::Added,
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// 2 コミット間の変更一覧（#51・Mode 2）。`git diff --name-status old new`。
+/// 未追跡・Dirty の union はしない（両側コミット済みのため）。
+pub(crate) fn changed_files_between(
+    repo: &Path,
+    old: &str,
+    new: &str,
+) -> Result<Vec<ChangedFile>, GitError> {
+    let out = git(repo, &["diff", "--name-status", "-z", old, new])?;
+    if !out.status.success() {
+        return Err(GitError(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(parse_name_status(repo, &out.stdout))
+}
+
+/// コミット一覧（#51・ピッカー用）。`git log --format=%H %s -n`。
+/// 要素は (フルハッシュ, subject)。失敗時はエラーをそのまま返す。
+pub(crate) fn commit_list(repo: &Path, n: usize) -> Result<Vec<(String, String)>, GitError> {
+    let out = run(repo, &["log", &format!("-{n}"), "--format=%H %s"])?;
+    let mut commits = Vec::new();
+    for line in out.lines() {
+        let Some((hash, subject)) = line.split_once(' ') else {
+            continue;
+        };
+        if hash.is_empty() {
+            continue;
+        }
+        commits.push((hash.to_string(), subject.to_string()));
+    }
+    Ok(commits)
+}
+/// `-z` name-status 出力の構文解析（純粋部）。レコードは NUL 区切り、
+/// R/C は「状態・旧・新」の 3 件。リネーム/コピーは Deleted(旧)＋Added(新)。
+fn parse_name_status(repo: &Path, stdout: &[u8]) -> Vec<ChangedFile> {
     let mut files = Vec::new();
-    // -z: レコードは NUL 区切り。R/C は「状態・旧・新」の 3 件。
-    let mut parts = out.stdout.split(|b| *b == 0);
+    let mut parts = stdout.split(|b| *b == 0);
     while let Some(status) = parts.next() {
         if status.is_empty() {
             continue;
@@ -279,20 +353,7 @@ pub(crate) fn changed_files(repo: &Path, base: &str) -> Result<Vec<ChangedFile>,
             }
         }
     }
-    // 未追跡は Added。
-    let out = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-    if out.status.success() {
-        for p in out.stdout.split(|b| *b == 0) {
-            if p.is_empty() {
-                continue;
-            }
-            files.push(ChangedFile {
-                path: repo.join(String::from_utf8_lossy(p).into_owned()),
-                status: ChangeStatus::Added,
-            });
-        }
-    }
-    Ok(files)
+    files
 }
 
 /// canvas 行（新側テキスト）の行種別。
@@ -490,6 +551,33 @@ pub(crate) fn parse_unified_zero(diff: &str, nlines: usize) -> FileDiff {
 }
 
 #[cfg(test)]
+/// temp git リポジトリを用意する（hermetic・テスト用）。
+#[cfg(test)]
+pub(crate) fn init_repo(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("mina-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let g = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    g(&["init", "-q"]);
+    g(&["config", "user.email", "t@t"]);
+    g(&["config", "user.name", "t"]);
+    root
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -547,29 +635,7 @@ mod tests {
     }
 
     /// temp git リポジトリを用意する（hermetic）。
-    fn init_repo(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("mina-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let g = |args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(args)
-                .env("LC_ALL", "C")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        g(&["init", "-q"]);
-        g(&["config", "user.email", "t@t"]);
-        g(&["config", "user.name", "t"]);
-        root
-    }
+    /// 共通ヘルパ `super::init_repo` を使う。
 
     #[test]
     fn worktree_lifecycle_in_temp_repo() {
@@ -658,5 +724,82 @@ mod tests {
         assert_eq!(ChangeStatus::Added.marker(), '+');
         assert_eq!(ChangeStatus::Modified.marker(), '~');
         assert_eq!(ChangeStatus::Deleted.marker(), '-');
+    }
+
+    #[test]
+    fn tagged_worktree_paths() {
+        // #51: tag なしは従来通り、tag 付きは末尾サフィックス。
+        let repo = std::env::temp_dir();
+        let plain = worktree_path(&repo);
+        assert_eq!(worktree_path_tagged(&repo, ""), plain);
+        let old = worktree_path_tagged(&repo, "old");
+        let new = worktree_path_tagged(&repo, "new");
+        assert_ne!(old, new);
+        assert!(old.to_string_lossy().ends_with("-old"));
+        assert!(new.to_string_lossy().ends_with("-new"));
+        // sweep/prune の命名則と互換（死 pid なら対象）。
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id().to_string();
+        child.wait().unwrap();
+        let tagged = std::env::temp_dir().join(format!("mina-base-{dead}-abc-old"));
+        std::fs::create_dir_all(&tagged).unwrap();
+        assert!(should_unregister_dead_root(tagged.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&tagged);
+    }
+
+    #[test]
+    fn changed_files_between_two_commits() {
+        // #51: 2 コミット間の M/A/D。未追跡は含まない。
+        let root = init_repo("between");
+        let g = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        std::fs::write(root.join("a.txt"), "v1\n").unwrap();
+        std::fs::write(root.join("del.txt"), "gone\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        let c1 = g(&["rev-parse", "HEAD"]).trim().to_string();
+        std::fs::write(root.join("a.txt"), "v2\n").unwrap();
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        std::fs::remove_file(root.join("del.txt")).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c2"]);
+        // c2 後に置いた未追跡は一覧に出ない (両側コミット済みのため)。
+        std::fs::write(root.join("untracked.txt"), "u\n").unwrap();
+        let c2 = g(&["rev-parse", "HEAD"]).trim().to_string();
+        let files = changed_files_between(&root, &c1, &c2).unwrap();
+        let mut got: Vec<(String, ChangeStatus)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    f.status,
+                )
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("a.txt".to_string(), ChangeStatus::Modified),
+                ("b.txt".to_string(), ChangeStatus::Added),
+                ("del.txt".to_string(), ChangeStatus::Deleted),
+            ]
+        );
+        // ピッカー用一覧に両コミットが載る。
+        let commits = commit_list(&root, 10).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].0, c2);
+        assert_eq!(commits[0].1, "c2");
+        assert_eq!(commits[1].0, c1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

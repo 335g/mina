@@ -3,7 +3,7 @@
 //! 見た目は P1 プロトタイプで確定（配色の実値は colors.rs の実パレット）。
 //! フレーム毎に全画面再構築する（`Buffer::diff` が差分を吸収する）。
 
-use mina_protocol::{HighlightGroup, Mode, ReviewSide, Severity, StateSnapshot};
+use mina_protocol::{Diagnostic, HighlightGroup, HighlightRange, Mode, ReviewSide, Severity, StateSnapshot};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
@@ -13,7 +13,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Overlay};
+use crate::app::{App, Overlay, V2View};
 use crate::colors::{ColorCapability, UiRole};
 use crate::git;
 
@@ -194,7 +194,23 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     let cmp_diff = app.compare_diff_for_render();
     let cmp_ref = cmp_diff.as_ref();
     let gap_cur = app.gap_review.map(|g| (g.gap_idx, g.line_idx, g.col));
-    draw_editor(f, app, editor_area, cmp_ref, gap_cur);
+    // #51: Mode 2 の canvas（diff があるときのみ新側テキスト。欠落時は空）。
+    let canvas: Option<String> = match (app.mode2_active(), cmp_ref) {
+        (true, Some(_)) => {
+            let snap = app.snapshot.clone();
+            Some(
+                app.compare
+                    .as_mut()
+                    .and_then(|c| c.mode2_canvas_text(&snap))
+                    .unwrap_or_default(),
+            )
+        }
+        _ => None,
+    };
+    let canvas_ref = canvas.as_deref();
+    let canvas_lines = canvas_ref.map(|t| t.split('\n').count());
+    let v2 = app.v2_view(editor_area.height as usize);
+    draw_editor(f, app, editor_area, cmp_ref, gap_cur, canvas_ref, v2);
     if let Some(area) = overlay_area {
         match app.overlay {
             Overlay::Diagnostics => draw_diag_view(f, app, area),
@@ -206,11 +222,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     if app.overlay == Overlay::Tree {
         draw_tree(f, app, body);
     }
+    if app.overlay == Overlay::Commits {
+        draw_commits(f, app, body);
+    }
     draw_status(f, app, status_area);
 
     // カーソル（エディタ可視時のみ。ツリー全画面時は置かない）
     if app.overlay != Overlay::Tree {
-        draw_cursor(f, app, editor_area, cmp_ref, gap_cur);
+        draw_cursor(f, app, editor_area, cmp_ref, gap_cur, canvas_ref, canvas_lines, v2);
     }
 }
 
@@ -261,23 +280,35 @@ fn draw_editor(
     area: Rect,
     diff: Option<&git::FileDiff>,
     gap_active: Option<(usize, usize, usize)>,
+    canvas: Option<&str>,
+    v2: Option<V2View>,
 ) {
     let snap = &app.snapshot;
     if area.height == 0 {
         return;
     }
-    let lines: Vec<&str> = snap.text.split('\n').collect();
+    // #51: Mode 2 は新側テキストを描く（hl・診断は snap 対応のため外す）。
+    let text: &str = canvas.unwrap_or(&snap.text);
+    let lines: Vec<&str> = text.split('\n').collect();
     let total = lines.len();
     // ガター幅: 実テキスト行数と削除行の旧番号の大きい方に合わせる。
     let num_w = digits(total.max(max_old_no(diff))).max(3);
-    let highlights = &snap.highlights;
-    let starts = line_starts(&snap.text);
-    let (cur_line, _) = cursor_line_col(snap);
+    let no_hl: &[HighlightRange] = &[];
+    let highlights: &[HighlightRange] = if canvas.is_some() { no_hl } else { &snap.highlights };
+    // #51: Mode 2 の診断マーカーは出さない（snap 対応のため）。
+    let no_diag: &[Diagnostic] = &[];
+    let diags: &[Diagnostic] = if canvas.is_some() { no_diag } else { &snap.diagnostics };
+    let starts = line_starts(text);
+    let (cur_line, _) = match v2 {
+        Some(v) => (v.line, 0),
+        None => cursor_line_col(snap),
+    };
 
-    // 可視の仮想行列（実テキスト行 + 削除 gap 行）。first_line は実テキスト行基準。
+    // 可視の仮想行列（実テキスト行 + 削除 gap 行）。first は実テキスト行基準。
     let h = area.height as usize;
     let mut vrows: Vec<VRow> = Vec::new();
-    let mut r = snap.first_line;
+    let first = v2.map(|v| v.first).unwrap_or(snap.first_line);
+    let mut r = first;
     loop {
         if vrows.len() >= h {
             break;
@@ -385,8 +416,7 @@ fn draw_editor(
                 };
                 Span::styled(m.to_string(), syn(app, mg))
             }
-            None => if let Some(sev) = snap
-            .diagnostics
+            None => if let Some(sev) = diags
             .iter()
             .filter(|d| {
                 let s = d.start.min(d.end.max(d.start));
@@ -463,26 +493,31 @@ fn draw_editor(
 }
 
 /// カーソル描画（プライマリカーソルを自色で — 端末カーソルを使う）。
+/// #51: Mode 2 は自前カーソル（v2 行・0 列目）を置く。
 fn draw_cursor(
     f: &mut Frame,
     app: &App,
     area: Rect,
     diff: Option<&git::FileDiff>,
     gap_cur: Option<(usize, usize, usize)>,
+    canvas: Option<&str>,
+    canvas_lines: Option<usize>,
+    v2: Option<V2View>,
 ) {
     let snap = &app.snapshot;
+    let first = v2.map(|v| v.first).unwrap_or(snap.first_line);
     // gapレビュー中: gap 行に端末カーソルを置く（デーモン選択は動かさない）。
     if let Some((gi, li, col)) = gap_cur {
         let pos: Option<(usize, u16)> = (|| {
             let d = diff?;
             let g = d.gaps.get(gi)?;
-            if g.at < snap.first_line {
+            if g.at < first {
                 return None;
             }
             let text = g.lines.get(li)?;
-            let mut rel = g.at - snap.first_line;
+            let mut rel = g.at - first;
             for (oi, og) in d.gaps.iter().enumerate() {
-                if og.at < snap.first_line {
+                if og.at < first {
                     continue;
                 }
                 if og.at < g.at || (og.at == g.at && oi < gi) {
@@ -493,7 +528,7 @@ fn draw_cursor(
             if rel >= area.height as usize {
                 return None;
             }
-            let gutter_w = gutter_width(snap, diff);
+            let gutter_w = gutter_width(snap, diff, canvas_lines);
             let disp_col = UnicodeWidthStr::width(
                 text.chars().take(col).collect::<String>().as_str(),
             ) as u16;
@@ -508,8 +543,11 @@ fn draw_cursor(
         }
         return;
     }
-    let (line, col) = cursor_line_col(snap);
-    if line < snap.first_line {
+    let (line, col) = match v2 {
+        Some(v) => (v.line, 0),
+        None => cursor_line_col(snap),
+    };
+    if line < first {
         return;
     }
     // 削除 gap 行の挿入分だけ表示位置が下がる。
@@ -517,24 +555,18 @@ fn draw_cursor(
         .map(|d| {
             d.gaps
                 .iter()
-                .filter(|g| g.at >= snap.first_line && g.at <= line)
+                .filter(|g| g.at >= first && g.at <= line)
                 .map(|g| g.lines.len())
                 .sum()
         })
         .unwrap_or(0);
-    let rel = line - snap.first_line + extra;
+    let rel = line - first + extra;
     if rel >= area.height as usize {
         return;
     }
-    let gutter_w = gutter_width(snap, diff);
-    let line_text: String = snap
-        .text
-        .split('\n')
-        .nth(line)
-        .unwrap_or("")
-        .chars()
-        .take(col)
-        .collect();
+    let gutter_w = gutter_width(snap, diff, canvas_lines);
+    let src = canvas.unwrap_or(&snap.text);
+    let line_text: String = src.split('\n').nth(line).unwrap_or("").chars().take(col).collect();
     let disp_col = UnicodeWidthStr::width(line_text.as_str()) as u16;
     let x = area
         .x
@@ -544,8 +576,9 @@ fn draw_cursor(
 }
 
 /// ガター幅（マーカー 1 + 空白 2 + 行番号 + 空白 1）。削除行の旧番号も収める。
-fn gutter_width(snap: &StateSnapshot, diff: Option<&git::FileDiff>) -> u16 {
-    let total = snap.text.split('\n').count();
+/// #51: Mode 2 は canvas 行数で数える。
+fn gutter_width(snap: &StateSnapshot, diff: Option<&git::FileDiff>, canvas_lines: Option<usize>) -> u16 {
+    let total = canvas_lines.unwrap_or_else(|| snap.text.split('\n').count());
     (1 + 2 + digits(total.max(max_old_no(diff))).max(3) + 1) as u16
 }
 
@@ -590,9 +623,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 .filter(|e| Some(e.path.as_str()) == app.snapshot.path.as_deref())
                 .count();
             if n > 0 {
-                format!(" ◈{} \"{}", c.short(), n)
+                format!(" ◈{} \"{}", c.label(), n)
             } else {
-                format!(" ◈{}", c.short())
+                format!(" ◈{}", c.label())
             }
         })
         .unwrap_or_default();
@@ -716,7 +749,59 @@ fn draw_tree(f: &mut Frame, app: &App, body: Rect) {
     f.render_widget(List::new(items).block(block), overlay);
 }
 
-/// 診断専用 view（全幅・高さ約 30%・下側固定）。アクティブな診断 1 件のみ表示。
+/// コミットピッカー（#51・Mode 2）。フラット一覧、o=旧側・n=新側の
+/// マーカー付き。選択行は反転で強調する。
+fn draw_commits(f: &mut Frame, app: &App, body: Rect) {
+    let overlay = Rect {
+        x: body.x + 2,
+        y: body.y + 1,
+        width: body.width.saturating_sub(4),
+        height: body.height.saturating_sub(3),
+    };
+    if overlay.width < 10 || overlay.height < 5 {
+        return;
+    }
+    let (old_mark, new_mark) = app
+        .compare
+        .as_ref()
+        .map(|c| {
+            (
+                c.short().to_string(),
+                c.short_new().unwrap_or("").to_string(),
+            )
+        })
+        .unwrap_or_default();
+    let items: Vec<ListItem> = app
+        .commits
+        .iter()
+        .enumerate()
+        .map(|(idx, (hash, subject))| {
+            let short = hash.get(..7).unwrap_or(hash);
+            let slot = if short == old_mark {
+                "old>"
+            } else if short == new_mark {
+                "new>"
+            } else {
+                "    "
+            };
+            let style = if idx == app.commit_sel {
+                base(app).patch(Style::default().add_modifier(ratatui::style::Modifier::REVERSED))
+            } else {
+                base(app)
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{slot} {short} {subject}"),
+                style,
+            )]))
+        })
+        .collect();
+    let block = Block::bordered()
+        .title(" コミット選択 (o:旧側 n:新側 Esc:閉じる) ")
+        .border_style(ui(app, UiRole::PopupBorder))
+        .style(base(app));
+    f.render_widget(Clear, overlay);
+    f.render_widget(List::new(items).block(block), overlay);
+}
 fn draw_diag_view(f: &mut Frame, app: &App, area: Rect) {
     // 重要度マーカーエリア（左上）: 存在する重要度にマーカー、アクティブのみ強調
     let mut markers = String::from(" ");
@@ -968,6 +1053,7 @@ mod tests {
             Overlay::Diagnostics,
             Overlay::Activity,
             Overlay::Peek,
+            Overlay::Commits,
         ] {
             let mut app = test_app();
             app.overlay = overlay;
@@ -987,6 +1073,7 @@ mod tests {
                 Overlay::Diagnostics => assert!(text.contains("診断")),
                 Overlay::Activity => assert!(text.contains("活動履歴")),
                 Overlay::Peek => assert!(text.contains("定義")),
+                Overlay::Commits => assert!(text.contains("コミット選択")),
                 Overlay::None => {}
             }
         }

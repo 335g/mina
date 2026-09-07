@@ -155,3 +155,7 @@ _Avoid_: baseline, old version, original
 **BaseRoot**:
 A Base materialized as files and registered with the Daemon. Read-only and lifecycle-managed: the Daemon analyses it (definitions, references, hover) but rejects text changes under it, and tears the analysis session down on unregister.
 _Avoid_: snapshot dir, temp root
+
+**ReviewComment**:
+A comment anchored to a diff location — side (Base or current), path, line number, the line's content at add time (snippet), and the comment body — held in Daemon-shared storage so both the TUI and headless Clients (`minas review`) can see it. Same-anchor adds overwrite; an empty body deletes that anchor. Listing resolves each entry against the current text (`stale` plus a resolved line) without rewriting the stored value; re-pin (when the base point changes), unregister, or explicit clear drops all entries, while a TUI disconnect keeps them.
+_Avoid_: inline comment, annotation

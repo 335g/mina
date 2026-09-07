@@ -48,6 +48,8 @@ pub(crate) enum Overlay {
     Activity,
     /// PeekDefinition の応答表示（MVP 簡易パネル）。
     Peek,
+    /// コミット選択（#51・Mode 2）。o=旧側・n=新側に設定する。
+    Commits,
 }
 
 /// コマンドライン系プロンプトの種類（Helix 流の `:` / `/` 等）。
@@ -289,23 +291,30 @@ impl TreeState {
     }
 }
 
-/// 比較閲覧 Mode 1 の状態（#49）。クライアントローカル — デーモン無変更。
-/// 基準はピン留めしたコミット、現在側はスナップショットのテキスト。
+/// 比較閲覧の状態（#49 Mode 1・#51 Mode 2）。クライアントローカル。
+/// `base`/`worktree` は旧側（Mode 1 の基準と同義）。`new_*` が Some のとき
+/// Mode 2（過去2コミット・両側読取り専用）で、canvas は新側テキストになる。
 pub(crate) struct CompareState {
-    /// ピン留めした基準コミット ID。
+    /// 旧側コミット ID（Mode 1 の基準）。
     base: String,
     /// リポジトリルート（絶対パス）。
     repo: PathBuf,
-    /// 基準コミットの実体（固定パス worktree）。
+    /// 旧側コミットの実体（固定パス worktree）。
     worktree: PathBuf,
+    /// 新側コミット ID（Mode 2 のみ Some）。
+    new_base: Option<String>,
+    /// 新側コミットの実体（Mode 2 のみ Some）。
+    new_worktree: Option<PathBuf>,
     /// 注釈表示の ON/OFF（D で切替）。
     show: bool,
     /// 変更一覧（絶対パス）。files_gen 世代のもの。
     files: Vec<git::ChangedFile>,
     /// 一覧を作った snapshot.generation。
     files_gen: u64,
-    /// 基準テキストのキャッシュ（基準不変なのでピン中は有効）。
+    /// 旧側テキストのキャッシュ（基準不変なのでピン中は有効）。
     base_texts: HashMap<String, Option<String>>,
+    /// 新側テキストのキャッシュ（Mode 2 の canvas。ピン中は有効）。
+    new_texts: HashMap<String, Option<String>>,
     /// パス → 差分キャッシュ（canvas 変化で再計算）。
     diffs: HashMap<String, CachedDiff>,
     /// 直近の git エラー（flash の重複抑止用）。
@@ -328,17 +337,80 @@ impl CompareState {
             base,
             repo,
             worktree,
+            new_base: None,
+            new_worktree: None,
             show: true,
             files: Vec::new(),
             files_gen: u64::MAX,
             base_texts: HashMap::new(),
+            new_texts: HashMap::new(),
             diffs: HashMap::new(),
             last_err: None,
         })
     }
 
+    /// Mode 2 でピン留め（#51）。旧=HEAD~1・新=HEAD の即ピン。両側の
+    /// worktree（-old/-new）を用意し、一覧は 2 コミット間の差分にする。
+    /// 未追跡・Dirty の union はしない（両側コミット済みのため）。
+    fn pin_mode2(repo: PathBuf) -> Result<Self, git::GitError> {
+        let old = git::run(&repo, &["rev-parse", "HEAD~1"])?;
+        let new = git::run(&repo, &["rev-parse", "HEAD"])?;
+        Self::pin_mode2_pair(repo, old.trim(), new.trim())
+    }
+
+    /// Mode 2 を明示ペアでピン留め（#51・ピッカー用）。失敗時は作らない。
+    fn pin_mode2_pair(repo: PathBuf, old: &str, new: &str) -> Result<Self, git::GitError> {
+        if old == new {
+            return Err(git::GitError("旧側と新側が同じコミットです".into()));
+        }
+        git::verify_object(&repo, old)?;
+        git::verify_object(&repo, new)?;
+        let old_wt = git::worktree_path_tagged(&repo, "old");
+        let new_wt = git::worktree_path_tagged(&repo, "new");
+        // 2 側の worktree を用意する（既存は捨てて作り直す・pin と同型）。
+        git::ensure_worktree_tagged(&repo, old, &old_wt)?;
+        if let Err(e) = git::ensure_worktree_tagged(&repo, new, &new_wt) {
+            git::remove_worktree(&repo, &old_wt);
+            return Err(e);
+        }
+        let files = git::changed_files_between(&repo, old, new).unwrap_or_default();
+        Ok(Self {
+            base: old.to_string(),
+            repo,
+            worktree: old_wt,
+            new_base: Some(new.to_string()),
+            new_worktree: Some(new_wt),
+            show: true,
+            files,
+            // ピン固定のため再計算しない（ensure_files は Mode 2 を素通し）。
+            files_gen: 0,
+            base_texts: HashMap::new(),
+            new_texts: HashMap::new(),
+            diffs: HashMap::new(),
+            last_err: None,
+        })
+    }
+
+    /// Mode 2 か（新側ピン留めあり・両側読取り専用）。
+    pub(crate) fn is_mode2(&self) -> bool {
+        self.new_base.is_some()
+    }
+
     pub(crate) fn short(&self) -> &str {
         self.base.get(..7).unwrap_or(&self.base)
+    }
+
+    /// 新側の短縮ハッシュ（Mode 2 のみ Some）。
+    pub(crate) fn short_new(&self) -> Option<&str> {
+        self.new_base.as_ref().map(|n| n.get(..7).unwrap_or(n))
+    }
+
+    /// ステータス行の比較マーク（Mode 1: ◈基準 / Mode 2: ◈旧..新）。
+    pub(crate) fn label(&self) -> String {
+        match self.short_new() {
+            Some(n) => format!("{}..{}", self.short(), n),
+            None => self.short().to_string(),
+        }
     }
 
     /// 注目文書の基準側絶対パス（worktree 配下・#50）。repo 外は None。
@@ -352,8 +424,12 @@ impl CompareState {
     }
 
     /// 変更一覧の再計算（世代が進んだら）。Dirty な注目文書は union する
-    /// （未保存編集が一覧から漏れないため）。
+    /// （未保存編集が一覧から漏れないため）。Mode 2 はピン固定のため
+    /// 何もしない（一覧は pin/rebuild 時に作る）。
     fn ensure_files(&mut self, snap: &StateSnapshot) {
+        if self.is_mode2() {
+            return;
+        }
         if snap.generation == self.files_gen {
             return;
         }
@@ -373,6 +449,7 @@ impl CompareState {
 
     /// 現在文書の差分配列（表示用）。show=false・対象外・エラー時は None。
     /// エラーは内容変化時のみ flash する（毎フレームの spam 回避）。
+    /// Mode 2 は旧側 vs 新側（canvas は新側テキスト）。
     fn diff_for(&mut self, snap: &StateSnapshot, flash: &mut Option<String>) -> Option<git::FileDiff> {
         if !self.show {
             return None;
@@ -380,6 +457,9 @@ impl CompareState {
         let path = snap.path.as_deref()?;
         let rel = Path::new(path).strip_prefix(&self.repo).ok()?;
         let rel = rel.to_string_lossy().replace('\\', "/");
+        if self.is_mode2() {
+            return self.diff_for_mode2(path, &rel, flash);
+        }
         let base = match self.base_texts.get(path) {
             Some(cached) => cached.clone(),
             None => match git::base_text(&self.repo, &self.base, &rel) {
@@ -419,6 +499,113 @@ impl CompareState {
                 None
             }
         }
+    }
+
+    /// Mode 2 の差分配列（#51）。旧側テキスト vs 新側テキストで、canvas は
+    /// 新側。旧欠落→全 Added、新欠落→全 Gap＋空 canvas。ピン固定のため
+    /// パス単位でキャッシュする（rebuild 時に捨てる）。
+    fn diff_for_mode2(
+        &mut self,
+        path: &str,
+        rel: &str,
+        flash: &mut Option<String>,
+    ) -> Option<git::FileDiff> {
+        if let Some(cached) = self.diffs.get(path) {
+            return Some(cached.diff.clone());
+        }
+        let new_commit = self.new_base.clone()?;
+        let old_commit = self.base.clone();
+        let repo = self.repo.clone();
+        let old_text = match self.base_texts.get(path) {
+            Some(cached) => cached.clone(),
+            None => match git::base_text(&repo, &old_commit, rel) {
+                Err(e) => {
+                    self.note_err(format!("{e}"), flash);
+                    return None;
+                }
+                Ok(text) => {
+                    self.base_texts.insert(path.to_string(), text.clone());
+                    text
+                }
+            },
+        };
+        let new_text = match self.new_texts.get(path) {
+            Some(cached) => cached.clone(),
+            None => match git::base_text(&repo, &new_commit, rel) {
+                Err(e) => {
+                    self.note_err(format!("{e}"), flash);
+                    return None;
+                }
+                Ok(text) => {
+                    self.new_texts.insert(path.to_string(), text.clone());
+                    text
+                }
+            },
+        };
+        let diff = match (old_text, new_text) {
+            (None, None) => return None,
+            (None, Some(n)) => git::FileDiff::all_added(n.split('\n').count()),
+            (Some(o), None) => git::FileDiff {
+                kinds: Vec::new(),
+                gaps: vec![git::Gap {
+                    at: 0,
+                    old_start: 1,
+                    lines: o.split('\n').map(str::to_string).collect(),
+                }],
+            },
+            (Some(o), Some(n)) => match git::diff_texts(&o, &n) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.note_err(format!("{e}"), flash);
+                    return None;
+                }
+            },
+        };
+        // canvas 不変（ピン固定）のため checksum は行数で代用する。
+        let checksum = diff.kinds.len() as u64;
+        self.diffs.insert(
+            path.to_string(),
+            CachedDiff {
+                canvas_checksum: checksum,
+                diff: diff.clone(),
+            },
+        );
+        Some(diff)
+    }
+
+    /// Mode 2 の canvas テキスト（新側ファイル内容・キャッシュ付き）。
+    /// render が snap.text の代わりに描く。新側欠落時は空文字（全 Gap 表示）。
+    /// 対象外・取得失敗時は None。
+    pub(crate) fn mode2_canvas_text(&mut self, snap: &StateSnapshot) -> Option<String> {
+        let new_commit = self.new_base.clone()?;
+        let path = snap.path.as_deref()?;
+        let rel = Path::new(path).strip_prefix(&self.repo).ok()?;
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if let Some(cached) = self.new_texts.get(path) {
+            return cached.clone();
+        }
+        match git::base_text(&self.repo, &new_commit, &rel) {
+            Err(_) => None,
+            Ok(text) => {
+                self.new_texts.insert(path.to_string(), text.clone());
+                text
+            }
+        }
+    }
+
+    /// Mode 2 の canvas 行数（v2 カーソルのクランプ用）。新側欠落時は
+    /// 空 canvas の 1 行。対象外のときは None。
+    pub(crate) fn mode2_canvas_len(&mut self, snap: &StateSnapshot) -> Option<usize> {
+        if self.new_base.is_none() {
+            return None;
+        }
+        let path = snap.path.as_deref()?;
+        Path::new(path).strip_prefix(&self.repo).ok()?;
+        Some(
+            self.mode2_canvas_text(snap)
+                .map(|t| t.split('\n').count())
+                .unwrap_or(1),
+        )
     }
 
     fn note_err(&mut self, e: String, flash: &mut Option<String>) {
@@ -480,6 +667,14 @@ pub(crate) struct GapCursor {
     pub(crate) col: usize,
 }
 
+/// Mode 2 の表示位置（render へ渡す値オブジェクト・#51）。
+/// 自前カーソル行とビューポート先頭（どちらも canvas 基準・0-origin）。
+#[derive(Clone, Copy)]
+pub(crate) struct V2View {
+    pub(crate) line: usize,
+    pub(crate) first: usize,
+}
+
 /// アプリケーション状態。
 pub(crate) struct App {
     pub(crate) conn: Option<Conn>,
@@ -491,6 +686,16 @@ pub(crate) struct App {
     pub(crate) tree: TreeState,
     pub(crate) compare: Option<CompareState>,
     pub(crate) gap_review: Option<GapCursor>,
+    /// Mode 2 の自前カーソル（canvas 行・0-origin）。デーモン選択と無関係。
+    pub(crate) v2_line: usize,
+    /// Mode 2 の自前ビューポート（canvas 先頭行）。
+    pub(crate) v2_first: usize,
+    /// v2 カーソルの対象パス（切替わりで 0 に戻す）。
+    pub(crate) v2_path: Option<String>,
+    /// コミット一覧（#51・ピッカー用）。要素は (フルハッシュ, subject)。
+    pub(crate) commits: Vec<(String, String)>,
+    /// コミット一覧の選択位置。
+    pub(crate) commit_sel: usize,
     /// daemon 保持のレビューコメント一覧のキャッシュ（#50）。マーカー表示と
     /// 編集 prefill 用。List 応答で更新し、比較終了・再ピンで捨てる。
     pub(crate) review_list: Vec<ReviewCommentView>,
@@ -528,6 +733,11 @@ impl App {
             tree: TreeState::new(root),
             compare: None,
             gap_review: None,
+            v2_line: 0,
+            v2_first: 0,
+            v2_path: None,
+            commits: Vec::new(),
+            commit_sel: 0,
             review_list: Vec::new(),
             diag_filter: Severity::Error,
             diag_index: 0,
@@ -756,6 +966,38 @@ impl App {
         self.handle_editor_key(key).await;
     }
 
+    /// オーバーレイ系ホットキー（T/G/A/C）。処理したら true。Mode 2 からも
+    /// live 文書側の表示として委譲される（#51・読取り専用に触れないもののみ）。
+    async fn overlay_hotkey(&mut self, code: KeyCode) -> bool {
+        use KeyCode::*;
+        match code {
+            Char('T') => {
+                self.tree.refresh();
+                self.tree.select_path(self.snapshot.path.as_deref());
+                self.annotate_tree();
+                self.overlay = Overlay::Tree;
+                true
+            }
+            Char('G') => {
+                self.reconcile_diag();
+                self.overlay = Overlay::Diagnostics;
+                self.diag_focus = DiagFocus::View;
+                self.sync_cursor_to_diag().await;
+                true
+            }
+            Char('A') => {
+                self.activity_scroll = usize::MAX; // 末尾（最新）から
+                self.overlay = Overlay::Activity;
+                true
+            }
+            Char('C') => {
+                self.cycle_colorscheme();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// エディタ（オーバーレイなし・プロンプトなし）のキー処理。
     async fn handle_editor_key(&mut self, key: KeyEvent) {
         use KeyCode::*;
@@ -764,38 +1006,21 @@ impl App {
             self.quit = true;
             return;
         }
+        // Mode 2 表示中は読取り専用ナビ（#51）。編集系キー（:・/・挿入・
+        // 移動の daemon 送信）はここで遮断し、後段へ届けない。
+        if self.mode2_active() {
+            self.handle_mode2_key(key).await;
+            return;
+        }
         let mode = self.snapshot.mode;
         // Normal のオーバーレイキー（T/G/A/C — G は診断 view。Goto 末尾は `g e`）
         if mode == Mode::Normal && key.modifiers.is_empty() {
+            if self.overlay_hotkey(key.code).await {
+                return;
+            }
             match key.code {
-                Char('T') => {
-                    self.pending.clear();
-                    self.tree.refresh();
-                    self.tree.select_path(self.snapshot.path.as_deref());
-                    self.annotate_tree();
-                    self.overlay = Overlay::Tree;
-                    return;
-                }
-                Char('G') => {
-                    self.pending.clear();
-                    self.reconcile_diag();
-                    self.overlay = Overlay::Diagnostics;
-                    self.diag_focus = DiagFocus::View;
-                    self.sync_cursor_to_diag().await;
-                    return;
-                }
-                Char('A') => {
-                    self.pending.clear();
-                    self.activity_scroll = usize::MAX; // 末尾（最新）から
-                    self.overlay = Overlay::Activity;
-                    return;
-                }
-                Char('C') => {
-                    self.pending.clear();
-                    self.cycle_colorscheme();
-                    return;
-                }
                 // D: 比較表示の切替（初回はピン留め）。B: 基準の更新。
+                // M: 過去2コミット比較（Mode 2）の切替（#51）。
                 // Normal 先行キー（T/G/A/C と同列 — keymap より優先）。
                 Char('D') => {
                     self.pending.clear();
@@ -804,7 +1029,16 @@ impl App {
                 }
                 Char('B') => {
                     self.pending.clear();
-                    self.repin_compare().await;
+                    if self.compare.as_ref().is_some_and(|c| c.is_mode2()) {
+                        self.flash = Some("コミット選択は次の更新で対応".into());
+                    } else {
+                        self.repin_compare().await;
+                    }
+                    return;
+                }
+                Char('M') => {
+                    self.pending.clear();
+                    self.toggle_mode2().await;
                     return;
                 }
                 // K: レビューコメント入力（比較表示中のみ。現在側カーソル行）。
@@ -906,6 +1140,34 @@ impl App {
                     _ => {}
                 }
                 let _ = close_on_esc;
+            }
+            Overlay::Commits => {
+                // #51: コミットピッカー（o=旧側・n=新側に設定）。
+                match key.code {
+                    Esc => self.overlay = Overlay::None,
+                    Down | Char('j') if key.modifiers.is_empty() => {
+                        if !self.commits.is_empty() {
+                            self.commit_sel = (self.commit_sel + 1) % self.commits.len();
+                        }
+                    }
+                    Up | Char('k') if key.modifiers.is_empty() => {
+                        if !self.commits.is_empty() {
+                            self.commit_sel =
+                                (self.commit_sel + self.commits.len() - 1) % self.commits.len();
+                        }
+                    }
+                    Char('o') if key.modifiers.is_empty() => {
+                        if let Some((hash, _)) = self.commits.get(self.commit_sel).cloned() {
+                            self.set_mode2_side(true, hash).await;
+                        }
+                    }
+                    Char('n') if key.modifiers.is_empty() => {
+                        if let Some((hash, _)) = self.commits.get(self.commit_sel).cloned() {
+                            self.set_mode2_side(false, hash).await;
+                        }
+                    }
+                    _ => {}
+                }
             }
             Overlay::Diagnostics => {
                 // Tab: view ⇄ エディタのフォーカス切替（両側でナビ・編集可能）。
@@ -1213,6 +1475,11 @@ impl App {
             self.flash = Some("比較を開始してください（D）".into());
             return;
         };
+        // #51: Mode 2 は単一 base スキーマのためコメント不可。
+        if cmp.is_mode2() {
+            self.flash = Some("過去比較は読取り専用です（コメントは Mode 1 で）".into());
+            return;
+        }
         let Some(path) = self.snapshot.path.clone() else {
             self.flash = Some("no file open".into());
             return;
@@ -1242,6 +1509,11 @@ impl App {
 
     /// K（基準側・gapレビュー中）: gap 行へのコメント入力を開く（#50）。
     fn open_review_prompt_gap(&mut self, gap_idx: usize, line_idx: usize) {
+        // #51: Mode 2 の gap からもコメントは付けない（単一 base スキーマ）。
+        if self.compare.as_ref().is_some_and(|c| c.is_mode2()) {
+            self.flash = Some("過去比較は読取り専用です（コメントは Mode 1 で）".into());
+            return;
+        }
         let Some((wt_path, line_no, snippet, base)) = (|| -> Option<(String, u32, String, String)> {
             let snap_path = self.snapshot.path.clone()?;
             let base = self.compare.as_ref()?.base.clone();
@@ -1575,20 +1847,32 @@ fn find_existing<'a>(
     }
 
     /// 基準側パス（worktree 配下）の表示用変換（#49）。対象外はそのまま。
+    /// #51: 新側 worktree 配下は新側短縮ハッシュで表示する。
     pub(crate) fn base_display_path(&self, path: &str) -> String {
-        self.compare
-            .as_ref()
-            .and_then(|cmp| {
-                Path::new(path).strip_prefix(&cmp.worktree).ok().map(|rel| {
-                    format!("{} @{}", rel.display(), cmp.short())
-                })
+        if let Some(mapped) = self.compare.as_ref().and_then(|cmp| {
+            Path::new(path).strip_prefix(&cmp.worktree).ok().map(|rel| {
+                format!("{} @{}", rel.display(), cmp.short())
             })
-            .unwrap_or_else(|| path.to_string())
+        }) {
+            return mapped;
+        }
+        if let Some(mapped) = self.compare.as_ref().and_then(|cmp| {
+            let new_wt = cmp.new_worktree.as_ref()?;
+            let short = cmp.short_new()?;
+            Path::new(path).strip_prefix(new_wt).ok().map(|rel| {
+                format!("{} @{}", rel.display(), short)
+            })
+        }) {
+            return mapped;
+        }
+        path.to_string()
     }
 
-    /// 終了時の後始末（best-effort）: 登録解除＋worktree 撤去。
-    async fn shutdown_compare(&mut self) {
+    /// 比較状態の破棄（終了・切替時・best-effort）: 両側の登録解除＋
+    /// worktree 撤去＋レビュー一覧の破棄。Mode 2 は 2 root 分行う。
+    async fn drop_compare(&mut self) {
         self.review_list.clear();
+        self.gap_review = None;
         let Some(cmp) = self.compare.take() else {
             return;
         };
@@ -1597,24 +1881,287 @@ fn find_existing<'a>(
         })
         .await;
         git::remove_worktree(&cmp.repo, &cmp.worktree);
+        if let Some(new_wt) = cmp.new_worktree {
+            self.send(&Command::UnregisterBaseRoot {
+                root: new_wt.to_string_lossy().into_owned(),
+            })
+            .await;
+            git::remove_worktree(&cmp.repo, &new_wt);
+        }
     }
-    /// 基準の再登録（再接続時・#49 adversarial）。表示中のみ送る。
-    /// 接続なし・未開始・worktree 消失時は送らない。
-    async fn reregister_compare(&mut self) {
-        let Some((root, commit, usable)) = self.compare.as_ref().filter(|c| c.show).map(|c| {
-            (
-                c.worktree.to_string_lossy().into_owned(),
-                c.base.clone(),
-                git::worktree_usable(&c.worktree),
-            )
-        }) else {
-            return;
-        };
-        if !usable {
-            self.flash = Some("worktree が消えているため基準を再登録できません".into());
+
+    /// 終了時の後始末（best-effort）: 登録解除＋worktree 撤去。
+    async fn shutdown_compare(&mut self) {
+        self.drop_compare().await;
+    }
+
+    /// M: Mode 2（過去2コミット比較）の切替（#51）。表示中なら終了し、
+    /// 未開始なら旧=HEAD~1・新=HEAD で即ピンする。Mode 1 とは相互排他。
+    async fn toggle_mode2(&mut self) {
+        if self.compare.as_ref().is_some_and(|c| c.is_mode2()) {
+            self.drop_compare().await;
+            self.annotate_tree();
+            self.flash = Some("過去比較を終了".into());
             return;
         }
-        self.send(&Command::RegisterBaseRoot { root, commit }).await;
+        let root = self.tree.root.clone();
+        let repo = match git::repo_root(&root) {
+            Ok(r) => r,
+            Err(e) => {
+                self.flash = Some(format!("過去比較を開始できません: {e}"));
+                return;
+            }
+        };
+        let cmp = match CompareState::pin_mode2(repo) {
+            Ok(c) => c,
+            Err(e) => {
+                self.flash = Some(format!("過去比較を開始できません: {e}"));
+                return;
+            }
+        };
+        // 先に旧状態（Mode 1 の場合あり）を捨ててから両側を登録する。
+        self.drop_compare().await;
+        self.send(&Command::RegisterBaseRoot {
+            root: cmp.worktree.to_string_lossy().into_owned(),
+            commit: cmp.base.clone(),
+        })
+        .await;
+        if let (Some(nb), Some(nwt)) = (cmp.new_base.clone(), cmp.new_worktree.clone()) {
+            self.send(&Command::RegisterBaseRoot {
+                root: nwt.to_string_lossy().into_owned(),
+                commit: nb,
+            })
+            .await;
+        }
+        self.flash = Some(format!(
+            "過去比較 {}（M:終了 B:コミット選択 Tab:削除レビュー）",
+            cmp.label()
+        ));
+        self.compare = Some(cmp);
+        self.annotate_tree();
+    }
+
+    /// Mode 2 表示中か（注釈ONのときのみ canvas が切り替わる）。
+    pub(crate) fn mode2_active(&self) -> bool {
+        self.compare
+            .as_ref()
+            .is_some_and(|c| c.is_mode2() && c.is_showing())
+    }
+
+    /// v2 カーソル位置の同期（パス切替で先頭へ・canvas 長でクランプ・追従）。
+    /// render 前に呼ぶ。非 Mode 2 では None。
+    pub(crate) fn v2_view(&mut self, height: usize) -> Option<V2View> {
+        if !self.mode2_active() {
+            return None;
+        }
+        let snap = self.snapshot.clone();
+        if self.v2_path != snap.path {
+            self.v2_path = snap.path.clone();
+            self.v2_line = 0;
+            self.v2_first = 0;
+        }
+        let len = self
+            .compare
+            .as_mut()?
+            .mode2_canvas_len(&snap)
+            .unwrap_or(1)
+            .max(1);
+        self.v2_line = self.v2_line.min(len - 1);
+        if self.v2_line < self.v2_first {
+            self.v2_first = self.v2_line;
+        }
+        let h = height.max(1);
+        if self.v2_line >= self.v2_first + h {
+            self.v2_first = self.v2_line - h + 1;
+        }
+        Some(V2View {
+            line: self.v2_line,
+            first: self.v2_first,
+        })
+    }
+
+    /// v2 カーソル移動（j/k）。canvas 長でクランプする。
+    fn v2_move(&mut self, delta: isize) {        let snap = self.snapshot.clone();
+        let len = self
+            .compare
+            .as_mut()
+            .and_then(|c| c.mode2_canvas_len(&snap))
+            .unwrap_or(1)
+            .max(1);
+        self.v2_line = (self.v2_line as isize + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    /// B（Mode 2）: コミットピッカーを開く（#51）。`git log -50` の
+    /// フラット一覧。o=旧側・n=新側に設定、Esc で閉じる。
+    fn open_commit_picker(&mut self) {
+        let Some(repo) = self.compare.as_ref().filter(|c| c.is_mode2()).map(|c| c.repo.clone())
+        else {
+            return;
+        };
+        match git::commit_list(&repo, 50) {
+            Err(e) => {
+                self.flash = Some(format!("コミット一覧を取得できません: {e}"));
+            }
+            Ok(commits) => {
+                if commits.is_empty() {
+                    self.flash = Some("コミットがありません".into());
+                    return;
+                }
+                self.commit_sel = 0;
+                self.commits = commits;
+                self.overlay = Overlay::Commits;
+            }
+        }
+    }
+
+    /// ピッカーで旧側/新側を差し替える（#51）。該当側の worktree を作り直し、
+    /// 再登録してキャッシュを捨てる。old==new は拒否する。
+    async fn set_mode2_side(&mut self, old_side: bool, commit: String) {
+        let Some((repo, cur_old, cur_new)) = self
+            .compare
+            .as_ref()
+            .filter(|c| c.is_mode2())
+            .map(|c| (c.repo.clone(), c.base.clone(), c.new_base.clone()))
+        else {
+            return;
+        };
+        let other = if old_side { cur_new } else { Some(cur_old) };
+        if Some(commit.clone()) == other {
+            self.flash = Some("旧側と新側が同じコミットです".into());
+            return;
+        }
+        let tag = if old_side { "old" } else { "new" };
+        let wt = git::worktree_path_tagged(&repo, tag);
+        if let Err(e) = git::ensure_worktree_tagged(&repo, &commit, &wt) {
+            self.flash = Some(format!("worktree を作り直せません: {e}"));
+            return;
+        }
+        self.send(&Command::RegisterBaseRoot {
+            root: wt.to_string_lossy().into_owned(),
+            commit: commit.clone(),
+        })
+        .await;
+        let short = commit.get(..7).unwrap_or(&commit).to_string();
+        let (old_id, new_id) = if old_side {
+            (commit.clone(), other.clone().unwrap_or_default())
+        } else {
+            (other.clone().unwrap_or_default(), commit.clone())
+        };
+        let files = git::changed_files_between(&repo, &old_id, &new_id).unwrap_or_default();
+        if let Some(cmp) = self.compare.as_mut().filter(|c| c.is_mode2()) {
+            if old_side {
+                cmp.base = commit;
+                cmp.worktree = wt;
+            } else {
+                cmp.new_base = Some(commit);
+                cmp.new_worktree = Some(wt);
+            }
+            cmp.base_texts.clear();
+            cmp.new_texts.clear();
+            cmp.diffs.clear();
+            cmp.files = files;
+        }
+        self.v2_line = 0;
+        self.v2_first = 0;
+        self.annotate_tree();
+        self.flash = Some(format!(
+            "{}側を {short} に更新",
+            if old_side { "旧" } else { "新" }
+        ));
+    }
+
+    /// Mode 2 のキー処理（#51）。移動・ジャンプ・終了のみ。編集不可。
+    /// オーバーレイ系（T/G/A/C）は live 文書の表示として許可する。
+    async fn handle_mode2_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        match key.code {
+            Esc | Char('M') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.toggle_mode2().await;
+                return;
+            }
+            Char('D') if key.modifiers.is_empty() => {
+                // Mode 2 中の D は Mode 1 に入らず終了する（toggle 放置防止）。
+                self.pending.clear();
+                self.toggle_mode2().await;
+                return;
+            }
+            Tab if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.enter_gap_review();
+                return;
+            }
+            Char('B') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.open_commit_picker();
+                return;
+            }
+            Down | Char('j') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.v2_move(1);
+                return;
+            }
+            Up | Char('k') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.v2_move(-1);
+                return;
+            }
+            Char('n') if key.modifiers.is_empty() => {
+                self.jump_changed(1);
+                return;
+            }
+            Char('N') if key.modifiers.is_empty() => {
+                self.jump_changed(-1);
+                return;
+            }
+            Char('T') | Char('G') | Char('A') | Char('C')
+                if key.modifiers.is_empty() =>
+            {
+                self.pending.clear();
+                // live 文書側の表示として既存アームへ委譲する。
+                self.overlay_hotkey(key.code).await;
+                return;
+            }
+            Char('K') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.flash = Some("過去比較は読取り専用です（コメントは Mode 1 で）".into());
+                return;
+            }
+            _ => {
+                self.pending.clear();
+                self.flash = Some("読取り専用です（M:終了）".into());
+                return;
+            }
+        }
+    }
+    /// 基準の再登録（再接続時・#49 adversarial）。表示中のみ送る。
+    /// 接続なし・未開始・worktree 消失時は送らない。Mode 2 は両側。
+    async fn reregister_compare(&mut self) {
+        let Some(cmp) = self.compare.as_ref().filter(|c| c.show) else {
+            return;
+        };
+        let sides: Vec<(String, String, bool)> = {
+            let mut v = vec![(
+                cmp.worktree.to_string_lossy().into_owned(),
+                cmp.base.clone(),
+                git::worktree_usable(&cmp.worktree),
+            )];
+            if let (Some(nb), Some(nwt)) = (cmp.new_base.clone(), cmp.new_worktree.clone()) {
+                v.push((
+                    nwt.to_string_lossy().into_owned(),
+                    nb,
+                    git::worktree_usable(&nwt),
+                ));
+            }
+            v
+        };
+        for (root, commit, usable) in sides {
+            if !usable {
+                self.flash = Some("worktree が消えているため基準を再登録できません".into());
+                return;
+            }
+            self.send(&Command::RegisterBaseRoot { root, commit }).await;
+        }
     }
 
     /// 起動時の死に基準 sweep（#49 adversarial）: daemon 側に残る登録のうち、
@@ -2181,6 +2728,224 @@ mod tests {
         });
     }
 
+    /// #51: Mode 2 の pin・canvas・差分（旧欠落/新欠落を含む）。
+    #[test]
+    fn mode2_pin_pair_and_diff() {
+        let root = git::init_repo("m2diff");
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        std::fs::write(root.join("a.txt"), "v1\n").unwrap();
+        std::fs::write(root.join("del.txt"), "gone\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        let c1 = g(&["rev-parse", "HEAD"]).trim().to_string();
+        std::fs::write(root.join("a.txt"), "v2\n").unwrap();
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        std::fs::remove_file(root.join("del.txt")).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c2"]);
+        let c2 = g(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let mut cmp = CompareState::pin_mode2_pair(root.clone(), &c1, &c2).unwrap();
+        assert!(cmp.is_mode2());
+        assert!(cmp.label().contains(".."), "label: {}", cmp.label());
+        assert_eq!(cmp.files.len(), 3, "M/A/D");
+        // worktree 実体が両側にある（後で撤去する）。
+        assert!(cmp.worktree.exists());
+        assert!(cmp.new_worktree.as_ref().unwrap().exists());
+        let snap_for = |name: &str| StateSnapshot {
+            path: Some(root.join(name).to_string_lossy().into_owned()),
+            ..StateSnapshot::default()
+        };
+        let mut flash = None;
+        // 変更あり: Modified（末尾空行は Same）。canvas は新側。
+        let d = cmp.diff_for(&snap_for("a.txt"), &mut flash).unwrap();
+        assert_eq!(d.kinds, vec![git::RowKind::Modified, git::RowKind::Same]);
+        let canvas = cmp.mode2_canvas_text(&snap_for("a.txt")).unwrap();
+        assert_eq!(canvas, "v2\n");
+        // 旧側のみ: 全 Gap＋空 canvas。
+        let d = cmp.diff_for(&snap_for("del.txt"), &mut flash).unwrap();
+        assert!(d.kinds.is_empty());
+        assert_eq!(d.gaps.len(), 1);
+        assert_eq!(d.gaps[0].lines[0], "gone");
+        // 新側のみ: 全 Added。
+        let d = cmp.diff_for(&snap_for("b.txt"), &mut flash).unwrap();
+        assert!(d.kinds.iter().all(|k| *k == git::RowKind::Added));
+        // 同一ペアは拒否する。
+        assert!(CompareState::pin_mode2_pair(root.clone(), &c1, &c1).is_err());
+        git::remove_worktree(&root, &cmp.worktree.clone());
+        git::remove_worktree(&root, cmp.new_worktree.as_ref().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #51: Mode 2 は読取り専用（編集系キーは遮断・j/k は自前カーソル）。
+    #[test]
+    fn mode2_readonly_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = git::init_repo("m2keys");
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        std::fs::write(root.join("a.txt"), "l1\nl2\nl3\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        std::fs::write(root.join("a.txt"), "l1\nL2\nl3\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c2"]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            app.tree = TreeState::new(root.clone());
+            // M で Mode 2 に入る（HEAD~1/HEAD 即ピン）。
+            let m = KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE);
+            app.handle_key(m).await;
+            assert!(app.compare.as_ref().is_some_and(|c| c.is_mode2()), "{:?}", app.flash);
+            // git の toplevel は正規化済みで返るため path も正規化する。
+            let canon = std::fs::canonicalize(&root).unwrap();
+            app.snapshot.path = Some(canon.join("a.txt").to_string_lossy().into_owned());
+            // i は遮断（プロンプトなし・flash）。
+            let i = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+            app.handle_key(i).await;
+            assert!(app.prompt.is_none());
+            assert!(app.flash.as_deref().unwrap_or("").contains("読取り専用"));
+            // : も遮断する。
+            let colon = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT);
+            app.handle_key(colon).await;
+            assert!(app.prompt.is_none());
+            // j/k は自前カーソルを動かす。
+            let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+            app.handle_key(j).await;
+            assert_eq!(app.v2_line, 1);
+            let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+            app.handle_key(k).await;
+            assert_eq!(app.v2_line, 0);
+            // K は flash のみ（プロンプトなし）。
+            let kk = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE);
+            app.handle_key(kk).await;
+            assert!(app.prompt.is_none());
+            // Esc で終了（worktree 撤去まで確認）。
+            let wt_old = app.compare.as_ref().unwrap().worktree.clone();
+            let wt_new = app.compare.as_ref().unwrap().new_worktree.clone().unwrap();
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            app.handle_key(esc).await;
+            assert!(app.compare.is_none());
+            assert!(!wt_old.exists() && !wt_new.exists());
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #51: ピッカーの o/n 差し替え（同値は拒否・別値は作り直し）。
+    #[test]
+    fn mode2_picker_assign() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = git::init_repo("m2pick");
+        let g = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        for (i, body) in ["one", "two", "three"].iter().enumerate() {
+            std::fs::write(root.join("a.txt"), format!("{body}\n")).unwrap();
+            g(&["add", "."]);
+            g(&["commit", "-qm", &format!("c{i}")]);
+        }
+        let c1 = g(&["rev-parse", "HEAD~2"]).trim().to_string();
+        let c2 = g(&["rev-parse", "HEAD~1"]).trim().to_string();
+        let c3 = g(&["rev-parse", "HEAD"]).trim().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = test_app();
+            app.tree = TreeState::new(root.clone());
+            app.compare = Some(CompareState::pin_mode2_pair(root.clone(), &c1, &c3).unwrap());
+            // B でピッカーが開く（3 件）。
+            let b = KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE);
+            app.handle_key(b).await;
+            assert_eq!(app.overlay, Overlay::Commits);
+            assert_eq!(app.commits.len(), 3);
+            // 先頭（c3＝新側と同値）を旧側に → 拒否。
+            app.commit_sel = 0;
+            let o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+            app.handle_key(o).await;
+            assert!(app.flash.as_deref().unwrap_or("").contains("同じコミット"));
+            assert_eq!(app.compare.as_ref().unwrap().base, c1);
+            // c2 を旧側に → 作り直し。
+            app.commit_sel = 1;
+            app.handle_key(o).await;
+            let cmp = app.compare.as_ref().unwrap();
+            assert_eq!(cmp.base, c2);
+            assert!(app.flash.as_deref().unwrap_or("").contains("旧側"));
+            // 後始末。
+            app.drop_compare().await;
+            assert!(app.compare.is_none());
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #51: Mode 2 の描画（新側 canvas のマーカー＋旧..新ラベル）。
+    #[test]
+    fn mode2_render_markers() {
+        let root = git::init_repo("m2render");
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        std::fs::write(root.join("a.txt"), "keep\nold\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        std::fs::write(root.join("a.txt"), "keep\nnew\nadded\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c2"]);
+        let mut app = test_app();
+        let c1 = git::run(&root, &["rev-parse", "HEAD~1"]).unwrap();
+        let c2 = git::run(&root, &["rev-parse", "HEAD"]).unwrap();
+        let cmp = CompareState::pin_mode2_pair(root.clone(), c1.trim(), c2.trim()).unwrap();
+        app.compare = Some(cmp);
+        app.snapshot.path = Some(root.join("a.txt").to_string_lossy().into_owned());
+        draw_to_test_backend(&mut app, |rows| {
+            let nospace: Vec<String> = rows.iter().map(|r| r.replace(' ', "")).collect();
+            assert!(nospace.iter().any(|r| r.contains('~')), "modified marker: {rows:?}");
+            assert!(nospace.iter().any(|r| r.contains('+')), "added marker: {rows:?}");
+            // 100 桁 backend では長いパスでラベルが切れるため記号だけ見る。
+            assert!(rows.iter().any(|r| r.contains("◈") && r.contains("..")), "label: {rows:?}");
+            assert!(rows.iter().any(|r| r.contains("new")), "canvas は新側: {rows:?}");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #49 adversarial: git リポジトリ外では D は失敗し、状態を作らない。
     #[test]
     fn toggle_outside_git_repo_fails_clean() {
@@ -2221,10 +2986,13 @@ mod tests {
                 base: "abc".into(),
                 repo: PathBuf::from("/definitely/not/a-repo-49"),
                 worktree: PathBuf::from("/definitely/not/a-repo-49-wt"),
+                new_base: None,
+                new_worktree: None,
                 show: false,
                 files: Vec::new(),
                 files_gen: 0,
                 base_texts: HashMap::new(),
+                new_texts: HashMap::new(),
                 diffs: HashMap::new(),
                 last_err: None,
             });
@@ -2253,10 +3021,13 @@ mod tests {
                 base: "abc".into(),
                 repo: PathBuf::from("/r"),
                 worktree: PathBuf::from("/tmp/wt"),
+                new_base: None,
+                new_worktree: None,
                 show: true,
                 files: Vec::new(),
                 diffs: HashMap::new(),
                 base_texts: HashMap::new(),
+                new_texts: HashMap::new(),
                 files_gen: 0,
                 last_err: None,
             });
@@ -2350,10 +3121,13 @@ mod tests {
             base: "abcdef123456".into(),
             repo: PathBuf::from("/r"),
             worktree: PathBuf::from("/tmp/wt"),
+            new_base: None,
+            new_worktree: None,
             show: true,
             files: Vec::new(),
             files_gen: 0,
             base_texts: HashMap::new(),
+            new_texts: HashMap::new(),
             diffs: HashMap::new(),
             last_err: None,
         });
@@ -2412,10 +3186,13 @@ mod tests {
             base: "abc".into(),
             repo: PathBuf::from("/r"),
             worktree: PathBuf::from("/tmp/mina-base-test"),
+            new_base: None,
+            new_worktree: None,
             show: true,
             files: Vec::new(),
             files_gen: 0,
             base_texts: HashMap::new(),
+            new_texts: HashMap::new(),
             diffs: HashMap::new(),
             last_err: None,
         });

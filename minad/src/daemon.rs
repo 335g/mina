@@ -3214,12 +3214,19 @@ async fn process_command(
                     // ではなくレビュー状態の管理のため #13 の趣旨と衝突しない）。
                     | Command::ListReviewComments
                     | Command::ClearReviewComments
+                    // #53: 基準登録も headless に許可する（`minas exec` 駆動）。
+                    // 書込みガードはパス基準で発信元を問わないため、登録で
+                    // 権限が広がることはない（基準配下は自他問わず読取り専用）。
+                    // sweep は `mina-base-*` 形式のみ対象のため、任意パス登録は
+                    // 消されない（掃除は登録した agent が Unregister で行う）。
+                    | Command::RegisterBaseRoot { .. }
+                    | Command::UnregisterBaseRoot { .. }
             ) {
                 let mut d = daemon.lock().await;
                 return snapshot(
                     &mut d,
                     Some(
-                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, Close, ListReviewComments, and ClearReviewComments"
+                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, Close, ListReviewComments, ClearReviewComments, RegisterBaseRoot, and UnregisterBaseRoot"
                             .into(),
                     ),
                 );
@@ -3622,7 +3629,8 @@ async fn process_command(
                 snapshot(&mut d, None)
             }
             // #50: レビューコメントの追加/更新/削除。TUI 駆動のみ（headless は
-            // #13 ゲートで拒否 — #49 の基準登録と同型）。同一アンカーは上書き、
+            // #13 ゲートで拒否。#53 で基準登録は headless 解禁済みだが、Add は
+            // TUI のカーソル行アンカーが前提のため対象外）。同一アンカーは上書き、
             // 空本文は削除。世代を進め push に載せる。
             Ok(Command::AddReviewComment {
                 path,
@@ -10308,7 +10316,64 @@ root-markers = [".docsroot"]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #50: レビューコメントの追加・上書き・stale 解決・削除・再ピン消去・
+    /// #53: headless（`minas exec` 想定）からの基準登録・解除の E2E。登録で
+    /// 世代が進み、基準配下の書込みガードは発信元を問わず効く（自作自演の
+    /// 読み取り専用化は解除で戻せる）。TUI 駆動と同型の世代進行を確認する。
+    #[tokio::test]
+    async fn base_root_headless_register_unregister_e2e() {
+        let dir = std::env::temp_dir().join(format!("minae-base-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        start_server(&sock).await;
+
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut agent, &Command::Open { path }).await;
+        let gen0 = snap.generation;
+
+        // headless 登録: 拒否されず世代が進む。
+        let snap = request(
+            &mut agent,
+            &Command::RegisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+                commit: "abc1234".into(),
+            },
+        )
+        .await;
+        assert!(snap.status.is_none(), "headless 登録は通る: {:?}", snap.status);
+        assert_eq!(snap.generation, gen0 + 1);
+        assert!(snap.events.iter().any(|e| e.kind == EventKind::BaseRoot));
+
+        // 基準配下への headless 自身の保存も拒否（ガードは発信元不問）。
+        let snap = request(&mut agent, &Command::Save).await;
+        assert!(
+            snap.status.as_deref().unwrap_or("").contains("読取り専用"),
+            "拒否理由: {:?}",
+            snap.status
+        );
+
+        // headless 解除: 世代が進み、保存が通る。
+        let snap = request(
+            &mut agent,
+            &Command::UnregisterBaseRoot {
+                root: dir.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert!(snap.status.is_none(), "headless 解除は通る: {:?}", snap.status);
+        let snap = request(&mut agent, &Command::Save).await;
+        assert!(
+            snap.status.as_deref().unwrap_or("").starts_with("saved"),
+            "解除後は保存できる: {:?}",
+            snap.status
+        );
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// Unregister 消去・切断保持・Clear・headless 拒否の E2E（ソケット経由・v14）。
     #[tokio::test]
     async fn review_comments_add_list_stale_clear_e2e() {
