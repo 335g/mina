@@ -669,6 +669,14 @@ pub(crate) struct GapCursor {
     pub(crate) col: usize,
 }
 
+/// エージェント起動の行き先（#54）。
+pub(crate) enum AgentLaunch {
+    /// `tmux split-window` の argv（spawn 用）。
+    Tmux(Vec<String>),
+    /// tmux 外: 手動実行用の文面（flash 表示）。
+    Manual(String),
+}
+
 /// 基準全文ブラウズの状態（#52・a2）。テキストは開いた時点の snapshot。
 #[derive(Clone, Default)]
 pub(crate) struct BaseBrowse {
@@ -708,6 +716,9 @@ pub(crate) struct App {
     pub(crate) commit_sel: usize,
     /// 基準全文ブラウズ（#52・a2）。None 以外のときだけ描く。
     pub(crate) base_browse: Option<BaseBrowse>,
+    /// エージェント起動コマンド（#54・config `agent_command`）。
+    /// `E` で `minas review | <agent_command>` を tmux 隣ペインに投げる。
+    pub(crate) agent_command: Option<String>,
     /// daemon 保持のレビューコメント一覧のキャッシュ（#50）。マーカー表示と
     /// 編集 prefill 用。List 応答で更新し、比較終了・再ピンで捨てる。
     pub(crate) review_list: Vec<ReviewCommentView>,
@@ -751,6 +762,7 @@ impl App {
             commits: Vec::new(),
             commit_sel: 0,
             base_browse: None,
+            agent_command: None,
             review_list: Vec::new(),
             diag_filter: Severity::Error,
             diag_index: 0,
@@ -2117,6 +2129,69 @@ fn find_existing<'a>(
         ));
     }
 
+    /// エージェント起動計画（#54・純粋部）。tmux の隣ペインに投げる。
+    /// pipeline は `minas review | <agent>`（#50 の抽出コマンドを再利用）。
+    /// argv 渡しのためクォート escape は不要（再分割されない）。
+    /// 起動計画を立てる（#54）。tmux 判定は呼び出し側（テスト容易性）。
+    pub(crate) fn agent_launch_plan(
+        agent_cmd: &str,
+        cwd: &Path,
+        under_tmux: bool,
+    ) -> AgentLaunch {
+        let pipeline = format!("minas review | {agent_cmd}");
+        if !under_tmux {
+            return AgentLaunch::Manual(pipeline);
+        }
+        AgentLaunch::Tmux(vec![
+            "tmux".into(),
+            "split-window".into(),
+            "-h".into(),
+            "-c".into(),
+            cwd.to_string_lossy().into_owned(),
+            "sh".into(),
+            "-c".into(),
+            pipeline,
+        ])
+    }
+
+    /// E: レビューコメントをエージェントに投げる（#54）。daemon 保持の
+    /// 一覧を `minas review` で渡す。tmux 外では実行文面を案内するだけ。
+    async fn launch_agent(&mut self) {
+        let under_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+        self.launch_agent_with(under_tmux).await;
+    }
+
+    /// `launch_agent` の本体（tmux 判定を注入可能にし、テストする）。
+    async fn launch_agent_with(&mut self, under_tmux: bool) {
+        let Some(cmd) = self.agent_command.clone().filter(|s| !s.trim().is_empty()) else {
+            self.flash =
+                Some("agent_command を config.toml に設定してください".into());
+            return;
+        };
+        match Self::agent_launch_plan(&cmd, &self.tree.root.clone(), under_tmux) {
+            AgentLaunch::Manual(pipeline) => {
+                self.flash =
+                    Some(format!("tmux 外です: 隣ペインで実行してください: {pipeline}"));
+            }
+            AgentLaunch::Tmux(argv) => {
+                match std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
+                    Ok(out) if out.status.success() => {
+                        self.flash = Some("エージェントを隣ペインに起動しました".into());
+                    }
+                    Ok(out) => {
+                        self.flash = Some(format!(
+                            "tmux 起動失敗: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ));
+                    }
+                    Err(e) => {
+                        self.flash = Some(format!("tmux を起動できません: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
     /// P: 基準全文ブラウズを開く（#52・a2）。注目文書の旧側テキストを
     /// フォーカスを動かさずに読む（復帰は Esc/P）。Mode 2 では旧側を見る。
     fn open_base_browse(&mut self) {
@@ -2426,6 +2501,8 @@ pub async fn run(files: Vec<String>) -> std::io::Result<()> {
     terminal.clear()?;
 
     let mut app = App::new(scheme, schemes_dir, capability, no_color);
+    // #54: エージェント起動コマンド（config のみ・daemon 非関与）。
+    app.agent_command = config.agent_command.clone();
     // 起動時: 死んだセッションの比較 worktree 残骸を掃除する（best-effort）。
     git::prune_stale_worktrees();
     // 起動: daemon へ接続（失敗は明示エラーで終了）

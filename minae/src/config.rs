@@ -1,4 +1,4 @@
-//! minae のユーザー設定（XDG）。現行キーは `colorscheme` のみ。
+//! minae のユーザー設定（XDG）。現行キーは `colorscheme` / `agent_command`。
 //!
 //! クライアントローカル — daemon 非関与。起動時に 1 回読む（ADR-0022）。
 //! 不在は無言でデフォルト、構文不正・未知キーは警告してデフォルト
@@ -14,19 +14,28 @@ pub struct Config {
     /// 起動時に適用する Colorscheme の名前（組み込み名 or `colorschemes/` のファイル名）。
     #[serde(default)]
     pub colorscheme: Option<String>,
+    /// レビューコメントを投げるエージェントコマンド（#54）。`E` で
+    /// `minas review | <agent_command>` を tmux の隣ペインに投げる。
+    /// パイプライン全体ではなくエージェント部分だけを書く（抽出の再利用）。
+    /// 例: `agent_command = "claude -p"`。未設定なら `E` は案内のみ。
+    #[serde(default)]
+    pub agent_command: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { colorscheme: None }
+        Self {
+            colorscheme: None,
+            agent_command: None,
+        }
     }
 }
 
-/// 既知のキー（MVP 最小: `colorscheme` のみ — 他は未知キーとして拒否）。
+/// 既知のキー（`colorscheme` + `agent_command` — 他は未知キーとして拒否）。
 /// パース時の `deny_unknown_fields` が実効的な拒否機構。
 #[allow(dead_code)]
 pub fn known_keys() -> &'static [&'static str] {
-    &["colorscheme"]
+    &["colorscheme", "agent_command"]
 }
 
 /// minae の設定ディレクトリ: `$XDG_CONFIG_HOME/minae`、なければ `~/.config/minae`。
@@ -73,8 +82,11 @@ mod tests {
     fn empty_config_is_default() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.colorscheme, None);
+        assert_eq!(config.agent_command, None);
         let config: Config = toml::from_str("colorscheme = \"iceberg-dark\"").unwrap();
         assert_eq!(config.colorscheme.as_deref(), Some("iceberg-dark"));
+        let config: Config = toml::from_str("agent_command = \"claude -p\"").unwrap();
+        assert_eq!(config.agent_command.as_deref(), Some("claude -p"));
     }
 
     #[test]
