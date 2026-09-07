@@ -1072,6 +1072,12 @@ impl App {
                     self.open_base_browse();
                     return;
                 }
+                // E: レビューコメントをエージェントに投げる（#54）。
+                Char('E') => {
+                    self.pending.clear();
+                    self.launch_agent().await;
+                    return;
+                }
                 // K: レビューコメント入力（比較表示中のみ。現在側カーソル行）。
                 Char('K') => {
                     self.pending.clear();
@@ -2306,6 +2312,11 @@ fn find_existing<'a>(
                 self.flash = Some("過去比較は読取り専用です（コメントは Mode 1 で）".into());
                 return;
             }
+            Char('E') if key.modifiers.is_empty() => {
+                self.pending.clear();
+                self.launch_agent().await;
+                return;
+            }
             _ => {
                 self.pending.clear();
                 self.flash = Some("読取り専用です（M:終了）".into());
@@ -3185,6 +3196,80 @@ mod tests {
             app.drop_compare().await;
         });
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #54: 起動計画（tmux argv / 手動文面）。
+    #[test]
+    fn agent_launch_plan_shapes() {
+        let cwd = PathBuf::from("/repo");
+        match App::agent_launch_plan("claude -p", &cwd, true) {
+            AgentLaunch::Tmux(argv) => {
+                assert_eq!(
+                    argv,
+                    vec![
+                        "tmux",
+                        "split-window",
+                        "-h",
+                        "-c",
+                        "/repo",
+                        "sh",
+                        "-c",
+                        "minas review | claude -p",
+                    ]
+                );
+            }
+            AgentLaunch::Manual(_) => panic!("tmux 下では分割する"),
+        }
+        match App::agent_launch_plan("claude -p", &cwd, false) {
+            AgentLaunch::Manual(text) => {
+                assert_eq!(text, "minas review | claude -p");
+            }
+            AgentLaunch::Tmux(_) => panic!("tmux 外では文面だけ"),
+        }
+    }
+
+    /// #54: E の振る舞い（未設定→案内 / tmux 外→文面 / spawn 経路）。
+    #[test]
+    fn agent_launch_key_behaviors() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 未設定: 案内のみ。
+            let mut app = test_app();
+            app.launch_agent_with(false).await;
+            assert!(
+                app.flash.as_deref().unwrap_or("").contains("agent_command"),
+                "{:?}",
+                app.flash
+            );
+            // tmux 外: 実行文面を案内する（起動しない）。
+            let mut app = test_app();
+            app.agent_command = Some("claude -p".into());
+            app.launch_agent_with(false).await;
+            let flash = app.flash.as_deref().unwrap_or("");
+            assert!(flash.contains("minas review | claude -p"), "{flash:?}");
+            // E キーからも同じ経路（未設定→案内）。
+            let mut app = test_app();
+            let e = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::NONE);
+            app.handle_key(e).await;
+            assert!(
+                app.flash.as_deref().unwrap_or("").contains("agent_command"),
+                "{:?}",
+                app.flash
+            );
+            // spawn 経路: tmux 非搭載環境でのみ失敗文面を検証する
+            // （搭載環境では実際に分割してしまうため開かない）。
+            if std::process::Command::new("tmux").arg("-V").output().is_err() {
+                let mut app = test_app();
+                app.agent_command = Some("true".into());
+                app.launch_agent_with(true).await;
+                let flash = app.flash.as_deref().unwrap_or("");
+                assert!(flash.contains("tmux"), "{flash:?}");
+            }
+        });
     }
 
     /// #49 adversarial: git リポジトリ外では D は失敗し、状態を作らない。

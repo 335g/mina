@@ -659,9 +659,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if app.gap_review.is_some() {
         right.push_str("j/k:移動 h/l:列 Enter:定義 K:コメント Esc:戻る");
     } else if app.compare.as_ref().is_some_and(|c| c.is_showing()) {
-        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較 K:コメント");
+        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較 K:コメント E:AI");
     } else {
-        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較");
+        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較 E:AI");
     }
 
     let status_style = ui(app, UiRole::StatusLine);
