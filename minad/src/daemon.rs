@@ -7823,6 +7823,7 @@ root-markers = [".docsroot"]
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
                 ServerMessage::ReviewComments { .. } => continue,
+                ServerMessage::ReadPath { .. } => continue,
             }
         }
     }
@@ -7846,6 +7847,7 @@ root-markers = [".docsroot"]
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
                 ServerMessage::ReviewComments { .. } => continue,
+                ServerMessage::ReadPath { .. } => continue,
             }
         }
     }
@@ -10362,6 +10364,7 @@ root-markers = [".docsroot"]
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
                 ServerMessage::ReviewComments { .. } => continue,
+                ServerMessage::ReadPath { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
             }
@@ -10760,6 +10763,9 @@ root-markers = [".docsroot"]
                     continue;
                 }
                 ServerMessage::ReviewComments { .. } => {
+                    continue;
+                }
+                ServerMessage::ReadPath { .. } => {
                     continue;
                 }
             }
@@ -11290,6 +11296,184 @@ root-markers = [".docsroot"]
             } => assert!(e.contains("読取り専用"), "{e}"),
             other => panic!("拒否のはず: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0048: ReadPath は LSP 非依存・バッファ非依存の軽量テキスト読み。
+    /// 実ファイルをディスクから読み、フォーカス（现在のバッファ）を動かさない。
+    #[tokio::test]
+    async fn read_path_returns_text_without_touching_focus() {
+        let dir = std::env::temp_dir().join(format!("minae-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "line one\nline two\nline three\n").unwrap();
+        let sock = dir.join("sock.sock");
+        let _ = std::fs::remove_file(&sock);
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        // normalize_open_path は symlink を解決する（macOS: /var → /private/var）。
+        let path = tokio::fs::canonicalize(&file)
+            .await
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // ReadPath: 全文が text で返り、error なし。
+        let mut line = serde_json::to_string(&Command::ReadPath {
+            path: path.clone(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::ReadPath {
+                path: p,
+                text,
+                error,
+                ..
+            } => {
+                assert_eq!(error, None, "エラーなし: {error:?}");
+                assert_eq!(p, path);
+                assert_eq!(text, "line one\nline two\nline three\n");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // 読むだけでフォーカスを動かさない: `get`（現在のバッファ）は空のまま。
+        let snap = request(&mut c, &Command::GetState).await;
+        assert!(snap.path.is_none(), "ReadPath がフォーカスを動かしてはいけない: {snap:?}");
+
+        // 存在しないパスは error（cannot open）。
+        let missing = dir.join("nope.txt").to_string_lossy().into_owned();
+        let mut line = serde_json::to_string(&Command::ReadPath { path: missing }).unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::ReadPath { error, .. } => {
+                assert!(error.as_deref().unwrap_or("").contains("cannot open"), "{error:?}");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // 開文書優先: Open した後は未保存編集込みのテキストが読める。
+        request(&mut c, &Command::Open { path: path.clone() }).await;
+        let mut line = serde_json::to_string(&Command::ReadPath {
+            path: path.clone(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::ReadPath { text, error, .. } => {
+                assert_eq!(error, None);
+                assert_eq!(text, "line one\nline two\nline three\n");
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0049: OutlineRecursive はファイル分割モジュール（`mod name;`）を
+    /// 定義ジャンプで辿り、定義ファイルのシンボルを children に埋める。
+    /// モックサーバ（--bare なし）が `mod` を Module として返し、その位置の
+    /// definition が `<name>.rs` を指すことを使う。
+    #[tokio::test]
+    async fn outline_recursive_follows_file_modules_via_mock() {
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir().join(format!("minae-outline-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("sock.sock");
+        let _ = std::fs::remove_file(&sock);
+        // ルートの lib.rs: `mod model;` 宣言 + シンボル。model.rs は別ファイル。
+        let lib = dir.join("lib.rs");
+        std::fs::write(&lib, "mod model;\npub fn run() {}\n").unwrap();
+        let model = dir.join("model.rs");
+        std::fs::write(&model, "pub struct Task;\npub fn make() {}\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        let lib_path = lib.to_string_lossy().into_owned();
+
+        // 非再帰（既存 Outline）: model モジュールの children は空。
+        let mut line = serde_json::to_string(&Command::Outline { path: lib_path.clone() })
+            .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        let flat = match c.recv_message().await {
+            ServerMessage::Outline { symbols, .. } => symbols,
+            other => panic!("想定外の応答: {other:?}"),
+        };
+        let model_flat = flat
+            .iter()
+            .find(|s| s.name == "model")
+            .expect("mod model; が Module として返る");
+        assert!(model_flat.children.is_empty(), "非再帰では children 空: {model_flat:?}");
+
+        // 再帰（OutlineRecursive depth 1）: model.rs のシンボルが children に埋まる。
+        let mut line =
+            serde_json::to_string(&Command::OutlineRecursive { path: lib_path.clone(), depth: 1 })
+                .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::Outline {
+                symbols,
+                error,
+                truncated,
+                ..
+            } => {
+                assert_eq!(error, None, "エラーなし: {error:?}");
+                assert!(!truncated, "小規模ツリーでは打ち切りなし");
+                let model = symbols
+                    .iter()
+                    .find(|s| s.name == "model")
+                    .expect("mod model; が Module として返る");
+                let names: Vec<_> = model.children.iter().map(|s| s.name.as_str()).collect();
+                assert!(
+                    names.contains(&"Task") && names.contains(&"make"),
+                    "model.rs のシンボルが children に埋まる: {names:?}"
+                );
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
+        // depth 0 は入力エラー（invalid input）。
+        let mut line = serde_json::to_string(&Command::OutlineRecursive {
+            path: lib_path.clone(),
+            depth: 0,
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        match c.recv_message().await {
+            ServerMessage::Outline { error, .. } => {
+                assert!(
+                    error.as_deref().unwrap_or("").starts_with("invalid input"),
+                    "depth 0 は invalid input: {error:?}"
+                );
+            }
+            other => panic!("想定外の応答: {other:?}"),
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

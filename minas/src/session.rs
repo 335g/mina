@@ -199,13 +199,14 @@ pub enum SessionCmd {
         path: PathBuf,
         /// Follow file-scoped module declarations to their definition files and
         /// inline the nested tree (ADR-0049). Without it, only the one file's
-        /// symbols are returned.
+        /// symbols are returned. Specifying --depth also enables recursion
+        /// (depth then overrides the default of 3).
         #[arg(long, short)]
         recursive: bool,
-        /// Maximum module depth for --recursive (default 3, must be >= 1).
-        /// 1 = direct child modules only.
-        #[arg(long, default_value_t = 3)]
-        depth: u32,
+        /// Maximum module depth for recursion (default 3, must be >= 1).
+        /// 1 = direct child modules only. Implies --recursive.
+        #[arg(long)]
+        depth: Option<u32>,
     },
     /// Report the symbol enclosing `<line>:<col>` (1-origin) with its exact
     /// range and name-token range (ADR-0031). Reads no full text — use the
@@ -452,6 +453,10 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // エージェントは得られた range を読み・編集の住所にする）。
             // 失敗: stderr に理由、exit 1（入力エラー: not supported / invalid）
             // または exit 2（再試行可能: LSP エラー等）。
+            // ADR-0049: --recursive か --depth 指定でモジュール横断（--depth は
+            // 既定 3 を上書きし、再帰を兼ねる）。
+            let recursive = recursive || depth.is_some();
+            let depth = depth.unwrap_or(3);
             if recursive && depth == 0 {
                 eprintln!("outline: invalid input: depth must be >= 1");
                 std::process::exit(1);

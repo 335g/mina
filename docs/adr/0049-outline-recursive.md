@@ -18,13 +18,15 @@ Status: accepted
 `textDocument/definition` を投げて**定義ファイルを解決 → そのファイルを
 再帰的に outline して children に埋める**。応答形状は既存
 `ServerMessage::Outline` を再利用(ツリーは children が深くなるだけ)。
+`--depth` は**再帰を兼ねる**(指定するだけで `--recursive` と同効。既定深さ 3
+を上書き)。
 
 - プロトコル: `Command::OutlineRecursive { path: String, depth: u32 }` を
   **追加**(既存 `Command::Outline { path }` の形状は変えない — 既存分岐の
   `serde_json::from_str::<Command::Outline>` 完全一致マッチ(daemon.rs:1486)を
   壊さないため)。応答は既存 [`ServerMessage::Outline`] を再利用。
-- **深さの既定値**: CLI 側で 3(`--depth` 未指定時)。`--depth 1` = 直接の子
-  モジュールまで。0 は許容しない(CLI が拒否)。
+- **深さの既定値**: CLI 側で 3(`--recursive` のみ・深さ未指定時)。
+  `--depth 1` = 直接の子モジュールまで。0 は許容しない(CLI が拒否)。
 - **検出**: ツリーの Module シンボルで children が空のものを候補にする。
   その `selection_range`(モジュール名トークン)の先頭位置を line:col に変換し、
   既存の definition 経路(lsp.rs の `textDocument/definition` + 
