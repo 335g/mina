@@ -169,12 +169,14 @@ rename tool exists.",
     ),
     (
         "check",
-        "minas check <path>: wait for diagnostics, returns only errors",
+        "minas check <path>...: wait for diagnostics, returns only errors",
         "CHECK — the edit -> verify loop in one command (ADR-0032)
 
-Use:      minas check <path>
-Output:   compact JSON, no file text: {\"path\", \"total\", \"diagnostics\"} where each
-          diagnostic is {\"severity\", \"line\" (1-origin), \"start\", \"end\", \"message\"}.
+Use:      minas check <path> [<path> ...]
+Output:   compact JSON, no file text: an array of {\"path\", \"total\",
+          \"diagnostics\", \"settled\"} (one entry per path; ADR-0046) where
+          each diagnostic is {\"severity\", \"line\" (1-origin), \"col\"
+          (1-origin, char units), \"start\", \"end\", \"message\"}.
 Exit:     0 = no error diagnostics (warnings alone are fine),
           2 = at least one error diagnostic, or a retryable LSP failure,
           1 = not supported / bad input.
@@ -183,12 +185,20 @@ Rules
 - After an edit (minas apply / edit), run check INSTEAD of wait + get +
   JSON-parsing the snapshot: it waits for LSP diagnostics to settle and returns
   only the diagnostics — the round trip and the full text are gone.
+- Pass multiple paths to verify every file you touched in one call
+  (ADR-0046): `minas check src/lib.rs src/other.rs`.
 - The 1-origin line is the address for `minas get --lines <n>:<n>`; the
-  char range is the address for `minas apply`.<old>.
+  char range is the address for `minas apply`.<old>. The line:col pair is the
+  address for `minas at / peek / hover <path> <line>:<col>` — pass it straight
+  through without computing anything (ADR-0047).
 - It is an LSP fast path (incremental), not a compiler: for semantics beyond
   the LSP (borrow checker etc.) still run the real build.
-- Clean files are detected by a settle budget (~10s): a cold workspace may
-  return \"clean\" before analysis finishes — re-check after a moment.",
+- settled == false means the diagnostics did NOT settle within the budget
+  (~10s): empty + settled=false is \"clean\" UNVERIFIED, NOT clean (ADR-0045).
+  Cross-symbol breakage (unresolved import, a renamed type left dangling) can
+  keep the server from settling and report an empty result. Treat empty
+  results as verified clean only when settled is true; otherwise re-check or
+  run the real build (cargo test) before trusting it.",
     ),
     (
         "hover",

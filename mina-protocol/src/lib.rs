@@ -45,7 +45,11 @@ use serde::{Deserialize, Serialize};
 /// v15: 基準診断の常駐（#52・a2）— `StateSnapshot` に `base_diagnostics`
 /// （注目文書の基準側対応物の診断）、`Command::RegisterBaseRoot` に `repo`
 /// （対応付け用・省略可）。bump 方式（ADR-0039）。
-pub const PROTOCOL_VERSION: u32 = 15;
+/// v16: `ServerMessage::Check` に `settled`（クリーン確定の根拠）を追加
+/// （ADR-0045）。応答 wire の変更のため bump。
+/// v17: `CheckDiagnostic` に `col`（1-origin 行内列 — at/peek/hover の住所）
+/// を追加（ADR-0047）。応答 wire の変更のため bump。
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -556,6 +560,11 @@ pub enum ServerMessage {
         total: usize,
         /// 診断（行番号・char 範囲・メッセージ）。クリーンなら空。
         diagnostics: Vec<CheckDiagnostic>,
+        /// クリーン（空）が解析完了の確認済みか（ADR-0045）。`true` = 非空が
+        /// 2 回連続で安定して確定。`false` = 予算切れで返った「クリーン**未確認**」
+        /// （解析未完・クロスシンボル破壊の可能性。exit 0 のまま — クリーンと
+        /// クリーン未確認は別物）。
+        settled: bool,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
@@ -604,12 +613,16 @@ pub struct WorkspaceSymbol {
 }
 
 /// [`Command::CheckDiagnostics`] の応答に含まれる診断 1 件（ADR-0032）。
-/// 1-origin 行番号（`--lines` の住所）と char 範囲（apply の住所）の両方を載せる。
+/// 1-origin 行番号（`--lines` の住所）・1-origin 行内列（at / peek / hover の
+/// 住所。ADR-0047）・char 範囲（apply の住所）を全部載せる。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckDiagnostic {
     pub severity: Severity,
     /// 1-origin 行番号（診断の開始位置）。
     pub line: u32,
+    /// 1-origin 行内列（char 単位）。`at` / `peek` / `hover` の `<line>:<col>`
+    /// 住所にそのまま渡せる（ADR-0047）。行頭の char を 1 とする。
+    pub col: u32,
     /// char インデックス範囲（start..end）。
     pub start: usize,
     pub end: usize,
@@ -1425,16 +1438,32 @@ mod tests {
             diagnostics: vec![CheckDiagnostic {
                 severity: Severity::Error,
                 line: 3,
+                col: 7,
                 start: 20,
                 end: 24,
                 message: "mock: TODO found".into(),
             }],
+            settled: true,
             error: None,
         };
         let json = serde_json::to_string(&check).unwrap();
         let back: ServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, check);
         assert!(json.contains("\"type\":\"check\""));
+        assert!(json.contains("\"settled\":true"));
+
+        // ADR-0045: 予算切れの空（クリーン未確認）も settled: false で表現できる
+        let unverified = ServerMessage::Check {
+            path: "src/lib.rs".into(),
+            generation: 3,
+            total: 0,
+            diagnostics: vec![],
+            settled: false,
+            error: None,
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&unverified).unwrap()).unwrap();
+        assert_eq!(back, unverified, "settled=false の空応答（クリーン未確認）");
     }
 
     #[test]
@@ -1488,6 +1517,7 @@ mod tests {
         let diag = CheckDiagnostic {
             severity: Severity::Error,
             line: 2,
+            col: 5,
             start: 10,
             end: 14,
             message: "mock: TODO found".into(),

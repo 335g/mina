@@ -2384,6 +2384,7 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         generation: 0,
         total: 0,
         diagnostics: Vec::new(),
+        settled: false, // 失敗はクリーン確定の根拠なし（ADR-0045）
         error: Some(msg),
     };
     let borrowed = match prepare_borrowed_session(daemon, path).await {
@@ -2413,17 +2414,18 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
     }
-    let Some(diags) = pulled else {
+    let Some((diags, settled)) = pulled else {
         // 恒久的失敗（セッションロック待ち・サーバ死亡）: 空ではなく理由を返す
         return err("LSP error: diagnostics pull failed (server dead or session lock timeout)"
             .into());
     };
-    // char インデックス → 1-origin 行番号（エージェントの --lines 住所）を付与
+    // char インデックス → 1-origin 行番号・行内列（エージェントの住所）を付与
     let diagnostics = diags
         .iter()
         .map(|d| CheckDiagnostic {
             severity: d.severity,
             line: line_of_char(&borrowed.text, d.start) + 1,
+            col: col_of_char(&borrowed.text, d.start),
             start: d.start,
             end: d.end,
             message: d.message.clone(),
@@ -2435,6 +2437,7 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         generation: daemon.lock().await.generation,
         total,
         diagnostics,
+        settled, // ADR-0045: 空でも「クリーン確定」でなければ false のまま伝える
         error: None,
     };
     record_agent_metric(daemon, msg).await
@@ -2477,7 +2480,9 @@ async fn fill_base_diagnostics(
     if borrows {
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
     }
-    let diags = pulled.unwrap_or_default();
+    // 基準診断は「基準側のエラーを見せる」ことが目的のため、settled は使わず
+    // 診断のみを取る（空 = クリーン扱いは ADR-0045 の対象外 — 基準側は表示用）。
+    let diags = pulled.map(|(diags, _)| diags).unwrap_or_default();
     {
         let mut d = daemon.lock().await;
         // Unregister で先に消えていたら捨てる（古い基準の残骸を載せない）。
@@ -2504,6 +2509,26 @@ fn line_of_char(text: &str, char_idx: usize) -> u32 {
         }
     }
     line
+}
+
+/// char インデックス → 1-origin 行内列（check 診断の col 付与用。ADR-0047）。
+/// 行頭（直前の改行の直後）の char を 1 とする。`char_idx` が文末を超えて
+/// いたら最終行の末尾列（クランプ）。
+fn col_of_char(text: &str, char_idx: usize) -> u32 {
+    let char_count = text.chars().count();
+    let char_idx = char_idx.min(char_count); // 文末超過は最終行の末尾扱い
+    let mut line_start = 0usize; // 行頭の char インデックス
+    let mut i = 0usize;
+    for ch in text.chars() {
+        if i >= char_idx {
+            break;
+        }
+        if ch == '\n' {
+            line_start = i + 1; // 次の行の行頭
+        }
+        i += 1;
+    }
+    (char_idx.saturating_sub(line_start) + 1) as u32
 }
 
 /// ADR-0032 の計測: hover / symbol search / check の要求回数と応答シリアライズ
@@ -5216,6 +5241,42 @@ fn convert_mode_back(m: mina_view::Mode) -> mina_protocol::Mode {
 mod tests {
     use super::*;
     use mina_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
+
+    #[test]
+    fn line_and_col_of_char_are_1_origin() {
+        // ADR-0047: 診断の char 位置 → 行番号(0-origin)と行内列(1-origin)が
+        // at/peek/hover の `line:col` 住所にそのまま使えることを検証する。
+        let text = "fn a() {}\nfn b() { TODO }";
+        // "TODO" は 2 行目（0-origin 1）・行頭から 10 char 目（1-origin 10）。
+        let start = char_idx_of(text, "TODO");
+        assert_eq!(line_of_char(text, start), 1, "0-origin 行番号");
+        assert_eq!(col_of_char(text, start), 10, "1-origin 行内列");
+        // --lines の住所は 1-origin 行番号（line + 1）
+        assert_eq!(line_of_char(text, start) + 1, 2);
+
+        // 文頭は行頭（列 1）
+        assert_eq!(col_of_char(text, 0), 1);
+        // 文末超過はクランプ（最終行「fn b() { TODO }」= 15 chars の末尾の次 = 16）
+        assert_eq!(col_of_char(text, text.len() + 5), 16);
+        // 改行の直後は次の行の行頭（列 1）
+        let with_nl = "ab\ncd";
+        assert_eq!(col_of_char(with_nl, 3), 1); // 'c' は 2 行目 1 列目
+        assert_eq!(col_of_char(with_nl, 4), 2); // 'd' は 2 行目 2 列目
+    }
+
+    #[test]
+    fn col_of_char_counts_chars_not_bytes() {
+        // マルチバイト（CJK）も char 単位で数える（start は char インデックス）。
+        let text = "あいうTODO";
+        let start = char_idx_of(text, "TODO");
+        assert_eq!(start, 3, "byte 位置ではなく char 位置");
+        assert_eq!(col_of_char(text, start), 4);
+    }
+
+    /// byte 位置（`str::find`）を char インデックスに変換するテストヘルパー。
+    fn char_idx_of(text: &str, needle: &str) -> usize {
+        text[..text.find(needle).unwrap()].chars().count()
+    }
 
     // lsp.rs から移設（daemon 統合の ensure / drain_into を直接検証する）
     #[tokio::test]
@@ -8777,7 +8838,8 @@ root-markers = [".docsroot"]
             other => panic!("想定外の応答: {other:?}"),
         }
 
-        // CheckDiagnostics: 1行目の TODO が error 診断として、1-origin 行 1 で返る。
+        // CheckDiagnostics: 1行目の TODO が error 診断として、1-origin 行 1・
+        // 行内列 16（"pub fn run() { " の 15 chars の次）で返る。
         let mut line =
             serde_json::to_string(&Command::CheckDiagnostics { path: path.clone() }).unwrap();
         line.push('\n');
@@ -8793,6 +8855,7 @@ root-markers = [".docsroot"]
                 assert_eq!(total, 1, "TODO 診断が1件: {diagnostics:?}");
                 assert_eq!(diagnostics[0].severity, mina_protocol::Severity::Error);
                 assert_eq!(diagnostics[0].line, 1, "1-origin 行");
+                assert_eq!(diagnostics[0].col, 16, "1-origin 行内列（ADR-0047）");
                 assert_eq!(diagnostics[0].message, "mock: TODO found");
             }
             other => panic!("想定外の応答: {other:?}"),

@@ -1043,15 +1043,17 @@ pub async fn workspace_symbols(
 /// `session check` 用（ADR-0032）: 診断が安定するまで pull を繰り返し、最後の
 /// 結果を返す。
 ///
-/// 安定判定は settle_open_diagnostics と同じ: 非空が 2 回連続で同数 = 安定、
-/// 空のまま予算（[`SEMANTIC_RETRIES`] × [`SEMANTIC_RETRY_WAIT`] ≈ 10 秒）を
-/// 使い切ったら「クリーン」として最後の空を返す。`None` は恒久的な失敗
-/// （セッションロック待ち・サーバ死亡・対象が current でない）。
+/// 安定判定は settle_open_diagnostics と同じ: 非空が 2 回連続で同数 = 安定
+/// （`settled` を true にして返す）、空のまま予算（[`SEMANTIC_RETRIES`] ×
+/// [`SEMANTIC_RETRY_WAIT`] ≈ 10 秒）を使い切ったら「クリーン**未確認**」として
+/// 最後の空と `settled: false` を返す（ADR-0045 — 解析未完・クロスシンボル
+/// 破壊の可能性を隠さない）。非空が 1 回だけのまま予算切れも `settled: false`。
+/// `None` は恒久的な失敗（セッションロック待ち・サーバ死亡・対象が current でない）。
 pub async fn pull_diagnostics_settled(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
-) -> Option<Vec<Diagnostic>> {
+) -> Option<(Vec<Diagnostic>, bool)> {
     let mut prev: Option<usize> = None;
     let mut last: Vec<Diagnostic> = Vec::new();
     for _ in 0..SEMANTIC_RETRIES {
@@ -1069,13 +1071,13 @@ pub async fn pull_diagnostics_settled(
         };
         let n = diags.len();
         if n > 0 && prev == Some(n) {
-            return Some(diags); // 非空が2回連続で同数 = 安定
+            return Some((diags, true)); // 非空が2回連続で同数 = 安定
         }
         prev = Some(n);
         last = diags;
         tokio::time::sleep(SEMANTIC_RETRY_WAIT).await;
     }
-    Some(last) // 予算切れ: 最後の結果（空ならクリーン扱い）
+    Some((last, false)) // 予算切れ: 未確認（空ならクリーン扱いにしない — ADR-0045）
 }
 
 // ---- 意味リネーム・参照（ADR-0029） ----
@@ -1961,9 +1963,10 @@ fn capabilities_of_parses_initialize_response() {
         ));
         let text = "fn ok() { TODO }\n";
         session.lock().await.did_open(&path, text).await;
-        let diags = pull_diagnostics_settled(&session, &path, text)
+        let (diags, settled) = pull_diagnostics_settled(&session, &path, text)
             .await
             .expect("診断が返る");
+        assert!(settled, "非空が2回連続で安定 = settled:true");
         assert_eq!(diags.len(), 1, "TODO 診断が1件: {diags:?}");
         assert_eq!(diags[0].message, "mock: TODO found");
     }

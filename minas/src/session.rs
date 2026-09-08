@@ -210,14 +210,15 @@ pub enum SessionCmd {
         /// Search query (fuzzy; empty is rejected with exit 1)
         query: String,
     },
-    /// Wait for the LSP diagnostics of `<path>` to settle and return only the
+    /// Wait for the LSP diagnostics of `<path>...` to settle and return only the
     /// diagnostics — no full text (ADR-0032). Replaces `wait` + `get` + JSON
-    /// parsing for the edit→verify loop. Exit 2 when at least one `error`
-    /// diagnostic is present (warnings alone exit 0); exit 1 on not-supported /
-    /// bad input; other failures exit 2.
+    /// parsing for the edit→verify loop. Multiple paths are checked in order and
+    /// aggregated (ADR-0046 — one round trip per path, client-side loop).
+    /// Exit 2 when at least one `error` diagnostic is present (warnings alone
+    /// exit 0); exit 1 on not-supported / bad input; other failures exit 2.
     Check {
-        /// Path
-        path: PathBuf,
+        /// Paths to check (one or more)
+        paths: Vec<PathBuf>,
     },
     /// List the daemon-held review comments for AI consumption (#50, read-only).
     /// Prints the full list (path, side, stored/resolved lines, stale flag,
@@ -468,30 +469,52 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             }
             println!("{}", serde_json::to_string(&outcome.symbols)?);
         }
-        SessionCmd::Check { path } => {
-            // 成功: 診断を compact JSON で出力する（全文なし — ADR-0032）。
+        SessionCmd::Check { paths } => {
+            // 成功: 各パスの診断を順に取得し、集約した compact JSON を出力する
+            // （全文なし — ADR-0032/0046）。複数ファイルの変更を 1 コマンドで
+            // 一括検証できる（第1回検証: 1ファイルずつしか渡せなかった）。
             // クリーン（エラーなし）は exit 0、error 診断が1件でもあれば exit 2
             // （警告のみなら 0 — エージェントは $? だけで分岐できる）。失敗: stderr
             // に理由、exit 1/2（outline / at と同じ分類）。
-            let outcome = execute_check(&path.to_string_lossy()).await?;
-            if let Some(e) = &outcome.error {
-                eprintln!("check: {e}");
-                std::process::exit(check_exit_code(e));
+            if paths.is_empty() {
+                eprintln!("check: at least one path is required");
+                std::process::exit(1);
             }
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
+            let mut results = Vec::new();
+            let mut any_error = false;
+            let mut worst_failure = 0;
+            for path in &paths {
+                let outcome = execute_check(&path.to_string_lossy()).await?;
+                if let Some(e) = &outcome.error {
+                    eprintln!("check {}: {e}", path.display());
+                    // 失敗の分類（not supported = exit 1、再試行可能 = exit 2）を
+                    // 保持しつつ、他パスの検証は続ける（ADR-0046）。
+                    worst_failure = worst_failure.max(check_exit_code(e));
+                    continue;
+                }
+                results.push(serde_json::json!({
                     "path": outcome.path,
                     "total": outcome.total,
                     "diagnostics": outcome.diagnostics,
-                }))?
-            );
-            if outcome
-                .diagnostics
-                .iter()
-                .any(|d| d.severity == Severity::Error)
-            {
-                std::process::exit(2);
+                    "settled": outcome.settled,
+                }));
+                // ADR-0045: 空でも解析が安定しなかった場合は「クリーン未確認」を
+                // 明示する（exit 0 のまま — $? 分岐を壊さない。エージェントは
+                // settled を見て cargo 等で再検証する判断ができる）。
+                if !outcome.settled && outcome.diagnostics.is_empty() {
+                    eprintln!(
+                        "check {}: clean-unverified (diagnostics did not settle; verify with cargo)",
+                        path.display()
+                    );
+                }
+                any_error |= outcome
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.severity == Severity::Error);
+            }
+            println!("{}", serde_json::to_string(&results)?);
+            if any_error || worst_failure > 0 {
+                std::process::exit(2.max(worst_failure));
             }
         }
         SessionCmd::Review { clear } => {
@@ -939,6 +962,8 @@ struct CheckOutcome {
     path: String,
     total: usize,
     diagnostics: Vec<CheckDiagnostic>,
+    /// クリーン（空）が解析完了の確認済みか（ADR-0045）。false = クリーン未確認。
+    settled: bool,
     error: Option<String>,
 }
 
@@ -1025,10 +1050,18 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
     let mut response = String::new();
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
-        Ok(ServerMessage::Check { path, total, diagnostics, error, .. }) => Ok(CheckOutcome {
+        Ok(ServerMessage::Check {
             path,
             total,
             diagnostics,
+            settled,
+            error,
+            ..
+        }) => Ok(CheckOutcome {
+            path,
+            total,
+            diagnostics,
+            settled,
             error,
         }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
