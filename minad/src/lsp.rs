@@ -878,6 +878,39 @@ pub async fn definition_peek_at_char(
     definition_peek_at(session, path, text, line, character).await
 }
 
+/// [`definition_peek_at`] の位置解決のみの軽量版（ADR-0049）: 指定位置の
+/// `textDocument/definition` で最初の定義先の URI だけを返す（スニペット
+/// 取得なし — モジュール横断 outline が「モジュール名 → 定義ファイル」を
+/// 解決するための経路）。定義なし・サーバエラー・ロック待ちは `None`。
+pub async fn definition_target_uri(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    line: u32,
+    character: u32,
+) -> Option<String> {
+    let (target_uri, _range) = {
+        let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
+            return None;
+        };
+        if session.client.is_dead() {
+            return None;
+        }
+        let result = session
+            .client
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": uri(path) },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await
+            .ok()?;
+        first_definition_target(&result)?
+    };
+    Some(target_uri)
+}
+
 /// エージェント向け（ADR-0025）: 1-origin 行:列を指定して定義を引く。
 /// `col` は文字数単位。行・列が範囲外なら定義なし（`None`）になる。
 pub async fn definition_peek_at_line_col(

@@ -231,7 +231,8 @@ async fn notification_channel_is_bounded() {
         count += 1;
     }
     assert_eq!(
-        count, mina_lsp::NOTIFICATION_CAPACITY,
+        count,
+        mina_lsp::NOTIFICATION_CAPACITY,
         "キューは容量を超えて蓄積しない（超過分は破棄される）: {count}"
     );
 
@@ -255,7 +256,8 @@ async fn pull_diagnostics_returns_items() {
     let (mut client, reader) = spawn_client(&[]).await;
     let result = client.request("initialize", json!({})).await.unwrap();
     assert_eq!(
-        result["capabilities"]["diagnosticProvider"]["identifier"], "mock"
+        result["capabilities"]["diagnosticProvider"]["identifier"],
+        "mock"
     );
     client.notify("initialized", json!({})).await.unwrap();
     client

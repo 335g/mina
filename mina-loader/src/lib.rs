@@ -150,10 +150,7 @@ fn collect(
     });
     let mut deduped: Vec<(usize, usize, HighlightGroup)> = Vec::new();
     for item in items {
-        if deduped
-            .last()
-            .is_some_and(|last| item.0 < last.1)
-        {
+        if deduped.last().is_some_and(|last| item.0 < last.1) {
             continue; // 直前の範囲と重なる（同一ノードの別 capture・ネスト）
         }
         deduped.push(item);
@@ -170,8 +167,7 @@ fn collect(
             let window = &text[r.start..r.end];
             let window_chars = window.chars().count();
             // 窓内の各文字の開始 byte（グローバル絶対値）
-            let starts: Vec<usize> =
-                window.char_indices().map(|(b, _)| b + r.start).collect();
+            let starts: Vec<usize> = window.char_indices().map(|(b, _)| b + r.start).collect();
             let (ws, re) = (window_char_start, r.end);
             Box::new(move |byte: usize| {
                 if byte < r.start {
@@ -288,7 +284,11 @@ mod tests {
             .iter()
             .find(|r| r.start == start)
             .expect("foo がハイライトされる");
-        assert_eq!(r.group, HighlightGroup::Function, "foo は Function に確定: {ranges:?}");
+        assert_eq!(
+            r.group,
+            HighlightGroup::Function,
+            "foo は Function に確定: {ranges:?}"
+        );
         assert_eq!(&src[r.start..r.end], "foo");
     }
 
@@ -391,14 +391,16 @@ let s = `total: ${count}`;
     }
 
     #[test]
-    
 
-fn broken_input_parses_without_panic() {
+    fn broken_input_parses_without_panic() {
         // 構文エラーを含む入力でもパースとクエリが走り、error グループが現れる
         // （M2 引き継ぎ #2: パニックしないことだけでなく error 発火も検証する）
         let def = language_by_name("rust").unwrap();
         let names = capture_names(def, "fn broken( {");
-        assert!(names.contains(&"error".to_string()), "error が発火する: {names:?}");
+        assert!(
+            names.contains(&"error".to_string()),
+            "error が発火する: {names:?}"
+        );
         // エラー入力でも正規集合外の capture は出ない
         for name in &names {
             assert!(
@@ -530,9 +532,7 @@ fn broken_input_parses_without_panic() {
         // 窓と交差する全文範囲だけが残る（start < 窓end かつ end > 窓start）
         let expected: Vec<_> = full
             .iter()
-            .filter(|r| {
-                r.start < window.end && r.end > window.start
-            })
+            .filter(|r| r.start < window.end && r.end > window.start)
             .cloned()
             .collect();
         assert_eq!(windowed, expected, "窓内範囲 == 全文範囲の交差部分");
@@ -554,6 +554,10 @@ fn broken_input_parses_without_panic() {
             .iter()
             .find(|r| r.group == HighlightGroup::Comment)
             .expect("窓内にコメントがある: {windowed:?}");
-        assert_eq!(text_of(src, comment), "/*\n * block\n * comment\n */", "コメント全体が捕捉される: {windowed:?}");
+        assert_eq!(
+            text_of(src, comment),
+            "/*\n * block\n * comment\n */",
+            "コメント全体が捕捉される: {windowed:?}"
+        );
     }
 }

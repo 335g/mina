@@ -108,9 +108,27 @@ fn main() {
                     write_frame(&mut stdout, &resp);
                 }
                 "textDocument/definition" => {
-                    // 定義: 現在の文書内の最初の "fn " の位置を Location で返す
-                    // （PeekDefinition の確認用。カーソル位置は解析しない）。
+                    // 定義のモック: 現在の文書内の "mod " 宣言（`mod NAME;`）の
+                    // NAME 位置なら `<NAME>.rs`（同一ディレクトリ・ファイル先頭）を
+                    // 返す（ADR-0049 のモジュール横断テスト用）。それ以外は現在の
+                    // 文書内の最初の "fn " の位置を Location で返す（PyDefinition の
+                    // 確認用。カーソル位置は解析しない）。
                     let loc = current.as_ref().map(|(uri, text)| {
+                        let pos = &msg["params"]["position"];
+                        let line = pos["line"].as_u64().unwrap_or(0) as u32;
+                        let character = pos["character"].as_u64().unwrap_or(0) as u32;
+                        // 対象位置が `mod NAME` の NAME 単語ならモジュール解決。
+                        if let Some(module) = module_at(text, line, character, utf16) {
+                            let dir = uri.rsplit_once('/').map_or("", |(d, _)| d);
+                            let module_uri = format!("{dir}/{module}.rs");
+                            return json!({
+                                "uri": module_uri,
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 0 },
+                                },
+                            });
+                        }
                         let start = text.find("fn ").unwrap_or(0);
                         let line = text[..start].matches('\n').count() as u32;
                         let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
@@ -217,17 +235,18 @@ fn main() {
                     // hover のモック: 位置の単語を返す（無ければ null = hover なし）。
                     // rust-analyzer と同じ配列形（先頭 = 型シグネチャの MarkedString、
                     // 続いて doc の MarkupContent）で返す。
-                    let hover = current.as_ref().and_then(|(_, text)| {
-                        let pos = &msg["params"]["position"];
-                        let line = pos["line"].as_u64().unwrap_or(0) as u32;
-                        let character = pos["character"].as_u64().unwrap_or(0) as u32;
-                        word_at(text, line, character, utf16).map(|w| json!({
+                    let hover =
+                        current.as_ref().and_then(|(_, text)| {
+                            let pos = &msg["params"]["position"];
+                            let line = pos["line"].as_u64().unwrap_or(0) as u32;
+                            let character = pos["character"].as_u64().unwrap_or(0) as u32;
+                            word_at(text, line, character, utf16).map(|w| json!({
                             "contents": [
                                 { "language": "rust", "value": format!("fn {w}() -> i32") },
                                 { "kind": "markdown", "value": format!("mock doc for {w}") },
                             ],
                         }))
-                    });
+                        });
                     let resp = json!({ "jsonrpc": "2.0", "id": id, "result": hover });
                     write_frame(&mut stdout, &resp);
                 }
@@ -338,17 +357,28 @@ fn inlay_hints(text: &str, utf16: bool) -> Vec<Value> {
 }
 
 /// 簡易アウトライン（[`textDocument/documentSymbol`] のモック応答）:
-/// 行ごとに `fn NAME` / `struct NAME` / `let NAME` を走査し、DocumentSymbol 配列を
-/// 返す。range は行全体、selectionRange は名前トークン。kind: 12=Function /
-/// 23=Struct / 13=Variable。階層（children）は持たない — 入れ子変換は
-/// minae-term の lsp.rs ユニットテストで検証する。
+/// 行ごとに `fn NAME` / `struct NAME` / `let NAME` / `mod NAME;` を走査し、
+/// DocumentSymbol 配列を返す。range は行全体、selectionRange は名前トークン。
+/// kind: 12=Function / 23=Struct / 13=Variable / 2=Module。階層（children）は
+/// 持たない — 入れ子変換は minae-term の lsp.rs ユニットテストで検証する。
 fn outline_symbols(text: &str, utf16: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for (line_idx, line) in text.lines().enumerate() {
-        for (kw, kind) in [("fn ", 12u64), ("struct ", 23u64), ("let ", 13u64)] {
+        for (kw, kind) in [
+            ("fn ", 12u64),
+            ("struct ", 23u64),
+            ("let ", 13u64),
+            // ADR-0049: ファイル分割モジュール（`mod NAME;`）を Module として
+            // 返す — 再帰 outline の解決対象を作る。inline `mod NAME {` は
+            // セミコロンで終わらないため対象外（range は軽く行全体を使う）。
+            ("mod ", 2u64),
+        ] {
             let Some(kw_pos) = line.find(kw) else {
                 continue;
             };
+            if kw == "mod " && !line.trim_end().ends_with(';') {
+                continue; // inline mod { } は Module にしない（children が別途入る）
+            }
             let name_start = kw_pos + kw.len();
             let name_end = line[name_start..]
                 .find(|c: char| !(c.is_alphanumeric() || c == '_'))
@@ -373,6 +403,42 @@ fn outline_symbols(text: &str, utf16: bool) -> Vec<Value> {
     out
 }
 
+/// 指定位置の単語が `mod NAME;` 宣言の NAME なら Some(NAME)（ADR-0049 の
+/// モジュール解決モック用）。`mod ` キーワードの直後の識別子に限る — inline
+/// `mod NAME {` や他の識別子位置では None。
+fn module_at(text: &str, line: u32, character: u32, utf16: bool) -> Option<String> {
+    let line_text = text.lines().nth(line as usize)?;
+    let char_col = if utf16 {
+        let mut units = 0u32;
+        let mut col = 0usize;
+        for ch in line_text.chars() {
+            let w = ch.len_utf16() as u32;
+            if units + w > character {
+                break;
+            }
+            units += w;
+            col += 1;
+        }
+        col
+    } else {
+        character as usize
+    };
+    let mod_pos = line_text.find("mod ")?;
+    // 指定位置が `mod ` の直後の名前トークン内にあるか
+    let name_start = mod_pos + 4;
+    let name_end = line_text[name_start..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(line_text.len(), |e| name_start + e);
+    if (name_start..name_end).contains(&char_col)
+        && !line_text.trim_end().ends_with('{')
+        && line_text.trim_end().ends_with(';')
+    {
+        Some(line_text[name_start..name_end].to_string())
+    } else {
+        None
+    }
+}
+
 /// workspace/symbol のモック応答（SymbolInformation[]）: 現在文書のアウトライン
 /// から、名前が `query` を部分一致で含むシンボルを `location` 付きで返す。
 fn workspace_symbol_info(text: &str, uri: &str, query: &str, utf16: bool) -> Vec<Value> {
@@ -385,8 +451,14 @@ fn workspace_symbol_info(text: &str, uri: &str, query: &str, utf16: bool) -> Vec
         .map(|s| {
             let name = s.get("name").cloned().unwrap_or(Value::Null);
             let kind = s.get("kind").cloned().unwrap_or(Value::Null);
-            let line = s.pointer("/range/start/line").and_then(Value::as_u64).unwrap_or(0);
-            let end = s.pointer("/range/end/character").and_then(Value::as_u64).unwrap_or(0);
+            let line = s
+                .pointer("/range/start/line")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let end = s
+                .pointer("/range/end/character")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             json!({
                 "name": name,
                 "kind": kind,
@@ -490,8 +562,8 @@ fn occurrences_at(
         let i = search_from + rel;
         let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
         let after = i + word.len();
-        let after_ok = after == bytes.len()
-            || !bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_';
+        let after_ok =
+            after == bytes.len() || !bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_';
         if before_ok && after_ok {
             let l = text[..i].matches('\n').count() as u32;
             out.push((l, i, after));

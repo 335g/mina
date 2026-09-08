@@ -105,8 +105,7 @@ impl Editor {
     /// メモリ蓄積の防止）。
     fn evict_oldest_if_over_cap(&mut self) {
         while self.documents.len() > MAX_DOCUMENTS {
-            let viewed: BTreeSet<DocumentId> =
-                self.views.iter().flatten().map(|v| v.doc).collect();
+            let viewed: BTreeSet<DocumentId> = self.views.iter().flatten().map(|v| v.doc).collect();
             let oldest = self
                 .documents
                 .keys()
@@ -198,9 +197,7 @@ impl Editor {
             Selection::new(
                 sel.ranges()
                     .iter()
-                    .map(|r| {
-                        mina_text::Range::new(r.anchor().min(new_len), r.head().min(new_len))
-                    })
+                    .map(|r| mina_text::Range::new(r.anchor().min(new_len), r.head().min(new_len)))
                     .collect(),
                 sel.primary_index(),
             )
@@ -627,12 +624,7 @@ impl Editor {
         // char index で panic する。保存されている選択は変更せず、計算用に
         // だけ文書末尾へクランプする。
         let doc = self.current_document();
-        let head = self
-            .view()
-            .selection
-            .primary()
-            .head()
-            .min(doc.len_chars());
+        let head = self.view().selection.primary().head().min(doc.len_chars());
         let cursor_line = doc.text().char_to_line(head);
         let first = self.view().first_line;
         if cursor_line < first {
@@ -1025,7 +1017,11 @@ mod tests {
         editor.set_selection(Selection::point(11));
         editor.scroll_to_cursor(5);
         assert_eq!(editor.first_line(), 0);
-        assert_eq!(editor.selection().primary().head(), 11, "保存選択は変更しない");
+        assert_eq!(
+            editor.selection().primary().head(),
+            11,
+            "保存選択は変更しない"
+        );
 
         // 空文書で範囲外でも panic しない
         let mut editor = Editor::new();

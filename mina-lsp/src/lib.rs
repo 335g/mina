@@ -183,10 +183,7 @@ impl Client {
         timeout(Duration::from_secs(2), write_frame(&mut self.write, &data))
             .await
             .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "LSP 書き込みタイムアウト",
-                )
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "LSP 書き込みタイムアウト")
             })?
     }
 
@@ -236,7 +233,10 @@ async fn read_frame(reader: &mut BufReader<ChildStdout>) -> std::io::Result<Opti
         }
     }
     let len = content_length.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "Content-Length ヘッダがない")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Content-Length ヘッダがない",
+        )
     })?;
     // 5f: 巨大な Content-Length で巨大アロケーションしないよう上限を設ける
     if len > MAX_FRAME_BYTES {

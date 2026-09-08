@@ -157,7 +157,11 @@ pub async fn request_hints(
     let mut response = String::new();
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
-        Ok(ServerMessage::Hints { path, generation, hints }) => Ok((path, generation, hints)),
+        Ok(ServerMessage::Hints {
+            path,
+            generation,
+            hints,
+        }) => Ok((path, generation, hints)),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -178,16 +182,15 @@ pub async fn request_hints(
         Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
-        | Ok(ServerMessage::ReviewComments { .. }) => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unexpected semantic response",
-            ))
-        }
+        | Ok(ServerMessage::ReviewComments { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected semantic response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -218,7 +221,9 @@ pub async fn request_peek(
     let mut response = String::new();
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
-        Ok(ServerMessage::Peek { path, line, text }) => Ok(mina_protocol::Peek { path, line, text }),
+        Ok(ServerMessage::Peek { path, line, text }) => {
+            Ok(mina_protocol::Peek { path, line, text })
+        }
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -239,16 +244,15 @@ pub async fn request_peek(
         Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
-        | Ok(ServerMessage::ReviewComments { .. }) => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unexpected semantic response",
-            ))
-        }
+        | Ok(ServerMessage::ReviewComments { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected semantic response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),
@@ -295,16 +299,15 @@ pub async fn request<T: serde::Serialize>(
         Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
-        | Ok(ServerMessage::ReviewComments { .. }) => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unexpected semantic response",
-            ))
-        }
+        | Ok(ServerMessage::ReviewComments { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected semantic response",
+        )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("不正な応答: {e}"),

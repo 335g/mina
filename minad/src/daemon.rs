@@ -1490,6 +1490,29 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // OutlineRecursive（ADR-0049）: ファイル分割モジュールを辿る
+                // 階層ツリー。読み取り専用 — Outline と同じく専用処理する。
+                if let Ok(Command::OutlineRecursive { path, depth }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_outline_recursive(&daemon, &path, depth).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
+                // ReadPath（ADR-0048）: パス指定の軽量テキスト読み。LSP 非依存・
+                // バッファ非依存 — 読み取り専用で状態・世代を動かさないため、
+                // PeekDefinitionAt / Outline と同じく専用処理する。
+                if let Ok(Command::ReadPath { path }) =
+                    serde_json::from_str::<Command>(line.trim())
+                {
+                    let message = serve_read_path(&daemon, &path).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 if let Ok(Command::EnclosingSymbol { path, line, col }) =
                     serde_json::from_str::<Command>(line.trim())
                 {
@@ -2048,6 +2071,7 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
         generation: 0,
         symbols: Vec::new(),
         error: Some(msg),
+        truncated: false,
     };
     // キャッシュ高速経路: テキストのチェックサムが一致する outline があれば
     // LSP に触れずに返す（実測: セマンティック要求は毎回の再解析で数秒かかる）。
@@ -2059,6 +2083,7 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
             path: path_buf.to_string_lossy().into_owned(),
             symbols,
             error: None,
+            truncated: false,
         };
         return record_metric(daemon, msg, true).await;
     }
@@ -2102,8 +2127,270 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
         path: borrowed.path_str,
         symbols,
         error,
+        truncated: false,
     };
     record_metric(daemon, msg, true).await
+}
+
+/// 再帰展開のシンボル総数上限（ADR-0049）。応答爆発を防ぐため、横断で
+/// 集めたシンボルの総数がこれを超えたら途中で打ち切り、`truncated: true`
+/// を応答に載せる（エージェントは必要なら per-file の outline で補う）。
+const MAX_RECURSIVE_OUTLINE_SYMBOLS: usize = 500;
+
+/// [`Command::OutlineRecursive`] の処理（ADR-0049）: ファイル分割モジュール
+/// （children が空の Module シンボル）を定義ジャンプで解決し、定義ファイルを
+/// 再帰的に outline して children に埋める。読み取り専用 — 世代・push・イベント
+/// は進めない。応答形状は既存 [`ServerMessage::Outline`]（`truncated` で
+/// 打ち切りを通知）。
+///
+/// モジュール解決は「モジュール名トークン位置 → `textDocument/definition`」
+/// （peek と同じ LSP 経路）。解決先が同一ファイル内なら inline `mod { }` と
+/// 判断して再帰しない。防御: visited パス集合（循環防止）+ depth 上限 +
+/// [`MAX_RECURSIVE_OUTLINE_SYMBOLS`]。
+async fn serve_outline_recursive(
+    daemon: &Mutex<Daemon>,
+    path: &str,
+    depth: u32,
+) -> ServerMessage {
+    let err = |msg: String| ServerMessage::Outline {
+        path: path.to_string(),
+        generation: 0,
+        symbols: Vec::new(),
+        error: Some(msg),
+        truncated: false,
+    };
+    if depth == 0 {
+        return err("invalid input: depth must be >= 1".into());
+    }
+    let borrowed = match prepare_borrowed_session(daemon, path).await {
+        Ok(b) => b,
+        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::NoServer(p)) => {
+            return err(format!("outline not supported for {p} (no LSP server configured)"))
+        }
+        Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
+    };
+    if !borrowed.session.lock().await.caps.document_symbols {
+        restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
+            .await;
+        return err(format!(
+            "outline not supported for {} (LSP server が documentSymbolProvider を advertise していません)",
+            borrowed.path_str
+        ));
+    }
+    let borrows = daemon
+        .lock()
+        .await
+        .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    let fetched = lsp::document_symbols_at(&borrowed.session, &borrowed.path, &borrowed.text).await;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(borrowed.path.clone());
+    let mut budget = MAX_RECURSIVE_OUTLINE_SYMBOLS;
+    // fetched は 1 回だけ match する（error 応答は空シンボル + error で返す）。
+    let (mut symbols, mut error, mut truncated) = (Vec::new(), None, false);
+    match fetched {
+        Ok(mut s) => {
+            daemon.lock().await.cache_outline(borrowed.path.clone(), &borrowed.text, s.clone());
+            truncated = expand_outline_modules(
+                daemon,
+                &borrowed.session,
+                &borrowed.path,
+                &borrowed.text,
+                &mut s,
+                depth,
+                &mut visited,
+                &mut budget,
+            )
+            .await;
+            symbols = s;
+        }
+        Err(e) => error = Some(e),
+    }
+    if borrows {
+        // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
+        restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    let msg = ServerMessage::Outline {
+        generation: daemon.lock().await.generation,
+        path: borrowed.path_str,
+        symbols,
+        error,
+        truncated,
+    };
+    record_metric(daemon, msg, true).await
+}
+
+/// ツリー全体を走査し、children が空の Module シンボルを定義ジャンプで
+/// 解決して再帰展開する（ADR-0049）。戻り値はシンボル総数上限で打ち切られたか。
+///
+/// 各モジュール解決は: モジュール名トークン（selection_range 先頭）の LSP 座標
+/// を求め、`textDocument/definition` で定義ファイルの URI を解決 → 同一ファイル
+/// なら inline と判断してスキップ、別ファイルならそのファイルの outline を取得
+/// して children に埋める（visited で循環防止、depth で深さ制限）。
+///
+/// ponytail: 再帰は深さ最大（既定 3）で、ボトルネックは LSP のセマンティック
+/// 要求（キャッシュが効くのは同一ファイルのみ）。逐次再帰のまま — 並列化は
+/// モジュール数の実測が要請してから。
+fn expand_outline_modules<'a>(
+    daemon: &'a Mutex<Daemon>,
+    session: &'a std::sync::Arc<tokio::sync::Mutex<lsp::LspSession>>,
+    owner_path: &'a std::path::Path,
+    owner_text: &'a str,
+    symbols: &'a mut Vec<mina_protocol::OutlineSymbol>,
+    depth: u32,
+    visited: &'a mut std::collections::HashSet<std::path::PathBuf>,
+    budget: &'a mut usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        let mut truncated = false;
+        for sym in symbols.iter_mut() {
+            // children が空の Module だけがファイル分割の候補（既に children が
+            // ある = inline mod { } の中身は LSP が既に展開済み）。
+            if sym.kind == mina_protocol::SymbolKind::Module
+                && sym.children.is_empty()
+                && depth > 0
+                && *budget > 0
+            {
+                // モジュール名トークン（selection_range 先頭）の LSP 座標。
+                let char_idx = sym.selection_range.anchor;
+                let (line, character) = {
+                    let Ok(s) =
+                        tokio::time::timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await
+                    else {
+                        break;
+                    };
+                    s.char_to_lsp_pos(owner_text, char_idx)
+                };
+                // 定義ジャンプで定義ファイルを解決。解決不能（inline 含む）は
+                // children 空のままスキップ（失敗ではない）。
+                let Some(target_uri) =
+                    lsp::definition_target_uri(session, owner_path, line, character).await
+                else {
+                    continue;
+                };
+                let Ok(target) = path_from_uri(&target_uri) else {
+                    continue;
+                };
+                let target_norm = normalize_open_path(target).await;
+                if target_norm == owner_path || !visited.insert(target_norm.clone()) {
+                    continue; // 同一ファイル（inline mod { }）または訪問済み
+                }
+                // 定義ファイルの outline を取得（キャッシュ or LSP）。
+                let target_path_str = target_norm.to_string_lossy().into_owned();
+                // LSP 非対応の解決先（異なる言語等）はスキップ。
+                let Ok(target_session) = prepare_borrowed_session(daemon, &target_path_str).await
+                else {
+                    continue;
+                };
+            if !target_session.session.lock().await.caps.document_symbols {
+                restore_focus_after_semantic(
+                    daemon,
+                    &target_session.session,
+                    &target_session.focused,
+                    &target_session.path,
+                )
+                .await;
+                continue;
+            }
+            let target_borrows = daemon
+                .lock()
+                .await
+                .borrows_focus_session(&target_session.focused, &target_session.path);
+            let target_fetched = lsp::document_symbols_at(
+                &target_session.session,
+                &target_session.path,
+                &target_session.text,
+            )
+            .await;
+            if target_borrows {
+                restore_focus_session(daemon, &target_session.session, &target_session.focused)
+                    .await;
+            }
+            let mut child_symbols = match target_fetched {
+                Ok(s) => {
+                    daemon.lock().await.cache_outline(
+                        target_session.path.clone(),
+                        &target_session.text,
+                        s.clone(),
+                    );
+                    s
+                }
+                Err(_) => Vec::new(),
+            };
+            // 予算: 追加したシンボル数を消費し、超過したら打ち切り。
+            let used = child_symbols.len() + 1; // +1 = モジュール自身
+            if *budget < used {
+                truncated = true;
+                child_symbols.clear();
+            } else {
+                *budget -= used;
+            }
+            if !child_symbols.is_empty() {
+                // さらに深いモジュールへ再帰。
+                truncated |= expand_outline_modules(
+                    daemon,
+                    &target_session.session,
+                    &target_session.path,
+                    &target_session.text,
+                    &mut child_symbols,
+                    depth - 1,
+                    visited,
+                    budget,
+                )
+                .await;
+                sym.children = child_symbols;
+            }
+        }
+        // インラインの children（既に LSP が展開済みの入れ子）も再帰走査する。
+        truncated |= expand_outline_modules(
+            daemon,
+            session,
+            owner_path,
+            owner_text,
+            &mut sym.children,
+            depth,
+            visited,
+            budget,
+        )
+        .await;
+    }
+    truncated
+    })
+}
+
+/// [`Command::ReadPath`] の処理（ADR-0048）: パス指定の軽量テキスト読み。
+/// バッファ非依存・LSP 非依存 — フォーカス・idle view・世代・push・イベントを
+/// 一切動かさず、任意パスのテキストだけを返す（開文書優先・未保存編集込み・
+/// ディスク fallback）。全文スナップショットを運ばない軽量応答。
+///
+/// 読み込み不可（存在しない・非正規ファイル等）は `error: Some(…)`。
+async fn serve_read_path(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let path_str = path_buf.to_string_lossy().into_owned();
+    let text = match resolve_doc_text(daemon, &path_buf).await {
+        Some(t) => t,
+        None => {
+            return ServerMessage::ReadPath {
+                path: path_str,
+                generation: 0,
+                text: String::new(),
+                error: Some(format!("cannot open {path}")),
+            }
+        }
+    };
+    let msg = ServerMessage::ReadPath {
+        path: path_str,
+        generation: daemon.lock().await.generation,
+        text,
+        error: None,
+    };
+    // read 専用メトリクス: 全文スナップショット（get_state）との対比で
+    // 「全文を読まなくて済んだ量」を観測する（issue #27 と同じ目的）。
+    let mut d = daemon.lock().await;
+    let bytes = serde_json::to_vec(&msg).map(|v| v.len() as u64).unwrap_or(0);
+    d.metrics.read_total += 1;
+    d.metrics.read_bytes += bytes;
+    msg
 }
 
 /// [`Command::EnclosingSymbol`] の処理（ADR-0031）: 指定位置（1-origin 行:列）
@@ -4670,6 +4957,16 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::Outline { .. } | Command::EnclosingSymbol { .. } => {
             // handle_connection で専用処理される（ServerMessage::Outline /
             // EnclosingSymbol 応答。ADR-0031）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::OutlineRecursive { .. } => {
+            // handle_connection で専用処理される（ServerMessage::Outline 応答。
+            // ADR-0049）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::ReadPath { .. } => {
+            // handle_connection で専用処理される（ServerMessage::ReadPath 応答。
+            // ADR-0048）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::HoverAt { .. } | Command::WorkspaceSymbol { .. } | Command::CheckDiagnostics { .. } => {

@@ -177,7 +177,11 @@ pub fn extend_line_below(doc: &Document, selection: &Selection) -> Selection {
         .iter()
         .map(|r| {
             // 選択の末尾側の文字位置（カーソルは自身、選択範囲は end-1）
-            let bottom = if r.is_cursor() { r.head() } else { r.end().saturating_sub(1) };
+            let bottom = if r.is_cursor() {
+                r.head()
+            } else {
+                r.end().saturating_sub(1)
+            };
             let anchor = step_line_start(&text, r.start());
             // bottom 行の末尾 → 1つ下の行の末尾（末尾改行を含む）
             let mut end = step_line_end(&text, bottom);
@@ -227,7 +231,12 @@ pub fn word_at(doc: &Document, pos: usize) -> Option<(usize, usize)> {
 /// `pos` から始まる単語の末尾（排他）。[`word_at`] の内部ヘルパー。
 fn end_of_word(text: &str, pos: usize) -> usize {
     (pos..text.chars().count())
-        .take_while(|&i| matches!(categorize(text.chars().nth(i).unwrap_or(' ')), CharCategory::Word))
+        .take_while(|&i| {
+            matches!(
+                categorize(text.chars().nth(i).unwrap_or(' ')),
+                CharCategory::Word
+            )
+        })
         .last()
         .map(|i| i + 1)
         .unwrap_or(pos + 1)
@@ -1046,27 +1055,18 @@ mod tests {
         // 行0 の 'あ' から: 下 → 行1 の 'い'（char 2）→ 行2 の 'う'（char 4）→ 行3 の 'え'（char 6）
         let mut sel = Selection::point(0);
         for expected in [2, 4, 6] {
-            sel = move_selection(
-                &doc,
-                &sel,
-                Movement::Line,
-                Direction::Forward,
-            );
+            sel = move_selection(&doc, &sel, Movement::Line, Direction::Forward);
             assert_eq!(sel.primary().head(), expected, "移動後位置: {sel:?}");
         }
         // 上の行にも戻れる
         let mut sel = Selection::point(6);
         for expected in [4, 2, 0] {
-            sel = move_selection(
-                &doc,
-                &sel,
-                Movement::Line,
-                Direction::Backward,
-            );
+            sel = move_selection(&doc, &sel, Movement::Line, Direction::Backward);
             assert_eq!(sel.primary().head(), expected, "移動後位置: {sel:?}");
         }
         // 日本語 + ASCII 混在（報告ケースに近い形）
-        let doc = Document::from("//! 検索: 文書内のパターン一致\n//! 主役は [`find_matches`]\nabc");
+        let doc =
+            Document::from("//! 検索: 文書内のパターン一致\n//! 主役は [`find_matches`]\nabc");
         let mut sel = Selection::point(0);
         sel = move_selection(&doc, &sel, Movement::Line, Direction::Forward);
         sel = move_selection(&doc, &sel, Movement::Line, Direction::Forward);
@@ -1364,7 +1364,11 @@ mod tests {
         // 単語の途中から b → [単語先頭, カーソル+1)。カーソルの文字も含む
         // （Helix の block-cursor セマンティクス。Helix のテストからの移植）
         assert_eq!(
-            word_sel("Basic backward motion from the middle of a word", 3, WordMoveTarget::PrevWordStart),
+            word_sel(
+                "Basic backward motion from the middle of a word",
+                3,
+                WordMoveTarget::PrevWordStart
+            ),
             sel(vec![(4, 0)], 0),
             "Basic の途中 → Basi が選択"
         );
@@ -1387,13 +1391,21 @@ mod tests {
     fn word_b_from_word_start_selects_preceding_whitespace() {
         // 単語先頭のカーソルから b → 直前の空白ランが選択される（Helix と同じ）
         assert_eq!(
-            word_sel("    Jump to start of line from start of word preceded by whitespace", 4, WordMoveTarget::PrevWordStart),
+            word_sel(
+                "    Jump to start of line from start of word preceded by whitespace",
+                4,
+                WordMoveTarget::PrevWordStart
+            ),
             sel(vec![(4, 0)], 0),
             "J の先頭 → 前の空白が選択"
         );
         // 単語途中で空白の直後 → 単語先頭まで
         assert_eq!(
-            word_sel("    Jump to start of a word preceded by whitespace", 5, WordMoveTarget::PrevWordStart),
+            word_sel(
+                "    Jump to start of a word preceded by whitespace",
+                5,
+                WordMoveTarget::PrevWordStart
+            ),
             sel(vec![(6, 4)], 0),
             "u の途中 → Ju が選択"
         );
@@ -1418,7 +1430,11 @@ mod tests {
     #[test]
     fn word_w_from_mid_word_selects_rest_of_word() {
         assert_eq!(
-            word_sel("Starting from mid-word leaves anchor at start position and moves head", 3, WordMoveTarget::NextWordStart),
+            word_sel(
+                "Starting from mid-word leaves anchor at start position and moves head",
+                3,
+                WordMoveTarget::NextWordStart
+            ),
             sel(vec![(3, 9)], 0),
             "Starting の途中 → rting が選択（Helix のテストからの移植）"
         );
@@ -1543,7 +1559,6 @@ mod tests {
             sel(vec![(0, 0)], 0)
         );
     }
-
 
     #[test]
     fn extend_to_keeps_anchor() {
