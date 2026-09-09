@@ -884,10 +884,10 @@ fn draw_base_browse(f: &mut Frame, app: &App, body: Rect) {
     f.render_widget(Clear, overlay);
     f.render_widget(List::new(items).block(block), overlay);
 }
-/// ヘルプオーバーレイ: 本文の中央 50%（幅・高）に bordered ブロックで表示。
+/// ヘルプオーバーレイ: 本文の中央 75%×50%（幅・高）に bordered ブロックで表示。
 /// スクロールは `help_scroll`（j/k・矢印で操作、ここでクランプ）。
 fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
-    let w = body.width / 2;
+    let w = body.width * 3 / 4;
     let h = body.height / 2;
     if w < 20 || h < 5 {
         return;
