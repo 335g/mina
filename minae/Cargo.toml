@@ -12,8 +12,8 @@ name = "minae"
 path = "src/main.rs"
 
 [dependencies]
-mina-conn = { path = "../mina-conn" }
-mina-protocol = { path = "../mina-protocol" }
+mina-conn = { path = "../mina-conn", version = "0.0.5" }
+mina-protocol = { path = "../mina-protocol", version = "0.0.5" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures-util = { workspace = true }
