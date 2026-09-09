@@ -45,7 +45,8 @@ fn scoped_path_call_is_highlighted_as_function() {
     }
     // パス部分 (HashMap, foo) は function にならない
     assert!(
-        r.iter().filter(|x| x.group == HighlightGroup::Function)
+        r.iter()
+            .filter(|x| x.group == HighlightGroup::Function)
             .all(|x| text_of(src, x) != "HashMap"),
         "パス部分は function にしない: {r:?}"
     );
@@ -76,7 +77,12 @@ fn crlf_comments() {
         .iter()
         .find(|x| x.group == HighlightGroup::Comment)
         .expect("comment がある");
-    println!("crlf comment: {}..{} = {:?}", c.start, c.end, text_of(src, c));
+    println!(
+        "crlf comment: {}..{} = {:?}",
+        c.start,
+        c.end,
+        text_of(src, c)
+    );
 }
 
 #[test]

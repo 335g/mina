@@ -220,9 +220,16 @@ mod tests {
             Some(Range::new(0, 3)),
             "from より前の最後の一致"
         );
-        assert_eq!(find_prev(&doc, "foo", 0, CaseSensitivity::Smart), Some(Range::new(0, 3)));
+        assert_eq!(
+            find_prev(&doc, "foo", 0, CaseSensitivity::Smart),
+            Some(Range::new(0, 3))
+        );
         assert_eq!(find_prev(&doc, "xyz", 16, CaseSensitivity::Smart), None);
-        assert_eq!(find_prev(&doc, "", 16, CaseSensitivity::Smart), None, "空クエリ");
+        assert_eq!(
+            find_prev(&doc, "", 16, CaseSensitivity::Smart),
+            None,
+            "空クエリ"
+        );
         // 大文字小文字を区別する場合
         let mixed = Document::from("Foo foo");
         assert_eq!(

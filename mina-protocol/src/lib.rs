@@ -49,7 +49,11 @@ use serde::{Deserialize, Serialize};
 /// （ADR-0045）。応答 wire の変更のため bump。
 /// v17: `CheckDiagnostic` に `col`（1-origin 行内列 — at/peek/hover の住所）
 /// を追加（ADR-0047）。応答 wire の変更のため bump。
-pub const PROTOCOL_VERSION: u32 = 17;
+/// v18: `Command::ReadPath`（パス指定の軽量テキスト読み。ADR-0048）と
+/// `Command::OutlineRecursive` + `ServerMessage::Outline.truncated`（モジュール
+/// 横断 outline。ADR-0049）、`ServerMetrics.read_total` / `read_bytes` を追加。
+/// コマンド・応答の追加のため bump。
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -93,9 +97,15 @@ pub enum Command {
     /// 選択を点に潰して移動する。ただし単語移動（[`Movement::Word`] /
     /// [`Movement::WordEnd`]）は Helix 流に anchor を保持し、移動した分を
     /// 選択状態にする（単語途中の b で現在の単語が選択される）。
-    Move { movement: Movement, direction: Direction },
+    Move {
+        movement: Movement,
+        direction: Direction,
+    },
     /// anchor を保ったまま head を移動する（選択の拡張・縮小）。
-    Extend { movement: Movement, direction: Direction },
+    Extend {
+        movement: Movement,
+        direction: Direction,
+    },
     /// 文書の先頭/末尾へ絶対移動する。
     Goto { target: GotoTarget },
     /// 表示範囲をページ単位でスクロールする（正で下）。高さは daemon 側が知っている。
@@ -198,7 +208,11 @@ pub enum Command {
     /// 置換して保存する。応答は全文を運ばない軽量 [`ServerMessage::RenameResult`]。
     /// 読み取り専用でない（テキストを変える）ため、通常経路は headless の
     /// `session rename`（daemon は headless ゲートをこのコマンドに限って解放する）。
-    Rename { path: String, old: String, new: String },
+    Rename {
+        path: String,
+        old: String,
+        new: String,
+    },
     /// シンボルの参照位置の列挙（読み取り専用。ADR-0029）。`old` の最初の識別子
     /// 出現を解決し、LSP の `textDocument/references` で全参照位置を返す。
     /// 応答は全文を運ばない軽量 [`ServerMessage::ReferencesResult`]。
@@ -209,6 +223,17 @@ pub enum Command {
     /// エージェントが全文を読まずに構造を把握し、得られた範囲をその後の
     /// 読み・編集（range-read / apply）の住所にするための経路。
     Outline { path: String },
+    /// ファイル分割モジュールを辿る Outline（読み取り専用。ADR-0049）。
+    /// `depth`（>= 1）まで module 宣言 → 定義ファイルの再帰で横断し、子
+    /// モジュールのシンボルを `children` に埋めて返す。応答形状は既存
+    /// [`ServerMessage::Outline`] を再利用（`truncated` で打ち切りを通知）。
+    OutlineRecursive { path: String, depth: u32 },
+    /// パス指定の軽量テキスト読み（読み取り専用。ADR-0048）。バッファ非依存・
+    /// LSP 非依存 — フォーカス・世代・push を動かさず、任意パスのテキストだけを
+    /// 返す（開文書優先・未保存編集込み・ディスク fallback）。応答は全文
+    /// スナップショットを運ばない軽量 [`ServerMessage::ReadPath`]。`--lines` の
+    /// 範囲切出しは CLI 側で行う。
+    ReadPath { path: String },
     /// 指定位置を囲むシンボルの取得（読み取り専用。ADR-0031）。`line:col`
     /// （1-origin）から、その位置を含む最も深い記号の名前・種別・正確な範囲を
     /// 返す（`documentSymbol` の selectionRange 由来）。エージェントが全文を
@@ -464,7 +489,7 @@ pub enum ServerMessage {
         base_roots: Vec<BaseRootInfo>,
     },
     /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
-/// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
+    /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
     Hints {
         path: String,
         /// 応答時点の世代（エージェントが状態と対応付けるための目印）。
@@ -510,8 +535,9 @@ pub enum ServerMessage {
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
-    /// [`Command::Outline`] の応答（ADR-0031）。シンボルの階層ツリーを全文なしで
-    /// 返す軽量応答。失敗は `error: Some(…)` で表す（`symbols` は空）。
+    /// [`Command::Outline`] / [`Command::OutlineRecursive`] の応答（ADR-0031 /
+    /// 0049）。シンボルの階層ツリーを全文なしで返す軽量応答。失敗は
+    /// `error: Some(…)` で表す（`symbols` は空）。
     Outline {
         /// 対象ファイルのパス。
         path: String,
@@ -521,6 +547,10 @@ pub enum ServerMessage {
         symbols: Vec<OutlineSymbol>,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
+        /// 再帰横断時（ADR-0049）、シンボル総数上限（500）に達して途中で
+        /// 打ち切られたか。非再帰・完走時は false。
+        #[serde(default)]
+        truncated: bool,
     },
     /// [`Command::HoverAt`] の応答（ADR-0032）。指定位置の hover テキスト（型・
     /// シグネチャ・doc を連結・切り詰め）。全文スナップショットを運ばない軽量
@@ -565,6 +595,21 @@ pub enum ServerMessage {
         /// （解析未完・クロスシンボル破壊の可能性。exit 0 のまま — クリーンと
         /// クリーン未確認は別物）。
         settled: bool,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
+    /// [`Command::ReadPath`] の応答（ADR-0048）。パス指定の軽量テキスト読み。
+    /// 全文スナップショットを運ばず `text` だけを返す。読み取り専用で
+    /// 状態・世代は進めない（`generation` は応答時点の目印）。失敗は
+    /// `error: Some(…)` で表す（`text` は空）。`--lines` の範囲切出しは
+    /// CLI 側で行う。
+    ReadPath {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 応答時点の世代。
+        generation: u64,
+        /// ファイルのテキスト（開文書優先・未保存編集込み、なければディスク読み）。
+        text: String,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
@@ -711,6 +756,11 @@ pub struct ServerMetrics {
     pub check_total: u64,
     /// CheckDiagnostics 応答の累積シリアライズ bytes（ADR-0032）。
     pub check_bytes: u64,
+    /// ReadPath 要求回数（ADR-0048）。パス指定の軽量読み — get_state_total
+    /// （全文再読の近似）と対比して「全文を読まなくて済んだ量」を観測する。
+    pub read_total: u64,
+    /// ReadPath 応答の累積シリアライズ bytes（ADR-0048）。
+    pub read_bytes: u64,
 }
 
 /// クライアント種別（接続開始時の [`Hello`] で宣言。イベントの source 判定に使う）。
@@ -1232,6 +1282,8 @@ mod tests {
                 symbol_search_bytes: 15,
                 check_total: 16,
                 check_bytes: 17,
+                read_total: 18,
+                read_bytes: 19,
             },
             base_roots: vec![BaseRootInfo {
                 root: "/tmp/mina-base-abc".into(),
@@ -1296,7 +1348,10 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
             assert_eq!(back, cmd);
         }
-        assert_eq!(serde_json::to_string(&ReviewSide::Current).unwrap(), "\"current\"");
+        assert_eq!(
+            serde_json::to_string(&ReviewSide::Current).unwrap(),
+            "\"current\""
+        );
         let msg = ServerMessage::ReviewComments {
             generation: 9,
             comments: vec![ReviewCommentView {
@@ -1326,13 +1381,25 @@ mod tests {
         let symbol = OutlineSymbol {
             name: "frobnicate".into(),
             kind: SymbolKind::Function,
-            range: Range { anchor: 0, head: 30 },
-            selection_range: Range { anchor: 3, head: 13 },
+            range: Range {
+                anchor: 0,
+                head: 30,
+            },
+            selection_range: Range {
+                anchor: 3,
+                head: 13,
+            },
             children: vec![OutlineSymbol {
                 name: "inner".into(),
                 kind: SymbolKind::Variable,
-                range: Range { anchor: 10, head: 20 },
-                selection_range: Range { anchor: 14, head: 19 },
+                range: Range {
+                    anchor: 10,
+                    head: 20,
+                },
+                selection_range: Range {
+                    anchor: 14,
+                    head: 19,
+                },
                 children: Vec::new(),
             }],
         };
@@ -1344,6 +1411,13 @@ mod tests {
         // Outline / EnclosingSymbol コマンドの round-trip
         for cmd in [
             Command::Outline {
+                path: "src/lib.rs".into(),
+            },
+            Command::OutlineRecursive {
+                path: "src/lib.rs".into(),
+                depth: 3,
+            },
+            Command::ReadPath {
                 path: "src/lib.rs".into(),
             },
             Command::EnclosingSymbol {
@@ -1384,18 +1458,59 @@ mod tests {
             generation: 3,
             symbols: vec![symbol],
             error: None,
+            truncated: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);
         assert!(json.contains("\"type\":\"outline\""));
+        // truncated はデフォルト false（後方互換）
+        assert!(json.contains("\"truncated\":false"));
+        let truncated: ServerMessage = serde_json::from_str(
+            &serde_json::to_string(&ServerMessage::Outline {
+                path: "src/lib.rs".into(),
+                generation: 3,
+                symbols: vec![],
+                error: None,
+                truncated: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            truncated,
+            ServerMessage::Outline {
+                path: "src/lib.rs".into(),
+                generation: 3,
+                symbols: vec![],
+                error: None,
+                truncated: true,
+            }
+        );
+
+        // ReadPath 応答の round-trip（ADR-0048）
+        let read_msg = ServerMessage::ReadPath {
+            path: "src/lib.rs".into(),
+            generation: 4,
+            text: "fn main() {}\n".into(),
+            error: None,
+        };
+        let read_back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&read_msg).unwrap()).unwrap();
+        assert_eq!(read_back, read_msg);
 
         let msg = ServerMessage::EnclosingSymbol {
             path: "src/lib.rs".into(),
             name: "frobnicate".into(),
             kind: SymbolKind::Function,
-            range: Range { anchor: 0, head: 30 },
-            selection_range: Range { anchor: 3, head: 13 },
+            range: Range {
+                anchor: 0,
+                head: 30,
+            },
+            selection_range: Range {
+                anchor: 3,
+                head: 13,
+            },
             found: true,
             error: None,
         };

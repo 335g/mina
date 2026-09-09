@@ -94,6 +94,19 @@ pub enum SessionCmd {
         #[arg(long)]
         lines: Option<String>,
     },
+    /// Read the text of any path without touching the current buffer
+    /// (ADR-0048). Buffer-independent and LSP-free: never moves focus/generation,
+    /// prefers the open document (unsaved edits included) and falls back to disk.
+    /// The response is a lightweight text message, not a full snapshot.
+    Read {
+        /// File to read (relative to the agent's cwd, like `Open`)
+        path: PathBuf,
+        /// Restrict output to a line range `start:end` (1-origin, inclusive; `end`
+        /// may be empty = last line). Prints only those numbered lines instead of
+        /// the whole text — same contract as `get --lines`.
+        #[arg(long)]
+        lines: Option<String>,
+    },
     /// Fetch the daemon build generation and metrics (printed as JSON, issue #27)
     Info,
     /// Run one `Command` (JSON is the wire [`Command`] as-is)
@@ -178,10 +191,22 @@ pub enum SessionCmd {
     },
     /// Fetch the hierarchical symbol outline of any path without full text
     /// (ADR-0031). Prints the symbol tree (name, kind, ranges) as JSON — the
-    /// ranges double as the addresses for later reads and edits.
+    /// ranges double as the addresses for later reads and edits. With
+    /// `--recursive`, file-scoped modules are followed to their definition files
+    /// and nested into the tree (ADR-0049).
     Outline {
         /// Path
         path: PathBuf,
+        /// Follow file-scoped module declarations to their definition files and
+        /// inline the nested tree (ADR-0049). Without it, only the one file's
+        /// symbols are returned. Specifying --depth also enables recursion
+        /// (depth then overrides the default of 3).
+        #[arg(long, short)]
+        recursive: bool,
+        /// Maximum module depth for recursion (default 3, must be >= 1).
+        /// 1 = direct child modules only. Implies --recursive.
+        #[arg(long)]
+        depth: Option<u32>,
     },
     /// Report the symbol enclosing `<line>:<col>` (1-origin) with its exact
     /// range and name-token range (ADR-0031). Reads no full text — use the
@@ -281,6 +306,21 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 // なので、節約は CLI 出力側（= LLM が読む量）で成立する。
                 Some(range) => print_line_range(&snapshot, &range)?,
                 None => println!("{}", serde_json::to_string_pretty(&snapshot)?),
+            }
+        }
+        SessionCmd::Read { path, lines } => {
+            // ADR-0048: パス指定の軽量テキスト読み。get（現在のバッファ）と違い
+            // 任意パスをバッファを汚さず読む。失敗は stderr + exit 1（cannot open = 
+            // 入力エラー、再試行不可）。
+            let outcome = execute_read(&path.to_string_lossy()).await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("read: {e}");
+                std::process::exit(1);
+            }
+            match lines {
+                // --lines: get と同じ番号付き行契約（read→apply の old にそのまま使える）。
+                Some(range) => print_text_lines(&outcome.path, outcome.generation, &outcome.text, &range)?,
+                None => print!("{}", outcome.text),
             }
         }
         SessionCmd::Info => {
@@ -408,15 +448,29 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 println!("{}:{}", loc.path, loc.line + 1);
             }
         }
-        SessionCmd::Outline { path } => {
+        SessionCmd::Outline { path, recursive, depth } => {
             // 成功: シンボルの階層ツリーを JSON で出力する（全文なし — ADR-0031。
             // エージェントは得られた range を読み・編集の住所にする）。
             // 失敗: stderr に理由、exit 1（入力エラー: not supported / invalid）
             // または exit 2（再試行可能: LSP エラー等）。
-            let outcome = execute_outline(&path.to_string_lossy()).await?;
+            // ADR-0049: --recursive か --depth 指定でモジュール横断（--depth は
+            // 既定 3 を上書きし、再帰を兼ねる）。
+            let recursive = recursive || depth.is_some();
+            let depth = depth.unwrap_or(3);
+            if recursive && depth == 0 {
+                eprintln!("outline: invalid input: depth must be >= 1");
+                std::process::exit(1);
+            }
+            let outcome =
+                execute_outline(&path.to_string_lossy(), recursive, depth).await?;
             if let Some(e) = &outcome.error {
                 eprintln!("outline: {e}");
                 std::process::exit(outline_exit_code(e));
+            }
+            if outcome.truncated {
+                // ADR-0049: シンボル総数上限で打ち切った旨を stderr に出す
+                // （exit は変えない — 部分結果は成功扱い）。
+                eprintln!("outline: truncated at {} symbols (use --depth to limit depth or per-file outline)", MAX_RECURSIVE_OUTLINE_SYMBOLS);
             }
             // compact JSON で出力する（トークン削減が目的の経路なので、pretty の
             // 空白を省く。262 記号で ~40% 削減 — ADR-0031 検証の実測）。
@@ -553,18 +607,30 @@ fn parse_position(pos: &str) -> io::Result<(u32, u32)> {
     Ok((line, col))
 }
 
-/// `session get --lines start:end` の出力。全文スナップショットの代わりに、対象行
-/// だけを番号付き JSON で返す（トークン削減 — P1）。`start` が行数を超えれば
-/// 説明付きゼロ結果（Q3/R1）、`end` が行数を超えれば最終行へクランプしてその旨を
-/// 載せる。read の結果（番号付き行）がそのまま `session apply` の `old` 指定に
-/// 使える（read/edit 契約統一 — P2）。
+/// `session get --lines start:end` / `session read --lines start:end` の出力。
+/// 全文の代わりに、対象行だけを番号付き JSON で返す（トークン削減 — P1）。
+/// `start` が行数を超えれば説明付きゼロ結果（Q3/R1）、`end` が行数を超えれば
+/// 最終行へクランプしてその旨を載せる。read/get の結果（番号付き行）がそのまま
+/// `session apply` の `old` 指定に使える（read/edit 契約統一 — P2）。
 fn print_line_range(snapshot: &StateSnapshot, range: &str) -> io::Result<()> {
+    print_text_lines(
+        &snapshot.path.clone().unwrap_or_default(),
+        snapshot.generation,
+        &snapshot.text,
+        range,
+    )
+}
+
+/// [`print_line_range`] のテキスト直接版（ADR-0048 — `read` の `--lines`）。
+/// スナップショットを介さず `path`/`generation`/`text` から同じ番号付き
+/// 出力を作る。
+fn print_text_lines(path: &str, generation: u64, text: &str, range: &str) -> io::Result<()> {
     let (start, end) = parse_line_range(range)?;
-    let r = slice_lines(&snapshot.text, start, end);
+    let r = slice_lines(text, start, end);
     let end_str = end.map_or(String::new(), |e| e.to_string());
     let mut obj = serde_json::Map::new();
-    obj.insert("path".into(), snapshot.path.clone().unwrap_or_default().into());
-    obj.insert("generation".into(), snapshot.generation.into());
+    obj.insert("path".into(), path.into());
+    obj.insert("generation".into(), generation.into());
     obj.insert("line_count".into(), (r.line_count as u64).into());
     if r.out_of_range {
         // Q3: 「空の成功」ではなく理由付きのゼロ結果。エージェントは次の範囲指定を
@@ -687,7 +753,13 @@ struct ReferencesOutcome {
 struct OutlineOutcome {
     symbols: Vec<OutlineSymbol>,
     error: Option<String>,
+    /// ADR-0049: 再帰横断時にシンボル総数上限で打ち切られたか。
+    truncated: bool,
 }
+
+/// outline --recursive のシンボル総数上限（ADR-0049。daemon 側の
+/// MAX_RECURSIVE_OUTLINE_SYMBOLS と同じ値 — truncated 警告の表示用）。
+const MAX_RECURSIVE_OUTLINE_SYMBOLS: usize = 500;
 
 /// rename の失敗を exit コードに分類する（ADR-0029）: 入力エラー（not supported /
 /// invalid input）は再試行しても通らないので 1、それ以外（シンボル未解決・
@@ -746,6 +818,7 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         | Ok(ServerMessage::ServerInfo { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -790,6 +863,7 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         | Ok(ServerMessage::ServerInfo { .. })
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -853,11 +927,19 @@ fn check_exit_code(e: &str) -> i32 {
 }
 
 /// daemon に接続し、シンボルの階層ツリーを軽量応答（[`ServerMessage::Outline`]）
-/// で受け取る（ADR-0031）。全文は運ばれない。
-async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
+/// で受け取る（ADR-0031）。`recursive` ならファイル分割モジュールを辿る
+/// [`Command::OutlineRecursive`]（ADR-0049）。全文は運ばれない。
+async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<OutlineOutcome> {
     let (mut write_half, mut reader) = open_one_shot().await?;
-    let command = Command::Outline {
-        path: conn::absolutize(path),
+    let command = if recursive {
+        Command::OutlineRecursive {
+            path: conn::absolutize(path),
+            depth,
+        }
+    } else {
+        Command::Outline {
+            path: conn::absolutize(path),
+        }
     };
     let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
     line.push('\n');
@@ -867,8 +949,12 @@ async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
         Ok(ServerMessage::Outline {
-            symbols, error, ..
-        }) => Ok(OutlineOutcome { symbols, error }),
+            symbols, error, truncated, ..
+        }) => Ok(OutlineOutcome {
+            symbols,
+            error,
+            truncated,
+        }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
             "Outline にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
         )),
@@ -881,8 +967,63 @@ async fn execute_outline(path: &str) -> io::Result<OutlineOutcome> {
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
-        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+        | Ok(ServerMessage::EnclosingSymbol { .. })
+        | Ok(ServerMessage::ReadPath { .. }) => {
             Err(invalid("Outline に想定外の軽量応答が返った"))
+        }
+        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+    }
+}
+
+/// `session read` の結果（[`ServerMessage::ReadPath`] の展開形。ADR-0048）。
+struct ReadOutcome {
+    path: String,
+    generation: u64,
+    text: String,
+    error: Option<String>,
+}
+
+/// daemon に接続し、パス指定の軽量テキスト読み（[`ServerMessage::ReadPath`]）で
+/// 受け取る（ADR-0048）。LSP 非依存・バッファ非依存 — フォーカス・世代を動かさず
+/// 任意パスのテキストだけを返す（開文書優先・未保存編集込み・ディスク fallback）。
+async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
+    let (mut write_half, mut reader) = open_one_shot().await?;
+    let command = Command::ReadPath {
+        path: conn::absolutize(path),
+    };
+    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::ReadPath {
+            path,
+            generation,
+            text,
+            error,
+        }) => Ok(ReadOutcome {
+            path,
+            generation,
+            text,
+            error,
+        }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "ReadPath にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+            Err(invalid("ReadPath に想定外の軽量応答が返った"))
         }
         Err(e) => Err(invalid(format!("不正な応答: {e}"))),
     }
@@ -934,6 +1075,7 @@ async fn execute_enclosing(
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -993,6 +1135,7 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1026,6 +1169,7 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1073,6 +1217,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
@@ -1104,6 +1249,7 @@ async fn execute_reviews() -> io::Result<Vec<ReviewCommentView>> {
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::ReadPath { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
@@ -1159,6 +1305,7 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         Ok(mina_protocol::ServerMessage::Hints { .. })
         | Ok(mina_protocol::ServerMessage::Peek { .. })
         | Ok(mina_protocol::ServerMessage::Outline { .. })
+        | Ok(mina_protocol::ServerMessage::ReadPath { .. })
         | Ok(mina_protocol::ServerMessage::Hover { .. })
         | Ok(mina_protocol::ServerMessage::WorkspaceSymbols { .. })
         | Ok(mina_protocol::ServerMessage::Check { .. })

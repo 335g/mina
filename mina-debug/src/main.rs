@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use mina_protocol::{fnv1a64, ClientKind, Command, DocumentEdit, Hello, ServerMessage, StateSnapshot};
+use mina_protocol::{
+    ClientKind, Command, DocumentEdit, Hello, ServerMessage, StateSnapshot, fnv1a64,
+};
 use serde::Serialize;
 
 /// daemon のソケットパス（minae-term の `daemon::socket_path()` と一致させること）。
@@ -120,13 +122,20 @@ fn report(after: &StateSnapshot, start: usize, end: usize, text: &str) -> std::i
         return Ok(());
     }
     cliclack::log::success(format!("適用: [{start}..{end}) → {:?}", text))?;
-    let event = after.events.last().map(|e| format!("{:?}/{:?}", e.kind, e.source));
+    let event = after
+        .events
+        .last()
+        .map(|e| format!("{:?}/{:?}", e.kind, e.source));
     cliclack::log::info(format!(
         "gen={} dirty={} event={}{}",
         after.generation,
         after.dirty,
         event.as_deref().unwrap_or("-"),
-        if after.deleted.is_some() { " deleted" } else { "" }
+        if after.deleted.is_some() {
+            " deleted"
+        } else {
+            ""
+        }
     ))?;
     cliclack::note("スニペット", snippet(&after.text, start, 1))?;
     Ok(())
@@ -169,7 +178,11 @@ fn snippet(text: &str, at: usize, context: usize) -> String {
         .map(|(k, (s, e))| {
             let ln = from + k;
             let marker = if ln == idx { ">" } else { " " };
-            format!("{marker} {:>3}: {}", ln + 1, chars[*s..*e].iter().collect::<String>())
+            format!(
+                "{marker} {:>3}: {}",
+                ln + 1,
+                chars[*s..*e].iter().collect::<String>()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -255,6 +268,8 @@ impl Conn {
             | Ok(ServerMessage::WorkspaceSymbols { .. })
             // #50: ReviewComments 応答もこの CLI では使わない
             | Ok(ServerMessage::ReviewComments { .. })
+            // ADR-0048/0049: ReadPath 応答もこの CLI では使わない
+            | Ok(ServerMessage::ReadPath { .. })
             | Ok(ServerMessage::Check { .. }) => {
                 Err(std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -301,7 +316,10 @@ fn ensure_daemon(path: &Path) -> std::io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err(std::io::Error::new(ErrorKind::NotFound, "daemon が起動しなかった"))
+    Err(std::io::Error::new(
+        ErrorKind::NotFound,
+        "daemon が起動しなかった",
+    ))
 }
 
 fn find_mina() -> Option<PathBuf> {
@@ -332,12 +350,12 @@ mod tests {
     fn snippet_marks_line_and_shows_context() {
         let text = "a\nbb\nccc\ndddd";
         // 'bb' の 'b'（at=2）を含む行が 2 行目。前後 1 行ずつ
-        assert_eq!(
-            snippet(text, 2, 1),
-            "    1: a\n>   2: bb\n    3: ccc"
-        );
+        assert_eq!(snippet(text, 2, 1), "    1: a\n>   2: bb\n    3: ccc");
         // 末尾（at=len）は最終行にフォールバック
-        assert_eq!(snippet(text, text.chars().count(), 1), "    3: ccc\n>   4: dddd");
+        assert_eq!(
+            snippet(text, text.chars().count(), 1),
+            "    3: ccc\n>   4: dddd"
+        );
         // 空テキスト
         assert_eq!(snippet("", 0, 0), ">   1: ");
     }
