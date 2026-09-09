@@ -453,32 +453,68 @@ fn draw_editor(
             num_style,
         ));
 
-        // 本文: ハイライト範囲で区切ってスタイル付け
+        // 本文: ハイライト範囲で区切ってスタイル付け。選択範囲に掛かる部分は
+        // Selection 背景を重ねる（Normal の x 行選択などを可視化する）。
         let base_style = tint(base(app), delta_fg);
+        let sel_style = ui(app, UiRole::Selection);
+        // 当該行に掛かる選択範囲（char オフセット、[ls, le) で切る。
+        // 空範囲（カーソル）は何も重ねない）。
+        let mut sel: Vec<(usize, usize)> = Vec::new();
+        for r in snap.selection.iter() {
+            let s = r.anchor.min(r.head);
+            let e = r.anchor.max(r.head);
+            if e > ls && s < le {
+                sel.push((s.max(ls), e.min(le)));
+            }
+        }
+        sel.sort();
+        let mut push_seg = |a: usize, b: usize, style: Style| {
+            let mut p = a;
+            for &(s, e) in sel.iter() {
+                if e <= p || s >= b {
+                    continue;
+                }
+                let ss = s.max(p);
+                if ss > p {
+                    spans.push(Span::styled(
+                        line_chars[p - ls..ss - ls].iter().collect::<String>(),
+                        style,
+                    ));
+                }
+                let ee = e.min(b);
+                spans.push(Span::styled(
+                    line_chars[ss - ls..ee - ls].iter().collect::<String>(),
+                    style.patch(sel_style),
+                ));
+                p = ee;
+                if p >= b {
+                    break;
+                }
+            }
+            if p < b {
+                spans.push(Span::styled(
+                    line_chars[p - ls..b - ls].iter().collect::<String>(),
+                    style,
+                ));
+            }
+        };
         let mut pos = ls;
         // 当該行に掛かる範囲だけを走査する（highlights は昇順・非重複）
         for hl in highlights.iter().filter(|h| h.start < le && h.end > ls) {
             let seg_start = hl.start.max(ls);
             let seg_end = hl.end.min(le);
             if seg_start > pos {
-                spans.push(Span::styled(
-                    line_chars[pos - ls..seg_start - ls].iter().collect::<String>(),
-                    base_style,
-                ));
+                push_seg(pos, seg_start, base_style);
             }
-            spans.push(Span::styled(
-                line_chars[seg_start - ls..seg_end - ls]
-                    .iter()
-                    .collect::<String>(),
+            push_seg(
+                seg_start,
+                seg_end,
                 tint(base_style.patch(syn(app, hl.group)), delta_fg),
-            ));
+            );
             pos = seg_end;
         }
         if pos < le {
-            spans.push(Span::styled(
-                line_chars[pos - ls..].iter().collect::<String>(),
-                base_style,
-            ));
+            push_seg(pos, le, base_style);
         }
         // #50: 現在側コメントのマーカー（`"`。解決行で照合）。
         if app.review_list.iter().any(|e| {
