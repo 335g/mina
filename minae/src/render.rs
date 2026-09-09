@@ -913,10 +913,11 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
             1 => UiRole::ModeSelect,
             _ => UiRole::ModeInsert,
         };
-        lines.push(Line::from(Span::styled(
-            format!("  {}", s.title),
-            ui(app, mode_role),
-        )));
+        lines.push(Line::from(vec![
+            // モード名左の空白は背景色を付けない（ベース色のまま）
+            Span::raw("  "),
+            Span::styled(s.title, ui(app, mode_role)),
+        ]));
         for e in s.entries {
             // lazygit 風: キーを右揃え、説明を左寄せ。揃え幅は表示幅基準で
             // 手動パディング（full-width キーでも揃う）。
@@ -929,8 +930,8 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
         lines.push(Line::from(""));
     }
 
-    // 本文の内側高さ = 枠2行 + 下に固定するフッター1行を除く
-    let inner_h = overlay.height.saturating_sub(3) as usize;
+    // 本文の内側高さ = 枠2行 + 下部固定（空白1 + フッター1）の計4行を除く
+    let inner_h = overlay.height.saturating_sub(4) as usize;
     app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(inner_h));
     let start = app.help_scroll;
     let body_txt = lines
@@ -945,17 +946,20 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
         .style(base(app));
     f.render_widget(Clear, overlay);
     f.render_widget(Paragraph::new(body_txt).style(base(app)).block(block), overlay);
-    // フッター操作ヒントは最下部行に中央寄せで固定（スクロール対象外）
+    // 下部固定2行: 1行目は空白、2行目に操作ヒントを中央寄せ（スクロール対象外）
     let footer_area = Rect {
         x: overlay.x + 1,
-        y: overlay.y + overlay.height.saturating_sub(2),
+        y: overlay.y + overlay.height.saturating_sub(3),
         width: overlay.width.saturating_sub(2),
-        height: 1,
+        height: 2,
     };
     f.render_widget(
-        Paragraph::new(Line::from(crate::help::FOOTER_HINT))
-            .style(base(app))
-            .alignment(ratatui::layout::Alignment::Center),
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(crate::help::FOOTER_HINT),
+        ])
+        .style(base(app))
+        .alignment(ratatui::layout::Alignment::Center),
         footer_area,
     );
 }
