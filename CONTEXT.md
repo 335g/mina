@@ -159,3 +159,11 @@ _Avoid_: snapshot dir, temp root
 **ReviewComment**:
 A comment anchored to a diff location — side (Base or current), path, line number, the line's content at add time (snippet), and the comment body — held in Daemon-shared storage so both the TUI and headless Clients (`minas review`) can see it. Same-anchor adds overwrite; an empty body deletes that anchor. Listing resolves each entry against the current text (`stale` plus a resolved line) without rewriting the stored value; re-pin (when the base point changes), unregister, or explicit clear drops all entries, while a TUI disconnect keeps them.
 _Avoid_: inline comment, annotation
+
+**Overlay**:
+A client-local display mode the TUI draws over the editor (Tree, Diagnostics, Peek, Help, …). Needs no Daemon command; the next key press is handled by the overlay, not the editor.
+_Avoid_: popup, panel, window
+
+**Help Overlay**:
+The Overlay opened with `?` from Normal or Select, listing every mode's keybindings in a centered half-size window. Scrollable; Esc or `?` closes it.
+_Avoid_: help window, keybind popup

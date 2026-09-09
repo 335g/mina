@@ -9,6 +9,7 @@ mod app;
 mod colors;
 mod config;
 mod git;
+mod help;
 mod keymap;
 mod render;
 

@@ -52,6 +52,8 @@ pub(crate) enum Overlay {
     Commits,
     /// 基準全文ブラウズ（#52・a2）。フォーカスを動かさない読取り専用表示。
     BaseBrowse,
+    /// キーバインドヘルプ（`?` で開く。クライアントローカル。Esc/? で閉じる）。
+    Help,
 }
 
 /// コマンドライン系プロンプトの種類（Helix 流の `:` / `/` 等）。
@@ -60,9 +62,9 @@ pub(crate) enum Overlay {
 pub(crate) enum Prompt {
     /// `:` コマンドライン。
     Command(String),
-    /// `/`（forward=true）または `?` の検索プロンプト。キー入力のたびに
-    /// [`Command::Search`] を送る（ライブ検索）。
-    Search { buf: String, forward: bool },
+    /// `/` の検索プロンプト。キー入力のたびに [`Command::Search`] を送る
+    /// （ライブ検索）。後方検索は `?` をヘルプに譲ったため無い（N で後方探索）。
+    Search(String),
     /// `r` 置換: 次の文字キーで選択/カーソル文字を置換する。
     Replace,
     /// `R` リネーム: カーソル位置の単語（`old`）を新しい名前に変える。
@@ -91,13 +93,7 @@ impl Prompt {
     pub(crate) fn prefix(&self) -> char {
         match self {
             Prompt::Command(_) => ':',
-            Prompt::Search { forward, .. } => {
-                if *forward {
-                    '/'
-                } else {
-                    '?'
-                }
-            }
+            Prompt::Search(_) => '/',
             Prompt::Replace => 'r',
             Prompt::Rename { .. } => 'R',
             Prompt::ReviewComment { .. } => '"',
@@ -106,7 +102,7 @@ impl Prompt {
 
     pub(crate) fn buf(&self) -> &str {
         match self {
-            Prompt::Command(b) | Prompt::Search { buf: b, .. } | Prompt::Rename { buf: b, .. } | Prompt::ReviewComment { buf: b, .. } => b,
+            Prompt::Command(b) | Prompt::Search(b) | Prompt::Rename { buf: b, .. } | Prompt::ReviewComment { buf: b, .. } => b,
             Prompt::Replace => "",
         }
     }
@@ -728,6 +724,8 @@ pub(crate) struct App {
     pub(crate) diag_focus: DiagFocus,
     pub(crate) activity_filter: ActivityFilter,
     pub(crate) activity_scroll: usize,
+    /// ヘルプオーバーレイのスクロール位置（0-origin）。
+    pub(crate) help_scroll: usize,
     pub(crate) scheme: Colorscheme,
     pub(crate) schemes_dir: PathBuf,
     pub(crate) capability: ColorCapability,
@@ -770,6 +768,7 @@ impl App {
             diag_focus: DiagFocus::View,
             activity_filter: ActivityFilter::All,
             activity_scroll: 0,
+            help_scroll: 0,
             scheme,
             schemes_dir,
             capability,
@@ -1106,13 +1105,16 @@ impl App {
                     self.prompt = Some(Prompt::Command(String::new()));
                     return;
                 }
-                Char('/') | Char('?') => {
+                Char('/') => {
                     self.pending.clear();
-                    let forward = key.code == Char('/');
-                    self.prompt = Some(Prompt::Search {
-                        buf: String::new(),
-                        forward,
-                    });
+                    self.prompt = Some(Prompt::Search(String::new()));
+                    return;
+                }
+                // ヘルプ（`?`）は後方検索を譲って貰った。後方探索は n/N で行う。
+                Char('?') => {
+                    self.pending.clear();
+                    self.overlay = Overlay::Help;
+                    self.help_scroll = 0;
                     return;
                 }
                 Char('r') => {
@@ -1224,6 +1226,14 @@ impl App {
                     Up | Char('k') if key.modifiers.is_empty() => self.move_browse(-1),
                     _ => {}
                 }
+            }
+            Overlay::Help => match key.code {
+                Esc | Char('?') => self.overlay = Overlay::None,
+                Down | Char('j') if key.modifiers.is_empty() => self.help_scroll += 1,
+                Up | Char('k') if key.modifiers.is_empty() => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                _ => {}
             }
             Overlay::Diagnostics => {
                 // Tab: view ⇄ エディタのフォーカス切替（両側でナビ・編集可能）。
@@ -1344,7 +1354,7 @@ impl App {
                 Enter => self.run_command_line(&buf).await,
                 _ => self.prompt = Some(Prompt::Command(buf)),
             },
-            Prompt::Search { mut buf, forward } => {
+            Prompt::Search(mut buf) => {
                 // ライブ検索: キー入力のたびに Search を送る
                 let keep = match key.code {
                     Char(c)
@@ -1371,15 +1381,11 @@ impl App {
                     if !buf.is_empty() {
                         self.send(&Command::Search {
                             query: buf.clone(),
-                            direction: if forward {
-                                Direction::Forward
-                            } else {
-                                Direction::Backward
-                            },
+                            direction: Direction::Forward,
                         })
                         .await;
                     }
-                    self.prompt = Some(Prompt::Search { buf, forward });
+                    self.prompt = Some(Prompt::Search(buf));
                 }
             }
             Prompt::Replace => match key.code {
@@ -2696,11 +2702,10 @@ mod tests {
             app.handle_key(key).await;
             assert_ne!(app.scheme.name, before, "C で配色が切り替わる");
 
-            // プロンプトを開くキー
+            // プロンプトを開くキー（? はヘルプに譲ったので含めない）
             for (ch, check) in [
                 (':', "command"),
                 ('/', "search"),
-                ('?', "search"),
                 ('r', "replace"),
             ] {
                 let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
@@ -2709,6 +2714,20 @@ mod tests {
                 app.handle_key(esc).await;
                 assert!(app.prompt.is_none(), "Esc でキャンセル");
             }
+
+            // ?: 後方検索ではなくヘルプ（Overlay::Help）を開く。j でスクロール、
+            // 再び ? や Esc で閉じる。
+            let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+            app.handle_key(q).await;
+            assert_eq!(app.overlay, Overlay::Help, "? でヘルプが開く");
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .await;
+            assert_eq!(app.help_scroll, 1, "j でスクロール");
+            app.handle_key(q).await;
+            assert_eq!(app.overlay, Overlay::None, "再び ? で閉じる");
+            app.handle_key(q).await;
+            app.handle_key(esc).await;
+            assert_eq!(app.overlay, Overlay::None, "Esc でも閉じる");
 
             // R: カーソル位置の単語を old にリネームプロンプト
             app.snapshot.text = "hello world".into();

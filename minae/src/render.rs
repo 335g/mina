@@ -228,10 +228,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     if app.overlay == Overlay::BaseBrowse {
         draw_base_browse(f, app, body);
     }
+    if app.overlay == Overlay::Help {
+        draw_help(f, app, body);
+    }
     draw_status(f, app, status_area);
 
-    // カーソル（エディタ可視時のみ。ツリー全画面時は置かない）
-    if app.overlay != Overlay::Tree {
+    // カーソル（エディタ可視時のみ。ツリー/ヘルプ全画面時は置かない）
+    if !matches!(app.overlay, Overlay::Tree | Overlay::Help) {
         draw_cursor(f, app, editor_area, cmp_ref, gap_cur, canvas_ref, canvas_lines, v2);
     }
 }
@@ -881,6 +884,54 @@ fn draw_base_browse(f: &mut Frame, app: &App, body: Rect) {
     f.render_widget(Clear, overlay);
     f.render_widget(List::new(items).block(block), overlay);
 }
+/// ヘルプオーバーレイ: 本文の中央 50%（幅・高）に bordered ブロックで表示。
+/// スクロールは `help_scroll`（j/k・矢印で操作、ここでクランプ）。
+fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
+    let w = body.width / 2;
+    let h = body.height / 2;
+    if w < 20 || h < 5 {
+        return;
+    }
+    let overlay = Rect {
+        x: body.x + (body.width - w) / 2,
+        y: body.y + (body.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    let help = crate::help::sections();
+    let key_w = help
+        .iter()
+        .flat_map(|s| s.entries.iter())
+        .map(|e| e.key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<String> = Vec::new();
+    for s in help {
+        lines.push(format!(" {}", s.title));
+        for e in s.entries {
+            lines.push(format!(" {:<key_w$}  {}", e.key, e.desc));
+        }
+        lines.push(String::new());
+    }
+    lines.push(crate::help::FOOTER_HINT.to_string());
+
+    let inner_h = overlay.height.saturating_sub(2) as usize;
+    app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(inner_h));
+    let start = app.help_scroll;
+    let body_txt = lines
+        .iter()
+        .skip(start)
+        .take(inner_h)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let block = Block::bordered()
+        .title(" キーバインドヘルプ (Esc/?: 閉じる) ")
+        .border_style(ui(app, UiRole::PopupBorder))
+        .style(base(app));
+    f.render_widget(Clear, overlay);
+    f.render_widget(Paragraph::new(body_txt).block(block), overlay);
+}
 fn draw_diag_view(f: &mut Frame, app: &App, area: Rect) {
     // 重要度マーカーエリア（左上）: 存在する重要度にマーカー、アクティブのみ強調
     let mut markers = String::from(" ");
@@ -1141,6 +1192,7 @@ mod tests {
             Overlay::Peek,
             Overlay::Commits,
             Overlay::BaseBrowse,
+            Overlay::Help,
         ] {
             let mut app = test_app();
             app.overlay = overlay;
@@ -1170,6 +1222,7 @@ mod tests {
                 Overlay::Peek => assert!(text.contains("定義")),
                 Overlay::Commits => assert!(text.contains("コミット選択")),
                 Overlay::BaseBrowse => assert!(text.contains("基準")),
+                Overlay::Help => assert!(text.contains("キーバインドヘルプ")),
                 Overlay::None => {}
             }
         }

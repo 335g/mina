@@ -216,8 +216,10 @@ impl Keymaps {
                 direction: Direction::Backward,
             },
         ));
-        // 検索ナビゲーション（Helix の n/N/*）。`/`/`?` はクライアント側で
-        // プロンプトを開くためキーマップにはない。
+        // 検索ナビゲーション（Helix の n/N/*）。`/` はクライアント側で
+        // 検索プロンプトを開くためキーマップにはない。`?` も後方検索
+        // プロンプトだったがヘルプ（Overlay::Help）に譲った — 後方探索は
+        // N で行う（n/N/* は Select でも有効）。
         out.push((
             vec![plain(KeyCode::Char('n'))],
             Command::SearchNext {
