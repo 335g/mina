@@ -920,12 +920,17 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
             Span::raw("  "),
             Span::styled(s.title, mode_style),
         ]));
-        // モード名の下側に「モード背景色と同じ色」の下線を引く（左の空白と
-        // 右の文末以降には引かない）
+        // モード名の下側に「モード背景色と同じ色」の下線を引く。
+        // 左の空白はそのまま（下線なし）、モード名の直後は空白1つを挟んで
+        // 右端まで下線を伸ばす。
         if let Some(bg) = mode_style.bg {
+            let inner_w = overlay.width.saturating_sub(2) as usize;
+            let fill = inner_w.saturating_sub(2 + 1 + title_w); // 左空白2 + 空白1
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("─".repeat(title_w), Style::default().fg(bg)),
+                Span::raw(" "),
+                Span::styled("─".repeat(fill), Style::default().fg(bg)),
             ]));
         }
         for e in s.entries {
