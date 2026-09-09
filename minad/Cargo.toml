@@ -12,11 +12,11 @@ name = "minad"
 path = "src/main.rs"
 
 [dependencies]
-mina-text = { path = "../mina-text", version = "0.0.4" }
-mina-view = { path = "../mina-view", version = "0.0.4" }
-mina-protocol = { path = "../mina-protocol", version = "0.0.4" }
-mina-lsp = { path = "../mina-lsp", version = "0.0.4" }
-mina-loader = { path = "../mina-loader", version = "0.0.4" }
+mina-text = { path = "../mina-text", version = "0.0.5" }
+mina-view = { path = "../mina-view", version = "0.0.5" }
+mina-protocol = { path = "../mina-protocol", version = "0.0.5" }
+mina-lsp = { path = "../mina-lsp", version = "0.0.5" }
+mina-loader = { path = "../mina-loader", version = "0.0.5" }
 tree-sitter.workspace = true
 serde.workspace = true
 serde_json.workspace = true

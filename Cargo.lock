@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "mina-conn"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "libc",
  "mina-protocol",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "mina-debug"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "cliclack",
  "libc",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "mina-loader"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "mina-protocol",
  "tree-sitter",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "mina-lsp"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "mina-protocol"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "mina-text"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "ropey",
  "smallvec",
@@ -884,14 +884,14 @@ dependencies = [
 
 [[package]]
 name = "mina-view"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "mina-text",
 ]
 
 [[package]]
 name = "minad"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "libc",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "minae"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "crossterm",
  "futures-util",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "minas"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "mina-conn",

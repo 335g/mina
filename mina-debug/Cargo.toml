@@ -10,7 +10,7 @@ publish = false
 description = "DocumentEdit を試行する対話 CLI（開発用デバッグツール）"
 
 [dependencies]
-mina-protocol = { path = "../mina-protocol", version = "0.0.4" }
+mina-protocol = { path = "../mina-protocol", version = "0.0.5" }
 cliclack = "0.5"
 serde.workspace = true
 serde_json.workspace = true
