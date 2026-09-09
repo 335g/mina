@@ -914,7 +914,6 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
             _ => UiRole::ModeInsert,
         };
         let mode_style = ui(app, mode_role);
-        let mode_color = mode_style.fg.or(mode_style.bg);
         lines.push(Line::from(vec![
             // モード名左の空白は背景色を付けない（ベース色のまま）
             Span::raw("  "),
@@ -924,16 +923,10 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
             // lazygit 風: キーを右揃え、説明を左寄せ。揃え幅は表示幅基準で
             // 手動パディング（full-width キーでも揃う）。
             let pad = key_w.saturating_sub(UnicodeWidthStr::width(e.key));
-            let mut spans = Vec::new();
-            // 行頭に `|` をモード色で置く（セクションの印）
-            if let Some(c) = mode_color {
-                spans.push(Span::styled("|", Style::default().fg(c)));
-            }
-            spans.push(Span::styled(
+            lines.push(Line::from(Span::styled(
                 format!(" {}{}  {}", " ".repeat(pad), e.key, e.desc),
                 base(app),
-            ));
-            lines.push(Line::from(spans));
+            )));
         }
         lines.push(Line::from(""));
     }
