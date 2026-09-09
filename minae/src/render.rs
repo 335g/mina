@@ -909,8 +909,10 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
     for s in help {
         lines.push(format!(" {}", s.title));
         for e in s.entries {
-            // lazygit 風: キーを右揃え、説明を左寄せ
-            lines.push(format!(" {:>key_w$}  {}", e.key, e.desc));
+            // lazygit 風: キーを右揃え、説明を左寄せ。揃え幅は表示幅基準で
+            // 手動パディング（full-width キーでも揃う）。
+            let pad = key_w.saturating_sub(UnicodeWidthStr::width(e.key));
+            lines.push(format!(" {}{}  {}", " ".repeat(pad), e.key, e.desc));
         }
         lines.push(String::new());
     }
