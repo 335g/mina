@@ -621,7 +621,7 @@ fn gutter_width(snap: &StateSnapshot, diff: Option<&git::FileDiff>, canvas_lines
     (1 + 2 + digits(total.max(max_old_no(diff))).max(3) + 1) as u16
 }
 
-/// ステータス行（左: モード + パス / 右: 報知 + キーヒント）。プロンプト中は入力行。
+/// ステータス行（左: モード + パス / 右: 報知）。プロンプト中は入力行。
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if let Some(prompt) = &app.prompt {
         let line = Line::from(vec![Span::styled(
@@ -671,7 +671,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mode_part = format!(" {mode_txt} ");
     let left_path = format!(" {path}{dirty}{cmp_mark}{gap_mark} ");
 
-    // 右: 報知エリア（スピナー + 今の活動）+ キーヒント
+    // 右: 報知エリア（フラッシュ/スピナー + 今の活動）
     let mut right = String::new();
     if let Some(flash) = &app.flash {
         right.push_str(flash);
@@ -692,13 +692,6 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
     if app.conn.is_none() {
         right.push_str("[未接続]   ");
-    }
-    if app.gap_review.is_some() {
-        right.push_str("j/k:移動 h/l:列 Enter:定義 K:コメント Esc:戻る");
-    } else if app.compare.as_ref().is_some_and(|c| c.is_showing()) {
-        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較 K:コメント E:AI");
-    } else {
-        right.push_str("T:ツリー G:診断 A:履歴 C:配色 D:比較 E:AI");
     }
 
     let status_style = ui(app, UiRole::StatusLine);
@@ -1130,7 +1123,7 @@ mod tests {
         assert!(text.contains("src/main.rs"), "パスがステータスに出る");
         assert!(text.contains("NORMAL"), "モードが出る");
         assert!(text.contains('!'), "warning マーカーが出る");
-        assert!(text.contains("T:ツリー"), "キーヒントが出る");
+        assert!(!text.contains("T:ツリー"), "ステータス右側にキーヒントを出さない");
         // モード名だけモード色・パスはステータス色（背景が違う）
         let buf = terminal.backend().buffer();
         let y = 23;
