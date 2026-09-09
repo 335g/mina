@@ -1227,13 +1227,23 @@ impl App {
                     _ => {}
                 }
             }
-            Overlay::Help => match key.code {
-                Esc | Char('?') => self.overlay = Overlay::None,
-                Down | Char('j') if key.modifiers.is_empty() => self.help_scroll += 1,
-                Up | Char('k') if key.modifiers.is_empty() => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
+            Overlay::Help => {
+                // 1頁 = ヘルプ本文の内側高さ（popup 高 = body_h/2、枠2 + フッター1）
+                let page = (self.body_h / 2).saturating_sub(3).max(1);
+                match key.code {
+                    Esc | Char('?') => self.overlay = Overlay::None,
+                    Down | Char('j') if key.modifiers.is_empty() => self.help_scroll += 1,
+                    Up | Char('k') if key.modifiers.is_empty() => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    Char('f') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        self.help_scroll += page;
+                    }
+                    Char('b') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        self.help_scroll = self.help_scroll.saturating_sub(page);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             Overlay::Diagnostics => {
                 // Tab: view ⇄ エディタのフォーカス切替（両側でナビ・編集可能）。

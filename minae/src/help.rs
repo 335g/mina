@@ -19,7 +19,7 @@ pub(crate) struct Section {
 }
 
 /// ポップアップ末尾の操作ヒント行。
-pub(crate) const FOOTER_HINT: &str = "j/k・↑/↓: スクロール    Esc/?: 閉じる";
+pub(crate) const FOOTER_HINT: &str = "j/k・↑/↓: 行送り   Ctrl-f/b: 頁送り   Esc/?: 閉じる";
 
 pub(crate) fn sections() -> &'static [Section] {
     &SECTIONS

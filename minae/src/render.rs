@@ -914,7 +914,7 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
             _ => UiRole::ModeInsert,
         };
         lines.push(Line::from(Span::styled(
-            format!(" {}", s.title),
+            format!("  {}", s.title),
             ui(app, mode_role),
         )));
         for e in s.entries {
@@ -928,9 +928,9 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
         }
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(crate::help::FOOTER_HINT));
 
-    let inner_h = overlay.height.saturating_sub(2) as usize;
+    // 本文の内側高さ = 枠2行 + 下に固定するフッター1行を除く
+    let inner_h = overlay.height.saturating_sub(3) as usize;
     app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(inner_h));
     let start = app.help_scroll;
     let body_txt = lines
@@ -945,6 +945,19 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
         .style(base(app));
     f.render_widget(Clear, overlay);
     f.render_widget(Paragraph::new(body_txt).style(base(app)).block(block), overlay);
+    // フッター操作ヒントは最下部行に中央寄せで固定（スクロール対象外）
+    let footer_area = Rect {
+        x: overlay.x + 1,
+        y: overlay.y + overlay.height.saturating_sub(2),
+        width: overlay.width.saturating_sub(2),
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(crate::help::FOOTER_HINT))
+            .style(base(app))
+            .alignment(ratatui::layout::Alignment::Center),
+        footer_area,
+    );
 }
 fn draw_diag_view(f: &mut Frame, app: &App, area: Rect) {
     // 重要度マーカーエリア（左上）: 存在する重要度にマーカー、アクティブのみ強調
