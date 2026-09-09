@@ -126,8 +126,8 @@ pub enum Command {
     DeleteWordForward,
     /// 選択（またはカーソル位置）を削除する。
     DeleteRange,
-    /// 各 Range を head の行全体（末尾改行を含む）へ広げる（Helix の `X` =
-    /// `extend_to_line_bounds`。行選択）。Select モードへの移行はしない。
+    /// 各 Range を head の行全体（末尾改行は含まない）へ広げる（行選択）。
+    /// head は行末（改行の直前）に置く。Select モードへの移行はしない。
     SelectLine,
     /// 各 Range を行選択の形へ整えてから、その下の行の末尾（末尾改行含む）
     /// まで head を拡張する（Helix の `x` = `extend_line_below`。連打で
