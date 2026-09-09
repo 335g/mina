@@ -913,11 +913,21 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
             1 => UiRole::ModeSelect,
             _ => UiRole::ModeInsert,
         };
+        let mode_style = ui(app, mode_role);
+        let title_w = UnicodeWidthStr::width(s.title);
         lines.push(Line::from(vec![
             // モード名左の空白は背景色を付けない（ベース色のまま）
             Span::raw("  "),
-            Span::styled(s.title, ui(app, mode_role)),
+            Span::styled(s.title, mode_style),
         ]));
+        // モード名の下側に「モード背景色と同じ色」の下線を引く（左の空白と
+        // 右の文末以降には引かない）
+        if let Some(bg) = mode_style.bg {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("─".repeat(title_w), Style::default().fg(bg)),
+            ]));
+        }
         for e in s.entries {
             // lazygit 風: キーを右揃え、説明を左寄せ。揃え幅は表示幅基準で
             // 手動パディング（full-width キーでも揃う）。
