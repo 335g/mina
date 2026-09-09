@@ -59,8 +59,10 @@ const SECTIONS: &[Section] = &[
             // 表示・操作
             Entry { key: ":", desc: "コマンドライン（w/q/open/colorscheme 等）" },
             Entry { key: "?", desc: "キーバインドヘルプを開く" },
-            Entry { key: "T / G", desc: "ツリー / 診断リスト" },
-            Entry { key: "A / C", desc: "活動履歴 / 配色を切替" },
+            Entry { key: "T", desc: "ツリー" },
+            Entry { key: "G", desc: "診断リスト" },
+            Entry { key: "A", desc: "活動履歴" },
+            Entry { key: "C", desc: "配色を切替" },
             Entry { key: "D / B / M", desc: "比較表示 / 基準更新 / 2コミット比較" },
             Entry { key: "P", desc: "基準全文ブラウズ" },
             Entry { key: "E / K", desc: "コメントをAIへ / コメント入力" },
