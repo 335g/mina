@@ -905,18 +905,30 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
         .map(|e| UnicodeWidthStr::width(e.key))
         .max()
         .unwrap_or(0);
-    let mut lines: Vec<String> = Vec::new();
-    for s in help {
-        lines.push(format!(" {}", s.title));
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, s) in help.iter().enumerate() {
+        // 見出しはフッターのモード名と同じモード色（背景あり）で塗る
+        let mode_role = match i {
+            0 => UiRole::ModeNormal,
+            1 => UiRole::ModeSelect,
+            _ => UiRole::ModeInsert,
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {}", s.title),
+            ui(app, mode_role),
+        )));
         for e in s.entries {
             // lazygit 風: キーを右揃え、説明を左寄せ。揃え幅は表示幅基準で
             // 手動パディング（full-width キーでも揃う）。
             let pad = key_w.saturating_sub(UnicodeWidthStr::width(e.key));
-            lines.push(format!(" {}{}  {}", " ".repeat(pad), e.key, e.desc));
+            lines.push(Line::from(Span::styled(
+                format!(" {}{}  {}", " ".repeat(pad), e.key, e.desc),
+                base(app),
+            )));
         }
-        lines.push(String::new());
+        lines.push(Line::from(""));
     }
-    lines.push(crate::help::FOOTER_HINT.to_string());
+    lines.push(Line::from(crate::help::FOOTER_HINT));
 
     let inner_h = overlay.height.saturating_sub(2) as usize;
     app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(inner_h));
@@ -926,14 +938,13 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
         .skip(start)
         .take(inner_h)
         .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
     let block = Block::bordered()
         .title(" キーバインドヘルプ (Esc/?: 閉じる) ")
         .border_style(ui(app, UiRole::PopupBorder))
         .style(base(app));
     f.render_widget(Clear, overlay);
-    f.render_widget(Paragraph::new(body_txt).block(block), overlay);
+    f.render_widget(Paragraph::new(body_txt).style(base(app)).block(block), overlay);
 }
 fn draw_diag_view(f: &mut Frame, app: &App, area: Rect) {
     // 重要度マーカーエリア（左上）: 存在する重要度にマーカー、アクティブのみ強調
