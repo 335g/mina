@@ -668,7 +668,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             }
         })
         .unwrap_or_default();
-    let left = format!("{mode_txt}  {path}{dirty}{cmp_mark}{gap_mark}");
+    let mode_part = format!(" {mode_txt} ");
+    let left_path = format!(" {path}{dirty}{cmp_mark}{gap_mark} ");
 
     // 右: 報知エリア（スピナー + 今の活動）+ キーヒント
     let mut right = String::new();
@@ -701,11 +702,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let status_style = ui(app, UiRole::StatusLine);
-    let left_w = UnicodeWidthStr::width(left.as_str());
+    let left_w =
+        UnicodeWidthStr::width(mode_part.as_str()) + UnicodeWidthStr::width(left_path.as_str());
     let right_w = UnicodeWidthStr::width(right.as_str());
     let pad = (area.width as usize).saturating_sub(left_w + right_w);
     let line = Line::from(vec![
-        Span::styled(format!(" {left} "), ui(app, mode_role)),
+        Span::styled(mode_part, ui(app, mode_role)),
+        Span::styled(left_path, status_style),
         Span::styled(" ".repeat(pad), status_style),
         Span::styled(format!(" {right} "), status_style),
     ]);
@@ -1128,6 +1131,12 @@ mod tests {
         assert!(text.contains("NORMAL"), "モードが出る");
         assert!(text.contains('!'), "warning マーカーが出る");
         assert!(text.contains("T:ツリー"), "キーヒントが出る");
+        // モード名だけモード色・パスはステータス色（背景が違う）
+        let buf = terminal.backend().buffer();
+        let y = 23;
+        let row: String = (0..80).map(|x| buf[(x as u16, y)].symbol().to_string()).collect();
+        let px = row.find("src/main.rs").expect("パス行");
+        assert_ne!(buf[(1u16, y)].bg, buf[(px as u16, y)].bg, "モード名とパスで背景色が違う");
     }
 
     #[test]
