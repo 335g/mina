@@ -902,14 +902,15 @@ fn draw_help(f: &mut Frame, app: &mut App, body: Rect) {
     let key_w = help
         .iter()
         .flat_map(|s| s.entries.iter())
-        .map(|e| e.key.chars().count())
+        .map(|e| UnicodeWidthStr::width(e.key))
         .max()
         .unwrap_or(0);
     let mut lines: Vec<String> = Vec::new();
     for s in help {
         lines.push(format!(" {}", s.title));
         for e in s.entries {
-            lines.push(format!(" {:<key_w$}  {}", e.key, e.desc));
+            // lazygit 風: キーを右揃え、説明を左寄せ
+            lines.push(format!(" {:>key_w$}  {}", e.key, e.desc));
         }
         lines.push(String::new());
     }
