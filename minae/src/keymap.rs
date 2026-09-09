@@ -61,7 +61,9 @@ pub struct Keymaps {
 /// termina は大文字バイトを `Char('G')+SHIFT` として報告する（ターミナルによっては
 /// `Char('g')+SHIFT` のこともある）。バインディングは「大文字 = 修飾子なし」に
 /// 統一するため、どちらも `Char('G')`（修飾子なし）へ正規化する。
-fn normalize(key: KeyEvent) -> KeyEvent {
+/// `app::handle_key` でも共用する（T/G/A/C 等のホットキーが Shift+T で
+/// 開かない問題の修正）。
+pub(crate) fn normalize(key: KeyEvent) -> KeyEvent {
     match key.code {
         KeyCode::Char(c)
             if c.is_ascii_alphabetic() && key.modifiers.contains(Modifiers::SHIFT) =>

@@ -22,7 +22,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use crate::colors::{self, ColorCapability, Colorscheme};
 use crate::config;
 use crate::git;
-use crate::keymap::{Keymaps, Resolution};
+use crate::keymap::{Keymaps, Resolution, normalize as normalize_key};
 use crate::render;
 
 /// スピナーの tick 間隔。
@@ -980,6 +980,9 @@ impl App {
             self.handle_gap_key(key).await;
             return;
         }
+        // 大文字キーは Shift 付きで届く（keymap と同じ正規化）。これをしないと
+        // T/G/A/C 等の `modifiers.is_empty()` ガードに弾かれて開かない。
+        let key = normalize_key(key);
         if self.prompt.is_some() {
             self.handle_prompt_key(key).await;
             return;
@@ -2670,6 +2673,14 @@ mod tests {
             let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             app.handle_key(esc).await;
             assert_eq!(app.overlay, Overlay::None, "Esc で閉じる");
+            // 実端末は Shift+T を Char('T')+SHIFT（や Char('t')+SHIFT）で報告する
+            for code in [KeyCode::Char('T'), KeyCode::Char('t')] {
+                let shift_t = KeyEvent::new(code, KeyModifiers::SHIFT);
+                app.handle_key(shift_t).await;
+                assert_eq!(app.overlay, Overlay::Tree, "Shift+T({code:?})でツリーが開く");
+                app.handle_key(esc).await;
+                assert_eq!(app.overlay, Overlay::None, "Esc で閉じる");
+            }
 
             // G/A/C
             let key = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE);
