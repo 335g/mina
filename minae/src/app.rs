@@ -18,6 +18,7 @@ use mina_protocol::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::time::timeout;
 
 use crate::colors::{self, ColorCapability, Colorscheme};
 use crate::config;
@@ -29,6 +30,10 @@ use crate::render;
 const SPIN_INTERVAL: Duration = Duration::from_millis(80);
 /// 接続断後の再接続バックオフ。
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+/// 起動時 Open 応答の待ち上限。daemon が LSP 初期化（rust-analyzer の
+/// spawn + initialize）に時間をかけても UI を固めないための安全弁。
+/// 超過した応答はメインループの read_sock_line が拾って反映する。
+const OPEN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// TUI の自己申告ラベル（ADR-0038）。
 const CLIENT_NAME: &str = "tui";
 
@@ -736,6 +741,9 @@ pub(crate) struct App {
     pub(crate) sent_viewport: usize,
     pub(crate) tick: u64,
     pub(crate) flash: Option<String>,
+    /// 起動時 Open の応答待ち表示（タイムアウト時はメインループが拾うまで残る。
+    /// スナップショットが届いたら on_socket_line で消える）。
+    pub(crate) pending_open: Option<String>,
     pub(crate) peek: Option<Peek>,
     pub(crate) quit: bool,
     pub(crate) retry_at: Option<Instant>,
@@ -779,6 +787,7 @@ impl App {
             sent_viewport: 0,
             tick: 0,
             flash: None,
+            pending_open: None,
             peek: None,
             quit: false,
             retry_at: None,
@@ -829,6 +838,7 @@ impl App {
         self.conn = None;
         self.retry_at = Some(Instant::now() + RECONNECT_BACKOFF);
         self.flash = Some(notice.into());
+        self.pending_open = None; // 未応答の起動ファイルは再接続後に追わない
     }
 
     /// コマンドを直列送信する（応答は常時読みループで受ける）。切断時は落とす。
@@ -862,6 +872,8 @@ impl App {
         };
         match msg {
             ServerMessage::Response { snapshot } | ServerMessage::Push { snapshot } => {
+                // 起動時 Open の遅延応答（全文スナップショット）が届いた: 待ち表示を消す
+                self.pending_open = None;
                 // PeekDefinition の応答だけが peek を運ぶ — 取り出して保持する
                 // （後続のスナップショットでは消さない。Esc か次の peek で消える）。
                 if let Some(peek) = snapshot.peek.clone() {
@@ -2542,26 +2554,43 @@ pub async fn run(files: Vec<String>) -> std::io::Result<()> {
             format!("daemon に接続できませんでした: {e}"),
         )
     })?;
-    // 起動時ファイルを開く
+    // 起動時ファイルを開く。初回描画を Open 応答より先に出しておく（応答待ちで
+    // 真っ暗にならないように）。応答待ちはタイムアウト付き — daemon が LSP
+    // 初期化（rust-analyzer の spawn + initialize）に時間をかけていても UI を
+    // 固めず、遅延応答はメインループの read_sock_line が拾って反映する。
     for file in &files {
+        app.pending_open = Some(file.clone());
+        terminal.draw(|f| render::render(f, &mut app))?;
         app.send(&Command::Open {
             path: conn::absolutize(file),
         })
         .await;
         // 応答を1行読んで状態に反映する（起動直後の空画面を避ける）
+        let mut line = String::new();
         if let Some(c) = app.conn.as_mut() {
-            let mut line = String::new();
-            if c.reader.read_line(&mut line).await.is_ok() {
-                app.on_socket_line(line).await;
-            } else {
-                app.disconnect("daemon との接続が切れました — 再接続します");
-                break;
+            match timeout(OPEN_RESPONSE_TIMEOUT, c.reader.read_line(&mut line)).await {
+                Ok(Ok(_)) => app.on_socket_line(line).await,
+                Ok(Err(_)) => {
+                    app.disconnect("daemon との接続が切れました — 再接続します");
+                    break;
+                }
+                Err(_) => {
+                    // 応答遅延: pending_open 表示を出したままメインループへ進む。
+                    // （起動ファイルは実質 0〜1 枚。2 枚目以降はタイムアウト時に
+                    // 保留され `:o` で開く — ponytail: 複数起動ファイル対応は
+                    // 応答順の追跡が必要になるため割り切る）
+                    break;
+                }
             }
         }
     }
     // 端末サイズを記録して SetViewport を送る
     // 起動時: 死んだセッションの基準登録を掃除する（#49 adversarial）。
-    app.sweep_dead_base_roots().await;
+    // Open 応答が遅延中（pending_open が残っている）なら sweep は後回し —
+    // sweep の逐次読みが遅延応答を吸ってしまうため（応答はメインループで拾う）。
+    if app.pending_open.is_none() {
+        app.sweep_dead_base_roots().await;
+    }
     if let Ok(size) = terminal.size() {
         app.width = size.width;
         app.height = size.height;

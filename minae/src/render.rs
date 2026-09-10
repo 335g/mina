@@ -679,6 +679,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if let Some(flash) = &app.flash {
         right.push_str(flash);
         right.push_str("   ");
+    } else if let Some(file) = &app.pending_open {
+        // 起動時 Open の応答待ち（タイムアウト後はメインループが拾うまで残る）
+        right.push_str(&format!("{file} を読込中…   "));
     } else if !snap.activities.is_empty() {
         let labels: Vec<_> = snap.activities.iter().map(|a| a.label.as_str()).collect();
         right.push_str(&format!("{} {}   ", spinner(app.tick), labels.join(" / ")));
