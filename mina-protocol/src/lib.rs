@@ -53,7 +53,9 @@ use serde::{Deserialize, Serialize};
 /// `Command::OutlineRecursive` + `ServerMessage::Outline.truncated`（モジュール
 /// 横断 outline。ADR-0049）、`ServerMetrics.read_total` / `read_bytes` を追加。
 /// コマンド・応答の追加のため bump。
-pub const PROTOCOL_VERSION: u32 = 18;
+/// v19: Helix の surround（`ms` / `mr` / `md`）— `Command::SurroundAdd` /
+/// `SurroundDelete` / `SurroundReplace` を追加。コマンドの追加のため bump。
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// daemon が bind するソケットのパス。
 ///
@@ -179,6 +181,18 @@ pub enum Command {
     Undo,
     /// 直近に undo された変更グループをやり直す。
     Redo,
+    /// 選択（カーソルの場合はその位置に空のペア）を `ch` の対応ペアで囲む
+    /// （Helix の `ms` = `surround_add`）。対応表（開き/閉じが既知の文字と
+    /// 引用符 `"` `'` `\`` `|`）は mina-text の `surround` モジュールが持つ。
+    /// 適用後は囲んだ全体を選択し Select モードを抜ける。
+    SurroundAdd { ch: char },
+    /// 各カーソルを囲む `ch` の対応ペアを両側とも削除する（Helix の `md` =
+    /// `surround_delete`）。ペアが見つからないカーソルが1つでもあると状態を
+    /// 変えず status で報告する。
+    SurroundDelete { ch: char },
+    /// 各カーソルを囲む `from` の対応ペアを `to` の対応ペアに置き換える
+    /// （Helix の `mr` = `surround_replace`）。`from` は閉じ側でもよい。
+    SurroundReplace { from: char, to: char },
     /// 現在の文書をファイルに書き込む（結果は status に報告）。
     Save,
     /// フォーカス文書を閉じる。残りの文書があればそこへ移り、無ければ空状態に戻る（ADR-0015）。
@@ -1060,6 +1074,31 @@ impl Default for StateSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surround_commands_round_trip_with_char_fields() {
+        // char は JSON では1文字の文字列になる（シングル文字の妥当性は serde が担保）
+        for (command, json) in [
+            (
+                Command::SurroundAdd { ch: '(' },
+                r#"{"SurroundAdd":{"ch":"("}}"#,
+            ),
+            (
+                Command::SurroundDelete { ch: '"' },
+                r#"{"SurroundDelete":{"ch":"\""}}"#,
+            ),
+            (
+                Command::SurroundReplace { from: '(', to: ']' },
+                r#"{"SurroundReplace":{"from":"(","to":"]"}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&command).unwrap(), json);
+            let back: Command = serde_json::from_str(json).unwrap();
+            assert_eq!(back, command);
+        }
+        // 複数文字の「文字」は char として解釈できない（拒否される）
+        assert!(serde_json::from_str::<Command>(r#"{"SurroundAdd":{"ch":"ab"}}"#).is_err());
+    }
 
     #[test]
     fn highlight_types_round_trip_with_lowercase_names() {

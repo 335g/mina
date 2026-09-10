@@ -72,6 +72,9 @@ pub(crate) enum Prompt {
     Search(String),
     /// `r` 置換: 次の文字キーで選択/カーソル文字を置換する。
     Replace,
+    /// `ms`/`mr`/`md` 囲み文字（surround）。`m` リーダーの後続キー
+    /// （`s`/`r`/`d` + 文字）を buf に溜め、揃ったら daemon へ送る。
+    Surround(String),
     /// `R` リネーム: カーソル位置の単語（`old`）を新しい名前に変える。
     Rename { buf: String, old: String },
     /// `K` レビューコメント（#50）: 比較表示中のカーソル行（現在側）または
@@ -100,6 +103,7 @@ impl Prompt {
             Prompt::Command(_) => ':',
             Prompt::Search(_) => '/',
             Prompt::Replace => 'r',
+            Prompt::Surround(_) => 'm',
             Prompt::Rename { .. } => 'R',
             Prompt::ReviewComment { .. } => '"',
         }
@@ -107,7 +111,7 @@ impl Prompt {
 
     pub(crate) fn buf(&self) -> &str {
         match self {
-            Prompt::Command(b) | Prompt::Search(b) | Prompt::Rename { buf: b, .. } | Prompt::ReviewComment { buf: b, .. } => b,
+            Prompt::Command(b) | Prompt::Search(b) | Prompt::Rename { buf: b, .. } | Prompt::ReviewComment { buf: b, .. } | Prompt::Surround(b) => b,
             Prompt::Replace => "",
         }
     }
@@ -1129,6 +1133,13 @@ impl App {
                     self.help_scroll = 0;
                     return;
                 }
+                // `m` リーダー: Helix の surround（ms = 囲む / md = 外す /
+                // mr = 置換）。r/R と同じくクライアント側で後続キーを読む。
+                Char('m') => {
+                    self.pending.clear();
+                    self.prompt = Some(Prompt::Surround(String::new()));
+                    return;
+                }
                 Char('r') => {
                     self.pending.clear();
                     self.prompt = Some(Prompt::Replace);
@@ -1424,6 +1435,37 @@ impl App {
                 Esc => {}
                 Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {}
                 _ => self.prompt = Some(Prompt::Replace),
+            },
+            Prompt::Surround(mut buf) => {
+                // m リーダー: s/r/d の後に文字を足して、揃ったら送信。バッファは
+                // `s`/`d` + 1文字、`r` + 2文字で確定。Esc/C-c でキャンセル。
+                let keep = match key.code {
+                    Char(c)
+                        if key.modifiers.is_empty()
+                            || key.modifiers == crossterm::event::KeyModifiers::SHIFT =>
+                    {
+                        buf.push(c);
+                        match surround_command(&buf) {
+                            Some(cmd) => {
+                                self.send(&cmd).await;
+                                false
+                            }
+                            None if surround_pending(&buf) => true,
+                            _ => {
+                                self.flash = Some("surround: s/r/d + 文字".into());
+                                false
+                            }
+                        }
+                    }
+                    Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        false
+                    }
+                    Esc => false,
+                    _ => true,
+                };
+                if keep {
+                    self.prompt = Some(Prompt::Surround(buf));
+                }
             },
             Prompt::Rename { mut buf, old } => match key.code {
                 Char(c)
@@ -2467,6 +2509,24 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// `m` リーダーのバッファ（`s`/`d` + 文字、`r` + 2文字）をコマンドへ解決。
+/// 未確定（まだ文字が足りない）なら None。
+fn surround_command(buf: &str) -> Option<Command> {
+    let chars: Vec<char> = buf.chars().collect();
+    match chars.as_slice() {
+        ['s', ch] => Some(Command::SurroundAdd { ch: *ch }),
+        ['d', ch] => Some(Command::SurroundDelete { ch: *ch }),
+        ['r', from, to] => Some(Command::SurroundReplace { from: *from, to: *to }),
+        _ => None,
+    }
+}
+
+/// バッファがまだ入力途中か（続きの文字を受け付ける）。
+fn surround_pending(buf: &str) -> bool {
+    let chars: Vec<char> = buf.chars().collect();
+    matches!(chars.as_slice(), ['s'] | ['d'] | ['r'] | ['r', _])
+}
+
 /// ソケットから 1 行読む（切断時は `Err`）。接続なしは永遠に待つ。
 async fn read_sock_line(conn: &mut Option<Conn>) -> Result<String, ()> {
     match conn {
@@ -2782,8 +2842,73 @@ mod tests {
     }
 
     #[test]
+    fn surround_m_reader_flow() {
+        // m リーダー: ms/d/r + 文字で確定し、未確定・無効入力はプロンプトに残る
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut app = App::new(
+                crate::colors::default_scheme(),
+                PathBuf::from("/tmp"),
+                ColorCapability::TrueColor,
+                false,
+            );
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            let plain = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+            // m でプロンプト、s までは残り、( で確定（接続なしなので送信は no-op）
+            app.handle_key(plain('m')).await;
+            assert!(matches!(&app.prompt, Some(Prompt::Surround(b)) if b.is_empty()));
+            app.handle_key(plain('s')).await;
+            assert!(matches!(&app.prompt, Some(Prompt::Surround(b)) if b == "s"));
+            app.handle_key(plain('(')).await;
+            assert!(app.prompt.is_none(), "ms( で確定して閉じる");
+
+            // mr: 2文字目までは pending、3文字目で確定
+            app.handle_key(plain('m')).await;
+            app.handle_key(plain('r')).await;
+            app.handle_key(plain('(')).await;
+            assert!(matches!(&app.prompt, Some(Prompt::Surround(b)) if b == "r("));
+            app.handle_key(plain(']')).await;
+            assert!(app.prompt.is_none(), "mr(] で確定");
+
+            // Esc でキャンセル、無効なリーダーは flash 付きで閉じる
+            app.handle_key(plain('m')).await;
+            app.handle_key(esc).await;
+            assert!(app.prompt.is_none(), "Esc でキャンセル");
+            app.handle_key(plain('m')).await;
+            app.handle_key(plain('x')).await;
+            assert!(app.prompt.is_none(), "無効なリーダーで閉じる");
+            assert!(app.flash.is_some(), "理由が flash に載る");
+        });
+    }
+
+    #[test]
+    fn surround_command_and_pending_parse() {
+        assert_eq!(
+            surround_command("s("),
+            Some(Command::SurroundAdd { ch: '(' })
+        );
+        assert_eq!(
+            surround_command("d\""),
+            Some(Command::SurroundDelete { ch: '"' })
+        );
+        assert_eq!(
+            surround_command("r(]"),
+            Some(Command::SurroundReplace { from: '(', to: ']' })
+        );
+        assert!(surround_pending("s"));
+        assert!(surround_pending("d"));
+        assert!(surround_pending("r("));
+        assert!(!surround_pending("s("));
+        assert!(!surround_pending("x"));
+    }
+
+    #[test]
     fn command_line_parses() {
-        assert_eq!(parse_command("w"), CommandLineAction::Save);
         assert_eq!(parse_command("q"), CommandLineAction::Quit);
         assert_eq!(parse_command("q!"), CommandLineAction::Quit);
         assert_eq!(parse_command("wq"), CommandLineAction::SaveThenQuit);

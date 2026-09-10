@@ -4200,6 +4200,21 @@ async fn process_command(
                             Some(text.clone()),
                         ))
                     }
+                    // surround（ms/md/mr）はテキストを変える — ReplaceRange 扱いで
+                    // 基準配下の書込み拒否（base_reject）と LSP 同期（is_edit）に載せる。
+                    Command::SurroundAdd { .. }
+                    | Command::SurroundDelete { .. }
+                    | Command::SurroundReplace { .. } => {
+                        let r = d.editor.selection().primary();
+                        Some((
+                            EventKind::ReplaceRange,
+                            Some(Range {
+                                anchor: r.start(),
+                                head: r.end(),
+                            }),
+                            None,
+                        ))
+                    }
                     Command::Change => {
                         // 選択があれば Delete、カーソル上なら SetMode 相当のイベント
                         let r = d.editor.selection().primary();
@@ -4368,6 +4383,9 @@ fn is_edit(command: &Command) -> bool {
             | Command::OpenBelow
             | Command::OpenAbove
             | Command::Replace { .. }
+            | Command::SurroundAdd { .. }
+            | Command::SurroundDelete { .. }
+            | Command::SurroundReplace { .. }
             | Command::KillToLineStart
             | Command::KillToLineEnd
             | Command::Undo
@@ -4676,6 +4694,14 @@ fn preempt(daemon: &mut Daemon, conn_id: u64) {
         if owner != conn_id && daemon.editor.mode() == mina_view::Mode::Insert {
             close_insert_session(daemon, mina_view::Mode::Normal);
         }
+    }
+}
+
+/// Select モードを抜ける（Helix の `exit_select_mode`。surround 後は選択を
+/// 残したまま Normal に戻る — 囲んだ全体が選択された状態になる）。
+fn exit_select_mode(daemon: &mut Daemon) {
+    if daemon.editor.mode() == mina_view::Mode::Select {
+        daemon.editor.set_mode(mina_view::Mode::Normal);
     }
 }
 
@@ -5208,6 +5234,56 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             let changed = !tx.is_noop();
             let selection_after = tx.map_selection(&selection, true);
             daemon.editor.apply(tx, selection_after);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::SurroundAdd { ch } => {
+            // Helix の `ms`: 選択（カーソルはその位置に空ペア）を ch の対応
+            // ペアで囲む。適用後は囲んだ全体を選択し、Select モードを抜ける。
+            preempt(daemon, conn_id);
+            let (tx, selection_after) = {
+                let doc = daemon.editor.current_document();
+                let selection = daemon.editor.selection();
+                mina_text::surround_add(doc, &selection, ch)
+            };
+            let changed = !tx.is_noop();
+            daemon.editor.apply(tx, selection_after);
+            exit_select_mode(daemon);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::SurroundDelete { ch } => {
+            // Helix の `md`: カーソルを囲む ch のペアを両側とも削除。ペアが
+            // 無ければ状態を変えず status で報告する（Helix の PairNotFound）。
+            preempt(daemon, conn_id);
+            let result: Option<(Transaction, Selection)> = {
+                let doc = daemon.editor.current_document();
+                let selection = daemon.editor.selection();
+                mina_text::surround_delete(doc, &selection, ch)
+            };
+            let Some((tx, selection_after)) = result else {
+                return (snapshot(daemon, Some("surround pair not found".into())), false);
+            };
+            let changed = !tx.is_noop();
+            daemon.editor.apply(tx, selection_after);
+            exit_select_mode(daemon);
+            daemon.editor.scroll_to_cursor(daemon.viewport_height);
+            (snapshot(daemon, None), changed)
+        }
+        Command::SurroundReplace { from, to } => {
+            // Helix の `mr`: from の対応ペアを to の対応ペアに置き換える。
+            preempt(daemon, conn_id);
+            let result: Option<(Transaction, Selection)> = {
+                let doc = daemon.editor.current_document();
+                let selection = daemon.editor.selection();
+                mina_text::surround_replace(doc, &selection, from, to)
+            };
+            let Some((tx, selection_after)) = result else {
+                return (snapshot(daemon, Some("surround pair not found".into())), false);
+            };
+            let changed = !tx.is_noop();
+            daemon.editor.apply(tx, selection_after);
+            exit_select_mode(daemon);
             daemon.editor.scroll_to_cursor(daemon.viewport_height);
             (snapshot(daemon, None), changed)
         }
@@ -6844,6 +6920,71 @@ root-markers = [".docsroot"]
             vec![Range { anchor: 0, head: 11 }],
             "文書全体"
         );
+    }
+
+    #[test]
+    fn surround_add_wraps_selection_and_cursor() {
+        // ms(: 選択を ( で囲み、囲んだ全体を選択したまま Normal に戻る
+        let mut d = daemon();
+        open(&mut d, "hello world");
+        apply(&mut d, Command::SetMode { mode: Mode::Select });
+        apply(&mut d, Command::Extend {
+            movement: Movement::Word,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::SurroundAdd { ch: '(' });
+        assert_eq!(s.text, "(hello )world");
+        assert_eq!(s.mode, Mode::Normal, "surround 後は Select を抜ける");
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 8 }], "囲んだ全体を選択");
+        // カーソル上は空ペアを挿入
+        let mut d2 = daemon();
+        open(&mut d2, "abc");
+        let s = apply(&mut d2, Command::SurroundAdd { ch: '[' });
+        assert_eq!(s.text, "[]abc", "カーソル上は空ペアを挿入");
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 2 }]);
+        // undo で戻る
+        let s = apply(&mut d, Command::Undo);
+        assert_eq!(s.text, "hello world");
+    }
+
+    #[test]
+    fn surround_delete_and_replace_with_status_on_missing_pair() {
+        // md(: カーソルを囲む ( を両側から削除
+        let mut d = daemon();
+        open(&mut d, "(abc) def");
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        apply(&mut d, Command::Move {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d, Command::SurroundDelete { ch: '(' });
+        assert_eq!(s.text, "abc def");
+        // ペアが無い位置では状態を変えず status で報告
+        let mut d2 = daemon();
+        open(&mut d2, "no pair");
+        let s = apply(&mut d2, Command::SurroundDelete { ch: '(' });
+        assert_eq!(s.text, "no pair");
+        assert!(
+            s.status.as_deref().unwrap_or("").contains("surround"),
+            "status に理由が載る: {:?}",
+            s.status
+        );
+        // mr(: を [ に置き換え（後方からも可）
+        let mut d3 = daemon();
+        open(&mut d3, "(ab) (cd)");
+        apply(&mut d3, Command::SetMode { mode: Mode::Select });
+        apply(&mut d3, Command::Extend {
+            movement: Movement::Char,
+            direction: Direction::Forward,
+        });
+        let s = apply(&mut d3, Command::SurroundReplace {
+            from: ')',
+            to: '[',
+        });
+        assert_eq!(s.text, "[ab] (cd)");
     }
 
     #[test]

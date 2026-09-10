@@ -9,6 +9,7 @@ pub mod edit;
 pub mod movement;
 pub mod search;
 pub mod selection;
+pub mod surround;
 pub mod transaction;
 
 pub use document::Document;
@@ -26,4 +27,5 @@ pub use movement::{
 pub use ropey::Rope;
 pub use search::{CaseSensitivity, find_matches, find_next, find_prev};
 pub use selection::{Range, Selection};
+pub use surround::{surround_add, surround_delete, surround_replace};
 pub use transaction::{Operation, Transaction};
