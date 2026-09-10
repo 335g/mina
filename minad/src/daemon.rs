@@ -3338,8 +3338,10 @@ async fn ensure(
             Err(_) => true, // 同期中: 生きているとみなす
         };
         if alive {
-            // ponytail: 同時 ensure は実質1クライアント前提で起きない。起きた場合は
-            // 既存を優先し、自分が spawn したセッションは破棄（プロセスは orphan）。
+            // ponytail: 初期化中のセッションは map に未登録のため、Open 直後に
+            // 意味解析コマンドを重ねると両者が spawn する（自分の分は破棄され
+            // プロセスは orphan）。起動の遅い LSP で目立つなら ensure を in-flight
+            // map で合流させる（今はまだ実測で問題になっていない）。
             return Ok(existing.clone());
         }
     }
@@ -3827,43 +3829,45 @@ async fn process_command(
                         }
                         d.editor.current_document().text().to_string()
                     };
-                    // LSP: ADR-0009 の「次回 Open でリスポーン」を維持するため、
-                    // サーバが死んでいればここで再生成し、現在のバッファ内容で
-                    // didOpen を再通知する（フルテキスト同期なので再利用への
-                    // 再通知は無害）。
-                    let session = if daemon
-                        .lock()
-                        .await
-                        .languages_refresh()
-                        .server_for(&path_buf)
-                        .is_some()
-                    {
-                        match ensure(&daemon, &path_buf).await {
-                            Ok(s) => Some(s),
-                            Err(_) => None, // サーバが無くても文書は保持される
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(session) = &session {
-                        lsp::open_document(session, &path_buf, &text).await;
-                        // ADR-0028: 診断取得の活動を確定してから spawn する（スナップショットに
-                        // 確実に乗るため。settle 側は出口で除去する）。
+                    // LSP: サーバが死んでいれば再生成し、現在のバッファ内容で didOpen を
+                    // 再通知する（フルテキスト同期なので再利用への再通知は無害）。
+                    // spawn + initialize + didOpen + 診断 settle は Open 応答をブロック
+                    // しないようバックグラウンドで走らせる（起動時に LSP 初期化が遅いと
+                    // Open 応答が数秒〜数十秒止まるため — 応答は文書状態のみ）。
+                    let spawn_lsp = {
                         let mut d = daemon.lock().await;
-                        d.add_activity(&path_buf, ActivityKind::DiagnosticsSettle, "診断取得中");
-                        drop(d);
+                        let supported = d.languages_refresh().server_for(&path_buf).is_some();
+                        if supported {
+                            // ADR-0028: 診断取得の活動は応答スナップショットに確実に乗せる
+                            // （settle 側は出口で除去）。
+                            d.add_activity(&path_buf, ActivityKind::DiagnosticsSettle, "診断取得中");
+                        }
+                        supported
+                    };
+                    if spawn_lsp {
                         let daemon_task = daemon.clone();
-                        let session_task = session.clone();
                         let path_task = path_buf.clone();
+                        let text_task = text.clone();
                         let push_task = push_tx.clone();
                         tokio::spawn(async move {
-                            settle_open_diagnostics(
-                                &daemon_task,
-                                session_task,
-                                path_task,
-                                push_task,
-                            )
-                            .await;
+                            match ensure(&daemon_task, &path_task).await {
+                                Ok(session) => {
+                                    lsp::open_document(&session, &path_task, &text_task).await;
+                                    settle_open_diagnostics(
+                                        &daemon_task,
+                                        session,
+                                        path_task,
+                                        push_task,
+                                    )
+                                    .await;
+                                }
+                                Err(_) => {
+                                    // init 失敗: 活動だけ除去して静かに終了
+                                    // （文書は保持される。次回の LSP 要求で再 spawn）
+                                    let mut d = daemon_task.lock().await;
+                                    d.remove_activity(&path_task, ActivityKind::DiagnosticsSettle);
+                                }
+                            }
                         });
                     }
                     let mut d = daemon.lock().await;
@@ -3883,29 +3887,27 @@ async fn process_command(
                     // 未開パス: 従来どおりディスクから読む
                     // SEC-1: 非正規ファイル・過大ファイルを metadata で検証してから読む
                     // （ADR-0008）。失敗時は状態を変えず status で報告する。
-                    let (contents, mut open_status) = read_open_target(&path_str).await;
-                    // M1/ADR-0009: LSP セッションの spawn + initialize（最大10秒）は
-                    // daemon ロック外で行う。失敗時は status に載せる。
-                    let lsp_supported = daemon
-                        .lock()
-                        .await
-                        .languages_refresh()
-                        .server_for(&path_buf)
-                        .is_some();
-                    let session = if contents.is_some() && lsp_supported {
-                        match ensure(&daemon, &path_buf).await {
-                            Ok(s) => Some(s),
-                            Err(msg) => {
-                                open_status = Some(msg);
-                                None
-                            }
+                    let (contents, open_status) = read_open_target(&path_str).await;
+                    // LSP: spawn + initialize + didOpen + 診断 settle は Open 応答を
+                    // ブロックしないようバックグラウンドで走らせる（起動時に LSP
+                    // 初期化が遅いと Open 応答が数秒〜数十秒止まるため — 応答は
+                    // 文書状態のみ。didOpen は全文同期で後から追いつく）。失敗は
+                    // Open の status に載せず、活動の除去だけで静かに終了する
+                    // （文書は保持される。次回の LSP 要求で再 spawn）。
+                    let lsp_supported = {
+                        let mut d = daemon.lock().await;
+                        let supported = contents.is_some()
+                            && d.languages_refresh().server_for(&path_buf).is_some();
+                        if supported {
+                            // ADR-0028: 診断取得の活動は応答スナップショットに確実に乗せる
+                            // （settle 側は出口で除去）。
+                            d.add_activity(&path_buf, ActivityKind::DiagnosticsSettle, "診断取得中");
                         }
-                    } else {
-                        None
+                        supported
                     };
                     // ロック内: 文書状態の変更のみ（await なし）
                     let mut d = daemon.lock().await;
-                    let (text, notify) = match &contents {
+                    let text = match &contents {
                         Some(contents) => {
                             d.editor.open_with_path(path_buf.clone(), contents);
                             let height = d.viewport_height;
@@ -3929,36 +3931,35 @@ async fn process_command(
                             }
                             d.deleted = None;
                             d.record_event(source, EventKind::Open, None, None);
-                            (contents.clone(), session.is_some())
+                            contents.clone()
                         }
-                        None => (String::new(), false),
+                        None => String::new(),
                     };
                     drop(d);
-                    // M1: didOpen 通知は daemon ロック外（lsp mutex のみ・タイムアウト付き）
-                    if notify {
-                        if let Some(session) = &session {
-                            lsp::open_document(session, &path_buf, &text).await;
-                        }
-                    }
-                    // 初期解析（crate ロード・数秒）が完了するまで pull で診断を追う。
-                    // 解析未完の間の pull は空を返すため、バックグラウンドで poll する。
-                    if let Some(session) = &session {
-                        // ADR-0028: 診断取得の活動を確定してから spawn する（settle 側は出口で除去）。
-                        let mut d = daemon.lock().await;
-                        d.add_activity(&path_buf, ActivityKind::DiagnosticsSettle, "診断取得中");
-                        drop(d);
+                    if lsp_supported {
                         let daemon_task = daemon.clone();
-                        let session_task = session.clone();
                         let path_task = path_buf.clone();
+                        let text_task = text;
                         let push_task = push_tx.clone();
                         tokio::spawn(async move {
-                            settle_open_diagnostics(
-                                &daemon_task,
-                                session_task,
-                                path_task,
-                                push_task,
-                            )
-                            .await;
+                            match ensure(&daemon_task, &path_task).await {
+                                Ok(session) => {
+                                    lsp::open_document(&session, &path_task, &text_task).await;
+                                    settle_open_diagnostics(
+                                        &daemon_task,
+                                        session,
+                                        path_task,
+                                        push_task,
+                                    )
+                                    .await;
+                                }
+                                Err(_) => {
+                                    // init 失敗: 活動だけ除去して静かに終了
+                                    // （文書は保持される。次回の LSP 要求で再 spawn）
+                                    let mut d = daemon_task.lock().await;
+                                    d.remove_activity(&path_task, ActivityKind::DiagnosticsSettle);
+                                }
+                            }
                         });
                     }
                     let mut d = daemon.lock().await;
