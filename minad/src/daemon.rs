@@ -4280,7 +4280,11 @@ async fn process_command(
                 if let Some(msg) = blocked {
                     return snapshot(&mut d, Some(msg));
                 }
-                let (_, changed) = apply_from(&mut d, command, conn_id);
+                let (applied, changed) = apply_from(&mut d, command, conn_id);
+                // 失敗理由（ペアが見つからない等）は apply_from のスナップショットの
+                // status に載っている。最終応答は LSP 同期後に作り直すため、
+                // status だけを引き継ぐ（落とすと TUI に何も表示されない）。
+                let status = applied.status.clone();
                 // ADR-0012: 実際に状態が変わった場合のみイベントを記録する。
                 // 拒否（サイズ超過等）・no-op（空削除・空挿入・履歴のない
                 // undo/redo・モード不変の SetMode）は世代もイベントも進めない。
@@ -4315,7 +4319,7 @@ async fn process_command(
                     None
                 };
                 drop(d);
-                sync_after_edit(daemon, sync_target, None, None).await
+                sync_after_edit(daemon, sync_target, status, None).await
             }
             Err(_) => {
                 // ADR-0011: Command として解釈できなければ DocumentEdit を試す
@@ -11617,5 +11621,77 @@ root-markers = [".docsroot"]
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn surround_commands_over_the_wire_as_interactive_client() {
+        // TUI と同じ経路（process_command のゲート → イベント分類 → apply_from）を
+        // 実ソケット越しに通す。headless は #13 ゲートで拒否される（TUI 専用）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-19-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-19-surround-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "(abc)").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let s = request(&mut tui, &Command::Open { path }).await;
+        assert_eq!(s.text, "(abc)");
+
+        // カーソルを index 2（'b'）へ
+        for _ in 0..2 {
+            request(
+                &mut tui,
+                &Command::Move {
+                    movement: Movement::Char,
+                    direction: Direction::Forward,
+                },
+            )
+            .await;
+        }
+        // md( : カーソルを囲む括弧を削除
+        let s = request(&mut tui, &Command::SurroundDelete { ch: '(' }).await;
+        assert_eq!(s.text, "abc", "surround_delete が wire 経由で効く");
+
+        // ms[ : 文書全体（%）を囲む
+        request(&mut tui, &Command::SelectAll).await;
+        let s = request(&mut tui, &Command::SurroundAdd { ch: '[' }).await;
+        assert_eq!(s.text, "[abc]");
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 5 }]);
+        assert_eq!(s.mode, Mode::Normal, "surround 後は囲んだ全体を選択したまま Normal");
+
+        // mr[{ : 角括弧を波括弧へ
+        let s = request(
+            &mut tui,
+            &Command::SurroundReplace {
+                from: '[',
+                to: '{',
+            },
+        )
+        .await;
+        assert_eq!(s.text, "{abc}");
+
+        // ペアが無ければ状態を変えず status で報告
+        let s = request(&mut tui, &Command::SurroundDelete { ch: '(' }).await;
+        assert_eq!(s.text, "{abc}");
+        assert!(
+            s.status.as_deref().unwrap_or("").contains("surround pair"),
+            "status: {:?}",
+            s.status
+        );
+
+        // headless クライアントは拒否（状態も世代も変えない）
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let s = request(&mut agent, &Command::SurroundAdd { ch: '(' }).await;
+        assert_eq!(s.text, "{abc}");
+        assert!(
+            s.status.as_deref().unwrap_or("").contains("headless"),
+            "status: {:?}",
+            s.status
+        );
+
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
     }
 }
