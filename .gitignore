@@ -17,3 +17,5 @@ tmp
 
 docs/verification
 docs/gitignore
+
+__pycache__/

@@ -153,6 +153,9 @@ FLOWS = {
                 "minas read src/main.rs",
             ],
         },
+        # step ごとに「受け取れているべき文字列」。空応答 + exit 0（無言の誤り）を検出する。
+        # cold では symbol が [] を返す（L0 実測 2026-09-12）— exit 0 なので rc では見えない。
+        "expect": {"lsp": ["validate", "validate", "validate"]},
     },
     "verify": {
         "goal": "timeout_ms を 5000 → 30000 に変更し、検証する",
@@ -175,6 +178,12 @@ FLOWS = {
                 "printf '%s' '[{\"old\":\"timeout_ms: 5000\",\"new\":\"timeout_ms: 30000\"},"
                 "{\"old\":\"max_retries: 3\",\"new\":\"max_retries: 5\"}]'"
                 " | minas apply src/config.rs --hunks-stdin",
+                "cargo check --offline",
+            ],
+            # 同じ 2 箇所を 1 つずつ（往復削減の対照群）
+            "apply2-cargo": [
+                'minas apply src/config.rs "timeout_ms: 5000" "timeout_ms: 30000"',
+                'minas apply src/config.rs "max_retries: 3" "max_retries: 5"',
                 "cargo check --offline",
             ],
         },
@@ -204,16 +213,17 @@ FLOWS = {
 
 
 def start_daemon(cwd: Path, env: dict) -> subprocess.Popen:
-    proc = subprocess.Popen(
-        [MINAD, "serve"], cwd=cwd, env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    log = Path(env["TMPDIR"]) / "minad.log"
+    with log.open("wb") as fh:
+        proc = subprocess.Popen(
+            [MINAD, "serve"], cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT,
+        )
     tmp = Path(env["TMPDIR"])
     for _ in range(200):
         if list(tmp.glob("minae-*.sock")):
             return proc
         if proc.poll() is not None:
-            raise RuntimeError(f"minad exited early (rc={proc.returncode})")
+            raise RuntimeError(f"minad exited early (rc={proc.returncode}): {log.read_text()[:400]}")
         time.sleep(0.05)
     proc.kill()
     raise RuntimeError("daemon socket did not appear in 10s")
@@ -253,17 +263,19 @@ def cost_metrics(out_Bs: list[int]) -> tuple[int, int, int]:
 
 
 def warm_lsp(scratch: Path, env: dict, meta: dict) -> None:
-    """LSP がワークスペースを読み終えるまで外から待つ。
+    """LSP がワークスペースを読み終えて応答が安定するまで外から待つ。
 
     現行 daemon は rust-analyzer の進捗を待たないので、索引未完のまま応答を返し、
     空応答 + exit 0（無言の誤り）や LSP セッションロック待ちを起こす。
-    そこで「プローブが速い応答で 2 回連続で当たる」まで待ってから計測する。
+    そこで「プローブが上限時間内に 2 回連続で当たる」まで待つ — 絶対時刻ではなく
+    応答時間で判定するので、fixture やマシンが変わっても同じ規則で使える。
     """
+    limit = meta.get("probe_max_ms", 1500)
     deadline = time.time() + 60
     fast = 0
     while time.time() < deadline:
         r = run(meta["probe"], scratch, env)
-        if r["rc"] == 0 and meta["probe_need"] in r["out"] and r["wall_ms"] < 300:
+        if r["rc"] == 0 and meta["probe_need"] in r["out"] and r["wall_ms"] < limit:
             fast += 1
             if fast >= 2:
                 return
@@ -291,7 +303,8 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
         if spec.get("warmup") and not cold:
             warm_lsp(scratch, env, meta)
         results, transcript = [], []
-        for raw in spec["arms"][arm]:
+        expect = spec.get("expect", {}).get(arm, [])
+        for i, raw in enumerate(spec["arms"][arm]):
             cmd = raw
             for k, v in meta.items():
                 cmd = cmd.replace("{" + k + "}", str(v))
@@ -299,6 +312,8 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
             r = run(cmd, scratch, env)
             after = server_metrics(scratch, env)
             r["delta"] = {k: after.get(k, 0) - before.get(k, 0) for k in after}
+            # 無言の誤り: exit 0 なのに期待した内容が返っていない（cold の symbol など）
+            r["silent"] = bool(i < len(expect) and expect[i] and expect[i] not in r["out"])
             results.append(r)
             transcript.append(r["out"] + r["err"])
         info = json.loads(run(f"{MINAS} info", scratch, env)["out"])
@@ -332,7 +347,8 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
         "resend_B": resend_B,
         "equiv_B": equiv,
         "wall_ms": round(sum(r["wall_ms"] for r in results), 1),
-        "fails": sum(1 for r in results if r["rc"] != 0),
+        "fails": sum(1 for r in results if r["rc"] != 0 or r["silent"]),
+        "silent": sum(1 for r in results if r["silent"]),
         "ok": verified,
         "cold": cold,
         "cli_generation": info.get("cli_generation"),
@@ -379,18 +395,23 @@ def table(rows: list[dict]) -> str:
 
 
 def log_block(note: str, rows: list[dict], stamp: str) -> str:
-    out = [f"\n## {stamp} — {note}\n", "```", table(rows), "```\n"]
+    out = [f"\n## {stamp} — {note}\n\n"]
+    if any(r.get("cold") for r in rows):
+        out.append("cold 測定（warmup なし・1 回観測）\n\n")
+    elif any("wall_ms_all" in r for r in rows):
+        out.append("warm 測定（warmup あり・wall は中央値）\n\n")
+    out.append("```\n" + table(rows) + "\n```\n\n")
     for r in rows:
-        if r.get("cold"):
-            out.append("- cold 測定（warmup なし）\n")
         if r["metrics"]:
             out.append(f"- `{r['flow']}/{r['arm']}` daemon 計測: "
                        + ", ".join(f"{k}={v}" for k, v in sorted(r["metrics"].items())) + "\n")
         for s in r["steps"]:
-            if s["rc"] != 0:
+            mark = " (silent)" if s.get("silent") else ""
+            if s["rc"] != 0 or s.get("silent"):
                 err = s["err"].strip().splitlines()
-                out.append(f"- `{r['flow']}/{r['arm']}` 失敗 step: `{s['cmd']}` "
+                out.append(f"- `{r['flow']}/{r['arm']}` 失敗 step{mark}: `{s['cmd']}` "
                            f"rc={s['rc']} {err[0] if err else ''}\n")
+    out.append("\n")
     return "".join(out)
 
 
@@ -458,7 +479,8 @@ def main() -> int:
             if "wall_ms_all" in r:
                 print(f"  wall per run: {r['wall_ms_all']}")
             for s in r["steps"]:
-                print(f"  {s['wall_ms']:>8.0f}ms  {s['out_B']:>7}B rc={s['rc']}  {s['cmd']}")
+                mark = " SILENT" if s.get("silent") else ""
+                print(f"  {s['wall_ms']:>8.0f}ms  {s['out_B']:>7}B rc={s['rc']}{mark}  {s['cmd']}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     jpath = Path(args.json) if args.json else OUT_DIR / f"l0-{time.strftime('%Y%m%d-%H%M%S')}.json"
