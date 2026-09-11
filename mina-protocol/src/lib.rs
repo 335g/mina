@@ -131,9 +131,9 @@ pub enum Command {
     /// 各 Range を head の行全体（末尾改行は含まない）へ広げる（行選択）。
     /// head は行末（改行の直前）に置く。Select モードへの移行はしない。
     SelectLine,
-    /// 各 Range を行選択の形へ整えてから、その下の行の末尾（末尾改行含む）
-    /// まで head を拡張する（Helix の `x` = `extend_line_below`。連打で
-    /// 選択に行が追加される）。
+    /// 各 Range を行選択の形へ広げ、その下の行まで head を拡張する
+    /// （Helix の `x` = `extend_line_below`。カーソルはまず現在行のみ、
+    /// 連打で1行ずつ選択に行が追加される）。
     ExtendLineBelow,
     /// 選択全体を文書全体（0..len）の1 Range へ置き換える（Helix の `%` =
     /// `select_all`）。

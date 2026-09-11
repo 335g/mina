@@ -261,11 +261,12 @@ impl Keymaps {
             &[plain(KeyCode::Char('i'))],
             Command::SetMode { mode: Mode::Insert },
         );
-        // Normal: 編集。x はカーソル行全体を選択（SelectLine）。X も同じく
-        // 行全体を選択。d は選択削除・c は削除+Insert。
+        // Normal: 編集。x はカーソル行全体を選択（ExtendLineBelow — 連打で
+        // 下の行も選択に追加。Helix 流）。X は行全体だけを選び直す（SelectLine）。
+        // d は選択削除・c は削除+Insert。
         // Backspace は1文字削除（vim 流）。
         // 保存は `:` コマンドモードの :w（Helix/vim 流）。s には割り当てない。
-        normal.insert(&[plain(KeyCode::Char('x'))], Command::SelectLine);
+        normal.insert(&[plain(KeyCode::Char('x'))], Command::ExtendLineBelow);
         normal.insert(&[plain(KeyCode::Char('X'))], Command::SelectLine);
         normal.insert(&[plain(KeyCode::Backspace)], Command::DeleteBackward);
         normal.insert(&[plain(KeyCode::Char('d'))], Command::DeleteRange);
@@ -612,10 +613,10 @@ mod tests {
     fn edit_bindings() {
         let km = Keymaps::new();
         let mut pending = Vec::new();
-        // Normal の x はカーソル行全体を選択（SelectLine）
+        // Normal の x はカーソル行全体を選択（ExtendLineBelow: 連打で1行ずつ下へ）
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('x')),
-            Resolution::Command(Command::SelectLine)
+            Resolution::Command(Command::ExtendLineBelow)
         ));
         assert!(matches!(
             km.resolve(Mode::Normal, &mut pending, k('X')),

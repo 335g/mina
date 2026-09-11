@@ -83,7 +83,7 @@ bump 方式で **PROTOCOL_VERSION 11 → 12**、新ソケット `minae-12.sock`�
 
 - **構成**: クライアント側・モード別（Normal / Insert / Select）prefix トライ（旧 `keymap.rs` を移植 — `Vec<(KeyEvent, Node)>` 線形探索・`Resolution` 列挙）。キー → `mina_protocol::Command` を解決して直列送信（解決はクライアント側 — research）。
 - **モード別バインディング**（旧 keymap.rs のバインディング表を移植。以下は MVP のコア）:
-  - Normal: `h`/`j`/`k`/`l`（Char/Line 移動）・`w`/`b`/`e`（単語）・`g g`（先頭）・`G`（末尾）・`Home`/`End`（行頭/末尾）・`i`/`a`/`o`/`O`（挿入・Helix 流）・`x`（行選択）・`Esc`（Normal 復帰）・`/`・`?`（検索・ライブ送信）・`:`（コマンドライン）・`Space k`（PeekDefinition）・`r`（置換）・`R`（リネーム）
+  - Normal: `h`/`j`/`k`/`l`（Char/Line 移動）・`w`/`b`/`e`（単語）・`g g`（先頭）・`G`（末尾）・`Home`/`End`（行頭/末尾）・`i`/`a`/`o`/`O`（挿入・Helix 流）・`x`（行選択・連打で下へ拡張）・`X`（行全体選択）・`Esc`（Normal 復帰）・`/`・`?`（検索・ライブ送信）・`:`（コマンドライン）・`Space k`（PeekDefinition）・`r`（置換）・`R`（リネーム）
   - Insert: 未バインドキーは挿入文字へ（Insert fallback）。`Esc` で Normal。単語削除（`C-w` 等）
   - Select: 移動 = Extend（movement_bindings(true) を共用）
 - **オーバーレイキー（新規・暫定）**: `T` = ツリー / `G` = 診断 view / `A` = 活動履歴 / `C` = カラースキーム切替（デバッグ用でも可）。確定は実装時のキーマップチューニングへ委ねる。

@@ -159,10 +159,11 @@ pub fn append_selection(doc: &Document, selection: &Selection) -> Selection {
     Selection::new(ranges, selection.primary_index())
 }
 
-/// 各 Range を「行全体（`X` 相当）+ その下の行」まで head を拡張する
-/// （Helix の `x` = `extend_line_below`。連打で行が追加されていく）。
-/// anchor は Range の先頭（top）側の行頭（列 0）、head は bottom 行の
-/// 1つ下の行の末尾（末尾改行を含む。最終行は文書末尾）に置く。
+/// 各 Range を行選択の形へ広げ、さらにその下の行まで head を拡張する
+/// （Helix の `x` = `extend_line_below`。連打で1行ずつ行が追加されていく）。
+/// カーソルはまず現在行のみ（末尾改行を含む）を選択し、そこから連打で
+/// 1行ずつ下へ伸びる。anchor は Range の先頭（top）側の行頭（列 0）、head は
+/// bottom 行の次の行の行頭（最終行は文書末尾）に置く。
 pub fn extend_line_below(doc: &Document, selection: &Selection) -> Selection {
     let text = doc.text().to_string();
     let len = text.chars().count();
@@ -170,13 +171,15 @@ pub fn extend_line_below(doc: &Document, selection: &Selection) -> Selection {
         .ranges()
         .iter()
         .map(|r| {
-            // 選択の末尾側の文字位置（カーソルは自身、選択範囲は end-1）
+            let anchor = step_line_start(&text, r.start());
+            // カーソルは現在行のみ（末尾改行を含む）。連打の2回目以降は下の
+            // 選択側の分岐に落ちて1行ずつ伸びる。
             let bottom = if r.is_cursor() {
-                r.head()
+                let end = step_line_end(&text, r.head());
+                return Range::new(anchor, (end + 1).min(len));
             } else {
                 r.end().saturating_sub(1)
             };
-            let anchor = step_line_start(&text, r.start());
             // bottom 行の末尾 → 1つ下の行の末尾（末尾改行を含む）
             let mut end = step_line_end(&text, bottom);
             if end < len {
@@ -1567,17 +1570,19 @@ mod tests {
 
     #[test]
     fn extend_line_below_adds_line_on_repeat() {
-        // カーソル → 現在の行 + 下の行（末尾改行含む）
+        // カーソル → まず現在行のみ（末尾改行含む）、連打で1行ずつ下へ
         let doc = Document::from("l0\nl1\nl2\nl3"); // 11 chars
         // 'l1' の先頭（char 3）
         let once = extend_line_below(&doc, &Selection::point(3));
-        assert_eq!(once, sel(vec![(3, 9)], 0), "現在行+1つ下 = \"l1\\nl2\\n\"");
-        // 連打で1行ずつ追加
+        assert_eq!(once, sel(vec![(3, 6)], 0), "現在行 = \"l1\\n\"");
         let twice = extend_line_below(&doc, &once);
-        assert_eq!(twice, sel(vec![(3, 11)], 0), "さらに l3 が加わる");
+        assert_eq!(twice, sel(vec![(3, 9)], 0), "l2 が加わる");
+        let thrice = extend_line_below(&doc, &twice);
+        assert_eq!(thrice, sel(vec![(3, 11)], 0), "最終行 l3 が加わる");
         // 最終行ではそれ以上伸びない（l3 の中盤 char 9）
         let last = extend_line_below(&doc, &Selection::point(9));
         assert_eq!(last, sel(vec![(9, 11)], 0));
+        assert_eq!(extend_line_below(&doc, &last), sel(vec![(9, 11)], 0));
     }
 
     #[test]

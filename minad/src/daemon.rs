@@ -6912,9 +6912,11 @@ root-markers = [".docsroot"]
         let s = apply(&mut d, Command::ExtendLineBelow); // カーソルは 0 行目先頭
         assert_eq!(
             s.selection,
-            vec![Range { anchor: 0, head: 6 }],
-            "l0 + l1（末尾改行含む）"
+            vec![Range { anchor: 0, head: 3 }],
+            "l0（末尾改行含む）"
         );
+        let s = apply(&mut d, Command::ExtendLineBelow);
+        assert_eq!(s.selection, vec![Range { anchor: 0, head: 6 }], "l1 が加わる");
         let s = apply(&mut d, Command::ExtendLineBelow);
         assert_eq!(s.selection, vec![Range { anchor: 0, head: 9 }], "l2 が加わる");
         // すべて選択（%）
