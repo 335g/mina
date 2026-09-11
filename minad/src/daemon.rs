@@ -3301,17 +3301,19 @@ async fn ensure(
     // 同一 root に複数言語が混在しても言語ごとにセッションを分ける。
     let key = (root.clone(), spec.language_id.to_string());
     // 既存セッション（キーに生きていれば）を再利用する
-    {
+    let reused = {
         let d = daemon.lock().await;
-        if let Some(session) = d.lsp_sessions.get(&key) {
+        d.lsp_sessions.get(&key).and_then(|session| {
             let reuse = match session.try_lock() {
                 Ok(s) => !s.client.is_dead(),
                 Err(_) => true, // 同期中: 生きているとみなして再利用
             };
-            if reuse {
-                return Ok(session.clone());
-            }
-        }
+            reuse.then(|| session.clone())
+        })
+    };
+    if let Some(session) = reused {
+        await_indexed(&session).await; // daemon ロック外で待つ
+        return Ok(session);
     }
     // 未作成 or 死亡: 上の最新テーブルで spawn + initialize（M1 / ADR-0030）。
     // languages_refresh は mtime 差分だけ再読込するため、ゲート（先に呼ばれた
@@ -3348,7 +3350,28 @@ async fn ensure(
     // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
     // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
     d.lsp_sessions.insert(key, arc.clone());
+    drop(d);
+    // 索引完走を待ってから返す（ADR-0051）。新しいセッションは上のロックで先に
+    // map へ登録済み — 待つ間の並行 ensure が 2 匹目のサーバを spawn しない。
+    await_indexed(&arc).await;
     Ok(arc)
+}
+
+/// 索引依存の LSP 要求を出す前に、サーバの索引完走（`$/progress` が静まるまで）
+/// を待つ（ADR-0051）。
+///
+/// LSP セッションロックは握ったまま待たない — 待ちの間 didChange を締め出すと、
+/// 編集の同期がスキップされ（`LSP_LOCK_TIMEOUT` で諦める設計）、以後の解析が
+/// 古いテキストのままになる。
+///
+/// ponytail: 待ちはセッションごとに 1 回だけ（`Progress` が確認済みを記録する）。
+/// 2 回目以降の索引更新（Cargo.toml 変更などでの再 prime）は待たない — 実測で
+/// 問題になってから、進捗の種類で絞る（今は「セッション生成直後の 1 回」で足りる）。
+async fn await_indexed(session: &Mutex<LspSession>) {
+    let progress = session.lock().await.progress();
+    // 上限まで待って未確認でも進む（待ち続けて要求を止めない）。進捗を送らない
+    // サーバ（work-done progress 非対応）は arm で解決する。
+    progress.wait_ready(lsp::LSP_READY).await;
 }
 
 /// セマンティック要求（rename / references）の前に、ワークスペース内の同拡張子

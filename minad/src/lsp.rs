@@ -5,9 +5,10 @@
 //! 間に届いた診断は次のキー入力で表示される。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use mina_lsp::{Client, LspRange, PositionEncoding, PublishDiagnostic};
+use mina_lsp::{Client, LspRange, PositionEncoding, Progress, PublishDiagnostic, ReadyPolicy};
 use mina_protocol::{Diagnostic, InlayHint, Severity};
 use serde::Deserialize;use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -35,6 +36,30 @@ const PULL_SETTLE: Duration = Duration::from_millis(250);
 pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 pub(crate) const LSP_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// 索引完走（`$/progress` が静まるまで）の待ち方。
+///
+/// 索引未完の LSP では `workspace/symbol` は空を返し、`rename` は開いていない
+/// ファイルを取りこぼしたまま「成功」する（実測: L0 `--cold` 2026-09-12）。
+/// 待つのはセッションごとに 1 回だけ（[`Progress`] が確認済みを記録する）。
+/// 上限は「待ち続けて要求を止めない」ためのもの — 超えたら未確認のまま進める。
+///
+/// `arm` の根拠（実測 2026-09-12）: rust-analyzer の最初の進捗は `initialized` の
+/// 約 0.26 秒後（Fetching）、typescript-language-server は進捗を 1 件も送らない
+/// （= TS は 1 セッション 1 回だけ 1 秒払う。TS は読み込み自体が秒単位なので相対的に
+/// 小さい）。初回進捗が 1 秒を超えるサーバを見つけたら `arm` を上げる。
+#[cfg(not(test))]
+pub(crate) const LSP_READY: ReadyPolicy = ReadyPolicy {
+    arm: Duration::from_secs(1),
+    quiesce: Duration::from_millis(300),
+    cap: Duration::from_secs(10),
+};
+#[cfg(test)]
+pub(crate) const LSP_READY: ReadyPolicy = ReadyPolicy {
+    arm: Duration::from_millis(100),
+    quiesce: Duration::from_millis(20),
+    cap: Duration::from_millis(400),
+};
 
 /// LSP セッションの状態（1セッション = 1サーバ。言語テーブルは ADR-0030）。
 pub struct LspSession {
@@ -109,6 +134,14 @@ pub(crate) fn uri(path: &Path) -> String {
 }
 
 impl LspSession {
+    /// work-done progress の状態（索引完走の待ちに使う）。
+    ///
+    /// 待つ側はセッションロックを握らない — この `Arc` を clone してからロックを
+    /// 離し、[`Progress::wait_ready`] を外側で待つ（編集中の didChange を締め出さない）。
+    pub(crate) fn progress(&self) -> Arc<Progress> {
+        self.client.progress()
+    }
+
     /// サーバを spawn し、initialize まで完了させる（**テスト専用**: 言語は rust、
     /// init options なし。本番は [`new_with_config`] を使う）。
     #[cfg(test)]
@@ -143,6 +176,9 @@ impl LspSession {
             "processId": null,
             "rootUri": uri(root),
             "capabilities": {
+                // work-done progress を購読する（索引完走の判定。ADR-0051）。
+                // advertise しないと rust-analyzer は `$/progress` を送らない（実測）。
+                "window": { "workDoneProgress": true },
                 "textDocument": {
                     "publishDiagnostics": { "relatedInformation": false },
                     // inlay hint は static 登録のみ（resolve は使わない。ADR-0020）。
