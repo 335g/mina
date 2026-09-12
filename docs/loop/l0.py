@@ -248,6 +248,19 @@ FLOWS = {
             ],
         },
     },
+    # iteration #4 で追加: hint 経路の実測（ADR-0020）。config.rs は let 束縛が無く
+    # ヒントが無い（[] が正常）ので main.rs を対象にする — `let cfg = Config::default()`
+    # の型ヒント `: Config` が返ることが期待値。キャッシュでなく pull されるので
+    # 往復 1 回・編集後の更新も反映される（ここで応答欠けの回帰を見張る）。
+    "hints": {
+        "goal": "パス指定で inlay hint を 1 往復で取得する（ADR-0020）",
+        "fixture": "rust",
+        "warmup": True,
+        "need": ": Config",
+        "arms": {
+            "hints": ["minas hints src/main.rs"],
+        },
+    },
 }
 
 # ---------------------------------------------------------------- runner

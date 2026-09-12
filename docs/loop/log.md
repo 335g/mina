@@ -379,3 +379,111 @@ pull 120 往復 → 約 6 往復）。非空の安定判定（2 回連続同数 
 ワークスペース全ファイルを didOpen する回避策）が、索引完走ゲートの導入後も必要か。
 不要なら複数ファイル rename のコストが大きく下がる。
 
+
+## 2026-09-12 12:39 — iteration #4: 初回 apply の ~1.1s の主因は hint pull か? — step2 で pull_after_edit から hint pull を外して A/B → 1回目不変（仮説棄却）。トレースで内訳確定: 初回コスト = 初回 pull_diagnostics 内の RA 再解析 ~600-1100ms（hint pull ≈0ms）。hints flow を追加
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568    1290.6         0  True
+explore  dump                  2      4750       298      4510      9260     164.5         0  True
+hints    hints                 1       110         8         0       110     730.8         0  True
+rename   lsp                   2       219         3       219       438    1737.2         0  True
+rename   apply                 5       406         4      1018      1424    2648.3         0  True
+verify   apply-check           2       246         2       108       354    1964.7         0  True
+verify   apply-cargo           2       108         1       108       216    1521.8         0  True
+verify   hunks-cargo           2       154         1       154       308    1812.5         0  True
+verify   apply2-cargo          3       218         2       327       545    1913.0         0  True
+verify-blind check                 2       240         2       104       344    1589.3         0  True
+verify-blind cargo                 2       104         1       104       208    1168.3         0  True
+verify-broken check                 2       450         2       105       555    1549.4         0  True
+verify-broken cargo                 2       105         1       105       210    1144.7         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=386, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## iteration #4 — 考察（hint pull 仮説は棄却。内訳はトレースで確定）
+
+**結論**: §4 の仮説「初回 apply の ~1.1s は hint pull が主因」は**棄却**。
+内訳は daemon に一時トレースを入れて直接確定した（A/B 除去でなく実測）。
+
+### 測り方 1（内訳の再現確認）
+
+`-f verify -r 3 -v`（iteration #4 開始時、変更なし）:
+
+- `apply2-cargo`: 1 回目 apply **1373ms** / 2 回目 **352ms**（iteration #3 の
+  1470/348、別セッション再測 1423/348 と一致 — 初回 vs 2 回目の差 ≈1.0s は再現）
+
+### 測り方 2（1 変更だけ: hint pull 除去）→ 仮説棄却
+
+`pull_after_edit` から `pull_inlay_hints` だけ外して再 build（行為の契約は他に触れない）、
+`-f verify -f explore -f rename -r 3`:
+
+| flow/arm | 比較 | 結果 |
+|---|---|---|
+| `verify/apply-cargo` 1 回目 | 1344 → **1430ms** | 不変（むしろ微増。ノイズ） |
+| `verify/apply2-cargo` 1 回目 / 2 回目 | 1373/352 → **1422/342ms** | 不変 |
+| `rename/apply` 1 回目 | — → **1400ms**（他は 350/343/389） | 不変 |
+| `explore/*` `rename/lsp` | calls/equiv_B | 完全不変 |
+
+→ 棄却条件 (c)「apply の 1 回目が下がらない」に該当。**hint pull は初回コストの
+主因ではない**（温まれば ≈0ms。2 回目 apply も除去前後で 352→342ms と不変）。
+対案（測り方 3: キャッシュ破棄）は「hint pull が高い」前提が崩れたので動機なし。
+変更は revert（`hints = None` のまま残すと編集後ヒントが stale になり棄却条件 (b)）。
+
+### 内訳の直接測定（仮説の修正）
+
+`pull_after_edit` と `sync_after_edit` に一時トレース（eprintln → minad.log）を入れ、
+`verify/apply2-cargo` を 2 回適用で観測:
+
+```
+[trace-sync] sync=0ms pull_total=856ms      ← 1 回目 apply（apply 合計 ~1003ms）
+[trace-pull] settle=251ms lock_wait=0ms diag_pull=604ms ns=0
+[trace-sync] sync=0ms pull_total=253ms      ← 2 回目 apply（合計 ~352ms）
+[trace-pull] settle=252ms lock_wait=0ms diag_pull=0ms ns=0
+```
+
+- `lsp::sync` ≈0ms — didChange は fire-and-forget。RA は lazy で応答不要。
+- 初回コストの実体は **初回 `pull_diagnostics` 内の RA 再解析 ≈600ms**（他 run では
+  ~1100ms。run 間で 1003–1518ms と振れるのはここ）。didChange 直後の最初の診断
+  要求がクレート再解析を背負う。
+- 2 回目は diag_pull ≈0ms（増分解析）。hint pull は 1〜数 ms。
+- `PULL_SETTLE` 250ms は**毎回の apply に定数で乗る**（1 回目も 2 回目も）。
+
+**重要な観察**: settle と diag_pull は加法（856 = 251 + 604）— 待っている間 RA の
+解析は進んでいない＝**RA は診断要求まで解析を始めない**（lazy）。すると settle は
+「解析が終わるのを待つ」のではなく「didChange 通知が RA に消費されるのを待つ」
+だけの可能性が高い。250ms はそのためには過大で、次の課題にできる
+（iteration #5: `PULL_SETTLE` の削減 — 空 pull の回帰を verify-broken/blind で
+見張りながら）。
+
+### 測り方 4（hints flow 追加 — 計測器の穴を埋める）
+
+`docs/loop/l0.py` の `FLOWS` に `hints` を追加:
+- 対象は `src/main.rs`（config.rs は let 束縛が無くヒントが無い — `[]` が正常）。
+  `let cfg = Config::default()` の型ヒント `: Config` を `need` にする。
+- 結果: 1 call / 110B / ~731ms（fresh daemon の初回取得は初回解析を背負う。回帰は
+  calls と応答欠けで見る）。キャッシュでなく自前 pull（ADR-0020）なので往復 1 回
+  は契約どおり。
+
+### 資産
+
+- 仮説「hint pull が初回 apply の主因」を **L0 で棄却**（L2 は回さない — method.md §3）。
+- 初回 apply の内訳が確定: 250ms 定数（settle）+ RA 初回再解析 ~600–1100ms + 編集処理 ~150ms。
+- `hints` flow 追加で hint 経路の費用・応答欠けを今後実測できる。
+- iteration #5 の課題は「毎回の apply に乗る `PULL_SETTLE` 250ms」に置ける
+  （初回再解析自体は LSP の本質コストで、契約上は外せない — 外すなら check の
+  settled 契約を変えることになり、別の大きい課題）。

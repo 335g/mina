@@ -15,10 +15,12 @@
 
 ## 現在地（2026-09-12 時点）
 
-- 完了: **#1 計測器の構築 → #2 LSP 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定（ADR-0052）**
+- 完了: **#1 計測器の構築 → #2 LSP 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定（ADR-0052）→ #4 初回 apply の内訳確定**
 - 効果（L0 実測）: `check`（クリーン）**10154ms → 589ms（−94%）**。cold の無言の誤り 0 件。
   `explore` / `rename` の `calls` / `equiv_B` は不変（回帰なし）
-- 次: **iteration #4**（`apply` が最初の 1 回だけ 1.0〜1.7 秒かかる件の内訳）。詳細と
+- **#4 の結末**: 「初回 apply の主因は hint pull」は棄却。トレースで内訳確定
+  （初回 diag pull 内の RA 再解析 + `PULL_SETTLE` 250ms/毎回）
+- 次: **iteration #5**（`PULL_SETTLE` 250ms の削減 — 空 pull 回帰を見張りながら）。詳細と
   受理・棄却条件は [`latest.md`](./latest.md) §4
 
 ## 中身
