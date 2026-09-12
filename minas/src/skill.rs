@@ -14,289 +14,78 @@
 //! 各トピックの内容はツール判断の指針であり、tools/ab の A/B 実測（t1〜t5）と
 //! ADR-0029（rename / references）・ADR-0031（outline / at）・ADR-0032
 //! （hover / symbol / check）の実測・仕様に基づく。
+//!
+//! 本文は `minas/skills/<topic>.md` に置き `include_str!` で同梱する（ハイライトの
+//! `highlights/*.scm` と同じ流儀）。文言の修正は Markdown だけで完結し、Rust の
+//! ソースを触らない。
 
-/// トピック定義。説明は索引行に使う。内容は「行動レベル」に書く（長手順・抑制・判断表）。
-const SKILLS: &[(&str, &str, &str)] = &[
-    (
-        "read",
-        "map files with outline; read only the lines you need",
-        "READ — reading files without wasting tokens
+/// 1トピックのスキル定義。
+pub struct Skill {
+    /// トピック名（`minas skill <topic>` の引数）。索引の左列。
+    pub name: &'static str,
+    /// 索引行に出る一行説明。
+    pub description: &'static str,
+    /// 本文。`skills/<name>.md` を `include_str!` で同梱したもの。
+    pub body: &'static str,
+}
 
-Use:      minas read <path> [--lines <start>:<end>]   (any file, buffer-free — ADR-0048)
-          minas get --lines <start>:<end>            (current buffer only)
-Output:   numbered lines: {\"n\":1500,\"text\":\"...\"}  (1-origin, end may be empty = last line)
-
-Rules
-- Read only the lines you need (measured: ranged read cuts task tokens by ~51% vs
-  whole-file reads).
-- `minas read <path>` reads ANY file without touching the current buffer — no
-  Open/apply needed just to look (a plain `minas read <path>` prints the raw
-  text; `--lines` prints numbered lines). `minas get` reads only the buffer
-  (last Open/apply) and returns the full snapshot.
-- On an unfamiliar file, minas outline FIRST (structure + exact spans for a
-  fraction of the bytes), then read only the symbol you need; minas at
-  <path> <line>:<col> names the symbol enclosing a spot you are about to touch,
-  so both reads and edits happen at symbol granularity.
-- For types, minas hover <path> <line>:<col> returns the signature without
-  any read; to find where a name lives in the workspace, minas symbol
-  <path> <query> replaces rg (both ADR-0032).
-- The numbered output lets you paste the exact text you saw into `minas apply`
-  as the <old> argument — read and edit share one contract.
-- Out-of-range start returns an explained zero result, e.g.
-  \"no lines in 3000..3100: file has 2000 lines\" — this is not an error, just pick
-  a valid range.
-- A whole-file read is allowed only when you really need the full text; prefer
-  --lines otherwise. A whole-file `minas get` is allowed only when you need the
-  checksum or diagnostic machinery of the snapshot.",
-    ),
-    (
-        "edit",
-        "edit via content (minas apply); never compute positions",
-        "EDIT — content-resolved edits (the front door)
-
-Use:      minas apply <path> <old> <new>
-          minas apply <path> --hunks-stdin   (JSON array of {\"old\",\"new\"} for many edits)
-What it does: Open -> find <old> -> verify (checksum + expected_text) -> replace -> Save,
-all in one command. Position math is done for you.
-
-Rules
-- Prefer content-resolved edits over positional ones. Measured: positional editing
-  (`minas edit` with computed char offsets) fails 0/5 vs 3/5 for content-resolved,
-  costs ~5x tokens, and can silently apply to the WRONG occurrence (a successful
-  exit with the wrong spot changed). Do not compute start/end char indices.
-- After an edit, VERIFY with `minas check <path>` (ADR-0032): it waits for LSP
-  diagnostics and returns only errors — 1 round trip, no full text. Exit 2 means
-  at least one error diagnostic (warnings alone exit 0). For semantics beyond the
-  LSP (borrow checker etc.), still run the real build.
-- Locate before you edit: minas outline / minas at return the exact span of
-  the symbol you are changing, so your <old> text targets the right region
-  instead of a look-alike occurrence elsewhere.
-- One invocation replaces the FIRST occurrence of <old>. Repeat for the next one,
-  or batch many changes with --hunks-stdin (faster: ~3x on one connection).
-- Small targeted replacements beat one huge <old> block: a big mismatch wipes too
-  much. For whole-file rewrites use --whole-stdin.
-- On rejection (exit 2) the message names the expected/found text and the range.
-  Re-read that spot fresh, fix, retry — do not blind-retry.",
-    ),
-    (
-        "outline",
-        "minas outline <path>: symbol tree (name/kind/span) without full text",
-        "OUTLINE — map a file's structure without reading it
-
-Use:      minas outline <path>
-          minas outline <path> --recursive [--depth N]  (cross files — ADR-0049)
-Output:   compact JSON tree, no file text: each symbol is
-          {\"name\", \"kind\", \"range\", \"selection_range\", \"children\"},
-          kinds: Module/Function/Method/Type/Enum/Constant/Variable/Other
-
-Rules
-- On an unfamiliar file, outline FIRST: every symbol's name, kind, and exact
-  span for a fraction of a read. Measured (7,981-line file): outline + at =
-  55 KB vs a full minas get = 814 KB (~93% fewer bytes).
-- --recursive follows file-scoped modules (`mod name;` → the file that defines
-  them) and inlines their symbols as children — one call maps a whole crate
-  instead of one outline per file. Default depth 3; --depth N implies --recursive
-  and sets the cap (--depth 1 = direct child modules only). A \"truncated\" note on
-  stderr means the 500-symbol cap cut the tree (still exit 0; per-file outline
-  for the parts you need).
-- ranges are char indices (the same unit as DocumentEdit positions);
-  selection_range is only the name token. Use them to choose WHICH lines to
-  read (minas get --lines / minas read --lines) and WHICH text to target in
-  minas apply — read at symbol granularity, not file granularity.
-- The tree is nested and grep-able: find the function you need by name instead
-  of scanning text.
-- The first outline on a path is cold (seconds: project load + LSP settle);
-  the daemon caches it, so pull it once at session start and reuse the ranges
-  for reads / at / edits. Warm calls are ~0.1s.
-- Exit 1 = not supported (no LSP server for this language) or bad input;
-  exit 2 = retryable LSP error (retry once later, then give up).",
-    ),
-    (
-        "at",
-        "minas at <path> <line>:<col>: enclosing symbol + its exact range",
-        "AT — the symbol enclosing a position, with its exact range
-
-Use:      minas at <path> <line>:<col>   (1-origin, like get --lines)
-Output:   pretty JSON, no file text: {\"name\", \"kind\", \"range\",
-          \"selection_range\", \"found\"}. found=false is a SUCCESS (exit 0):
-          the position is in no symbol — pick a different spot.
-
-Rules
-- Before touching a spot, ask what it belongs to: at names the enclosing
-  function/type and its exact span, so your read and your <old> text are
-  scoped to the right region — no full-file reads, no guessing which function
-  a matching string lives in.
-- selection_range is the substring of the symbol NAME: the address for
-  rename-style edits and for locating the token named in a rejection message.
-- Ranges are char indices: pair the span with minas get --lines to see the
-  actual lines before editing inside it.
-- Warm after an outline of that path: ~0.1s (measured 6.5s -> 0.09s cold to
-  cached); the cold cost is paid by the one session-start outline, not by
-  every at.
-- Exit 1/2 as with outline/rename (1 = not supported / bad input, 2 =
-  retryable LSP error).",
-    ),
-    (
-        "rename",
-        "minas rename <path> <old> <new> (semantic); apply for a few",
-        "RENAME — semantic rename vs apply (measured decision)
-
-minas has a built-in semantic rename (content-addressed, ADR-0029):
-    minas rename <path> <old> <new>
-- Use it for renames with MANY occurrences or MULTIPLE files. Measured (3 files,
-  21 occurrences): LSP rename 5/5 success vs apply loop 2/5 (apply kept missing
-  occurrences), ~half the tokens (-49%) and cost (-57%).
-- It renames the definition and ALL references (imports, calls) in one call,
-  saves to disk, and prints the impact: `renamed: old -> new (N files, M edits)`
-  plus a `changed:` list — verify the impact is what you meant.
-- Exit 1 = not supported / bad input (do not retry), exit 2 = retryable
-  (symbol not found, LSP error, stale analysis — re-read and retry).
-
-If only content-editing is available (minas apply):
-- For a handful of occurrences in ONE file, loop with apply. Measured on a small
-  file it is as cheap as LSP rename.
-- For many occurrences or cross-file renames you MUST verify with a final
-  `minas references <path> <old>` (or grep/read) that no old name remains —
-  measured failure mode is silently leaving one occurrence behind.
-
-Never try to re-implement the rename by hand-editing each call site when an LSP
-rename tool exists.",
-    ),
-    (
-        "references",
-        "minas references <path> <old>: list a symbol's references",
-        "REFERENCES — impact check before/after a rename (ADR-0029)
-
-    minas references <path> <old>
-
-- Resolves <old> like rename (first identifier occurrence) and lists every
-  reference with the definition: `path:line` (1-origin), e.g.
-      2 references in 1 files:
-      /abs/path.rs:4
-      /abs/path.rs:1
-- Use before a rename to see what will change, or after apply-based edits to
-  verify nothing was missed — the T5 failure mode is a silently-left occurrence.
-- The output is locations only (token-cheap): read a location with
-  `minas get --lines <line>:<line>`.
-- Exit 1/2 as with rename.",
-    ),
-    (
-        "check",
-        "minas check <path>...: wait for diagnostics, returns only errors",
-        "CHECK — the edit -> verify loop in one command (ADR-0032)
-
-Use:      minas check <path> [<path> ...]
-Output:   compact JSON, no file text: an array of {\"path\", \"total\",
-          \"diagnostics\", \"settled\"} (one entry per path; ADR-0046) where
-          each diagnostic is {\"severity\", \"line\" (1-origin), \"col\"
-          (1-origin, char units), \"start\", \"end\", \"message\"}.
-Exit:     0 = no error diagnostics (warnings alone are fine),
-          2 = at least one error diagnostic, or a retryable LSP failure,
-          1 = not supported / bad input.
-
-Rules
-- After an edit (minas apply / edit), run check INSTEAD of wait + get +
-  JSON-parsing the snapshot: it waits for LSP diagnostics to settle and returns
-  only the diagnostics — the round trip and the full text are gone.
-- Pass multiple paths to verify every file you touched in one call
-  (ADR-0046): `minas check src/lib.rs src/other.rs`.
-- The 1-origin line is the address for `minas get --lines <n>:<n>`; the
-  char range is the address for `minas apply`.<old>. The line:col pair is the
-  address for `minas at / peek / hover <path> <line>:<col>` — pass it straight
-  through without computing anything (ADR-0047).
-- It is an LSP fast path (incremental), not a compiler: for semantics beyond
-  the LSP (borrow checker etc.) still run the real build.
-- settled == false means the result is NOT a verified clean: empty +
-  settled=false is \"clean\" UNVERIFIED, NOT clean (ADR-0045). It comes back
-  fast — the pull answer is stable on the first request, so an empty result is
-  returned after ~0.6s instead of burning a ~10s budget (ADR-0052), and waiting
-  would not turn it into a clean anyway. rust-analyzer's pull misses real
-  errors (a broken method call can report empty), so never treat empty as
-  clean: run the real build (cargo check / cargo test) before trusting it.",
-    ),
-    (
-        "hover",
-        "minas hover <path> <line>:<col>: type & signature without full text",
-        "HOVER — type/signature lookup without reading (ADR-0032)
-
-Use:      minas hover <path> <line>:<col>   (1-origin, like get --lines)
-Output:   compact JSON: {\"path\", \"text\"} — type + signature + doc, no file text.
-          Empty text is a SUCCESS (exit 0): nothing to hover at that position
-          (whitespace, comments).
-
-Rules
-- Before reading a definition to learn its type, hover the call site: the
-  server returns the signature in one round trip (token-cheap).
-- The doc comment is truncated (<=2000 chars) — the type/signature is the
-  reliable part; read the doc only when the short part is not enough.
-- Pair with minas peek <path> <line>:<col> to jump to the definition.
-- Exit 1/2 as with outline/at (1 = not supported / bad input, 2 = retryable).",
-    ),
-    (
-        "symbol",
-        "minas symbol <path> <query>: find where a name lives in the workspace",
-        "SYMBOL — workspace search instead of rg (ADR-0032)
-
-Use:      minas symbol <path> <query>
-Output:   compact JSON array, no file text: each hit is
-          {\"name\", \"kind\", \"path\", \"line\" (1-origin)} — read the location
-          with `minas get --lines`.
-
-Rules
-- <path> is any file in the workspace (it anchors the workspace root);
-  results can span the whole root, not just that file.
-- Use it INSTEAD of rg when you need to know WHERE a name is defined or
-  declared: the server returns exact symbols (no whole lines, no false
-  positive comments/strings), and the hit range is the definition.
-- Fuzzy matching varies by server; a broad query then narrowing by kind/line
-  is cheaper than many greps.
-- Exit 1 = not supported / bad input (empty query), 2 = retryable.",
-    ),
-    (
-        "persist",
-        "minas edit leaves the buffer dirty; save explicitly",
-        "PERSIST — when changes hit the disk
-
-- `minas apply` (and --hunks-stdin) Save for you: after success the file on
-  disk is updated.
-- Raw `minas edit` does NOT save: the daemon buffer changes but the disk file
-  stays old (dirty=true). If you used edit, persist with:
-      minas exec \"Save\"
-- When an edit succeeded but the buffer is dirty, minas prints a stderr note:
-  \"buffer is dirty (not saved); persist with: minas exec '\"Save\"'\".
-- Before relying on a file's on-disk content, prefer apply (which re-opens the
-  file fresh) over mixing edit + assumptions.",
-    ),
-    (
-        "errors",
-        "exit codes 0/1/2 and how to recover from rejections",
-        "ERRORS — exit codes and recovery
-
-Exit codes (applies to minas apply / edit / hunks):
-  0  success (applied, or no-op)
-  1  usage/CLI error — fix the arguments; do not retry the same call
-  2  retryable failure — old text not found, checksum/expected_text mismatch,
-     or Save failed. Re-read the file fresh, then retry.
-
-Semantic commands (rename / references / outline / at / hover / symbol / check)
-share 0/1/2 but classify differently: exit 1 = not supported / invalid input
-(do not retry), exit 2 = retryable (symbol not found, LSP error — re-run once
-later). Exceptions:
-- minas at with no enclosing symbol is exit 0 (found=false), not an error —
-  only the LSP request itself can fail.
-- minas hover with nothing at the position is exit 0 (empty text), not an error.
-- minas check returns exit 2 when at least one error diagnostic is present
-  (warnings alone exit 0) — branch on $? without parsing the JSON.
-
-Rejections are the editor telling you what changed:
-- \"document changed since read\"      -> the file moved; re-read and retry.
-- \"expected text mismatch: expected X,\n  found Y at [lo,hi)\" -> the range is not
-  what you assumed; re-read THAT range (use --lines) and fix the old text.
-- \"NOT FOUND: text\"                  -> the old string is not in the file; re-grep.
-
-Recovery loop: read the reported spot with `minas get --lines`, correct the
-old/new, retry. Never blind-retry a rejected edit.",
-    ),
+/// 全トピック。索引の順序がそのまま表示順。
+const SKILLS: &[Skill] = &[
+    Skill {
+        name: "read",
+        description: "map files with outline; read only the lines you need",
+        body: include_str!("../skills/read.md"),
+    },
+    Skill {
+        name: "edit",
+        description: "edit via content (minas apply); never compute positions",
+        body: include_str!("../skills/edit.md"),
+    },
+    Skill {
+        name: "outline",
+        description: "minas outline <path>: symbol tree (name/kind/span) without full text",
+        body: include_str!("../skills/outline.md"),
+    },
+    Skill {
+        name: "at",
+        description: "minas at <path> <line>:<col>: enclosing symbol + its exact range",
+        body: include_str!("../skills/at.md"),
+    },
+    Skill {
+        name: "rename",
+        description: "minas rename <path> <old> <new> (semantic); apply for a few",
+        body: include_str!("../skills/rename.md"),
+    },
+    Skill {
+        name: "references",
+        description: "minas references <path> <old>: list a symbol's references",
+        body: include_str!("../skills/references.md"),
+    },
+    Skill {
+        name: "check",
+        description: "minas check <path>...: wait for diagnostics, returns only errors",
+        body: include_str!("../skills/check.md"),
+    },
+    Skill {
+        name: "hover",
+        description: "minas hover <path> <line>:<col>: type & signature without full text",
+        body: include_str!("../skills/hover.md"),
+    },
+    Skill {
+        name: "symbol",
+        description: "minas symbol <path> <query>: find where a name lives in the workspace",
+        body: include_str!("../skills/symbol.md"),
+    },
+    Skill {
+        name: "persist",
+        description: "minas edit leaves the buffer dirty; save explicitly",
+        body: include_str!("../skills/persist.md"),
+    },
+    Skill {
+        name: "errors",
+        description: "exit codes 0/1/2 and how to recover from rejections",
+        body: include_str!("../skills/errors.md"),
+    },
 ];
 
 /// `minas skill [topic]` の本体。daemon は必要としない（静的コンテンツ）。
@@ -304,19 +93,20 @@ pub fn run(topic: Option<String>) -> std::io::Result<()> {
     match topic {
         None => {
             // 索引: 1トピック1行。薄く保つことが設計要件（常時ロードしても軽い）。
-            for (name, desc, _) in SKILLS {
-                println!("{name:<10} {desc}");
+            for s in SKILLS {
+                println!("{:<10} {}", s.name, s.description);
             }
             Ok(())
         }
-        Some(t) => match SKILLS.iter().find(|(name, _, _)| *name == t) {
-            Some((_, _, body)) => {
-                println!("{body}");
+        Some(t) => match SKILLS.iter().find(|s| s.name == t) {
+            Some(s) => {
+                // 同梱した Markdown は末尾改行付きなので、二重改行にしない
+                println!("{}", s.body.trim_end());
                 Ok(())
             }
             None => {
                 // 未知トピック: stderr に理由＋候補（エージェントは $?=1 で修正できる）
-                let known: Vec<&str> = SKILLS.iter().map(|(n, _, _)| *n).collect();
+                let known: Vec<&str> = SKILLS.iter().map(|s| s.name).collect();
                 eprintln!(
                     "unknown skill topic: {t:?} (known topics: {})",
                     known.join(", ")
@@ -333,7 +123,7 @@ mod tests {
 
     #[test]
     fn index_lists_every_topic_once() {
-        let mut names = SKILLS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>();
+        let mut names = SKILLS.iter().map(|s| s.name).collect::<Vec<_>>();
         let before = names.len();
         names.sort();
         names.dedup();
@@ -342,7 +132,7 @@ mod tests {
         // ADR-0032 の3コマンドは索引に載る（エージェントが発見できる）
         for required in ["check", "hover", "symbol"] {
             assert!(
-                SKILLS.iter().any(|(n, _, _)| *n == required),
+                SKILLS.iter().any(|s| s.name == required),
                 "索引に {required} トピックが必要"
             );
         }
@@ -350,18 +140,20 @@ mod tests {
 
     #[test]
     fn every_topic_has_description_and_body() {
-        for (name, desc, body) in SKILLS {
-            assert!(!desc.is_empty(), "{name}: 索引説明が空");
-            assert!(body.len() > 100, "{name}: 内容が短すぎる");
-            assert!(!body.contains('\0'));
+        for s in SKILLS {
+            assert!(!s.description.is_empty(), "{}: 索引説明が空", s.name);
+            assert!(s.body.len() > 100, "{}: 内容が短すぎる", s.name);
+            assert!(!s.body.contains('\0'));
         }
     }
 
     #[test]
     fn topic_lookup_by_name() {
-        let found = SKILLS.iter().find(|(n, _, _)| *n == "edit");
+        let found = SKILLS.iter().find(|s| s.name == "edit");
         assert!(found.is_some(), "edit トピックが存在する");
-        let (_, _, body) = found.unwrap();
-        assert!(body.contains("minas apply"), "本編は行動レベルの内容");
+        assert!(
+            found.unwrap().body.contains("minas apply"),
+            "本編は行動レベルの内容"
+        );
     }
 }
