@@ -183,8 +183,10 @@ python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
 - **fixture が小さい**: `cargo check` が 0.2〜0.5s で終わるので、`wall_ms` の結論は
   実プロジェクトに外挿しない（`calls` / `equiv_B` は契約の形で決まるので外挿可）。
   規模の確認は L2 の仕事。
-- **`minas apply` は 1 ファイル 1.0〜1.5 秒**（`sync_after_edit` が診断 + inlay hint を
-  pull する。config.rs 300 行で遅い）。`apply` を挟む flow の wall はこれを含む。
+- **`minas apply` の残りの ~1 秒は RA の初回再解析**（diagnostics の pull が解析完了まで
+  ブロックする。iteration #4 のトレースで確定、#5 で下調べ済み）。他のコマンド
+  （`symbol` / `check`）が先に解析を起こしていれば `apply` は 100ms 台。
+  編集処理自体は ~150ms（旧記述の「診断 + hint の pull の固定待ち」は #5 で撤去済み — ADR-0053）。
 - **1 アーム 1 回の観測**: `equiv_B` / `calls` は決定論的（同じ契約なら同じ値）、
   `wall_ms` は揺れる（`-r 3` で中央値）。
 - **`C_0`（システムプロンプト等の固定費）は測らない**: アーム間で同じなら比較に影響しない。
@@ -196,7 +198,9 @@ python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
   恒久的に測りたいなら計時ログの追加が要る（そのときは計測器側の課題として扱う）。
 - **同じ arm の中で複数回叩くと「初回 vs 2 回目」が分かる**: 初回だけ高いコスト
   （初回 pull・初回 didChange 後の解析など）はここで検出する。既知の例:
-  `apply` は初回 1.0〜1.7 秒 / 2 回目 約 350ms。
+  `apply` は初回 1.0〜1.4 秒（RA の初回再解析）/ 2 回目 約 100ms。
+  残っている固定待ちは `SEMANTIC_RETRY_WAIT` 500ms（`symbol` / `rename` / `check` が
+  毎回払う — iteration #6 の課題）。
 
 ## 8. 結果の書き先（どこに何を書くか）
 

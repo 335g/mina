@@ -11,3 +11,9 @@ LSP の inlay hint（type / parameter の 2 種）を TUI に表示し、headles
 
 - wire 変更（新 Command / 新 ServerMessage::Hints / `StateSnapshot.inlay_hints` / 新 `InlayHint` 型）→ PROTOCOL_VERSION 2 → 3
 - ツールチップ（`inlayHint/resolve`）・kind 別表示・トグルは対象外（必要になったら足す）
+
+## 注記
+
+- 2026-09-12（ADR-0053）: 「編集後 250ms settle」は撤去した。pull 自身が解析完了まで
+  ブロックするため（ADR-0052）、待ちは純粋な遅延だった（`minas apply` で毎回 −250ms）。
+  編集後のヒントは `pull_after_edit` の 2 つ目の pull で従来どおり更新される。

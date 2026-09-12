@@ -487,3 +487,201 @@ verify-broken cargo                 2       105         1       105       210   
 - iteration #5 の課題は「毎回の apply に乗る `PULL_SETTLE` 250ms」に置ける
   （初回再解析自体は LSP の本質コストで、契約上は外せない — 外すなら check の
   settled 契約を変えることになり、別の大きい課題）。
+
+## 2026-09-12 14:14 — iteration #5: 毎回の apply に乗る PULL_SETTLE 250ms は通知消費待ちだけで、pull 自身が解析完了までブロックする（ADR-0052）ので削れる。50ms / 0ms の A/B で空 pull 回帰なし → settle を撤去（ADR-0053）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568    1283.5         0  True
+explore  dump                  2      4750       298      4510      9260     163.7         0  True
+hints    hints                 1       110         8         0       110     707.0         0  True
+rename   lsp                   2       219         3       219       438    1740.6         0  True
+rename   apply                 5       406         4      1018      1424    1637.9         0  True
+verify   apply-check           2       246         2       108       354    1652.4         0  True
+verify   apply-cargo           2       108         1       108       216    1280.6         0  True
+verify   hunks-cargo           2       154         1       154       308    1274.9         0  True
+verify   apply2-cargo          3       218         2       327       545    1352.4         0  True
+verify-blind check                 2       240         2       104       344    1285.8         0  True
+verify-blind cargo                 2       104         1       104       208     878.8         0  True
+verify-broken check                 2       450         2       105       555    1370.2         0  True
+verify-broken cargo                 2       105         1       105       210     843.8         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=386, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## iteration #5 — 考察（`PULL_SETTLE` 250ms は削れた。しかも 0 まで）
+
+**結論**: §4 の仮説「`PULL_SETTLE` を短くすると apply の wall が毎回下がる」は**採用**。
+予想より強く、**50ms で空回帰が出なかったので 0ms（撤去）まで試し、それも
+空回帰が出なかったため settle 自体を削除した**（ADR-0053）。apply 系全体が
+毎回 ~230ms 下がった。
+
+### 測り方 1（50ms で A/B）
+
+`minad/src/lsp.rs` の `PULL_SETTLE` を 250ms → 50ms にして `cargo build`、
+`-f verify -r 3 -v`（iteration #4 開始時の基準値は apply-cargo 1 回目 1359ms /
+2 回目 346ms。今回の開始時再測は 1 回目 ~1300–1400ms / 2 回目 346ms）:
+
+| step | 250ms | 50ms | 差 |
+|---|---|---|---|
+| `verify/apply-cargo` apply 1 回目 | 1296–1405ms | 1188ms | −150〜−200ms |
+| `verify/apply2-cargo` apply 2 回目 | 346ms | 156ms | **−190ms** |
+| `verify/apply2-cargo` apply 1 回目 | 1359ms | 1132ms | −227ms |
+
+2 回目の −190ms は「settle の短縮分がそのまま出た」形（2 回目は増分解析で
+diag_pull ≈0ms なので settle がほぼ全額）。**仮説どおり、settle は解析と重ならない
+純粋な遅延**だった（iteration #4 の加法の観察と整合）。
+
+空 pull の回帰は無し: `verify-broken/check` は rc=2 / 345B に `Syntax Error` 2 件
+（fails 0）、`verify-blind/*` も fails 0。
+
+### 測り方 2（0ms = 撤去で A/B）
+
+「50ms が安全」なら「0ms も安全」かを確かめた（固定待ちが本当に要るのか、
+要らないなら定数ごと消す方が小さい）:
+
+| step | 250ms | 50ms | 0ms（撤去） |
+|---|---|---|---|
+| `verify/apply2-cargo` apply 1 回目 | 1359ms | 1132ms | 1133ms |
+| `verify/apply2-cargo` apply 2 回目 | 346ms | 156ms | **107ms** |
+| `verify-broken/check` | rc=2 345B | rc=2 345B | **rc=2 345B（回帰なし）** |
+| `verify-blind/*` | fails 0 | fails 0 | **fails 0** |
+
+さらに回帰の取りこぼしを減らすため **`-r 10`（10 回観測）で 30 run** 回した:
+`verify-broken`（check/cargo）・`verify-blind`（check/cargo）・`hints` の
+**fails 0 / ok True 全件**、`hints` は 1 call 110B で不変（編集後ヒントも出続ける）。
+1 回目の apply が 50ms と 0ms で同値（1132 vs 1133ms）なのは、撤去後に残る
+**RA の初回再解析 ~600–1100ms が下限**だからで、settle 分はもう乗っていない。
+
+### 測り方 3（プロトコル直叩き — daemon を介さない独立の根拠）
+
+「なぜ settle 無しで空が出ないのか」を daemon の外で確かめた。
+`python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe0 4 0.0`（round 間の
+待ちを 0 にした）:
+
+| ケース | round0 | round3 |
+|---|---|---|
+| 構文エラー（main.rs） | `Syntax Error` ×2 | 同じ（round0 == round3） |
+| フィールド削除 / 未知フィールド（config.rs） | `no such field` | 同じ |
+| メソッド解決エラー | 空 | 空（ADR-0052 どおり永久に空） |
+
+**didChange 直後（待ち 0）の 1 回目で最終集合が返る** — pull 自身が解析完了まで
+ブロックするので、こちらで待つ必要が無い。
+
+### 原因の帰属（なぜ空が出ないか）
+
+1. **順序**: `notify(didChange)` と `request(textDocument/diagnostic)` は同じ
+   `LspSession` の `write` に、同じ mutex（`session.lock()`）の下で**直列に**書かれる
+   （`mina-lsp` の `Client::notify` は `write_frame` の完了を await して返る）。
+   daemon 側で notify が fire-and-forget に見えるのは「応答を待たない」だけで、
+   書き込み自体は完了している。よって pull が didChange を追い越すことはない。
+2. **RA は lazy**: 診断要求が来るまで解析を始めない（iteration #4 の加法の観察）。
+   解析は**要求の中で**走り、pull はその完了を待って最終集合を返す（ADR-0052:
+   round0 == round11）。つまり 250ms は「解析の先走り」を買えていなかった。
+
+### 採用した修正
+
+`minad/src/lsp.rs`: `PULL_SETTLE` 定数と `tokio::time::sleep` を削除。
+`pull_after_edit` の doc コメントは「撤去した理由（ADR-0053）」＋回帰時の
+upgrade path（固定待ちを戻すのではなく push を解析完了シグナルに使う）に置換。
+設計判断は `docs/adr/0053-no-pull-settle-after-edit.md` に、`docs/adr/0020`
+（inlay hint の settle に触れている）には注記を追加。
+
+### 回帰
+
+- `cargo test`: **462 passed**（変更前と同じ）
+- `calls` / `out_B` / `equiv_B`: **全 flow 完全不変**（契約は変えていない。
+  `explore` 1017/1568、`rename/lsp` 219/438、`rename/apply` 406/1424、
+  `verify/apply2-cargo` 218/545 …）
+- `fails`: 全 flow 0（30 run の追加観測を含む）
+- `hints`: 1 call / 110B のまま（編集後の hint pull も従来どおり）
+
+### 数字の読み方（外挿の範囲）
+
+- `wall_ms` の絶対値は fixture が小さいので外挿不可（method.md §7）。ただし
+  「毎回 250ms の固定待ちが消えた」は**契約とコードの事実**で、規模に依らず効く。
+- `explore` / `rename` の wall も同程度下がっている（`rename/apply` では
+  1 回目の apply が減る。順序の都合で中央値は揺れる）。
+
+### 資産
+
+- `PULL_SETTLE` の撤去（ADR-0053）— apply 系全体で毎回 ~250ms。
+- 「settle が要る」という前提が**計測で 2 回否定された**（iteration #4: 加法、
+  #5: 0ms でも空回帰なし）。次に同じ症状（診断が消える）を見たら、settle ではなく
+  順序（didChange が書かれたか）か push 通知を疑う。
+- 計測器: `verify-broken` / `verify-blind` の `-r 10` 運用が「空回帰の見張り」として
+  機能することを確認（fails / silent がそのまま検出器になる）。
+
+### 次の課題（iteration #6）の下調べ — 残っている ~600ms の正体
+
+`apply` から settle を外した後、もう一度「1 コマンドの内訳」を測り直した
+（`tmp/loop/recon6.py`、同じ daemon に順に投げて wall を見るだけ。索引完走後）:
+
+| コマンド | 1 回目 | 2 回目 | 3 回目 |
+|---|---|---|---|
+| `minas symbol src/main.rs validate` | 586ms | 588ms | — |
+| `minas at src/config.rs 17:12` | 637ms | 84ms | — |
+| `minas hints src/main.rs` | 730ms | 82ms | — |
+| `minas check src/config.rs` | 945ms | 594ms | 587ms |
+| `minas apply …` | 137ms | 98ms | 102ms |
+| `minas rename …` | 609ms | 609ms | — |
+
+- `symbol` と `rename` は**毎回 ~590–610ms**（初回だけではない）。`apply` は
+  100ms 台 — settle 撤去の効果がそのまま出ている。ここで `apply` が速いのは、
+  このシーケンスでは `symbol`/`check` が先に解析を起こしているため
+  （= 初回 apply の ~1s は RA の初回再解析であって待ちではない、の裏取り）。
+- `check` の 594ms も、既知の 500ms（`SEMANTIC_RETRY_WAIT`）+ 1 往復に一致。
+- 残りの正体は `minad/src/lsp.rs` の `request_with_loading_retry`:
+  **「2 回連続で同一」を確かめるために `SEMANTIC_RETRY_WAIT`（500ms）を挟んで
+  必ず 2 回目を投げる**。結果が既に完全でも 500ms を払う（`symbol` / `rename` /
+  `references` が全部これを通る）。`pull_diagnostics_settled` の 500ms も同じ定数。
+  → iteration #6 の課題はここに置く（`latest.md` §4）。
+
+## 2026-09-12 14:17 — iteration #5 の cold 再測（PULL_SETTLE 撤去後 — ADR-0053）。§3 の cold 表を更新し、索引完走ゲート（ADR-0051）が cold rename を守っていることを確認する
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568    8825.4         0  True
+explore  dump                  2      4750       298      4510      9260     168.7         0  True
+hints    hints                 1       110         8         0       110    8067.4         0  True
+rename   lsp                   2       219         3       219       438    9027.6         0  True
+rename   apply                 5       406         4      1018      1424     581.9         0  True
+verify   apply-check           2       246         2       108       354    8257.6         0  True
+verify   apply-cargo           2       108         1       108       216     419.1         0  True
+verify   hunks-cargo           2       154         1       154       308     426.3         0  True
+verify   apply2-cargo          3       218         2       327       545     497.8         0  True
+verify-blind check                 2       240         2       104       344    9094.7         0  True
+verify-blind cargo                 2       104         1       104       208     433.8         0  True
+verify-broken check                 2       450         2       105       555    8793.3         0  True
+verify-broken cargo                 2       105         1       105       210     338.1         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+

@@ -15,13 +15,15 @@
 
 ## 現在地（2026-09-12 時点）
 
-- 完了: **#1 計測器の構築 → #2 LSP 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定（ADR-0052）→ #4 初回 apply の内訳確定**
-- 効果（L0 実測）: `check`（クリーン）**10154ms → 589ms（−94%）**。cold の無言の誤り 0 件。
-  `explore` / `rename` の `calls` / `equiv_B` は不変（回帰なし）
-- **#4 の結末**: 「初回 apply の主因は hint pull」は棄却。トレースで内訳確定
-  （初回 diag pull 内の RA 再解析 + `PULL_SETTLE` 250ms/毎回）
-- 次: **iteration #5**（`PULL_SETTLE` 250ms の削減 — 空 pull 回帰を見張りながら）。詳細と
-  受理・棄却条件は [`latest.md`](./latest.md) §4
+- 完了: **#1 計測器の構築 → #2 LSP 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定（ADR-0052）→ #4 初回 apply の内訳確定 → #5 編集後の固定 settle 撤去（ADR-0053）**
+- 効果（L0 実測）: `check`（クリーン）**10154ms → 589ms（−94%）**。`apply` は
+  **1 回目 1359 → 1133ms / 2 回目 346 → 107ms**（毎回の固定 250ms が消えた）。
+  cold の無言の誤り 0 件。`explore` / `rename` の `calls` / `equiv_B` は不変（回帰なし）
+- **#5 の結末**: 「`PULL_SETTLE` 250ms は通知消費待ちで削れる」は**採用**（50ms で
+  空回帰が出ず、0ms まで削って撤去。ADR-0053）。根拠は「pull 自身が解析完了まで
+  ブロックして最終集合を返す」
+- 次: **iteration #6**（`symbol` / `rename` / `check` が毎回払っている
+  `SEMANTIC_RETRY_WAIT` 500ms の削減）。詳細と受理・棄却条件は [`latest.md`](./latest.md) §4
 
 ## 中身
 
@@ -43,7 +45,7 @@
 cd /Users/335g/dev/other/mina
 cargo build                                          # 計測対象は target/debug
 python3 docs/loop/l0.py --selftest                   # 計測器の健全性
-python3 docs/loop/l0.py -f verify -r 3 -v            # 現状の基準値（apply 初回/check 0.59s）
+python3 docs/loop/l0.py -f verify -r 3 -v            # 現状の基準値（apply 初回/2回目・check 0.59s）
 cargo test                                           # 462 passed が期待値
 ```
 

@@ -18,13 +18,6 @@ use tokio::time::timeout;
 /// 1回の publish で取り込む診断の上限（5c: 診断 flood 対策）。
 const MAX_DIAGNOSTICS: usize = 500;
 
-/// 編集後の pull 診断を打つまでの待ち時間。
-///
-/// rust-analyzer は解析完了まで pull に「解析前の空」を返すため、didChange の
-/// 直後に pull すると誤ってクリーン扱いになる。インクリメンタル解析は概ね
-/// 100ms 前後で完了するため、250ms 待ってから pull する。
-const PULL_SETTLE: Duration = Duration::from_millis(250);
-
 /// LSP セッションの Mutex 取得のタイムアウト（MEDIUM-4）。
 ///
 /// サーバが生きているが応答しない（stdin を読まない）と `notify` が最大 2 秒
@@ -1593,19 +1586,19 @@ pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
 ///
 /// 編集後の診断を pull で取り込む（daemon ロック外・lsp mutex のみ）。
 ///
-/// didChange の直後は解析未完了で pull が空を返すため、[`PULL_SETTLE`] だけ
-/// 待ってから打つ。`None`（サーバ死亡・ロック待ち・エラー応答）なら呼び出し側は
-/// 現状維持する。
+/// かつては didChange の直後に固定 250ms 待っていた（「解析前の空」回避のつもり）。
+/// ADR-0053 で撤去: pull 自身が解析完了までブロックして最終集合を返すため
+/// （ADR-0052）、待ちは解析と重ならない純粋な遅延だった（実測 −250ms/apply）。
+/// `None`（サーバ死亡・ロック待ち・エラー応答）なら呼び出し側は現状維持する。
 ///
-/// ponytail: 固定待ち 250ms。解析が遅い環境では「解析前の空」が返り、次の編集
-/// まで診断が消えることがある。気になるなら push 通知を解析完了シグナルとして
-/// 使ってから pull する方式に差し替える。
+/// ponytail: settle 無し。将来「編集直後の pull が空」という回帰が出たら、
+/// push（publishDiagnostics）を解析完了シグナルに使う方式へ差し替える
+/// （固定待ちを戻すのではなく）。
 pub async fn pull_after_edit(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
 ) -> (Option<Vec<Diagnostic>>, Option<Vec<InlayHint>>) {
-    tokio::time::sleep(PULL_SETTLE).await;
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
         return (None, None);
     };
