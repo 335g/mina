@@ -1399,14 +1399,19 @@ async fn apply(
     // 未存在パス: 空ファイルを作成してから再 Open し、Save で新規作成する
     // （#28/#29: 新規ファイルを直接アドレスする現実解。report 3-1 の touch→open
     // 2段階ハックをコマンド側に内包。自動オープンの範囲外判断（#28）には触れない）。
-    // ponytail: 編集失敗時も空ファイルが残る（touch と同じ挙動）。気になるなら
-    // daemon 側の Open で未存在パスのドキュメント生成を検討する。
+    // 失敗経路（NOT FOUND / EDIT REJECTED / SAVE FAILED / 再 Open 失敗）では、ここで
+    // 作った空ファイルを rollback_created で消し、作成前（未存在）に戻す。失敗した
+    // apply が 0 バイトのファイルを残すと、次の Open が「在るが空」を掴んで NOT FOUND の
+    // 原因が見えなくなる。
+    let mut created = false;
     if snapshot.status.is_some() && std::fs::metadata(&abs).is_err() {
         std::fs::write(&abs, "")
             .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
+        created = true;
         snapshot = conn::request(&mut write_half, &mut reader, &Command::Open { path: abs.clone() }).await?;
     }
     if let Some(status) = &snapshot.status {
+        rollback_created(&abs, created);
         return Err(invalid(format!("Open 失敗: {status}")));
     }
     let text = snapshot.text.clone();
@@ -1419,6 +1424,7 @@ async fn apply(
             // 探索失敗は再試行可能な失敗として exit 2（`session edit` の拒否と同格）
             None => {
                 eprintln!("NOT FOUND: {:?}", short(old));
+                rollback_created(&abs, created);
                 std::process::exit(2);
             }
         },
@@ -1436,6 +1442,7 @@ async fn apply(
     if let Some(status) = &snapshot.status {
         // 拒否（checksum/expected_text 不一致）: 再試行可能な失敗として exit 2
         eprintln!("EDIT REJECTED: {status}");
+        rollback_created(&abs, created);
         std::process::exit(2);
     }
 
@@ -1446,13 +1453,22 @@ async fn apply(
         .is_some_and(|s| s.starts_with("saved"));
     if !saved {
         eprintln!("SAVE FAILED: {:?}", snapshot.status);
+        rollback_created(&abs, created);
         std::process::exit(2);
     }
     match &old_text {
         Some(_) => println!("applied: {abs} (chars {start}..{end})"),
-        None => println!("applied: {abs} (whole file, {} chars)", text.chars().count()),
+        None => println!("applied: {abs} (whole file, {} chars)", new_text.chars().count()),
     }
     Ok(())
+}
+
+/// 失敗経路の後始末: apply が新規作成した空ファイルを消し、作成前（未存在）に戻す。
+/// 作成していなければ何もしない。成功経路では呼ばない。
+fn rollback_created(path: &str, created: bool) {
+    if created {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// `text` 中の `old` の最初の出現位置を char インデックスで返す（[`DocumentEdit`]
@@ -1545,10 +1561,13 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         &Command::Open { path: abs.clone() },
     )
     .await?;
-    // 既存 apply と同じ: 未存在パスは空ファイルを touch して再 Open（Save で新規作成）
+    // 既存 apply と同じ: 未存在パスは空ファイルを touch して再 Open（Save で新規作成）。
+    // 失敗経路では rollback_created で作成前（未存在）に戻す。
+    let mut created = false;
     if snapshot.status.is_some() && std::fs::metadata(&abs).is_err() {
         std::fs::write(&abs, "")
             .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
+        created = true;
         snapshot = conn::request(
             &mut write_half,
             &mut reader,
@@ -1557,6 +1576,7 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         .await?;
     }
     if let Some(status) = &snapshot.status {
+        rollback_created(&abs, created);
         return Err(invalid(format!("Open 失敗: {status}")));
     }
 
@@ -1566,7 +1586,8 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         let text = snapshot.text.clone();
         let Some((start, end)) = find_range(&text, &hunk.old) else {
             eprintln!("NOT FOUND: {:?}", short(&hunk.old));
-            std::process::exit(2); // Save 前なのでディスク無変更
+            rollback_created(&abs, created); // Save 前なのでディスクは作成前の状態に戻す
+            std::process::exit(2);
         };
         let edit = DocumentEdit {
             start,
@@ -1578,6 +1599,7 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         snapshot = conn::request(&mut write_half, &mut reader, &edit).await?;
         if let Some(status) = &snapshot.status {
             eprintln!("EDIT REJECTED: {status}");
+            rollback_created(&abs, created);
             std::process::exit(2);
         }
         applied += 1;
@@ -1590,6 +1612,7 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         .is_some_and(|s| s.starts_with("saved"));
     if !saved {
         eprintln!("SAVE FAILED: {:?}", snapshot.status);
+        rollback_created(&abs, created);
         std::process::exit(2);
     }
     // Q3: 成功時に generation を返す（エージェントは wait <generation> を直接呼べる）
