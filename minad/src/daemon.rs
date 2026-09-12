@@ -198,6 +198,9 @@ pub struct Daemon {
     /// 使う — Open/Save/SetMode などの非内容変化では進めない（apply の Open
     /// 段階で古いテキストを返す早起床を避ける）。
     last_content_generation: u64,
+    /// 最後に内容が変わった時刻（rust2 #18）。既に十分静まっていれば settle を
+    /// 飛ばして即返す（`wait 0` の高速化）。進行中のバッチだけ settle する。
+    last_content_change_at: Option<tokio::time::Instant>,
     /// 文書ごとの構文ハイライトキャッシュ（ADR-0016: Syntax は Daemon 所有）。
     ///
     /// スナップショット生成時にテキストの checksum が変わっていれば再計算
@@ -501,6 +504,7 @@ impl Daemon {
                 | EventKind::Rename
         ) {
             self.last_content_generation = self.generation;
+            self.last_content_change_at = Some(tokio::time::Instant::now());
         }
         self.events.push_back(ChangeEvent {
             generation: self.generation,
@@ -551,6 +555,7 @@ impl Daemon {
             deleted: None,
             external_warning: None,
             last_content_generation: 0,
+            last_content_change_at: None,
             syntax: HashMap::new(),
             hints: HashMap::new(),
             hint_order: VecDeque::new(),
@@ -3905,28 +3910,30 @@ async fn process_command(
             // rust2 #16: `minas apply` は Open → replace_range → Save と 3 世代
             // 進めるため、generation の超過だけで即返ると Open 段階の古いテキスト
             // を返す。そこで:
-            //   - 内容変化（編集・Undo/Redo・外部変更・Rename）を観測したら、
-            //     それが静まるまで（WAIT_SETTLE）待ってから返す。連続する hunk を
-            //     飲み込んで原子バッチの最終状態を返す。
+            //   - 内容変化を観測したら、最後の内容変化から WAIT_SETTLE 静まるまで
+            //     待ってから返す（連続 hunk を飲み込む）。既に静まっていれば即返す
+            //     （rust2 #18: `wait 0` を 200ms にしない）。
             //   - 内容変化が来ない超過（Open だけ等）は待ち続け、WAIT_CONTENT_FALLBACK
             //     経過で旧契約（ADR-0014 の即応）を守って返す。
             //   - 連続編集で際限なく伸びないよう WAIT_HARD_CAP で打ち切る。
             let started = tokio::time::Instant::now();
-            let mut quiet_until: Option<tokio::time::Instant> = None;
             loop {
                 let now = tokio::time::Instant::now();
+                let mut deadline = started + WAIT_CONTENT_FALLBACK;
                 {
                     let mut d = daemon.lock().await;
                     if d.generation > generation {
                         if d.content_changed_since(generation) {
-                            // 内容が変わった: 静まるまで待つ
-                            match quiet_until {
-                                Some(deadline) if now >= deadline => {
-                                    return snapshot(&mut d, None);
-                                }
-                                Some(_) => {}
-                                None => quiet_until = Some(now + WAIT_SETTLE),
+                            // 内容変化あり: 最後の変化から settle 窓が過ぎていれば
+                            // 即返す。進行中なら静まるまで待つ（後続変化で延びる）。
+                            let quiet_at = d
+                                .last_content_change_at
+                                .map(|t| t + WAIT_SETTLE)
+                                .unwrap_or(now);
+                            if now >= quiet_at {
+                                return snapshot(&mut d, None);
                             }
+                            deadline = quiet_at;
                         } else if now - started >= WAIT_CONTENT_FALLBACK {
                             // 内容変化が来ないまま fallback 経過: 旧契約で返す
                             return snapshot(&mut d, None);
@@ -3934,7 +3941,6 @@ async fn process_command(
                     }
                 }
                 // 締切（settle または fallback / hard cap）まで次の変化を待つ。
-                let deadline = quiet_until.unwrap_or(started + WAIT_CONTENT_FALLBACK);
                 let deadline = deadline.min(started + WAIT_HARD_CAP);
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
