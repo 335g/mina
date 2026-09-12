@@ -1186,13 +1186,18 @@ async fn watch_disk(
                 if d.editor.reload_doc(doc_id, text) {
                     reloaded = true;
                     let new_len = text.chars().count();
-                    // 小さいファイルでも効くよう、絶対しきい値は最小限に留める
-                    // （50% 未満への縮小を警告 — 外部 truncate の早期検知）。
+                    // 50% 未満への縮小を警告（外部 truncate の早期検知）。
+                    // パスを明記する — status はグローバル one-shot なので、
+                    // 別文書のバッファに載る。対象パスを入れないとエージェントが
+                    // 「今のバッファ（B.rs）が壊れた」と誤読する（rust2 #8: A.rs の
+                    // 縮小が B.rs の status に載った）。
                     if new_len * 2 < old_len {
                         let warning = format!(
-                            "reloaded from disk (WARNING: file shrank {} -> {} chars; \
+                            "reloaded from disk (path: {}; WARNING: file shrank {} -> {} chars; \
                              external truncate? undo already gone — apply to restore)",
-                            old_len, new_len
+                            path.display(),
+                            old_len,
+                            new_len
                         );
                         shrunk_note = Some(warning.clone());
                         // activity にも記録（恒久ログ。--brief では落ちるので、
