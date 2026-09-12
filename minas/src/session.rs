@@ -66,7 +66,7 @@ async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>
         let exe = conn::daemon_exe().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "minad が見つかりません（cargo install minad、または MINAD_EXE で指定）",
+                "minad not found (cargo install minad, or set MINAD_EXE)",
             )
         })?;
         conn::spawn_daemon(&exe, &["serve"])?;
@@ -387,13 +387,13 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
         }
         SessionCmd::Exec { json } => {
             let command: Command = serde_json::from_str(&json)
-                .map_err(|e| invalid(format!("コマンド JSON を解釈できません: {e}")))?;
+                .map_err(|e| invalid(format!("cannot parse the command JSON: {e}")))?;
             let snapshot = execute(&command).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         SessionCmd::Edit { json, brief } => {
             let edit: DocumentEdit = serde_json::from_str(&json)
-                .map_err(|e| invalid(format!("DocumentEdit JSON を解釈できません: {e}")))?;
+                .map_err(|e| invalid(format!("cannot parse the DocumentEdit JSON: {e}")))?;
             // 位置指定 edit の静かな破壊ガード（rust2 #5-2）: expected_text は
             // 「置換範囲が本当に想定テキストか」を検証する唯一の手段。文書
             // checksum は文書単位なので位置ズレを検出できず、exit 0 で壊す
@@ -478,7 +478,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 }
                 WaitOutcome::TimedOut(snapshot) => {
                     eprintln!(
-                        "wait timed out after {}s: generation {generation} が観測されなかった（再試行可能）",
+                        "wait timed out after {}s: generation {generation} was not observed (retryable)",
                         WAIT_TIMEOUT.as_secs()
                     );
                     print(&snapshot)?;
@@ -506,7 +506,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // exit 2（再試行可能: シンボル未解決・LSP エラー・保存失敗）。
             let outcome = execute_rename(&path.to_string_lossy(), &old, &new).await?;
             if let Some(e) = &outcome.error {
-                eprintln!("renamed: {e}");
+                eprintln!("rename failed: {e}");
                 std::process::exit(rename_exit_code(e));
             }
             println!("renamed: {old} -> {new} ({} files, {} edits)", outcome.files, outcome.edits);
@@ -622,10 +622,10 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             if let Some(crate_root) = &crate_root {
                 let root_abs = conn::absolutize(&crate_root.to_string_lossy());
                 if !root_abs.ends_with(".rs") {
-                    return Err(invalid("--crate-root は .rs ファイルを指定してください (例: src/lib.rs)"));
+                    return Err(invalid("--crate-root takes a .rs file (e.g. src/lib.rs)"));
                 }
                 let Some(crate_dir) = std::path::Path::new(&root_abs).parent() else {
-                    return Err(invalid("--crate-root の親ディレクトリを解決できません"));
+                    return Err(invalid("cannot resolve the parent directory of --crate-root"));
                 };
                 let mut rs = Vec::new();
                 collect_rs_files(crate_dir, &mut rs);
@@ -741,8 +741,13 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             if !summary {
                 println!("{}", serde_json::to_string(&results)?);
             }
-            if any_error || worst_failure > 0 {
-                std::process::exit(2.max(worst_failure));
+            // 集約: error 診断が 1 件でもあれば 2（確定）。なければ各パスの失敗分類
+            // （1 = 再試行不可 / 2 = 再試行可能）を最大値で返す。以前は
+            // `2.max(worst_failure)` で常に 2 以上になり、1 分類が握り潰されていた
+            // （rust2 #23: `check README.md` が exit 2 になっていた）。
+            let code = check_final_exit_code(any_error, worst_failure);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         SessionCmd::Review { clear } => {
@@ -767,16 +772,16 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
 /// `<line>:<col>`（1-origin）を解釈する。不正ならエラー。
 fn parse_position(pos: &str) -> io::Result<(u32, u32)> {
     let Some((line, col)) = pos.split_once(':') else {
-        return Err(invalid(format!("位置は <行>:<列> 形式で指定してください: {pos:?}")));
+        return Err(invalid(format!("position must be <line>:<col>: {pos:?}")));
     };
     let line = line
         .parse::<u32>()
-        .map_err(|_| invalid(format!("行番号が不正です: {line:?}")))?;
+        .map_err(|_| invalid(format!("invalid line number: {line:?}")))?;
     let col = col
         .parse::<u32>()
-        .map_err(|_| invalid(format!("列番号が不正です: {col:?}")))?;
+        .map_err(|_| invalid(format!("invalid column number: {col:?}")))?;
     if line == 0 || col == 0 {
-        return Err(invalid("行・列は 1 始まりです（0 は指定できません）"));
+        return Err(invalid("line and column are 1-origin (0 is not allowed)"));
     }
     Ok((line, col))
 }
@@ -853,13 +858,13 @@ fn print_text_lines(path: &str, generation: u64, text: &str, range: &str) -> io:
 fn parse_line_range(range: &str) -> io::Result<(usize, Option<usize>)> {
     let (s, e) = range
         .split_once(':')
-        .ok_or_else(|| invalid("行範囲は start:end 形式です (1-origin)"))?;
+        .ok_or_else(|| invalid("the line range must be start:end (1-origin)"))?;
     let start: usize = s
         .trim()
         .parse()
-        .map_err(|_| invalid(format!("行番号が不正です: {s:?}")))?;
+        .map_err(|_| invalid(format!("invalid line number: {s:?}")))?;
     if start == 0 {
-        return Err(invalid("行は 1 始まりです（0 は指定できません）"));
+        return Err(invalid("lines are 1-origin (0 is not allowed)"));
     }
     let end = if e.trim().is_empty() {
         None
@@ -867,12 +872,12 @@ fn parse_line_range(range: &str) -> io::Result<(usize, Option<usize>)> {
         let v: usize = e
             .trim()
             .parse()
-            .map_err(|_| invalid(format!("行番号が不正です: {e:?}")))?;
+            .map_err(|_| invalid(format!("invalid line number: {e:?}")))?;
         if v == 0 {
-            return Err(invalid("行は 1 始まりです（0 は指定できません）"));
+            return Err(invalid("lines are 1-origin (0 is not allowed)"));
         }
         if v < start {
-            return Err(invalid("end は start 以上にしてください"));
+            return Err(invalid("end must be greater than or equal to start"));
         }
         Some(v)
     };
@@ -980,7 +985,7 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         old: old.to_string(),
         new: new.to_string(),
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1000,7 +1005,7 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
             error,
         }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "Rename にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "Rename returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1013,9 +1018,9 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
-            Err(invalid("Rename に想定外の軽量応答が返った"))
+            Err(invalid("Rename: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1027,7 +1032,7 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         path: conn::absolutize(path),
         old: old.to_string(),
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1045,7 +1050,7 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
             error,
         }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "References にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "References returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1058,9 +1063,9 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
-            Err(invalid("References に想定外の軽量応答が返った"))
+            Err(invalid("References: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1108,11 +1113,26 @@ fn symbol_exit_code(e: &str) -> i32 {
 /// （not supported / invalid）は再試行しても通らないので 1、それ以外（LSP エラー）
 /// は再試行可能なので 2。
 fn check_exit_code(e: &str) -> i32 {
-    if e.starts_with("check not supported") || e.starts_with("invalid input") {
+    // 再試行不可（usage / 対象外 / 開けない）は 1。LSP の再試行可能失敗は 2。
+    // rust2 #23: outline と同型に揃える（exit code だけで分岐するエージェントが
+    // `check README.md` を無限再試行しない）。
+    if e.starts_with("check not supported")
+        || e.starts_with("invalid input")
+        || e.starts_with("cannot open")
+    {
         1
     } else {
         2
     }
+}
+
+/// check の最終 exit code: error 診断が 1 件でもあれば 2（確定）。なければ各パスの
+/// 失敗分類（1 = 再試行不可 / 2 = 再試行可能）を最大値で返す。
+///
+/// rust2 #23: 以前は `2.max(worst_failure)` で常に 2 以上になり、`check not
+/// supported` / `cannot open` の 1 分類が握り潰されていた。
+fn check_final_exit_code(any_error: bool, worst_failure: i32) -> i32 {
+    if any_error { 2 } else { worst_failure }
 }
 
 /// daemon に接続し、シンボルの階層ツリーを軽量応答（[`ServerMessage::Outline`]）
@@ -1130,7 +1150,7 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
             path: conn::absolutize(path),
         }
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1145,7 +1165,7 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
             truncated,
         }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "Outline にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "Outline returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1158,9 +1178,9 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
         | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::ReadPath { .. }) => {
-            Err(invalid("Outline に想定外の軽量応答が返った"))
+            Err(invalid("Outline: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1180,7 +1200,7 @@ async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
     let command = Command::ReadPath {
         path: conn::absolutize(path),
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1199,7 +1219,7 @@ async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
             error,
         }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "ReadPath にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "ReadPath returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1212,9 +1232,9 @@ async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
-            Err(invalid("ReadPath に想定外の軽量応答が返った"))
+            Err(invalid("ReadPath: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1231,7 +1251,7 @@ async fn execute_enclosing(
         line,
         col,
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1256,7 +1276,7 @@ async fn execute_enclosing(
             "error": error,
         })),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "EnclosingSymbol にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "EnclosingSymbol returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1269,9 +1289,9 @@ async fn execute_enclosing(
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. }) => {
-            Err(invalid("EnclosingSymbol に想定外の軽量応答が返った"))
+            Err(invalid("EnclosingSymbol: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1307,7 +1327,7 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
         line,
         col,
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1316,7 +1336,7 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
     match serde_json::from_str::<ServerMessage>(&response) {
         Ok(ServerMessage::Hover { path, text, error, .. }) => Ok(HoverOutcome { path, text, error }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "Hover にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "Hover returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1328,8 +1348,8 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
-        | Ok(ServerMessage::ReviewComments { .. }) => Err(invalid("Hover に想定外の軽量応答が返った")),
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        | Ok(ServerMessage::ReviewComments { .. }) => Err(invalid("Hover: unexpected lightweight response")),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1341,7 +1361,7 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
         path: conn::absolutize(path),
         query: query.to_string(),
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1350,7 +1370,7 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
     match serde_json::from_str::<ServerMessage>(&response) {
         Ok(ServerMessage::WorkspaceSymbols { symbols, error, .. }) => Ok(SymbolOutcome { symbols, error }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "WorkspaceSymbol にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "WorkspaceSymbol returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1363,9 +1383,9 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. }) => {
-            Err(invalid("WorkspaceSymbol に想定外の軽量応答が返った"))
+            Err(invalid("WorkspaceSymbol: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1376,7 +1396,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
     let command = Command::CheckDiagnostics {
         path: conn::absolutize(path),
     };
-    let mut line = serde_json::to_string(&command).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1398,7 +1418,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
             error,
         }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "Check にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "Check returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1411,9 +1431,9 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::ReviewComments { .. }) => {
-            Err(invalid("Check に想定外の軽量応答が返った"))
+            Err(invalid("Check: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1421,7 +1441,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
 /// （[`ServerMessage::ReviewComments`]）で受け取る（#50）。全文は運ばれない。
 async fn execute_reviews() -> io::Result<Vec<ReviewCommentView>> {
     let (mut write_half, mut reader) = open_one_shot().await?;
-    let mut line = serde_json::to_string(&Command::ListReviewComments).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&Command::ListReviewComments).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1430,7 +1450,7 @@ async fn execute_reviews() -> io::Result<Vec<ReviewCommentView>> {
     match serde_json::from_str::<ServerMessage>(&response) {
         Ok(ServerMessage::ReviewComments { comments, .. }) => Ok(comments),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
-            "Review にスナップショット応答が返った（旧 daemon: 再ビルドしてください）",
+            "Review returned a snapshot response (old daemon: rebuild)",
         )),
         Ok(ServerMessage::Hints { .. })
         | Ok(ServerMessage::Peek { .. })
@@ -1443,9 +1463,9 @@ async fn execute_reviews() -> io::Result<Vec<ReviewCommentView>> {
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. }) => {
-            Err(invalid("Review に想定外の軽量応答が返った"))
+            Err(invalid("Review: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1461,7 +1481,7 @@ async fn execute_peek(path: &str, line: u32, col: u32) -> io::Result<mina_protoc
 /// スナップショットを運ばず世代・push・イベントを進めない軽量応答なので専用経路。
 async fn execute_server_info() -> io::Result<serde_json::Value> {
     let (mut write_half, mut reader) = open_one_shot().await?;
-    let mut line = serde_json::to_string(&Command::GetServerInfo).expect("コマンドはシリアライズ可能");
+    let mut line = serde_json::to_string(&Command::GetServerInfo).expect("the command must be serializable");
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
     write_half.flush().await?;
@@ -1489,7 +1509,7 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         })),
         Ok(mina_protocol::ServerMessage::Response { .. })
         | Ok(mina_protocol::ServerMessage::Push { .. }) => {
-            Err(invalid("GetServerInfo にスナップショット応答が返った（旧 daemon: 再ビルドしてください）"))
+            Err(invalid("GetServerInfo returned a snapshot response (old daemon: rebuild)"))
         }
         Ok(mina_protocol::ServerMessage::Hints { .. })
         | Ok(mina_protocol::ServerMessage::Peek { .. })
@@ -1500,13 +1520,13 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         | Ok(mina_protocol::ServerMessage::Check { .. })
         | Ok(mina_protocol::ServerMessage::EnclosingSymbol { .. })
         | Ok(mina_protocol::ServerMessage::ReviewComments { .. }) => {
-            Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
+            Err(invalid("GetServerInfo: unexpected lightweight response"))
         }
         Ok(mina_protocol::ServerMessage::RenameResult { .. })
         | Ok(mina_protocol::ServerMessage::ReferencesResult { .. }) => {
-            Err(invalid("GetServerInfo に想定外の軽量応答が返った"))
+            Err(invalid("GetServerInfo: unexpected lightweight response"))
         }
-        Err(e) => Err(invalid(format!("不正な応答: {e}"))),
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
 }
 
@@ -1573,7 +1593,7 @@ async fn apply(
     // 他入力指定と排他。
     if hunks_stdin {
         if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() || !pair.is_empty() {
-            return Err(invalid("--hunks-stdin は他の入力指定と併用できません"));
+            return Err(invalid("--hunks-stdin cannot be combined with other input options"));
         }
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
@@ -1585,11 +1605,11 @@ async fn apply(
     // 渡す --hunks-stdin 相当（--old-file/--new-file の複数版。原子性は同じ）。
     if !pair.is_empty() {
         if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() {
-            return Err(invalid("--pair は他の入力指定と併用できません"));
+            return Err(invalid("--pair cannot be combined with other input options"));
         }
         let hunks = pairs_to_hunks(&pair)?;
         if hunks.is_empty() {
-            return Err(invalid("--pair は OLD_FILE NEW_FILE の組で指定してください"));
+            return Err(invalid("--pair takes OLD_FILE NEW_FILE pairs"));
         }
         return apply_hunks(path, &hunks).await;
     }
@@ -1613,16 +1633,16 @@ async fn apply(
         // --whole-stdin` で domain/ も無いケース — rust2 フィードバック #1-2）。
         if let Some(parent) = std::path::Path::new(&abs).parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| invalid(format!("親ディレクトリ作成失敗: {}: {e}", parent.display())))?;
+                .map_err(|e| invalid(format!("failed to create the parent directory: {}: {e}", parent.display())))?;
         }
         std::fs::write(&abs, "")
-            .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
+            .map_err(|e| invalid(format!("failed to create the file: {abs}: {e}")))?;
         created = true;
         snapshot = conn::request(&mut write_half, &mut reader, &Command::Open { path: abs.clone() }).await?;
     }
     if let Some(status) = &snapshot.status {
         rollback_created(&abs, created);
-        return Err(invalid(format!("Open 失敗: {status}")));
+        return Err(invalid(format!("open failed: {status}")));
     }
     let text = snapshot.text.clone();
 
@@ -1792,7 +1812,7 @@ fn resolve_apply_args(
 ) -> io::Result<(Option<String>, String)> {
     if whole_stdin {
         if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() {
-            return Err(invalid("--whole-stdin は他の入力指定と併用できません"));
+            return Err(invalid("--whole-stdin cannot be combined with other input options"));
         }
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
@@ -1800,27 +1820,27 @@ fn resolve_apply_args(
     }
     if let Some(w) = whole {
         if old.is_some() || new.is_some() || old_file.is_some() || new_file.is_some() {
-            return Err(invalid("--whole は他の入力指定と併用できません"));
+            return Err(invalid("--whole cannot be combined with other input options"));
         }
         return Ok((None, w));
     }
     let old = match old_file {
         Some(f) => {
             if old.is_some() {
-                return Err(invalid("old と --old-file は併用できません"));
+                return Err(invalid("old and --old-file cannot be combined"));
             }
             std::fs::read_to_string(&f).map_err(|e| invalid(format!("--old-file {f:?}: {e}")))?
         }
-        None => old.ok_or_else(|| invalid("置換対象テキストが必要です (old, または --whole / --whole-stdin / --old-file)"))?,
+        None => old.ok_or_else(|| invalid("the text to replace is required (old, or --whole / --whole-stdin / --old-file)"))?,
     };
     let new = match new_file {
         Some(f) => {
             if new.is_some() {
-                return Err(invalid("new と --new-file は併用できません"));
+                return Err(invalid("new and --new-file cannot be combined"));
             }
             std::fs::read_to_string(&f).map_err(|e| invalid(format!("--new-file {f:?}: {e}")))?
         }
-        None => new.ok_or_else(|| invalid("置換後のテキストが必要です (new, または --new-file)"))?,
+        None => new.ok_or_else(|| invalid("the replacement text is required (new, or --new-file)"))?,
     };
     Ok((Some(old), new))
 }
@@ -1837,12 +1857,12 @@ struct Hunk {
 /// `--hunks-stdin` の入力を解釈する。少なくとも 1 つ、かつ `old` が空でないこと。
 fn parse_hunks(input: &str) -> io::Result<Vec<Hunk>> {
     let hunks: Vec<Hunk> = serde_json::from_str(input)
-        .map_err(|e| invalid(format!("--hunks-stdin の JSON を解釈できません: {e}")))?;
+        .map_err(|e| invalid(format!("cannot parse the --hunks-stdin JSON: {e}")))?;
     if hunks.is_empty() {
-        return Err(invalid("--hunks-stdin は少なくとも 1 つの hunk が必要です"));
+        return Err(invalid("--hunks-stdin requires at least one hunk"));
     }
     if hunks.iter().any(|h| h.old.is_empty()) {
-        return Err(invalid("hunk.old は空にできません (置換対象が必要)"));
+        return Err(invalid("hunk.old cannot be empty (the text to replace is required)"));
     }
     Ok(hunks)
 }
@@ -1851,7 +1871,7 @@ fn parse_hunks(input: &str) -> io::Result<Vec<Hunk>> {
 /// 検証は呼び出し側で行う — この関数は入力の整形だけ担う）。
 fn pairs_to_hunks(pair: &[PathBuf]) -> io::Result<Vec<Hunk>> {
     if pair.len() % 2 != 0 {
-        return Err(invalid("--pair は OLD_FILE NEW_FILE の組で指定してください"));
+        return Err(invalid("--pair takes OLD_FILE NEW_FILE pairs"));
     }
     let mut hunks = Vec::with_capacity(pair.len() / 2);
     for chunk in pair.chunks_exact(2) {
@@ -1860,7 +1880,7 @@ fn pairs_to_hunks(pair: &[PathBuf]) -> io::Result<Vec<Hunk>> {
         let n = std::fs::read_to_string(&chunk[1])
             .map_err(|e| invalid(format!("--pair new-file {:?}: {e}", chunk[1])))?;
         if o.is_empty() {
-            return Err(invalid("--pair の old ファイルが空です（空 old は全文置換と区別できません）"));
+            return Err(invalid("the --pair old file is empty (an empty old cannot be distinguished from a whole-file replacement)"));
         }
         hunks.push(Hunk { old: o, new: n });
     }
@@ -1893,10 +1913,10 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         // 新規作成: 親ディレクトリが無ければ作る（apply 単発と同じ扱い）。
         if let Some(parent) = std::path::Path::new(&abs).parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| invalid(format!("親ディレクトリ作成失敗: {}: {e}", parent.display())))?;
+                .map_err(|e| invalid(format!("failed to create the parent directory: {}: {e}", parent.display())))?;
         }
         std::fs::write(&abs, "")
-            .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
+            .map_err(|e| invalid(format!("failed to create the file: {abs}: {e}")))?;
         created = true;
         snapshot = conn::request(
             &mut write_half,
@@ -1907,7 +1927,7 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
     }
     if let Some(status) = &snapshot.status {
         rollback_created(&abs, created);
-        return Err(invalid(format!("Open 失敗: {status}")));
+        return Err(invalid(format!("open failed: {status}")));
     }
 
     // バッファ原子性（rust2 バグ報告）: edit を 1 件も送る前に、全 hunk の old が
@@ -2059,6 +2079,25 @@ mod tests {
             matches!(&timed_out, WaitOutcome::TimedOut(s) if s.generation == 5),
             "タイムアウト時は現状スナップショットを返す: {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn check_exit_codes_distinguish_retryable() {
+        // rust2 #23: not supported / cannot open は再試行不可（1）、LSP 失敗は 2。
+        assert_eq!(check_exit_code("check not supported for /x.md (no LSP server configured)"), 1);
+        assert_eq!(check_exit_code("cannot open /x.rs"), 1);
+        assert_eq!(check_exit_code("invalid input"), 1);
+        assert_eq!(
+            check_exit_code("diagnostics pull failed: the session lock is held"),
+            2,
+            "再試行可能な LSP 失敗は 2"
+        );
+        // 集約: error 診断がなければ各パスの分類をそのまま返す（以前は常に 2 以上に
+        // なって 1 が握り潰されていた）。
+        assert_eq!(check_final_exit_code(false, 0), 0);
+        assert_eq!(check_final_exit_code(false, 1), 1, "not supported は 1 のまま");
+        assert_eq!(check_final_exit_code(false, 2), 2);
+        assert_eq!(check_final_exit_code(true, 1), 2, "error 診断があれば 2");
     }
 
     #[test]
