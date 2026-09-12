@@ -1,6 +1,6 @@
 # LSP の索引完走(work-done progress)を待ってから索引依存の要求を出す
 
-L0 計測(2026-09-12, `tools/loop/l0.py --cold`)で、daemon が索引未完の
+L0 計測(2026-09-12, `docs/gitignore/loop/l0.py --cold`)で、daemon が索引未完の
 言語サーバへ要求を出すと**無言の誤り**が出ることを実測した:
 
 - `minas symbol <path> <query>` が `[]` を返す(exit 0)。「見つからない」と
@@ -83,6 +83,6 @@ Status: accepted
 
 - 実装: `mina-lsp/src/lib.rs`(`Progress` / `ReadyPolicy`)、
   `minad/src/lsp.rs`(`LSP_READY` / advertise)、`minad/src/daemon.rs`(`await_indexed`)
-- 反復の記録: `docs/benchmarks/agent-loop-log.md`(iteration #2)
-- 実測の方法: `tools/loop/README.md`(L0)
+- 反復の記録: `docs/gitignore/loop/log.md`（手元の作業用） iteration #2
+- 実測の方法: `docs/gitignore/loop/method.md`(L0)
 - 判定の既存 ADR: ADR-0045(空応答をクリーンの根拠にしない)

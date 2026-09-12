@@ -70,5 +70,5 @@ Status: accepted
 
 - 実装: `minad/src/lsp.rs`（`SEMANTIC_EMPTY_ROUNDS` / `pull_diagnostics_settled`）、
   `minad/src/daemon.rs`（`settle_open_diagnostics_loop`）
-- 測定の記録: `docs/benchmarks/agent-loop-log.md`（iteration #3）
+- 測定の記録: `docs/gitignore/loop/log.md`（手元の作業用） iteration #3
 - 判定の既存 ADR: ADR-0045（空応答をクリーンの根拠にしない）、ADR-0051（索引完走ゲート）

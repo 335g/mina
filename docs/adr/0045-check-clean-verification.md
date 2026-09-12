@@ -64,5 +64,5 @@ PROTOCOL_VERSION を 15 → 16 に上げる(応答 wire 形状の変更。ADR-00
 - 関数名タイポ（呼び出し側が壊れる）→ 両ファイルとも空 + exit 0
 
 つまり「空 + 索引完走」はクリーンの根拠にならない。`settled:false` = 未確認の
-契約はそのまま。`check` の空応答が ~10 秒かかる件（予算切れ）は別の反復で扱う
-（`docs/benchmarks/agent-loop-log.md` iteration #3）。
+契約はそのまま。`check` の空応答が ~10 秒かかる件（予算切れ）は ADR-0052 で
+片付けた（計測の記録: `docs/gitignore/loop/log.md` 手元の作業用・iteration #3）。
