@@ -94,6 +94,14 @@ const FIRST_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const FIRST_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
 
+// rust2 #16: WaitFor の早起床対策。`minas apply` は Open → replace_range → Save と
+// 3 世代進めるため、generation の超過だけで即座に返すと Open 段階の古いテキスト
+// を返す。内容変化を観測した後「静まるまで」待つ（連続する hunk を飲み込む）
+// settle 窓と、内容変化が来ない場合に旧契約（ADR-0014 の即応）を保つ fallback。
+const WAIT_SETTLE: Duration = Duration::from_millis(120);
+const WAIT_CONTENT_FALLBACK: Duration = Duration::from_millis(500);
+const WAIT_HARD_CAP: Duration = Duration::from_secs(2);
+
 /// daemon が保持する編集状態。
 pub struct Daemon {
     pub(crate) editor: Editor,
@@ -186,6 +194,10 @@ pub struct Daemon {
     /// 外部 truncate の警告（縮小リロード時に設定。次の snapshot の status に
     /// 1 回だけ載ってクリアされる — rust2 #6: 軽量経路 get --brief でも見える）。
     external_warning: Option<String>,
+    /// 最後に「内容（テキスト）を変えた」世代（rust2 #16）。WaitFor の起床判定に
+    /// 使う — Open/Save/SetMode などの非内容変化では進めない（apply の Open
+    /// 段階で古いテキストを返す早起床を避ける）。
+    last_content_generation: u64,
     /// 文書ごとの構文ハイライトキャッシュ（ADR-0016: Syntax は Daemon 所有）。
     ///
     /// スナップショット生成時にテキストの checksum が変わっていれば再計算
@@ -477,6 +489,19 @@ impl Daemon {
         text: Option<String>,
     ) {
         self.generation += 1;
+        // 内容を変える操作だけ別カウンタを進める（WaitFor の起床条件。rust2 #16）。
+        if matches!(
+            kind,
+            EventKind::Insert
+                | EventKind::Delete
+                | EventKind::ReplaceRange
+                | EventKind::Undo
+                | EventKind::Redo
+                | EventKind::ExternalChange
+                | EventKind::Rename
+        ) {
+            self.last_content_generation = self.generation;
+        }
         self.events.push_back(ChangeEvent {
             generation: self.generation,
             source,
@@ -487,6 +512,15 @@ impl Daemon {
         while self.events.len() > MAX_EVENTS {
             self.events.pop_front();
         }
+    }
+
+    /// `since` より後の世代に「内容（テキスト）を変えるイベント」があるか。
+    /// WaitFor の早起床対策（rust2 #16）: `minas apply` は Open → replace_range →
+    /// Save と 3 世代進めるため、単純な generation 比較では Open 段階（テキスト
+    /// 未変更）で起床し、編集前のテキストを返してしまう。内容を変える kind の
+    /// みで起床させる（最後の内容変化世代を O(1) で保持 — リング溢れに強い）。
+    fn content_changed_since(&self, since: u64) -> bool {
+        self.last_content_generation > since
     }
 
     pub(crate) fn new() -> Self {
@@ -516,6 +550,7 @@ impl Daemon {
             baselines: HashMap::new(),
             deleted: None,
             external_warning: None,
+            last_content_generation: 0,
             syntax: HashMap::new(),
             hints: HashMap::new(),
             hint_order: VecDeque::new(),
@@ -3867,20 +3902,58 @@ async fn process_command(
             }
             let mut rx = push_tx.subscribe();
             rx.borrow_and_update();
+            // rust2 #16: `minas apply` は Open → replace_range → Save と 3 世代
+            // 進めるため、generation の超過だけで即返ると Open 段階の古いテキスト
+            // を返す。そこで:
+            //   - 内容変化（編集・Undo/Redo・外部変更・Rename）を観測したら、
+            //     それが静まるまで（WAIT_SETTLE）待ってから返す。連続する hunk を
+            //     飲み込んで原子バッチの最終状態を返す。
+            //   - 内容変化が来ない超過（Open だけ等）は待ち続け、WAIT_CONTENT_FALLBACK
+            //     経過で旧契約（ADR-0014 の即応）を守って返す。
+            //   - 連続編集で際限なく伸びないよう WAIT_HARD_CAP で打ち切る。
+            let started = tokio::time::Instant::now();
+            let mut quiet_until: Option<tokio::time::Instant> = None;
             loop {
+                let now = tokio::time::Instant::now();
                 {
                     let mut d = daemon.lock().await;
                     if d.generation > generation {
-                        return snapshot(&mut d, None);
+                        if d.content_changed_since(generation) {
+                            // 内容が変わった: 静まるまで待つ
+                            match quiet_until {
+                                Some(deadline) if now >= deadline => {
+                                    return snapshot(&mut d, None);
+                                }
+                                Some(_) => {}
+                                None => quiet_until = Some(now + WAIT_SETTLE),
+                            }
+                        } else if now - started >= WAIT_CONTENT_FALLBACK {
+                            // 内容変化が来ないまま fallback 経過: 旧契約で返す
+                            return snapshot(&mut d, None);
+                        }
                     }
                 }
-                // 次の状態変化を待つ（世代が進むたびに send され、値が変わら
-                // なければ changed() は完了しない）。
-                if rx.changed().await.is_err() {
-                    // push 送信元が消えた（daemon 終了）: 現状を返して接続を
-                    // 後始末に任せる。
+                // 締切（settle または fallback / hard cap）まで次の変化を待つ。
+                let deadline = quiet_until.unwrap_or(started + WAIT_CONTENT_FALLBACK);
+                let deadline = deadline.min(started + WAIT_HARD_CAP);
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
                     let mut d = daemon.lock().await;
-                    return snapshot(&mut d, Some("daemon terminated while waiting".into()));
+                    return snapshot(&mut d, None);
+                }
+                match tokio::time::timeout(deadline - now, rx.changed()).await {
+                    // 次の変化が来た: 条件を再評価する
+                    Ok(Ok(())) => {}
+                    // 締切: settle 完了（または fallback）で確定
+                    Err(_) => {
+                        let mut d = daemon.lock().await;
+                        return snapshot(&mut d, None);
+                    }
+                    // push 送信元が消えた（daemon 終了）
+                    Ok(Err(_)) => {
+                        let mut d = daemon.lock().await;
+                        return snapshot(&mut d, Some("daemon terminated while waiting".into()));
+                    }
                 }
             }
         }
@@ -10615,7 +10688,8 @@ root-markers = [".docsroot"]
 
     #[tokio::test]
     async fn wait_for_generation_returns_immediately_when_already_passed() {
-        // ADR-0012 #12: 既に世代が target を超えていれば即応答する。
+        // ADR-0012 #12: 既に世代が target を超えていれば即応答する
+        // （内容変化を待つ fallback はあるが、即応の契約は保つ）。
         let dir = std::env::temp_dir();
         let sock = dir.join(format!("minae-12b-sock-{}.sock", std::process::id()));
         let file = dir.join(format!("minae-12b-file-{}.txt", std::process::id()));
@@ -10630,6 +10704,43 @@ root-markers = [".docsroot"]
         let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let snap = request(&mut agent, &Command::WaitFor { generation: 0 }).await;
         assert!(snap.generation >= 1, "既に超えていれば即応答");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn wait_for_does_not_wake_on_open_before_content_change() {
+        // rust2 #16: apply は Open → replace_range → Save と 3 世代進める。
+        // Open 段階（内容未変更）で起床して編集前のテキストを返してはならない —
+        // 内容変化が静まるまで待ってから最新を返す。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-16a-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-16a-file-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "abc").unwrap();
+        start_server(&sock).await;
+
+        let path = file.to_string_lossy().into_owned();
+        let mut a = connect_client(&sock, ClientKind::Interactive).await;
+        let _ = request(&mut a, &Command::Open { path: path.clone() }).await; // gen 1
+
+        // waiter: gen 1 を超える変化を待つ
+        let mut agent = connect_client(&sock, ClientKind::Headless).await;
+        let mut wait = tokio::spawn(async move {
+            request(&mut agent, &Command::WaitFor { generation: 1 }).await
+        });
+
+        // 別クライアントの apply 相当: Open（内容不変）→ Insert（内容変化）
+        let mut b = connect_client(&sock, ClientKind::Interactive).await;
+        let _ = request(&mut b, &Command::Open { path: path.clone() }).await;
+        let _ = request(&mut b, &Command::Insert { text: "X".into() }).await;
+
+        let snap = wait.await.unwrap();
+        assert!(
+            snap.text.contains('X'),
+            "Open 段階で起床せず、内容変化後のテキストを返す: {:?}",
+            snap.text
+        );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }

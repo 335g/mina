@@ -456,6 +456,8 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // WAIT_TIMEOUT 以内に世代が進まなければ、現状を返して再試行可能な
             // exit code 2 で終了する（settle が進まない編集等で永久ブロック
             // しないため — e2e-01 の中タスクで再現した欠陥）。
+            // 内容変化のみで起床する契約は daemon 側の WaitFor が担う
+            // （rust2 #16: Open 段階での早起床を避ける）。
             let print = |snapshot: &StateSnapshot| -> io::Result<()> {
                 if brief {
                     print_brief_snapshot(snapshot)
