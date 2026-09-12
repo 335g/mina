@@ -113,7 +113,11 @@ pub enum SessionCmd {
         #[arg(long)]
         lines: Option<String>,
     },
-    /// Fetch the daemon build generation and metrics (printed as JSON, issue #27)
+    /// Fetch the daemon build generation and metrics (printed as JSON, issue #27).
+    /// This is the DAEMON's build/metrics — not the LSP server list. The wire
+    /// command is `GetServerInfo`; `base_roots` lists only comparison roots
+    /// registered via `RegisterBaseRoot` (empty is normal — language servers are
+    /// resolved per file, not through base_roots; rust2 #27).
     Info,
     /// Run one `Command` (JSON is the wire [`Command`] as-is)
     Exec {
