@@ -178,6 +178,11 @@ pub enum SessionCmd {
     Wait {
         /// Generation
         generation: u64,
+        /// Strip `events` / `activity` from the snapshot response (token
+        /// reduction — same as `get --brief`; the wait loop pays this cost per
+        /// wake, rust2 #15: 68KB per wake without it)
+        #[arg(long)]
+        brief: bool,
     },
     /// Fetch inlay hints for any path without full text (ADR-0020)
     Hints {
@@ -447,10 +452,18 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             )
             .await?;
         }
-        SessionCmd::Wait { generation } => {
+        SessionCmd::Wait { generation, brief } => {
             // WAIT_TIMEOUT 以内に世代が進まなければ、現状を返して再試行可能な
             // exit code 2 で終了する（settle が進まない編集等で永久ブロック
             // しないため — e2e-01 の中タスクで再現した欠陥）。
+            let print = |snapshot: &StateSnapshot| -> io::Result<()> {
+                if brief {
+                    print_brief_snapshot(snapshot)
+                } else {
+                    println!("{}", serde_json::to_string_pretty(snapshot)?);
+                    Ok(())
+                }
+            };
             match wait_with_timeout(
                 WAIT_TIMEOUT,
                 execute(&Command::WaitFor { generation }),
@@ -459,14 +472,14 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             .await?
             {
                 WaitOutcome::Completed(snapshot) => {
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    print(&snapshot)?;
                 }
                 WaitOutcome::TimedOut(snapshot) => {
                     eprintln!(
                         "wait timed out after {}s: generation {generation} が観測されなかった（再試行可能）",
                         WAIT_TIMEOUT.as_secs()
                     );
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    print(&snapshot)?;
                     std::process::exit(2);
                 }
             }
