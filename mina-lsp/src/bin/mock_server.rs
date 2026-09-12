@@ -79,10 +79,10 @@ fn main() {
                     write_frame(&mut stdout, &resp);
                 }
                 "textDocument/diagnostic" => {
-                    // pull 診断: 現在のテキストの TODO 位置を items で返す
+                    // pull 診断: 現在のテキストの TODO 位置を items で返す（無ければ空）
                     let diag = current
                         .as_ref()
-                        .map(|(_, text)| todo_diagnostic(text, utf16));
+                        .and_then(|(_, text)| todo_diagnostic(text, utf16));
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -284,7 +284,7 @@ fn main() {
                 let notif = json!({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",
-                    "params": { "uri": uri, "diagnostics": vec![todo_diagnostic(&text, utf16)] },
+                    "params": { "uri": uri, "diagnostics": todo_diagnostic(&text, utf16).into_iter().collect::<Vec<_>>() },
                 });
                 write_frame(&mut stdout, &notif);
             }
@@ -293,9 +293,11 @@ fn main() {
 }
 
 /// テキスト内の "TODO" 位置の error 診断（LSP 座標は UTF-8 バイト or UTF-16 単位）。
-fn todo_diagnostic(text: &str, utf16: bool) -> Value {
+/// TODO が無いテキストは `None`（診断なし — 空応答の経路をテストできるようにする。
+/// 以前は位置 0 に診断をでっち上げていた）。
+fn todo_diagnostic(text: &str, utf16: bool) -> Option<Value> {
     let needle = "TODO";
-    let start_byte = text.find(needle).unwrap_or(0);
+    let start_byte = text.find(needle)?;
     // LSP の character は行頭からの UTF-16 単位（--cjk 時は utf-16 を advertise）。
     let start = if utf16 {
         text[..start_byte].encode_utf16().count() as u32
@@ -303,7 +305,7 @@ fn todo_diagnostic(text: &str, utf16: bool) -> Value {
         start_byte as u32
     };
     let end = start + 4; // "TODO" は ASCII なので UTF-16 でも 4 単位
-    json!({
+    Some(json!({
         "range": {
             "start": { "line": 0, "character": start },
             "end": { "line": 0, "character": end },
@@ -311,7 +313,7 @@ fn todo_diagnostic(text: &str, utf16: bool) -> Value {
         "severity": 1,
         "source": "mock",
         "message": "mock: TODO found",
-    })
+    }))
 }
 
 /// テキスト内の固定パターン inlay hint（LSP 座標）:

@@ -1113,17 +1113,23 @@ pub async fn workspace_symbols(
 /// 結果を返す。
 ///
 /// 安定判定は settle_open_diagnostics と同じ: 非空が 2 回連続で同数 = 安定
-/// （`settled` を true にして返す）、空のまま予算（[`SEMANTIC_RETRIES`] ×
-/// [`SEMANTIC_RETRY_WAIT`] ≈ 10 秒）を使い切ったら「クリーン**未確認**」として
-/// 最後の空と `settled: false` を返す（ADR-0045 — 解析未完・クロスシンボル
-/// 破壊の可能性を隠さない）。非空が 1 回だけのまま予算切れも `settled: false`。
-/// `None` は恒久的な失敗（セッションロック待ち・サーバ死亡・対象が current でない）。
+/// （`settled` を true にして返す）。
+///
+/// 空は早期に打ち切る（ADR-0052）: 実測（2026-09-12）で pull は**1 回目で最終的な
+/// 集合**を返し（編集直後の round0 と 11 ラウンド後の round11 が同一）、
+/// `SEMANTIC_EMPTY_ROUNDS` 回連続で空ならこれ以上待っても答えは変わらない。
+/// 特に「コンパイルは壊れているが pull が見ないエラー」（クロスファイルの型エラー）
+/// は待っても永久に空なので、予算（≈10 秒）を使い切る意味が無い —
+/// 未確認（`settled: false`）のまま即返す（ADR-0045 の意味は不変: 空は
+/// クリーンの根拠にしない）。`None` は恒久的な失敗（セッションロック待ち・
+/// サーバ死亡・対象が current でない）。
 pub async fn pull_diagnostics_settled(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
 ) -> Option<(Vec<Diagnostic>, bool)> {
     let mut prev: Option<usize> = None;
+    let mut empty_rounds = 0;
     let mut last: Vec<Diagnostic> = Vec::new();
     for _ in 0..SEMANTIC_RETRIES {
         let pulled = {
@@ -1141,6 +1147,15 @@ pub async fn pull_diagnostics_settled(
         let n = diags.len();
         if n > 0 && prev == Some(n) {
             return Some((diags, true)); // 非空が2回連続で同数 = 安定
+        }
+        if n == 0 {
+            empty_rounds += 1;
+            if empty_rounds >= SEMANTIC_EMPTY_ROUNDS {
+                // 空: 未確認のまま返す（クリーン扱いはしない — ADR-0045）
+                return Some((diags, false));
+            }
+        } else {
+            empty_rounds = 0;
         }
         prev = Some(n);
         last = diags;
@@ -1195,6 +1210,17 @@ pub struct RawLspEdit {
 /// 「not found」扱いになる。
 const SEMANTIC_RETRIES: usize = 20;
 const SEMANTIC_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// 空応答を確定と見なすまでに必要な連続空 pull の回数（ADR-0052）。
+///
+/// 1 回で十分という実測（pull は 1 回目で最終集合を返す）だが、最初の pull が
+/// 解析と競合するサーバ（自分で解析を起こさず pull を待たせる実装）に対する
+/// 安全代（約 500ms だけ余分に払う）。未確認（`settled: false`）のまま返すので、
+/// このマージンが足りない場合の被害は「エージェントが cargo に落ちる 1 往復」で
+/// あって、誤ったクリーンではない。
+/// `settle_open_diagnostics_loop`（daemon の Open 経路）と共有する — 同じ問い
+/// 「空はいつ確定か」に対する同じ答えを 2 箇所に別々に書かない。
+pub(crate) const SEMANTIC_EMPTY_ROUNDS: usize = 2;
 
 /// `textDocument/rename` を実行し、WorkspaceEdit を内部形へ変換して返す。
 ///
@@ -2038,6 +2064,34 @@ fn capabilities_of_parses_initialize_response() {
         assert!(settled, "非空が2回連続で安定 = settled:true");
         assert_eq!(diags.len(), 1, "TODO 診断が1件: {diags:?}");
         assert_eq!(diags[0].message, "mock: TODO found");
+    }
+
+    #[tokio::test]
+    async fn pull_diagnostics_settled_gives_up_early_when_empty() {
+        // ADR-0052: 空は早期に打ち切る（空のまま予算 20×500ms を使い切らない）。
+        // 未確認（settled:false）は不変 — 空をクリーンの根拠にしない（ADR-0045）。
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
+        if !std::path::Path::new(bin).exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let path = PathBuf::from("/tmp/clean.rs");
+        let session = Arc::new(Mutex::new(
+            LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
+        ));
+        let text = "fn ok() {}\n"; // TODO なし = 診断は空
+        session.lock().await.did_open(&path, text).await;
+        let t0 = std::time::Instant::now();
+        let (diags, settled) = pull_diagnostics_settled(&session, &path, text)
+            .await
+            .expect("診断が返る");
+        let elapsed = t0.elapsed();
+        assert!(diags.is_empty());
+        assert!(!settled, "空はクリーン確定にしない（ADR-0045）");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "空は早期に返る（予算 {SEMANTIC_RETRIES} × {SEMANTIC_RETRY_WAIT:?} を使い切らない）: {elapsed:?}"
+        );
     }
 
     #[tokio::test]

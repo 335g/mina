@@ -188,6 +188,47 @@ FLOWS = {
             ],
         },
     },
+    "verify-broken": {
+        "goal": "pull が見えるエラー（構文）を、早期確定後も検出できるか",
+        "fixture": "rust",
+        "warmup": True,
+        "verify": "grep -q 'fn main( {' src/main.rs",  # 編集自体は入っている
+        # 検出は「期待どおりの exit」で見る（0 以外が正常な flow があるため）
+        "ok_rc": {"check": {1: 2}, "cargo": {1: 101}},
+        "expect": {"check": ["", "Syntax Error"], "cargo": ["", "unclosed delimiter"]},
+        "arms": {
+            "check": [
+                'minas apply src/main.rs "fn main() {" "fn main( {"',
+                "minas check src/main.rs",
+            ],
+            "cargo": [
+                'minas apply src/main.rs "fn main() {" "fn main( {"',
+                "cargo check --offline",
+            ],
+        },
+    },
+    # pull が *見ない* エラー（メソッド解決）の契約確認: check は空 + settled:false の
+    # まま（= 未確認。クリーンの根拠にしない — ADR-0045）。ここが将来 rc=2 になったら
+    # rust-analyzer の挙動が変わったということ。
+    "verify-blind": {
+        "goal": "pull が取りこぼすエラーで check が偽クリーンを主張しないこと",
+        "fixture": "rust",
+        "warmup": True,
+        "verify": "grep -q 'validate2' src/main.rs",
+        "ok_rc": {"check": {1: 0}, "cargo": {1: 101}},
+        # 空は「未確認」で返る（settled:false）— 偽クリーンを主張しない
+        "expect": {"check": ["", '"settled":false'], "cargo": ["", "validate2"]},
+        "arms": {
+            "check": [
+                'minas apply src/main.rs "cfg.validate()" "cfg.validate2()"',
+                "minas check src/main.rs",
+            ],
+            "cargo": [
+                'minas apply src/main.rs "cfg.validate()" "cfg.validate2()"',
+                "cargo check --offline",
+            ],
+        },
+    },
     "rename": {
         "goal": "max_retries を retry_count へ全箇所リネームする",
         "fixture": "rust",
@@ -304,6 +345,7 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
             warm_lsp(scratch, env, meta)
         results, transcript = [], []
         expect = spec.get("expect", {}).get(arm, [])
+        ok_rc = spec.get("ok_rc", {}).get(arm, {})
         for i, raw in enumerate(spec["arms"][arm]):
             cmd = raw
             for k, v in meta.items():
@@ -312,8 +354,12 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
             r = run(cmd, scratch, env)
             after = server_metrics(scratch, env)
             r["delta"] = {k: after.get(k, 0) - before.get(k, 0) for k in after}
-            # 無言の誤り: exit 0 なのに期待した内容が返っていない（cold の symbol など）
-            r["silent"] = bool(i < len(expect) and expect[i] and expect[i] not in r["out"])
+            # 無言の誤り: 期待した内容が返っていない（cold の symbol、取りこぼしなど）。
+            # stdout だけでなく stderr も見る（cargo のエラーは stderr に出る）。
+            hay = r["out"] + r["err"]
+            r["silent"] = bool(i < len(expect) and expect[i] and expect[i] not in hay)
+            # 0 以外の exit が正常な flow（エラー検出の検証）があるので期待値と比べる
+            r["rc_ok"] = r["rc"] == ok_rc.get(i, 0)
             results.append(r)
             transcript.append(r["out"] + r["err"])
         info = json.loads(run(f"{MINAS} info", scratch, env)["out"])
@@ -325,10 +371,12 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
             proc.kill()
 
     texts = "\n".join(transcript)
-    verified = None
+    # ok = 期待どおりの exit が全て揃い、無言の取りこぼし（expect 不一致）が無いこと
+    verified = (all(r["rc_ok"] and not r["silent"] for r in results)
+                if spec.get("ok_rc") else None)
     if "verify" in spec:
         verified = run(spec["verify"], scratch, env)["rc"] == 0
-    if "need" in spec:
+    if spec.get("need"):
         verified = verified is not False and spec["need"] in texts
 
     t = len(results)
@@ -347,7 +395,7 @@ def run_arm(flow: str, arm: str, spec: dict, cold: bool = False) -> dict:
         "resend_B": resend_B,
         "equiv_B": equiv,
         "wall_ms": round(sum(r["wall_ms"] for r in results), 1),
-        "fails": sum(1 for r in results if r["rc"] != 0 or r["silent"]),
+        "fails": sum(1 for r in results if not r["rc_ok"] or r["silent"]),
         "silent": sum(1 for r in results if r["silent"]),
         "ok": verified,
         "cold": cold,
@@ -406,11 +454,13 @@ def log_block(note: str, rows: list[dict], stamp: str) -> str:
             out.append(f"- `{r['flow']}/{r['arm']}` daemon 計測: "
                        + ", ".join(f"{k}={v}" for k, v in sorted(r["metrics"].items())) + "\n")
         for s in r["steps"]:
+            # 期待どおりの非 0 exit（エラー検出の検証）は失敗ではない
+            if s.get("rc_ok", True) and not s.get("silent"):
+                continue
             mark = " (silent)" if s.get("silent") else ""
-            if s["rc"] != 0 or s.get("silent"):
-                err = s["err"].strip().splitlines()
-                out.append(f"- `{r['flow']}/{r['arm']}` 失敗 step{mark}: `{s['cmd']}` "
-                           f"rc={s['rc']} {err[0] if err else ''}\n")
+            err = s["err"].strip().splitlines()
+            out.append(f"- `{r['flow']}/{r['arm']}` 失敗 step{mark}: `{s['cmd']}` "
+                       f"rc={s['rc']} {err[0] if err else ''}\n")
     out.append("\n")
     return "".join(out)
 
@@ -480,6 +530,8 @@ def main() -> int:
                 print(f"  wall per run: {r['wall_ms_all']}")
             for s in r["steps"]:
                 mark = " SILENT" if s.get("silent") else ""
+                if not s.get("rc_ok", True):
+                    mark += " RC!"
                 print(f"  {s['wall_ms']:>8.0f}ms  {s['out_B']:>7}B rc={s['rc']}{mark}  {s['cmd']}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

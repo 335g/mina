@@ -2663,7 +2663,8 @@ async fn serve_workspace_symbols(
 /// エージェントの「編集→検証」ループを 1 コマンドに圧縮する経路: 従来の
 /// 「wait → get → JSON から診断を読む」の往復と全文スナップショットをこれ 1 つで
 /// 置き換える。安定判定は settle_open_diagnostics と同じ（非空が 2 回連続で同数 /
-/// 空のまま予算切れ = クリーン扱い）。失敗は `error: Some(…)`（LSP 非対応・
+/// 連続 2 回の空 — 空は「クリーン**未確認**」で `settled: false`。ADR-0045/0052）。
+/// 失敗は `error: Some(…)`（LSP 非対応・
 /// spawn 失敗は exit 1、LSP エラーは再試行可能な exit 2）。
 async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     let err = |msg: String| ServerMessage::Check {
@@ -3609,9 +3610,11 @@ async fn settle_open_diagnostics_loop(
             if prev == Some(n) {
                 return;
             }
-        } else if i >= 60 {
-            // 30秒間空のまま: クリーンファイルとみなして停止（解析が遅くても
-            // 次の編集の pull で自己修復する）。
+        } else if i >= lsp::SEMANTIC_EMPTY_ROUNDS {
+            // 空のまま数ラウンド: 解析済みでクリーン（または pull が見ない
+            // エラー）とみなして停止。測定（ADR-0052）: pull は 1 回目で最終集合を
+            // 返すので、以前の 30 秒（60 ラウンド × 2 pull = 120 往復）を待つ意味が
+            // 無い。次の編集の pull で自己修復する。
             return;
         }
         prev = Some(n);
@@ -8940,7 +8943,7 @@ root-markers = [".docsroot"]
         // 初回解析が mock に載るのを待つ（didOpen 後の settle 用）
         let _ = poll_snapshot(
             &mut c,
-            |s| !s.diagnostics.is_empty(),
+            |s| s.activities.is_empty(), // 診断 settle の完了待ち（診断の有無ではない）
             std::time::Duration::from_secs(10),
         )
         .await;
@@ -9047,7 +9050,7 @@ root-markers = [".docsroot"]
         let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
         let _ = poll_snapshot(
             &mut c,
-            |s| !s.diagnostics.is_empty(),
+            |s| s.activities.is_empty(), // 診断 settle の完了待ち（診断の有無ではない）
             std::time::Duration::from_secs(10),
         )
         .await;

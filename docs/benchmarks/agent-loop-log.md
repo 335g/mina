@@ -242,3 +242,139 @@ L0 の warmup フェーズがその 1 回を吸収する。
 
 **次の測定**: fixture を「エラーが後から顕在化する」形（編集直後に pull が空を
 返し、数百 ms 後に非空になる）にして、pull の初出遅延を分布で測る。
+
+## iteration #3 — 修正: 空の pull は早期に確定する（10 秒待たない）
+
+## 2026-09-12 10:21 — 仮説: 空の pull は 1 回で最終集合（測定済み）なので、空の早期確定（連続2回）で check の wall が 10000ms 台から 1000ms 未満に落ち、かつ pull が見えるエラー（構文）は取りこぼさない。warm 計測（r=3 中央値）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568    1282.1         0  True
+explore  dump                  2      4750       298      4510      9260     165.8         0  True
+rename   lsp                   2       219         3       219       438    1796.3         0  True
+rename   apply                 5       406         4      1018      1424    2721.1         0  True
+verify   apply-check           2       246         2       108       354    2021.8         0  True
+verify   apply-cargo           2       108         1       108       216    1575.0         0  True
+verify   hunks-cargo           2       154         1       154       308    1882.2         0  True
+verify   apply2-cargo          3       218         2       327       545    1971.8         0  True
+verify-blind check                 2       240         2       104       344    1635.1         0  True
+verify-blind cargo                 2       104         1       104       208    1232.2         0  True
+verify-broken check                 2       450         2       105       555    1671.2         0  True
+verify-broken cargo                 2       105         1       105       210    1155.8         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=386, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 10:23 — 仮説: 空の早期確定は cold でも効き、索引待ち（ゲート）以外の待ちを無くす。索引未完の無言の誤りも出ない。cold 計測（1 回観測）
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568    6740.2         0  True
+explore  dump                  2      4750       298      4510      9260     173.3         0  True
+rename   lsp                   2       219         3       219       438    6712.3         0  True
+rename   apply                 5       406         4      1018      1424    1322.8         0  True
+verify   apply-check           2       246         2       108       354    6414.8         0  True
+verify   apply-cargo           2       108         1       108       216     424.5         0  True
+verify   hunks-cargo           2       154         1       154       308     434.8         0  True
+verify   apply2-cargo          3       218         2       327       545     721.7         0  True
+verify-blind check                 2       240         2       104       344    6254.1         0  True
+verify-blind cargo                 2       104         1       104       208     436.5         0  True
+verify-broken check                 2       450         2       105       555    5800.6         0  True
+verify-broken cargo                 2       105         1       105       210     336.7         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+### 考察（iteration #3）
+
+**最初の測定（`pull` の初出遅延）**: rust-analyzer を直叩きして、編集後の pull を
+50ms 間隔で 12 秒観測した。結果は **round0 == round11**（1 回目で最終集合）で、
+空が後から非空に変わることは無かった。クロスファイルの型エラーは
+**12 秒待っても空のまま**。つまり予算 20×500ms は「同じ答えしか返らない待ち」。
+daemon の settle 判定が「非空が 2 回連続で同数」なのは、そもそも空を確定できない
+構造だったため（ADR-0045 の `settled:false` は正しいが、待つ意味は無い）。
+
+**pull が見るエラー / 見ないエラー（warm・索引完走後・汚染なしの再測定）**:
+
+| 壊し方 | main.rs の pull | config.rs の pull |
+|---|---|---|
+| 構文エラー（main.rs） | **round0 で出る** | — |
+| メソッド解決（`cfg.validate2()`） | **永久に空**（`cargo check` は検出） | — |
+| フィールド削除（config.rs） | 空のまま | round0 で `no such field` |
+
+→ pull は「同じファイルに閉じた構文エラーと一部の型エラー」を即返し、
+「メソッド解決の失敗」のような実在するエラーを取りこぼす。**待っても直らない**。
+`settled:false`（空 = 未確認）はこのため必要で、早期確定と両立する。
+
+**修正**: `pull_diagnostics_settled` は連続 2 回の空で打ち切り（ADR-0052）。
+Open 経路の `settle_open_diagnostics_loop` も同じ定数を共有（30 秒 → 実測 2.7 秒、
+pull 120 往復 → 約 6 往復）。非空の安定判定（2 回連続同数 = `settled:true`）は不変。
+
+**結果（warm r=3）**: `check`（クリーン）**10154 → 589ms（−94%）**、`apply`→`check`
+合計 11550 → 2022ms。`explore` / `rename` は不変（回帰なし）。cold も全アーム
+`ok` / `fails=0` / `silent=0` で、索引待ち（約 6 秒）以外の待ちが消えた。
+
+**棄却条件の確認（早期確定がエラーを落とさないか）** — 新 flow 2 本で常時検証:
+
+- `verify-broken`（構文エラー = pull が見る）: `check` は rc=2 + `Syntax Error`
+  を **591ms** で返す ✓（落としていない）
+- `verify-blind`（メソッド解決 = pull が見ない）: `check` は rc=0 + `settled:false`
+  + 空を **592ms** で返す（偽クリーンを主張しない ✓）。同じ編集で `cargo check` は
+  rc=101 で検出する（= 二段構えが必要な理由がデータで残る）
+
+**L0 計測器の改善**: 期待 exit コード（`ok_rc`）と per-step の `expect` を足した。
+「0 以外の exit が正常」な flow（エラー検出の検証）を `fails`/`ok` で正しく扱える。
+`expect` は stderr も見る（cargo のエラーは stderr に出る）。mock サーバは TODO の
+無いテキストで診断をでっち上げるのをやめた（空応答の経路をテストできるように）。
+
+**契約の更新**: `minas skill errors` の「settled:false は約 10 秒の予算切れ」という
+記述を「早期に返る。待ってもクリーンにはならない」に更新（エージェントの行動は
+不変 — 空を信用せず cargo に行く）。
+
+### iteration #4 の課題設定
+
+**課題**: `apply` が 1 ファイルあたり 1.0〜1.5 秒かかる（`check` の 0.59 秒より高い）。
+`apply` の応答は `sync_after_edit`（didChange + `pull_after_edit`）を通り、
+`pull_after_edit` は `PULL_SETTLE`(250ms) + 診断 pull + **inlay hint pull** を行う。
+300 行の config.rs では hint の計算が重い（apply が main.rs で 1.0 秒、config.rs で
+1.5 秒という差が hint のコストを示唆）。
+
+**仮説**: 編集直後の hint pull は、編集の応答に不要（hint は次の描画・明示要求で
+足りる）。`sync_after_edit` から hint を外せば `apply` の wall が
+1.0〜1.5 秒 → 0.3〜0.4 秒になり、hint は Open 経路の settle か明示 pull で埋まる。
+
+**棄却条件**: hint を外した結果、(a) TUI の編集直後のヒントが消えたままになる、
+(b) `minas hints` の往復が増える、のいずれかが L0/L2 で見えたら戻す。
+測り方: `apply` ステップの wall（hint あり / なし）と、`hints` を使う flow を追加して
+往復数とバイトを比較する。
+
+**別候補（前回から保留）**: `open_workspace_files`（rename/references の前に
+ワークスペース全ファイルを didOpen する回避策）が、索引完走ゲートの導入後も必要か。
+不要なら複数ファイル rename のコストが大きく下がる。

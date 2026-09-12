@@ -206,12 +206,13 @@ Rules
   through without computing anything (ADR-0047).
 - It is an LSP fast path (incremental), not a compiler: for semantics beyond
   the LSP (borrow checker etc.) still run the real build.
-- settled == false means the diagnostics did NOT settle within the budget
-  (~10s): empty + settled=false is \"clean\" UNVERIFIED, NOT clean (ADR-0045).
-  Cross-symbol breakage (unresolved import, a renamed type left dangling) can
-  keep the server from settling and report an empty result. Treat empty
-  results as verified clean only when settled is true; otherwise re-check or
-  run the real build (cargo test) before trusting it.",
+- settled == false means the result is NOT a verified clean: empty +
+  settled=false is \"clean\" UNVERIFIED, NOT clean (ADR-0045). It comes back
+  fast — the pull answer is stable on the first request, so an empty result is
+  returned after ~0.6s instead of burning a ~10s budget (ADR-0052), and waiting
+  would not turn it into a clean anyway. rust-analyzer's pull misses real
+  errors (a broken method call can report empty), so never treat empty as
+  clean: run the real build (cargo check / cargo test) before trusting it.",
     ),
     (
         "hover",
