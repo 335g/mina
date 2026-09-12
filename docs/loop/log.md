@@ -685,3 +685,214 @@ verify-broken cargo                 2       105         1       105       210   
 - `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
 - `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
 
+
+## 2026-09-12 14:55 — iteration #6 baseline: SEMANTIC_RETRY_WAIT=500ms のまま
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568    1298.2         0  True
+explore  dump                  2      4750       298      4510      9260     161.8         0  True
+rename   lsp                   2       219         3       219       438    1718.0         0  True
+rename   apply                 5       406         4      1018      1424    1571.9         0  True
+verify   apply-check           2       246         2       108       354    1698.4         0  True
+verify   apply-cargo           2       108         1       108       216    1271.9         0  True
+verify   hunks-cargo           2       154         1       154       308    1257.3         0  True
+verify   apply2-cargo          3       218         2       327       545    1374.9         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## 2026-09-12 15:01 — iteration #6 A/B: SEMANTIC_RETRY_WAIT 500→0ms (仮説: symbol/rename/check が毎回 ~500ms 下がる)
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568     294.5         0  True
+explore  dump                  2      4750       298      4510      9260     169.4         0  True
+rename   lsp                   2       219         3       219       438    1312.5         0  True
+rename   apply                 5       406         4      1018      1424    1694.1         0  True
+hints    hints                 1       110         8         0       110     770.4         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+
+
+## 2026-09-12 15:06 — iteration #6 正しさの見張り: verify/verify-broken/verify-blind (check step が ~500ms 下がるか・契約不変か)
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354    1229.6         0  True
+verify   apply-cargo           2       108         1       108       216    1323.3         0  True
+verify   hunks-cargo           2       154         1       154       308    1371.5         0  True
+verify   apply2-cargo          3       218         2       327       545    1461.1         0  True
+verify-broken check                 2       450         2       105       555     850.5         0  True
+verify-broken cargo                 2       105         1       105       210     916.7         0  True
+verify-blind check                 2       240         2       104       344     892.2         0  True
+verify-blind cargo                 2       104         1       104       208     994.4         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 15:07 — iteration #6 cold 見張り: SEMANTIC_RETRY_WAIT=0ms で索引ゲートが cold の完全 rename / 非空 symbol を守るか
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+rename   lsp                   2       219         3       219       438    9126.5         0  True
+rename   apply                 5       406         4      1018      1424     596.8         0  True
+explore  lsp                   3      1017        17       551      1568    8205.0         0  True
+explore  dump                  2      4750       298      4510      9260     169.4         0  True
+```
+
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+
+
+## 2026-09-12 15:14 — iteration #6 -r10: 部分結果の取りこぼしを確率的に踏む (SEMANTIC_RETRY_WAIT=0ms)
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568     314.9         0  True
+explore  dump                  2      4750       298      4510      9260     178.4         0  True
+rename   lsp                   2       219         3       219       438    1309.9         0  True
+rename   apply                 5       406         4      1018      1424    1776.9         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+
+
+## 2026-09-12 15:22 — iteration #6 A/B2: loading のみリトライ + wait 100ms (1往復削減が成立するか)
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1014        17       548      1562     300.4         0  True
+explore  dump                  2      4750       298      4510      9260     173.6         0  True
+rename   lsp                   2       217         3       217       434    1259.2         0  True
+rename   apply                 5       402         4      1008      1410    1739.1         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4941, read_total=1, symbol_range_bytes=248, symbol_range_total=1, symbol_search_bytes=199, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5338, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+
+
+## 2026-09-12 15:29 — iteration #6 確定: SEMANTIC_RETRY_WAIT=0ms 採用（案A・2回確認維持）。回帰全体確認
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1014        17       548      1562     309.9         0  True
+explore  dump                  2      4750       298      4510      9260     177.8         0  True
+rename   lsp                   2       217         3       217       434    1363.8         0  True
+rename   apply                 5       402         4      1008      1410    1779.1         0  True
+hints    hints                 1       110         8         0       110     783.4         0  True
+verify   apply-check           2       244         2       107       351    1323.1         0  True
+verify   apply-cargo           2       107         1       107       214    1376.9         0  True
+verify   hunks-cargo           2       153         1       153       306    1353.4         0  True
+verify   apply2-cargo          3       216         2       324       540    1487.1         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4941, read_total=1, symbol_range_bytes=248, symbol_range_total=1, symbol_search_bytes=199, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5338, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=177, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## 2026-09-12 15:40 — iteration #6 考察: SEMANTIC_RETRY_WAIT 500ms → 0ms（採用・ADR-0054）
+
+### 仮説と A/B の設計
+
+- 仮説: `request_with_loading_retry` は「2 回連続で同一になるまで」確認するが、その間の
+  `SEMANTIC_RETRY_WAIT` 500ms は毎回必ず挟まる（1 回目の結果が既に完全でも待つ）。
+  要求は自身が解析完了までブロックしてから返る（§4 の根拠・iteration #5 と同型）ので、
+  この待ちは「同じ答えをもう一度買っている」だけ。0ms にすれば `symbol`/`rename`/`check`
+  の wall が毎回 ~500ms 下がるはず。
+- 案 A（採用）: `SEMANTIC_RETRY_WAIT` 500 → **0ms**。2 回連続確認ロジックは残す。
+- 案 B（比較のみ・不採用）: 「2 回連続同一確認」を捨て、**loading（null/空）のときだけ
+  リトライ**に縮める（1 往復削減）。wait は 100ms に戻して測った。
+
+### 検証結果（warm、r=3 中央値）
+
+| step | #5 基準 (500ms) | 案 A (0ms) | 案 B (loadingのみ+100ms) |
+|---|---|---|---|
+| `symbol`（explore/lsp 1step） | 583ms | **82ms** | 84ms |
+| `rename`（rename/lsp 1step） | 1594ms（2120 揺れ） | **1150ms** | 1162ms |
+| `check`（verify/apply-check） | 589ms | **87ms** | — |
+| `hints`（pull_inlay_hints、影響外） | 704ms | 770ms | — |
+
+- `calls` / `out_B` / `equiv_B` は全 flow で不変（案 A で explore/lsp 1568→1562、rename/lsp
+  438→434 は 1〜4B の表示揺れ。契約の形は同じ）。
+- `-r 10`（explore / rename）: fails 0。部分結果の取りこぼしなし。
+- `verify` / `verify-broken` / `verify-blind`（r=3）: fails 0。`verify-broken/check` は
+  rc=2（Syntax Error 2 件）のまま、`verify-blind/check` は `settled:false` 契約を維持。
+- `--cold`（rename / explore を 1 回）: `rename/lsp` の verify（cargo check green = 4 箇所
+  すべてリネーム）・`explore/lsp` の非空 symbol（134B）とも維持。索引完走ゲート
+  （ADR-0051）が cold の完全性を引き続き守っている。
+- `cargo test`: 462 passed。
+
+### 考察
+
+1. **待ちは本当に無駄だった**: 0ms で回帰ゼロ（warm r=3 × 3 flow + cold + -r10 =
+   40 run 相当で fails 0）。`apply` の settle 撤去（#5）と同じ結論 — 「解析完了まで
+   ブロックして返る」LSP 要求には待ちを挟む余地がない。ADR-0052 の「予算 20×500ms
+   ≈10 秒」は実質 0 になったが、予算機構（SEMANTIC_RETRIES のループ）自体は残す
+   （遅いサーバ・大きいプロジェクトでの安全弁。loading 時のリトライ回数上限）。
+2. **案 B は差が出なかった**: 1 回目の request 自体が ~80ms かかっており、2 回目の確認は
+   同一クエリの再送でほぼ無料。1 往復削減の効果（〜40ms）は誤差で、代わりに loading 時に
+   100ms 待つコードが残る。**「2 回連続同一確認」は login 上の防御としては安いまま**。
+   案 B は複雑さだけ増すので不採用。
+3. **残った wall の内訳**: `symbol` 82ms / `rename` 1150ms / `check` 87ms。`rename` が
+   他より桁違いに高いのは WorkspaceEdit の計算（RA 側の編集コスト）で、これは待ちでは
+   ない。`rename` の 1150ms の内訳は未調査（#7 の候補: トレース）。
+4. **hints は影響を受けない**: `pull_inlay_hints` は `request_with_loading_retry` を
+   通らない（直接 request 1 回）。770ms は RA 側の inlay hint 計算コストと推定。
+5. **ADR の更新**: ADR-0051（索引ゲート）と ADR-0052（check の空の早期確定）の
+   「安全代」は、待ち時間ではなく**ロジック（2 回連続同一確認・空の 2 回連続）**が本尊。
+   待ちなしでも契約は維持できた。ADR-0054 として記録。
+
+### 結論
+
+- **採用**: `SEMANTIC_RETRY_WAIT` = 0ms（リトライループと 2 回連続確認は残す）。
+  `symbol` 583→82ms（−86%）、`rename` ~1594→~1150ms（−28%）、`check` 589→87ms（−85%）。
+- 効果確認: `calls`/`equiv_B` 不変・fails 0・462 test green。

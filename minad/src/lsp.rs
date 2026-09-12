@@ -1202,7 +1202,7 @@ pub struct RawLspEdit {
 /// rename 不能な場合もリトライ予算（約 10 秒）だけ余分に待ってから
 /// 「not found」扱いになる。
 const SEMANTIC_RETRIES: usize = 20;
-const SEMANTIC_RETRY_WAIT: Duration = Duration::from_millis(500);
+const SEMANTIC_RETRY_WAIT: Duration = Duration::from_millis(0); // iteration #6 採用: 500ms → 0ms（ADR-0051 ゲート + request 自身が解析完了までブロックするため待ちは不要。2回連続同一確認は残す）
 
 /// 空応答を確定と見なすまでに必要な連続空 pull の回数（ADR-0052）。
 ///
