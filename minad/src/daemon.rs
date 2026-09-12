@@ -22,8 +22,8 @@ use mina_protocol::{
     Activity, ActivityKind, ActivityRecord, BaseDiagnostic, BaseRootInfo, ChangeEvent,
     CheckDiagnostic, ClientKind, Command, Diagnostic, DocumentEdit, EventKind, EventSource,
     GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range, ReviewComment,
-    ReviewCommentView, ReviewSide, ServerMessage, ServerMetrics, Severity, StateSnapshot,
-    SymbolKind, WorkspaceSymbol, fnv1a64,
+    ReviewCommentView, ReviewSide, SearchMatch, ServerMessage, ServerMetrics, Severity,
+    StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1592,6 +1592,22 @@ async fn handle_connection(
                     }
                     continue;
                 }
+                // SearchMatches（rust2 要望）: 任意パスのリテラル一致位置を全文なしで
+                // 返す。ReadPath と同じ解決（開文書優先・ディスク fallback）で
+                // 読み取り専用 — 状態・世代を動かさない。
+                if let Ok(Command::SearchMatches {
+                    path,
+                    query,
+                    case_sensitive,
+                }) = serde_json::from_str::<Command>(line.trim())
+                {
+                    let message =
+                        serve_search_matches(&daemon, &path, &query, case_sensitive).await;
+                    if !write_message(&mut write_half, conn_id, message).await {
+                        break; // 切断 or 書き込みタイムアウト
+                    }
+                    continue;
+                }
                 if let Ok(Command::EnclosingSymbol { path, line, col }) =
                     serde_json::from_str::<Command>(line.trim())
                 {
@@ -2487,6 +2503,87 @@ async fn serve_read_path(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     d.metrics.read_total += 1;
     d.metrics.read_bytes += bytes;
     msg
+}
+
+/// [`Command::SearchMatches`] の処理（rust2 要望）: 任意パスのリテラル一致位置を
+/// 全文なしで返す軽量応答。テキスト解決は [`resolve_doc_text`]（開文書優先・
+/// 未保存編集込み・ディスク fallback = ADR-0048 と同じ）。読み取り専用 —
+/// フォーカス・世代・push・イベントを動かさない。
+///
+/// エージェントは全文を読まずに一致位置を得て、必要な行だけ `--lines` で引ける
+/// （rg の代替を minas 内で完結させる）。
+const MAX_SEARCH_MATCHES: usize = 200;
+
+async fn serve_search_matches(
+    daemon: &Mutex<Daemon>,
+    path: &str,
+    query: &str,
+    case_sensitive: bool,
+) -> ServerMessage {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let path_str = path_buf.to_string_lossy().into_owned();
+    let err = |msg: String| ServerMessage::SearchMatches {
+        path: path_str.clone(),
+        generation: 0,
+        total: 0,
+        truncated: false,
+        matches: Vec::new(),
+        error: Some(msg),
+    };
+    if query.is_empty() {
+        return err("query must not be empty".into());
+    }
+    let text = match resolve_doc_text(daemon, &path_buf).await {
+        Some(t) => t,
+        None => return err(format!("cannot open {path}")),
+    };
+    let (matches, total, truncated) = search_text(&text, query, case_sensitive);
+    ServerMessage::SearchMatches {
+        path: path_str,
+        generation: daemon.lock().await.generation,
+        total,
+        truncated,
+        matches,
+        error: None,
+    }
+}
+
+/// テキストのリテラル一致を列挙する（純関数 — ユニットテスト可能）。
+/// 非重複・行優先順で、1-origin 行 / 1-origin char 列 / char 長を返す。
+/// 上限 [`MAX_SEARCH_MATCHES`]²までで打ち切り、`truncated` で知らせる。
+///
+/// 大文字小文字を無視する場合は行とクエリを `to_lowercase` して照合する（
+/// 列番号は小文字化後テキスト基準 — 例外的な文字で元テキストと 1 char ずれる
+/// 可能性はあるが、検索用途では実害がない）。
+fn search_text(text: &str, query: &str, case_sensitive: bool) -> (Vec<SearchMatch>, usize, bool) {
+    let len = query.chars().count() as u32;
+    let mut matches = Vec::new();
+    let mut total = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        let (hay, needle) = if case_sensitive {
+            (line.to_string(), query.to_string())
+        } else {
+            (line.to_lowercase(), query.to_lowercase())
+        };
+        let mut from = 0usize;
+        while let Some(pos) = hay[from..].find(&needle) {
+            let byte_start = from + pos;
+            total += 1;
+            if matches.len() < MAX_SEARCH_MATCHES {
+                matches.push(SearchMatch {
+                    line: i as u32 + 1,
+                    col: hay[..byte_start].chars().count() as u32 + 1,
+                    len,
+                });
+            }
+            from = byte_start + needle.len().max(1);
+            if from > hay.len() {
+                break;
+            }
+        }
+    }
+    let truncated = total > matches.len();
+    (matches, total, truncated)
 }
 
 /// [`Command::EnclosingSymbol`] の処理（ADR-0031）: 指定位置（1-origin 行:列）
@@ -5169,6 +5266,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         Command::WaitFor { .. } => {
             // process_command の専用アームで処理される（読み取り専用）。
             // ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
+        Command::SearchMatches { .. } => {
+            // handle_connection で専用処理される（ServerMessage::SearchMatches
+            // 応答。読み取り専用）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
         Command::GetInlayHints { .. } => {
@@ -8194,7 +8296,7 @@ root-markers = [".docsroot"]
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
                 ServerMessage::ReviewComments { .. } => continue,
-                ServerMessage::ReadPath { .. } => continue,
+                ServerMessage::ReadPath { .. } | ServerMessage::SearchMatches { .. } => continue,
             }
         }
     }
@@ -8218,7 +8320,7 @@ root-markers = [".docsroot"]
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
                 ServerMessage::ReviewComments { .. } => continue,
-                ServerMessage::ReadPath { .. } => continue,
+                ServerMessage::ReadPath { .. } | ServerMessage::SearchMatches { .. } => continue,
             }
         }
     }
@@ -10645,6 +10747,44 @@ root-markers = [".docsroot"]
         let _ = std::fs::remove_file(&file);
     }
 
+    #[test]
+    fn search_text_finds_literal_matches_by_line_and_char_col() {
+        // rust2 要望: 全文を読まずに一致位置だけを得る。1-origin 行 / char 列。
+        let text = "fn a() {}\nlet x = a + a;\n// a\n";
+        let (m, total, truncated) = search_text(text, "a", true);
+        assert_eq!(total, 4, "行ごとの全出現を数える: {m:?}");
+        assert!(!truncated);
+        assert_eq!((m[0].line, m[0].col), (1, 4), "fn a() → 4 列目");
+        assert_eq!((m[1].line, m[1].col), (2, 9));
+        assert_eq!((m[2].line, m[2].col), (2, 13));
+        assert_eq!(m[0].len, 1);
+
+        // 大文字小文字を無視
+        let (m2, total2, _) = search_text("A a A\n", "a", false);
+        assert_eq!(total2, 3);
+        assert_eq!(m2.len(), 3);
+        let (m3, total3, _) = search_text("A a A\n", "a", true);
+        assert_eq!(total3, 1);
+        assert_eq!(m3[0].col, 3);
+
+        // マルチバイト（char 列。日本語コメント・絵文字で byte とずれない）
+        let (m4, _, _) = search_text("// あい\nlet x = 1;\n", "x", true);
+        assert_eq!((m4[0].line, m4[0].col), (2, 5));
+        let (m5, _, _) = search_text("// 😀😀 target\n", "target", true);
+        assert_eq!(m5[0].col, 7, "絵文字 2 個（各 1 char）+ 空白 2 = 7 列目");
+
+        // 一致なし
+        let (m6, total6, _) = search_text("abc\n", "zzz", true);
+        assert!(m6.is_empty() && total6 == 0);
+
+        // 上限で打ち切り（total は全数を報告する）
+        let many = "a\n".repeat(MAX_SEARCH_MATCHES + 10);
+        let (m7, total7, truncated7) = search_text(&many, "a", true);
+        assert_eq!(m7.len(), MAX_SEARCH_MATCHES);
+        assert_eq!(total7, MAX_SEARCH_MATCHES + 10);
+        assert!(truncated7, "上限を超えたら truncated");
+    }
+
     #[tokio::test]
     async fn wait_for_generation_blocks_until_change() {
         // ADR-0012 #12: WaitFor は世代が target を超えるまでブロックし、
@@ -10781,7 +10921,7 @@ root-markers = [".docsroot"]
                 | ServerMessage::WorkspaceSymbols { .. }
                 | ServerMessage::Check { .. } => continue,
                 ServerMessage::ReviewComments { .. } => continue,
-                ServerMessage::ReadPath { .. } => continue,
+                ServerMessage::ReadPath { .. } | ServerMessage::SearchMatches { .. } => continue,
                 ServerMessage::Peek { .. } => continue,
                 ServerMessage::ServerInfo { .. } => continue,
             }
@@ -11201,6 +11341,9 @@ root-markers = [".docsroot"]
                     continue;
                 }
                 ServerMessage::ReadPath { .. } => {
+                    continue;
+                }
+                ServerMessage::SearchMatches { .. } => {
                     continue;
                 }
             }

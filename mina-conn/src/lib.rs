@@ -183,6 +183,7 @@ pub async fn request_hints(
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -193,7 +194,7 @@ pub async fn request_hints(
         )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("不正な応答: {e}"),
+            format!("invalid response: {e}"),
         )),
     }
 }
@@ -245,6 +246,7 @@ pub async fn request_peek(
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -255,7 +257,7 @@ pub async fn request_peek(
         )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("不正な応答: {e}"),
+            format!("invalid response: {e}"),
         )),
     }
 }
@@ -300,6 +302,7 @@ pub async fn request<T: serde::Serialize>(
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -310,7 +313,7 @@ pub async fn request<T: serde::Serialize>(
         )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("不正な応答: {e}"),
+            format!("invalid response: {e}"),
         )),
     }
 }

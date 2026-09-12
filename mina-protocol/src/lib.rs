@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 /// コマンド・応答の追加のため bump。
 /// v19: Helix の surround（`ms` / `mr` / `md`）— `Command::SurroundAdd` /
 /// `SurroundDelete` / `SurroundReplace` を追加。コマンドの追加のため bump。
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
 /// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
@@ -256,6 +256,17 @@ pub enum Command {
     /// スナップショットを運ばない軽量 [`ServerMessage::ReadPath`]。`--lines` の
     /// 範囲切出しは CLI 側で行う。
     ReadPath { path: String },
+    /// 任意パスのテキスト一致検索（読み取り専用）。全文を読まずに一致位置だけを
+    /// 得る — 開文書優先・未保存編集込み・ディスク fallback（[`Command::ReadPath`]
+    /// と同じ解決）。応答は軽量 [`ServerMessage::SearchMatches`]（rust2 要望）。
+    SearchMatches {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 検索するリテラル文字列（空不可）。
+        query: String,
+        /// 大文字小文字を区別するか。
+        case_sensitive: bool,
+    },
     /// 指定位置を囲むシンボルの取得（読み取り専用。ADR-0031）。`line:col`
     /// （1-origin）から、その位置を含む最も深い記号の名前・種別・正確な範囲を
     /// 返す（`documentSymbol` の selectionRange 由来）。エージェントが全文を
@@ -635,6 +646,22 @@ pub enum ServerMessage {
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
+    /// [`Command::SearchMatches`] の応答（軽量）。一致位置のみを返し、行の内容は
+    /// 渡さない — エージェントは位置から範囲 read で引く。
+    SearchMatches {
+        /// 対象ファイルのパス。
+        path: String,
+        /// 応答時点の世代。
+        generation: u64,
+        /// 一致総数（上限で打ち切る前の数）。
+        total: usize,
+        /// 上限で打ち切られたか。
+        truncated: bool,
+        /// 一致位置（上限まで）。
+        matches: Vec<SearchMatch>,
+        /// 失敗理由（成功時は None）。
+        error: Option<String>,
+    },
     /// [`Command::EnclosingSymbol`] の応答（ADR-0031）。指定位置を囲む記号の
     /// 名前・種別・正確な範囲（選択範囲 = 名前トークン）を全文なしで返す軽量応答。
     /// 位置がどの記号にも含まれない・対象が読めない場合は `found: false`（
@@ -664,6 +691,18 @@ pub enum ServerMessage {
         /// コメント一覧（追加順）。
         comments: Vec<ReviewCommentView>,
     },
+}
+
+/// [`Command::SearchMatches`] の応答に含まれる一致位置 1 件。1-origin の行と
+/// 行内 char 列、および一致の char 長。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchMatch {
+    /// 1-origin 行番号。
+    pub line: u32,
+    /// 1-origin 行内列（char 単位）。
+    pub col: u32,
+    /// 一致の char 長（検索クエリの char 数）。
+    pub len: u32,
 }
 
 /// [`Command::WorkspaceSymbol`] の応答に含まれるシンボル 1 件（ADR-0032）。
@@ -1472,6 +1511,11 @@ mod tests {
             },
             Command::ReadPath {
                 path: "src/lib.rs".into(),
+            },
+            Command::SearchMatches {
+                path: "src/lib.rs".into(),
+                query: "fn ".into(),
+                case_sensitive: true,
             },
             Command::EnclosingSymbol {
                 path: "src/lib.rs".into(),

@@ -113,6 +113,20 @@ pub enum SessionCmd {
         #[arg(long)]
         lines: Option<String>,
     },
+    /// Find literal matches in any file without reading it in full (read-only).
+    /// Prints `{path, generation, total, truncated, matches:[{line,col,len}]}`
+    /// (1-origin line, 1-origin CHAR column, char length). Buffer-first: the open
+    /// document's unsaved edits are searched, else the file on disk. Use it to
+    /// locate occurrences cheaply, then read only the lines you need.
+    Search {
+        /// File to search (relative to the agent's cwd, like `Open`)
+        path: PathBuf,
+        /// Literal text to find (empty is rejected)
+        query: String,
+        /// Case-insensitive search
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+    },
     /// Fetch the daemon build generation and metrics (printed as JSON, issue #27).
     /// This is the DAEMON's build/metrics — not the LSP server list. The wire
     /// command is `GetServerInfo`; `base_roots` lists only comparison roots
@@ -380,6 +394,34 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 Some(range) => print_text_lines(&outcome.path, outcome.generation, &outcome.text, &range)?,
                 None => print!("{}", outcome.text),
             }
+        }
+        SessionCmd::Search {
+            path,
+            query,
+            ignore_case,
+        } => {
+            // 全文を読まずに一致位置だけを得る（rust2 要望）。失敗は stderr + exit 1
+            // （cannot open / empty query = 入力エラー、再試行不可）。
+            let outcome = execute_search(
+                &path.to_string_lossy(),
+                &query,
+                !ignore_case,
+            )
+            .await?;
+            if let Some(e) = &outcome.error {
+                eprintln!("search: {e}");
+                std::process::exit(1);
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "path": outcome.path,
+                    "generation": outcome.generation,
+                    "total": outcome.total,
+                    "truncated": outcome.truncated,
+                    "matches": outcome.matches,
+                }))?
+            );
         }
         SessionCmd::Info => {
             // #27: ワンショット CLI にも GetServerInfo 経路を用意する。daemon の
@@ -1016,6 +1058,7 @@ async fn execute_rename(path: &str, old: &str, new: &str) -> io::Result<RenameOu
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1061,6 +1104,7 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
         | Ok(ServerMessage::RenameResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1180,7 +1224,8 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
-        | Ok(ServerMessage::ReadPath { .. }) => {
+        | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. }) => {
             Err(invalid("Outline: unexpected lightweight response"))
         }
         Err(e) => Err(invalid(format!("invalid response: {e}"))),
@@ -1234,8 +1279,77 @@ async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("ReadPath: unexpected lightweight response"))
+        }
+        Err(e) => Err(invalid(format!("invalid response: {e}"))),
+    }
+}
+
+/// `minas search` の結果（[`ServerMessage::SearchMatches`] の展開形）。
+struct SearchOutcome {
+    path: String,
+    generation: u64,
+    total: usize,
+    truncated: bool,
+    matches: Vec<mina_protocol::SearchMatch>,
+    error: Option<String>,
+}
+
+/// daemon に接続し、パス指定のリテラル一致検索（[`ServerMessage::SearchMatches`]）
+/// を受け取る。テキスト解決は read と同じ（開文書優先・未保存編集込み・ディスク
+/// fallback）— 全文は運ばれない。
+async fn execute_search(
+    path: &str,
+    query: &str,
+    case_sensitive: bool,
+) -> io::Result<SearchOutcome> {
+    let (mut write_half, mut reader) = open_one_shot().await?;
+    let command = Command::SearchMatches {
+        path: conn::absolutize(path),
+        query: query.to_string(),
+        case_sensitive,
+    };
+    let mut line = serde_json::to_string(&command).expect("the command must be serializable");
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    match serde_json::from_str::<ServerMessage>(&response) {
+        Ok(ServerMessage::SearchMatches {
+            path,
+            generation,
+            total,
+            truncated,
+            matches,
+            error,
+        }) => Ok(SearchOutcome {
+            path,
+            generation,
+            total,
+            truncated,
+            matches,
+            error,
+        }),
+        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
+            "SearchMatches returned a snapshot response (old daemon: rebuild)",
+        )),
+        Ok(ServerMessage::Hints { .. })
+        | Ok(ServerMessage::Peek { .. })
+        | Ok(ServerMessage::ServerInfo { .. })
+        | Ok(ServerMessage::RenameResult { .. })
+        | Ok(ServerMessage::ReferencesResult { .. })
+        | Ok(ServerMessage::Outline { .. })
+        | Ok(ServerMessage::Hover { .. })
+        | Ok(ServerMessage::WorkspaceSymbols { .. })
+        | Ok(ServerMessage::Check { .. })
+        | Ok(ServerMessage::ReviewComments { .. })
+        | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
+        | Ok(ServerMessage::EnclosingSymbol { .. }) => {
+            Err(invalid("SearchMatches: unexpected lightweight response"))
         }
         Err(e) => Err(invalid(format!("invalid response: {e}"))),
     }
@@ -1288,6 +1402,7 @@ async fn execute_enclosing(
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1348,6 +1463,7 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1382,6 +1498,7 @@ async fn execute_symbol(path: &str, query: &str) -> io::Result<SymbolOutcome> {
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::Check { .. })
@@ -1430,6 +1547,7 @@ async fn execute_check(path: &str) -> io::Result<CheckOutcome> {
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
@@ -1462,6 +1580,7 @@ async fn execute_reviews() -> io::Result<Vec<ReviewCommentView>> {
         | Ok(ServerMessage::ReferencesResult { .. })
         | Ok(ServerMessage::Outline { .. })
         | Ok(ServerMessage::ReadPath { .. })
+        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. })
         | Ok(ServerMessage::Hover { .. })
         | Ok(ServerMessage::WorkspaceSymbols { .. })
@@ -1522,6 +1641,7 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
         | Ok(mina_protocol::ServerMessage::WorkspaceSymbols { .. })
         | Ok(mina_protocol::ServerMessage::Check { .. })
         | Ok(mina_protocol::ServerMessage::EnclosingSymbol { .. })
+        | Ok(mina_protocol::ServerMessage::SearchMatches { .. })
         | Ok(mina_protocol::ServerMessage::ReviewComments { .. }) => {
             Err(invalid("GetServerInfo: unexpected lightweight response"))
         }
