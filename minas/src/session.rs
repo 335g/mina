@@ -529,7 +529,9 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // 一括検証できる（第1回検証: 1ファイルずつしか渡せなかった）。
             // クリーン（エラーなし）は exit 0、error 診断が1件でもあれば exit 2
             // （警告のみなら 0 — エージェントは $? だけで分岐できる）。失敗: stderr
-            // に理由、exit 1/2（outline / at と同じ分類）。
+            // に理由、exit 1/2（outline / at と同じ分類）。失敗したパスも
+            // 配列の 1 要素（"error" 付き）として返す — stdout が `[]` になると
+            // 「診断なし」と「取得失敗」が区別できない（ADR-0046 追記）。
             if paths.is_empty() {
                 eprintln!("check: at least one path is required");
                 std::process::exit(1);
@@ -544,6 +546,13 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                     // 失敗の分類（not supported = exit 1、再試行可能 = exit 2）を
                     // 保持しつつ、他パスの検証は続ける（ADR-0046）。
                     worst_failure = worst_failure.max(check_exit_code(e));
+                    results.push(serde_json::json!({
+                        "path": outcome.path,
+                        "total": 0,
+                        "diagnostics": [],
+                        "settled": false,
+                        "error": e,
+                    }));
                     continue;
                 }
                 results.push(serde_json::json!({
@@ -1456,6 +1465,11 @@ async fn apply(
         rollback_created(&abs, created);
         std::process::exit(2);
     }
+    // no-op（old == new / 同一内容の全文置換）は daemon が status に載せない（ADR-0012）。
+    // 「成功」と読めてしまうので stderr に明示する（exit は 0 のまま — 冪等な編集）。
+    if snapshot.text == text {
+        eprintln!("NO-OP: the replacement left the buffer unchanged");
+    }
     match &old_text {
         Some(_) => println!("applied: {abs} (chars {start}..{end})"),
         None => println!("applied: {abs} (whole file, {} chars)", new_text.chars().count()),
@@ -1581,7 +1595,8 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
     }
 
     let mut applied = 0usize;
-    for hunk in hunks {
+    let mut noops = 0usize;
+    for (i, hunk) in hunks.iter().enumerate() {
         // 直前の編集適用後の現在テキストに対し位置を再計算する（行揺れを踏む。char 単位）
         let text = snapshot.text.clone();
         let Some((start, end)) = find_range(&text, &hunk.old) else {
@@ -1602,6 +1617,13 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
             rollback_created(&abs, created);
             std::process::exit(2);
         }
+        // change しなかった hunk（old == new 等）は daemon が status に載せない
+        // （ADR-0012: no-op は世代を進めない）。一括適用では 1 件の静かな no-op が
+        // 「8 件適用」に埋もれるので、件数と該当 hunk を明示する。
+        if snapshot.text == text {
+            noops += 1;
+            eprintln!("HUNK NO-OP: #{} (unchanged) {:?}", i + 1, short(&hunk.old));
+        }
         applied += 1;
     }
 
@@ -1621,6 +1643,7 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         serde_json::json!({
             "applied": abs,
             "edits": applied,
+            "edits_noop": noops,
             "generation": snapshot.generation,
             "checksum": snapshot.checksum,
         })

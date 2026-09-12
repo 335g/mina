@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mina_lsp::{Client, LspRange, PositionEncoding, Progress, PublishDiagnostic, ReadyPolicy};
 use mina_protocol::{Diagnostic, InlayHint, Severity};
@@ -1116,43 +1116,68 @@ pub async fn workspace_symbols(
 /// 特に「コンパイルは壊れているが pull が見ないエラー」（クロスファイルの型エラー）
 /// は待っても永久に空なので、予算（≈10 秒）を使い切る意味が無い —
 /// 未確認（`settled: false`）のまま即返す（ADR-0045 の意味は不変: 空は
-/// クリーンの根拠にしない）。`None` は恒久的な失敗（セッションロック待ち・
-/// サーバ死亡・対象が current でない）。
+/// クリーンの根拠にしない）。恒久的な失敗は [`PullFail`] で理由を保って返す。
+///
+/// ロック取得前に、対象が current 文書でなければ開き直す: didOpen はロック競合で
+/// 黙ってスキップされうる（`open_document`）。pull は current 文書にしか応えない
+/// ため、そのまま引くと healthy な daemon を「サーバ死亡」と誤報していた。
 pub async fn pull_diagnostics_settled(
     session: &Mutex<LspSession>,
     path: &Path,
     text: &str,
-) -> Option<(Vec<Diagnostic>, bool)> {
+) -> Result<(Vec<Diagnostic>, bool), PullFail> {
     // ADR-0056: pull の round 別所要（round0 = 初回解析を背負う回、以降は settle 確認）。
     let mut trace = Trace::new("check.pull");
     let mut round = 0;
     let mut prev: Option<usize> = None;
     let mut empty_rounds = 0;
     let mut last: Vec<Diagnostic> = Vec::new();
+    let not_ready_deadline = Instant::now() + PULL_NOT_READY_BUDGET;
     for _ in 0..SEMANTIC_RETRIES {
         round += 1;
         let pulled = {
             let Ok(mut s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
-                return None;
+                return Err(PullFail::LockBusy);
             };
             if s.client.is_dead() {
-                return None;
+                return Err(PullFail::ServerDead);
+            }
+            // ロックを握ったまま対象を開き直す（この 2 行の間は他タスクが current を
+            // 奪えない）。既に current なら何もしない。
+            if s.current_uri() != Some(uri(path).as_str()) {
+                s.did_open(path, text).await;
             }
             s.pull_diagnostics(path, text).await
         };
         trace.mark(&format!("round{}", round - 1));
         let Some(diags) = pulled else {
-            return None;
+            // 索引ゲートが cap で未確認のまま返った直後は、サーバがまだロード中で
+            // pull に error を返す（トレース実測: cold の check は ensure 10.0s →
+            // pull 1.3s で error、2 回目は ensure 0.3s で成功）。未確認（ready で
+            // ない）= 時間の問題なので、予算内で待って再試行する。
+            let ready = match timeout(LSP_LOCK_TIMEOUT, session.lock()).await {
+                Ok(s) => s.progress().is_ready(),
+                Err(_) => return Err(PullFail::LockBusy),
+            };
+            if !ready && Instant::now() < not_ready_deadline {
+                tokio::time::sleep(PULL_NOT_READY_WAIT).await;
+                continue;
+            }
+            return Err(if ready {
+                PullFail::Protocol
+            } else {
+                PullFail::NotReady
+            });
         };
         let n = diags.len();
         if n > 0 && prev == Some(n) {
-            return Some((diags, true)); // 非空が2回連続で同数 = 安定
+            return Ok((diags, true)); // 非空が2回連続で同数 = 安定
         }
         if n == 0 {
             empty_rounds += 1;
             if empty_rounds >= SEMANTIC_EMPTY_ROUNDS {
                 // 空: 未確認のまま返す（クリーン扱いはしない — ADR-0045）
-                return Some((diags, false));
+                return Ok((diags, false));
             }
         } else {
             empty_rounds = 0;
@@ -1161,7 +1186,52 @@ pub async fn pull_diagnostics_settled(
         last = diags;
         tokio::time::sleep(SEMANTIC_RETRY_WAIT).await;
     }
-    Some((last, false)) // 予算切れ: 未確認（空ならクリーン扱いにしない — ADR-0045）
+    Ok((last, false)) // 予算切れ: 未確認（空ならクリーン扱いにしない — ADR-0045）
+}
+
+/// 診断 pull が応答を返せなかった理由。ADR-0045 の `settled` とは別物（あちらは
+/// 「空がクリーンの根拠になるか」）。
+///
+/// エージェントの回復手順が理由ごとに違うため、1 文（旧: "server dead or session
+/// lock timeout"）に潰さない − 潰すと「サーバ死亡（次回 Open で再 spawn）」と
+/// 「ロック競合（ただちに再試行）」を区別できず、回復手順を誤る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullFail {
+    /// セッションロックが `LSP_LOCK_TIMEOUT` 以内に取れない = 別の解析タスク
+    /// （背景 pull / 基準診断）が保持中。サーバは生きているので再試行が正しい。
+    LockBusy,
+    /// LSP サーバが死んでいる。次の .rs Open が spawn し直す（ADR-0009）。
+    ServerDead,
+    /// 対象を開き直した直後でも応答が無い（サーバ側エラー・不正な形状）。
+    Protocol,
+    /// 索引ゲートが上限（`LSP_READY.cap`）で未確認のまま返り、サーバがまだ
+    /// ロード中で pull に error を返している（実測: cold の check は
+    /// `ensure` 10.0s → pull 1.3s で error。次の check は 0.3s で成功）。
+    /// コード側の問題ではなく時間の問題なので、再試行が正しい。
+    NotReady,
+}
+
+impl PullFail {
+    /// エージェント向けの 1 行（理由を保ったまま）。
+    pub fn detail(self) -> &'static str {
+        match self {
+            PullFail::LockBusy => {
+                "diagnostics pull failed: the session lock is held by another analysis \
+                 task (transient -- retry)"
+            }
+            PullFail::ServerDead => {
+                "diagnostics pull failed: the LSP server is dead (the next .rs Open \
+                 respawns it)"
+            }
+            PullFail::Protocol => {
+                "diagnostics pull failed: the server returned no usable diagnostics response"
+            }
+            PullFail::NotReady => {
+                "diagnostics pull failed: the LSP server is still loading/indexing \
+                 (retry shortly)"
+            }
+        }
+    }
 }
 
 // ---- 意味リネーム・参照（ADR-0029） ----
@@ -1221,6 +1291,18 @@ const SEMANTIC_RETRY_WAIT: Duration = Duration::from_millis(0); // iteration #6:
 /// `settle_open_diagnostics_loop`（daemon の Open 経路）と共有する — 同じ問い
 /// 「空はいつ確定か」に対する同じ答えを 2 箇所に別々に書かない。
 pub(crate) const SEMANTIC_EMPTY_ROUNDS: usize = 2;
+
+/// 索引未確認のまま pull が error を返したときに粘る総予算（[`PullFail::NotReady`]）。
+///
+/// cold の rust-analyzer は `LSP_READY.cap`（10s）を超えてロードが続き、
+/// その間の pull は error（= `None`）になる。これはコードの問題ではなく時間の
+/// 問題なので、短い待ちを挟んで再試行する（1 回の成功で抜ける）。回数ではなく
+/// **時間**で切る（1 回の pull 自体が数秒かかるため）: 予算を使い切ったら
+/// `NotReady` を返し、エージェントは「再試行」を選べる。
+/// `SEMANTIC_RETRY_WAIT`（ADR-0054 で 0ms）と共有しない: あちらは「解析完了まで
+/// ブロックする応答」の待ちで、こちらは「まだ準備できていない」の合図。
+const PULL_NOT_READY_WAIT: Duration = Duration::from_millis(500);
+const PULL_NOT_READY_BUDGET: Duration = Duration::from_secs(20);
 
 /// `textDocument/rename` を実行し、WorkspaceEdit を内部形へ変換して返す。
 ///

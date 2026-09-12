@@ -774,6 +774,12 @@ pub struct ServerMetrics {
     /// （全文再読の近似）と対比して「全文を読まなくて済んだ量」を観測する。
     pub read_total: u64,
     /// ReadPath 応答の累積シリアライズ bytes（ADR-0048）。
+    ///
+    /// ソケットを流れた量（`get_state` との対比。ローカル IPC なので転送自体は
+    /// 無料）。`--lines` でも daemon は全文を返し CLI が行を切るため、範囲読みでも
+    /// この値は**ファイル全文に近い**。LLM が読む量（トークン）の削減は CLI の
+    /// stdout 側で起きる — 「read_bytes が小さい = 節約できた」と読まないこと
+    /// （節約量は stdout bytes で見る）。
     pub read_bytes: u64,
 }
 

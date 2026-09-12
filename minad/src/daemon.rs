@@ -2728,10 +2728,11 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
         trace.mark("restore");
     }
-    let Some((diags, settled)) = pulled else {
-        // 恒久的失敗（セッションロック待ち・サーバ死亡）: 空ではなく理由を返す
-        return err("LSP error: diagnostics pull failed (server dead or session lock timeout)"
-            .into());
+    let (diags, settled) = match pulled {
+        Ok(v) => v,
+        // 失敗理由を潰さず返す: 回復手順が理由ごとに違う（ロック競合 = ただちに
+        // 再試行、サーバ死亡 = 次の .rs Open で再 spawn、プロトコル = 再試行）。
+        Err(fail) => return err(format!("LSP error: {}", fail.detail())),
     };
     trace.note("settled", settled);
     trace.note("diags", diags.len());

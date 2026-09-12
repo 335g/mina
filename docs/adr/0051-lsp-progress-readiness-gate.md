@@ -86,3 +86,50 @@ Status: accepted
 - 反復の記録: `docs/loop/log.md` iteration #2
 - 実測の方法: `docs/loop/method.md`(L0)
 - 判定の既存 ADR: ADR-0045(空応答をクリーンの根拠にしない)
+
+## 追記（2026-09-12、`check` の「server dead or session lock timeout」の内訳）
+
+別セッションのエージェント実運用（sample-rust）で、この ADR が消したはずの
+`check` の LSP error が再発した。コードを追うと原因が 2 つに分かれ、どちらも
+1 文に潰れていた:
+
+1. **didOpen の黙ったスキップ**: `open_document`（`minad/src/lsp.rs`）は
+   セッションロックを `LSP_LOCK_TIMEOUT`（3 秒）で取れないと**何もせず返る**。
+   pull は current 文書にしか応えない（`pull_diagnostics` は URI 不一致で `None`）
+   ため、直後の `pull_diagnostics_settled` は応答を得られず、healthy な daemon を
+   「サーバ死亡」と報告していた。
+2. **理由の混線**: ロック競合（ただちに再試行が正しい）とサーバ死亡（次の .rs
+   Open が再 spawn する。ADR-0009）が同じ文面だったため、回復手順が選べなかった。
+
+対処:
+
+- `pull_diagnostics_settled` はロックを握ったまま `current_uri` を確認し、
+  対象でなければ `did_open` し直してから pull する（開き直しと pull が同じ
+  ロック内なので、他タスクが current を奪う隙間が無い）。
+- 失敗理由を `PullFail`（`LockBusy` / `ServerDead` / `Protocol`）で返し、
+  `serve_check_diagnostics` は `PullFail::detail()` をそのままメッセージにする。
+- `settled` の契約（ADR-0045）と exit コード（0/1/2）は不変。
+
+### 追記2（2026-09-12、cold の `check` が再び error を返す経路）
+
+上の対処後も、**コールド起動直後の `check` は error を返していた**（計時ログで確定）:
+
+```
+minad.trace borrow ensure 10007     ← 索引ゲートが cap(10s) で未確認のまま返った
+minad.trace check.pull round0 1304  ← その直後の pull は RA のロード中に error → None
+```
+
+`await_indexed` は cap で打ち切って**未確認のまま要求を進める**設計（ADR-0051
+Decision 6）。`symbol` / `rename` では「正しい応答が遅れて届く」側に倒れるが、
+`check` では**失敗**（exit 2）になってしまう — これが実運用で「check は検証器に
+ならない」と受け取られた一因。
+
+対処（`pull_diagnostics_settled`）:
+
+- pull が `None` を返し、かつ `Progress::is_ready()` が false（= 索引未確認）なら
+  `PullFail::NotReady` として**予算内（20 秒）で再試行**する。固定の待ちではなく、
+  pull 自体が信頼できる合図（成功したら抜ける）。
+- `is_ready()` が true なのに応答が無い場合は `PullFail::Protocol`（サーバ側の
+  問題）として区別する。
+- 実測（release、cold）: 26 秒かかるが **exit 0 / clean-unverified**（旧: exit 2 の
+  LSP error）。2 回目以降は warm で ~0.1s。

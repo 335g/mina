@@ -23,6 +23,9 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=MINA_GIT_HASH={}", hash);
-
-    println!("cargo:rerun-if-changed=build.rs");
+    // rerun-if-changed を出さない: cargo の既定（パッケージ内のどのファイルが変わっても
+    // rerun）に戻す。build.rs だけを watch すると、HEAD が動いてもスクリプト出力が
+    // キャッシュされ、`minas info` の cli_generation / build_ts が最初のビルドのまま
+    // 凍る（実測: 再インストール後も 18ddb80 / 古い ts を報告し、新旧バイナリの
+    // 検知ができなかった）。代償はビルドごとの `git rev-parse` 1 回。
 }
