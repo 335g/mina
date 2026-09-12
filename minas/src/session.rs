@@ -690,7 +690,14 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 // Hint/Info を含むファイルはまとめて「hints (n)」とする（warnings に
                 // 数えない — check が返すのは LSP 診断であって rustc lint ではない）。
                 let (verdict, has_errors) = if outcome.diagnostics.is_empty() {
-                    ("clean-unverified".to_string(), false)
+                    // プロジェクト外（マーカーなし）なら LSP は解析対象を持たず、
+                    // 空は「クリーン」でも「未 settle」でもなく「対象外」（rust2 #21）。
+                    let v = if in_project(&outcome.path) {
+                        "clean-unverified"
+                    } else {
+                        "unlinked-unverified"
+                    };
+                    (v.to_string(), false)
                 } else {
                     let n_e = outcome
                         .diagnostics
@@ -720,15 +727,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 };
                 any_error |= has_errors;
                 if summary {
-                    println!(
-                        "{}: {}",
-                        outcome.path,
-                        if outcome.diagnostics.is_empty() {
-                            "clean-unverified".to_string()
-                        } else {
-                            verdict.clone()
-                        }
-                    );
+                    println!("{}: {}", outcome.path, verdict);
                 } else {
                     results.push(serde_json::json!({
                         "path": outcome.path,
@@ -1709,6 +1708,33 @@ fn find_range(text: &str, old: &str) -> Option<(usize, usize)> {
     Some((start, start + old.chars().count()))
 }
 
+/// パスが言語サーバの解析対象プロジェクトに属するか（祖先ディレクトリに root
+/// マーカーがあるか）。
+///
+/// minad の `GENERIC_ROOT_MARKERS`（minad/src/languages.rs）を鏡写しにした
+/// ヒューリスティック。false のときは「プロジェクト外なので LSP に解析対象が
+/// 無く、pull が空を返す」— 診断なし＝クリーンではない（rust2 #21: /tmp の
+/// スクラッチファイルは構文エラーがあっても total 0 / settled false になる）。
+/// languages.toml で独自 root-markers を設定した場合は偽陰性になり得るが、
+/// verdict は「未検証」で安全側。
+fn in_project(path: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        ".git",
+    ];
+    let mut dir = std::path::Path::new(path).parent();
+    while let Some(d) = dir {
+        if MARKERS.iter().any(|m| d.join(m).exists()) {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
 /// `dir` 配下の `.rs` ファイルを再帰収集する（check --crate-root 用）。
 /// `target` / `.git` / ドットディレクトリは除外（生成物・メタを混ぜない）。
 /// 並び順は探索順（read_dir の順） — 呼び出し側で必要ならソートする。
@@ -2033,6 +2059,30 @@ mod tests {
             matches!(&timed_out, WaitOutcome::TimedOut(s) if s.generation == 5),
             "タイムアウト時は現状スナップショットを返す: {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn in_project_detects_root_markers() {
+        // rust2 #21: プロジェクト外（マーカーなし）は unlinked-unverified にする。
+        let base = std::env::temp_dir().join(format!("inproj-{}", std::process::id()));
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join("Cargo.toml"), "").unwrap();
+        std::fs::write(proj.join("src/lib.rs"), "").unwrap();
+        let scratch = base.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("x.rs"), "").unwrap();
+
+        assert!(
+            in_project(proj.join("src/lib.rs").to_str().unwrap()),
+            "Cargo.toml を祖先に持つファイルはプロジェクト内"
+        );
+        assert!(
+            !in_project(scratch.join("x.rs").to_str().unwrap()),
+            "マーカーなしはプロジェクト外"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
