@@ -1,5 +1,12 @@
 # tools/loop — ループエンジニアリング（minas のコスト低減を回す）
 
+> 手元の作業用ドキュメント（`docs/gitignore` は gitignore 対象で clone には含まれない）:
+> [`docs/gitignore/loop/method.md`](../../docs/gitignore/loop/method.md) に運用マニュアル
+> （コマンド・判定規則・落とし穴・LSP 直叩きプローブ）、
+> [`docs/gitignore/loop/latest.md`](../../docs/gitignore/loop/latest.md) に最新結果と
+> 次の課題設定がある。**新しいセッションはその 2 つを読めば次のループを回せる。**
+> 本ファイルは計測器（L0）の仕様で、上の 2 つが参照する正本。
+
 minas の目的は**エージェントのコスト低減**。その改善は「思いつきで直す」のではなく、
 **課題設定 → 検証 → 考察 → 修正 → 効果確認**のループとして回す。このディレクトリは
 そのループの**計測器と手順**を提供する。

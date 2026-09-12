@@ -2,6 +2,7 @@
 
 課題設定（仮説）→ L0 検証 → 考察 → 修正 → 効果確認 の各反復を追記する。
 方法と指標の定義: [`../../tools/loop/README.md`](../../tools/loop/README.md)。
+運用マニュアルと最新結果（手元の作業用・gitignore 対象）: `docs/gitignore/loop/method.md` / `docs/gitignore/loop/latest.md`。
 L2（実LLM A/B）の結果は [`agent-editor-ab-results.md`](./agent-editor-ab-results.md)。
 
 指標: `calls` 往復数 / `out_B` 総出力バイト / `equiv_B` 再送込みトークン等価量 /
