@@ -176,7 +176,7 @@ impl LspSession {
             "processId": null,
             "rootUri": uri(root),
             "capabilities": {
-                // work-done progress を購読する（索引完走の判定）。
+                // work-done progress を購読する（索引完走の判定。ADR-0051）。
                 // advertise しないと rust-analyzer は `$/progress` を送らない（実測）。
                 "window": { "workDoneProgress": true },
                 "textDocument": {
@@ -1115,7 +1115,7 @@ pub async fn workspace_symbols(
 /// 安定判定は settle_open_diagnostics と同じ: 非空が 2 回連続で同数 = 安定
 /// （`settled` を true にして返す）。
 ///
-/// 空は早期に打ち切る: 実測（2026-09-12）で pull は**1 回目で最終的な
+/// 空は早期に打ち切る（ADR-0052）: 実測（2026-09-12）で pull は**1 回目で最終的な
 /// 集合**を返し（編集直後の round0 と 11 ラウンド後の round11 が同一）、
 /// `SEMANTIC_EMPTY_ROUNDS` 回連続で空ならこれ以上待っても答えは変わらない。
 /// 特に「コンパイルは壊れているが pull が見ないエラー」（クロスファイルの型エラー）
@@ -1211,7 +1211,7 @@ pub struct RawLspEdit {
 const SEMANTIC_RETRIES: usize = 20;
 const SEMANTIC_RETRY_WAIT: Duration = Duration::from_millis(500);
 
-/// 空応答を確定と見なすまでに必要な連続空 pull の回数。
+/// 空応答を確定と見なすまでに必要な連続空 pull の回数（ADR-0052）。
 ///
 /// 1 回で十分という実測（pull は 1 回目で最終集合を返す）だが、最初の pull が
 /// 解析と競合するサーバ（自分で解析を起こさず pull を待たせる実装）に対する
@@ -2068,7 +2068,7 @@ fn capabilities_of_parses_initialize_response() {
 
     #[tokio::test]
     async fn pull_diagnostics_settled_gives_up_early_when_empty() {
-        // 空は早期に打ち切る（空のまま予算 20×500ms を使い切らない）。
+        // ADR-0052: 空は早期に打ち切る（空のまま予算 20×500ms を使い切らない）。
         // 未確認（settled:false）は不変 — 空をクリーンの根拠にしない（ADR-0045）。
         let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/mock-server");
         if !std::path::Path::new(bin).exists() {

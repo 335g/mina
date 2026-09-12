@@ -2663,7 +2663,7 @@ async fn serve_workspace_symbols(
 /// エージェントの「編集→検証」ループを 1 コマンドに圧縮する経路: 従来の
 /// 「wait → get → JSON から診断を読む」の往復と全文スナップショットをこれ 1 つで
 /// 置き換える。安定判定は settle_open_diagnostics と同じ（非空が 2 回連続で同数 /
-/// 連続 2 回の空 — 空は「クリーン**未確認**」で `settled: false`。ADR-0045）。
+/// 連続 2 回の空 — 空は「クリーン**未確認**」で `settled: false`。ADR-0045/0052）。
 /// 失敗は `error: Some(…)`（LSP 非対応・
 /// spawn 失敗は exit 1、LSP エラーは再試行可能な exit 2）。
 async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
@@ -3352,14 +3352,14 @@ async fn ensure(
     // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
     d.lsp_sessions.insert(key, arc.clone());
     drop(d);
-    // 索引完走を待ってから返す。新しいセッションは上のロックで先に
+    // 索引完走を待ってから返す（ADR-0051）。新しいセッションは上のロックで先に
     // map へ登録済み — 待つ間の並行 ensure が 2 匹目のサーバを spawn しない。
     await_indexed(&arc).await;
     Ok(arc)
 }
 
 /// 索引依存の LSP 要求を出す前に、サーバの索引完走（`$/progress` が静まるまで）
-/// を待つ。
+/// を待つ（ADR-0051）。
 ///
 /// LSP セッションロックは握ったまま待たない — 待ちの間 didChange を締め出すと、
 /// 編集の同期がスキップされ（`LSP_LOCK_TIMEOUT` で諦める設計）、以後の解析が
@@ -3612,7 +3612,7 @@ async fn settle_open_diagnostics_loop(
             }
         } else if i >= lsp::SEMANTIC_EMPTY_ROUNDS {
             // 空のまま数ラウンド: 解析済みでクリーン（または pull が見ない
-            // エラー）とみなして停止。測定: pull は 1 回目で最終集合を
+            // エラー）とみなして停止。測定（ADR-0052）: pull は 1 回目で最終集合を
             // 返すので、以前の 30 秒（60 ラウンド × 2 pull = 120 往復）を待つ意味が
             // 無い。次の編集の pull で自己修復する。
             return;

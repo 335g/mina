@@ -18,6 +18,7 @@
 | `agent-editor-ab-test-plans.md` | 実LLM A/B のテストプラン（t1〜t3 設計） |
 | `agent-editor-ab-results.md` | 実測結果（t1〜t6・生データ・限界） |
 | `tools/ab/` | 再利用可能ハーネス（opencode ツール制御・minae/LSP shim・計測） |
+| `docs/loop/` | **L0（LLM なし・決定論的）**のフロー費用計測と、改善ループの回し方・全反復の記録。まず `docs/loop/README.md` |
 | **本ファイル** | 総括・スキル反映マップ |
 
 方法: opencode の bash 専用 agent（native read/edit 無効）＋ minae/LSP shim 強制。

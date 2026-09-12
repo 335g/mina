@@ -1,5 +1,9 @@
 # tools/ab — opencode ツール制御 A/B ハーネス
 
+> 位置づけ: これは **L2（実LLM・分単位・高分散）**。安く何度も回す **L0（LLM なし・決定論的）**は
+> `docs/loop/`（`docs/loop/l0.py`）。**L0 で差が出た仮説だけ**をここで確認する — 手順は
+> `docs/loop/method.md`、現在の課題は `docs/loop/latest.md`。
+
 opencode のエージェントを **bash 専用（native read/edit/glob/grep 無効）** に制御し、
 ファイル読み書きを **minae CLI をラップした shim（`r` / `e`）に強制**して、
 エディタ契約（範囲read・apply vs edit・拒否理由の有無）を実LLMで A/B 計測する。
