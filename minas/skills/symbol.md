@@ -1,3 +1,5 @@
+minas symbol <path> <query>: find where a name lives in the workspace
+
 SYMBOL — workspace search instead of rg (ADR-0032)
 
 Use:      minas symbol <path> <query>

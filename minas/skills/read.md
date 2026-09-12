@@ -1,3 +1,5 @@
+map files with outline; read only the lines you need
+
 READ — reading files without wasting tokens
 
 Use:      minas read <path> [--lines <start>:<end>]   (any file, buffer-free — ADR-0048)

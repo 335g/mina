@@ -1,3 +1,5 @@
+edit via content (minas apply); never compute positions
+
 EDIT — content-resolved edits (the front door)
 
 Use:      minas apply <path> <old> <new>

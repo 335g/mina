@@ -1,3 +1,5 @@
+minas rename <path> <old> <new> (semantic); apply for a few
+
 RENAME — semantic rename vs apply (measured decision)
 
 minas has a built-in semantic rename (content-addressed, ADR-0029):

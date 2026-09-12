@@ -15,76 +15,92 @@
 //! ADR-0029（rename / references）・ADR-0031（outline / at）・ADR-0032
 //! （hover / symbol / check）の実測・仕様に基づく。
 //!
-//! 本文は `minas/skills/<topic>.md` に置き `include_str!` で同梱する（ハイライトの
-//! `highlights/*.scm` と同じ流儀）。文言の修正は Markdown だけで完結し、Rust の
-//! ソースを触らない。
+//! 各トピックは `minas/skills/<topic>.md` に置き `include_str!` で同梱する
+//! （ハイライトの `highlights/*.scm` と同じ流儀）。ファイル形式は
+//! **1行目 = 索引に出る一行説明 / 空行 / 本文**。文言の修正は Markdown だけで
+//! 完結し、Rust のソースを触らない。
 
 /// 1トピックのスキル定義。
+///
+/// 生テキストを丸ごと持つので、説明と本文はその場で切り出す（11件×1回の
+/// `split_once` は無視できるコスト）。
 pub struct Skill {
     /// トピック名（`minas skill <topic>` の引数）。索引の左列。
     pub name: &'static str,
-    /// 索引行に出る一行説明。
-    pub description: &'static str,
-    /// 本文。`skills/<name>.md` を `include_str!` で同梱したもの。
-    pub body: &'static str,
+    /// `skills/<name>.md` の中身（1行目 = 説明、空行、本文）。
+    raw: &'static str,
+}
+
+impl Skill {
+    /// 索引行に出る一行説明（ファイルの1行目）。
+    pub fn description(&self) -> &'static str {
+        self.raw
+            .split_once('\n')
+            .map_or(self.raw, |(d, _)| d)
+            .trim_end()
+    }
+
+    /// 本文（説明行と区切りの空行を除いた残り）。
+    pub fn body(&self) -> &'static str {
+        self.split().1
+    }
+
+    fn split(&self) -> (&'static str, &'static str) {
+        match self.raw.split_once('\n') {
+            Some((d, rest)) => (
+                d.trim_end(),
+                rest.trim_start_matches(['\n', '\r']).trim_end(),
+            ),
+            None => (self.raw, ""),
+        }
+    }
 }
 
 /// 全トピック。索引の順序がそのまま表示順。
 const SKILLS: &[Skill] = &[
     Skill {
         name: "read",
-        description: "map files with outline; read only the lines you need",
-        body: include_str!("../skills/read.md"),
+        raw: include_str!("../skills/read.md"),
     },
     Skill {
         name: "edit",
-        description: "edit via content (minas apply); never compute positions",
-        body: include_str!("../skills/edit.md"),
+        raw: include_str!("../skills/edit.md"),
     },
     Skill {
         name: "outline",
-        description: "minas outline <path>: symbol tree (name/kind/span) without full text",
-        body: include_str!("../skills/outline.md"),
+        raw: include_str!("../skills/outline.md"),
     },
     Skill {
         name: "at",
-        description: "minas at <path> <line>:<col>: enclosing symbol + its exact range",
-        body: include_str!("../skills/at.md"),
+        raw: include_str!("../skills/at.md"),
     },
     Skill {
         name: "rename",
-        description: "minas rename <path> <old> <new> (semantic); apply for a few",
-        body: include_str!("../skills/rename.md"),
+        raw: include_str!("../skills/rename.md"),
     },
     Skill {
         name: "references",
-        description: "minas references <path> <old>: list a symbol's references",
-        body: include_str!("../skills/references.md"),
+        raw: include_str!("../skills/references.md"),
     },
     Skill {
         name: "check",
-        description: "minas check <path>...: wait for diagnostics, returns only errors",
-        body: include_str!("../skills/check.md"),
+        raw: include_str!("../skills/check.md"),
     },
     Skill {
         name: "hover",
-        description: "minas hover <path> <line>:<col>: type & signature without full text",
-        body: include_str!("../skills/hover.md"),
+        raw: include_str!("../skills/hover.md"),
     },
     Skill {
         name: "symbol",
-        description: "minas symbol <path> <query>: find where a name lives in the workspace",
-        body: include_str!("../skills/symbol.md"),
+        raw: include_str!("../skills/symbol.md"),
     },
     Skill {
         name: "persist",
-        description: "minas edit leaves the buffer dirty; save explicitly",
-        body: include_str!("../skills/persist.md"),
+        raw: include_str!("../skills/persist.md"),
     },
     Skill {
         name: "errors",
-        description: "exit codes 0/1/2 and how to recover from rejections",
-        body: include_str!("../skills/errors.md"),
+        raw: include_str!("../skills/errors.md"),
     },
 ];
 
@@ -94,14 +110,13 @@ pub fn run(topic: Option<String>) -> std::io::Result<()> {
         None => {
             // 索引: 1トピック1行。薄く保つことが設計要件（常時ロードしても軽い）。
             for s in SKILLS {
-                println!("{:<10} {}", s.name, s.description);
+                println!("{:<10} {}", s.name, s.description());
             }
             Ok(())
         }
         Some(t) => match SKILLS.iter().find(|s| s.name == t) {
             Some(s) => {
-                // 同梱した Markdown は末尾改行付きなので、二重改行にしない
-                println!("{}", s.body.trim_end());
+                println!("{}", s.body());
                 Ok(())
             }
             None => {
@@ -141,9 +156,11 @@ mod tests {
     #[test]
     fn every_topic_has_description_and_body() {
         for s in SKILLS {
-            assert!(!s.description.is_empty(), "{}: 索引説明が空", s.name);
-            assert!(s.body.len() > 100, "{}: 内容が短すぎる", s.name);
-            assert!(!s.body.contains('\0'));
+            let (desc, body) = (s.description(), s.body());
+            assert!(!desc.is_empty(), "{}: 索引説明が空", s.name);
+            assert!(!desc.contains('\n'), "{}: 説明は1行", s.name);
+            assert!(body.len() > 100, "{}: 内容が短すぎる", s.name);
+            assert!(!body.contains('\0'));
         }
     }
 
@@ -152,7 +169,7 @@ mod tests {
         let found = SKILLS.iter().find(|s| s.name == "edit");
         assert!(found.is_some(), "edit トピックが存在する");
         assert!(
-            found.unwrap().body.contains("minas apply"),
+            found.unwrap().body().contains("minas apply"),
             "本編は行動レベルの内容"
         );
     }

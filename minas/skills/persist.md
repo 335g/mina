@@ -1,3 +1,5 @@
+minas edit leaves the buffer dirty; save explicitly
+
 PERSIST — when changes hit the disk
 
 - `minas apply` (and --hunks-stdin) Save for you: after success the file on

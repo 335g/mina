@@ -1,3 +1,5 @@
+minas hover <path> <line>:<col>: type & signature without full text
+
 HOVER — type/signature lookup without reading (ADR-0032)
 
 Use:      minas hover <path> <line>:<col>   (1-origin, like get --lines)

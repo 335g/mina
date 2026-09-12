@@ -1,3 +1,5 @@
+exit codes 0/1/2 and how to recover from rejections
+
 ERRORS — exit codes and recovery
 
 Exit codes (applies to minas apply / edit / hunks):

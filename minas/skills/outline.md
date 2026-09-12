@@ -1,3 +1,5 @@
+minas outline <path>: symbol tree (name/kind/span) without full text
+
 OUTLINE — map a file's structure without reading it
 
 Use:      minas outline <path>

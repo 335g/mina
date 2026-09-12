@@ -1,3 +1,5 @@
+minas check <path>...: wait for diagnostics, returns only errors
+
 CHECK — the edit -> verify loop in one command (ADR-0032)
 
 Use:      minas check <path> [<path> ...]

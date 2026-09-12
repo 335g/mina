@@ -1,3 +1,5 @@
+minas at <path> <line>:<col>: enclosing symbol + its exact range
+
 AT — the symbol enclosing a position, with its exact range
 
 Use:      minas at <path> <line>:<col>   (1-origin, like get --lines)

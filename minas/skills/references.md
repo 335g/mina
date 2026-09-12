@@ -1,3 +1,5 @@
+minas references <path> <old>: list a symbol's references
+
 REFERENCES — impact check before/after a rename (ADR-0029)
 
     minas references <path> <old>
