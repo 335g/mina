@@ -1,0 +1,6 @@
+# 共有マシンのディスク逼迫対策（2026-09-12, rust2 #11 報告）:
+# 開発中の再ビルドで target/debug/incremental が 1.4G まで膨張した。
+# この workspace では incremental を無効化してキャッシュの再生成を防ぐ。
+# 速度差はほぼ体感できない（本 workspace のビルドは大部分が再コンパイル対象）。
+[build]
+incremental = false
