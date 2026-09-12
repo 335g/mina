@@ -1164,6 +1164,7 @@ async fn watch_disk(
                 d.deleted = None;
             }
             let mut reloaded = false;
+            let mut shrunk_note: Option<String> = None;
             for (path, text) in &contents {
                 // 閉じられた文書のパスは対象外
                 let Some(doc_id) = d.editor.doc_id_for_path(path) else {
@@ -1173,8 +1174,30 @@ async fn watch_disk(
                 if d.insert_owner.is_some() {
                     close_insert_session(&mut d, mina_view::Mode::Normal);
                 }
+                // リロードで「大幅縮小」なら警告する（外部 truncate の早期検知 —
+                // rust2 #5-5: 497→86 行に切り詰められたことに即座に気づけなかった）。
+                // Undo で戻せるとは限らない（reload_doc は undo 履歴を置き換える）
+                // ため、status に載せてエージェントの get/wait から見えるようにする。
+                let old_len = d.editor.document(doc_id).text().chars().count();
                 if d.editor.reload_doc(doc_id, text) {
                     reloaded = true;
+                    let new_len = text.chars().count();
+                    // 小さいファイルでも効くよう、絶対しきい値は最小限に留める
+                    // （50% 未満への縮小を警告 — 外部 truncate の早期検知）。
+                    if new_len * 2 < old_len {
+                        shrunk_note = Some(format!(
+                            "reloaded from disk (WARNING: file shrank {} -> {} chars; \
+                             external truncate? undo already gone — apply to restore)",
+                            old_len, new_len
+                        ));
+                        // activity にも記録し、ワンショット get からも見えるようにする
+                        d.record_activity(
+                            "watch_disk".into(),
+                            EventKind::ExternalChange,
+                            true,
+                            shrunk_note.clone().unwrap(),
+                        );
+                    }
                     if let Ok(md) = std::fs::metadata(path) {
                         d.baselines.insert(
                             path.clone(),
@@ -1204,7 +1227,7 @@ async fn watch_disk(
             if reloaded || focused_deleted || focused_reappeared {
                 snap = Some(snapshot(
                     &mut d,
-                    reloaded.then(|| "reloaded from disk".into()),
+                    Some(shrunk_note.unwrap_or_else(|| "reloaded from disk".into())),
                 ));
             }
         }

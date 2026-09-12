@@ -93,6 +93,12 @@ pub enum SessionCmd {
         /// result (Q3), `end` past EOF is clamped with a note.
         #[arg(long)]
         lines: Option<String>,
+        /// Strip the unbounded history fields (`events`, `activity`) from the
+        /// output. The snapshot itself is small; these two are the token bomb
+        /// (78-char buffer -> tens of KB; rust2 #5-3). Use when you only need
+        /// text / checksum / dirty.
+        #[arg(long)]
+        brief: bool,
     },
     /// Read the text of any path without touching the current buffer
     /// (ADR-0048). Buffer-independent and LSP-free: never moves focus/generation,
@@ -114,10 +120,17 @@ pub enum SessionCmd {
         /// Command JSON
         json: String,
     },
-    /// Run one [`DocumentEdit`] (position-addressed edit)
+    /// Run one [`DocumentEdit`] (position-addressed edit). `expected_text` is
+    /// REQUIRED: without it a shifted range is not detected (document checksum
+    /// is whole-document, not range-local) and the edit silently corrupts
+    /// (rust2 #5-2). Prefer `apply` for content-addressed editing.
     Edit {
         /// DocumentEdit JSON
         json: String,
+        /// Strip `events` / `activity` from the snapshot response (token
+        /// reduction — same as `get --brief`; rust2 #5-3)
+        #[arg(long)]
+        brief: bool,
     },
     /// One-command verified edit: Open → expected_text-checked replace → Save
     /// (issue #29 F1 — the minae helper flow, productized). Substring replace of
@@ -149,6 +162,17 @@ pub enum SessionCmd {
         /// Read the replacement from a file (avoids shell quoting)
         #[arg(long)]
         new_file: Option<PathBuf>,
+        /// Apply several verified edits from file pairs (repeatable):
+        /// `--pair old.txt new.txt [--pair old2.txt new2.txt ...]`. Each pair is
+        /// applied in order on one connection (same atomic contract as
+        /// --hunks-stdin, but texts come from files — no JSON \n escaping).
+        #[arg(long, num_args = 2, value_names = ["OLD_FILE", "NEW_FILE"])]
+        pair: Vec<std::path::PathBuf>,
+        /// Allow replacing a non-empty file with empty text (—whole /
+        /// --whole-stdin). Without it, an empty whole-file replacement is
+        /// refused: it almost always means stdin was not connected (rust2 #5-1).
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Block until the generation exceeds `<generation>` and return the state
     Wait {
@@ -238,12 +262,20 @@ pub enum SessionCmd {
     /// Wait for the LSP diagnostics of `<path>...` to settle and return only the
     /// diagnostics — no full text (ADR-0032). Replaces `wait` + `get` + JSON
     /// parsing for the edit→verify loop. Multiple paths are checked in order and
-    /// aggregated (ADR-0046 — one round trip per path, client-side loop).
+    /// aggregated (ADR-0046 — one round trip per path, client-side loop). Each
+    /// entry carries a `verdict` (`errors` / `warnings` / `clean-unverified` /
+    /// on failure `failed` with an `error` reason) so agents can branch without
+    /// re-deriving the settled semantics (ADR-0045/0052). `--summary` prints
+    /// `path: verdict` lines instead of the JSON array.
     /// Exit 2 when at least one `error` diagnostic is present (warnings alone
     /// exit 0); exit 1 on not-supported / bad input; other failures exit 2.
     Check {
         /// Paths to check (one or more)
         paths: Vec<PathBuf>,
+        /// Print one verdict line per path (`path: errors|clean-unverified|failed
+        /// — reason`) instead of the full JSON array. Exit codes are unchanged.
+        #[arg(long)]
+        summary: bool,
     },
     /// List the daemon-held review comments for AI consumption (#50, read-only).
     /// Prints the full list (path, side, stored/resolved lines, stale flag,
@@ -298,14 +330,21 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
         }),
     );
     match cmd {
-        SessionCmd::Get { lines } => {
+        SessionCmd::Get { lines, brief } => {
             let snapshot = execute(&Command::GetState).await?;
             match lines {
                 // --lines: 全文スナップショットを渡す代わりに、対象行だけを番号付きで
                 // 返す（トークン削減 — P1）。daemon へのソケット転送はローカルで無料
                 // なので、節約は CLI 出力側（= LLM が読む量）で成立する。
                 Some(range) => print_line_range(&snapshot, &range)?,
-                None => println!("{}", serde_json::to_string_pretty(&snapshot)?),
+                None => {
+                    // --brief: events/activity（無制限近い履歴・数十KB）を落とす。
+                    if brief {
+                        print_brief_snapshot(&snapshot)?;
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    }
+                }
             }
         }
         SessionCmd::Read { path, lines } => {
@@ -337,11 +376,27 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             let snapshot = execute(&command).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        SessionCmd::Edit { json } => {
+        SessionCmd::Edit { json, brief } => {
             let edit: DocumentEdit = serde_json::from_str(&json)
                 .map_err(|e| invalid(format!("DocumentEdit JSON を解釈できません: {e}")))?;
+            // 位置指定 edit の静かな破壊ガード（rust2 #5-2）: expected_text は
+            // 「置換範囲が本当に想定テキストか」を検証する唯一の手段。文書
+            // checksum は文書単位なので位置ズレを検出できず、exit 0 で壊す
+            // （println! 2 箇所で +5 ずらす再現）。headless からは apply を
+            // 使うのが正しく、raw edit は expected_text 必須とする。
+            if edit.expected_text.is_none() {
+                return Err(invalid(
+                    "positional edit requires expected_text (the old text at start..end) — \
+                     document checksum cannot detect a shifted range. Use `minas apply` \
+                     for content-addressed editing (rust2 #5-2)",
+                ));
+            }
             let snapshot = execute_edit(&edit).await?;
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            if brief {
+                print_brief_snapshot(&snapshot)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            }
             // #11: daemon の拒否（status 付き応答）を exit code 2 で明示する。
             // エージェントは $? だけで失敗を検知し、再読み込み→再試行できる。
             let code = edit_exit_code(&snapshot);
@@ -365,6 +420,8 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             hunks_stdin,
             old_file,
             new_file,
+            pair,
+            allow_empty,
         } => {
             apply(
                 &path,
@@ -375,6 +432,8 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 hunks_stdin,
                 old_file,
                 new_file,
+                pair,
+                allow_empty,
             )
             .await?;
         }
@@ -523,7 +582,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             }
             println!("{}", serde_json::to_string(&outcome.symbols)?);
         }
-        SessionCmd::Check { paths } => {
+        SessionCmd::Check { paths, summary } => {
             // 成功: 各パスの診断を順に取得し、集約した compact JSON を出力する
             // （全文なし — ADR-0032/0046）。複数ファイルの変更を 1 コマンドで
             // 一括検証できる（第1回検証: 1ファイルずつしか渡せなかった）。
@@ -542,40 +601,62 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             for path in &paths {
                 let outcome = execute_check(&path.to_string_lossy()).await?;
                 if let Some(e) = &outcome.error {
-                    eprintln!("check {}: {e}", path.display());
                     // 失敗の分類（not supported = exit 1、再試行可能 = exit 2）を
-                    // 保持しつつ、他パスの検証は続ける（ADR-0046）。
+                    // 保持しつつ、他パスの検証は続ける（ADR-0046）。失敗したパスも
+                    // 配列の 1 要素（"error" 付き）として返す — stdout が `[]` に
+                    // なると「診断なし」と「取得失敗」が区別できない（ADR-0046 追記）。
                     worst_failure = worst_failure.max(check_exit_code(e));
-                    results.push(serde_json::json!({
-                        "path": outcome.path,
-                        "total": 0,
-                        "diagnostics": [],
-                        "settled": false,
-                        "error": e,
-                    }));
+                    if summary {
+                        println!("failed: {} — {e}", outcome.path);
+                    } else {
+                        results.push(serde_json::json!({
+                            "path": outcome.path,
+                            "total": 0,
+                            "diagnostics": [],
+                            "settled": false,
+                            "verdict": "failed",
+                            "error": e,
+                        }));
+                    }
                     continue;
                 }
-                results.push(serde_json::json!({
-                    "path": outcome.path,
-                    "total": outcome.total,
-                    "diagnostics": outcome.diagnostics,
-                    "settled": outcome.settled,
-                }));
-                // ADR-0045: 空でも解析が安定しなかった場合は「クリーン未確認」を
-                // 明示する（exit 0 のまま — $? 分岐を壊さない。エージェントは
-                // settled を見て cargo 等で再検証する判断ができる）。
-                if !outcome.settled && outcome.diagnostics.is_empty() {
-                    eprintln!(
-                        "check {}: clean-unverified (diagnostics did not settle; verify with cargo)",
-                        path.display()
+                // ADR-0045/0052: 空は常に settled:false（クリーンの根拠にしない）。
+                // verdict は「確定クリーン」を決して言わない（pull は実在エラーを
+                // 取りこぼすため — クリーン判定は cargo）。エージェントは verdict で
+                // 分岐し、グリーン判定は実ビルドに落とす。
+                let (verdict, has_errors) = if outcome.diagnostics.is_empty() {
+                    ("clean-unverified", false)
+                } else {
+                    let errors = outcome
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.severity == Severity::Error);
+                    (if errors { "errors" } else { "warnings" }, errors)
+                };
+                any_error |= has_errors;
+                if summary {
+                    println!(
+                        "{}: {}",
+                        outcome.path,
+                        if outcome.diagnostics.is_empty() {
+                            verdict.to_string()
+                        } else {
+                            format!("{verdict} ({})", outcome.total)
+                        }
                     );
+                } else {
+                    results.push(serde_json::json!({
+                        "path": outcome.path,
+                        "total": outcome.total,
+                        "diagnostics": outcome.diagnostics,
+                        "settled": outcome.settled,
+                        "verdict": verdict,
+                    }));
                 }
-                any_error |= outcome
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.severity == Severity::Error);
             }
-            println!("{}", serde_json::to_string(&results)?);
+            if !summary {
+                println!("{}", serde_json::to_string(&results)?);
+            }
             if any_error || worst_failure > 0 {
                 std::process::exit(2.max(worst_failure));
             }
@@ -628,6 +709,21 @@ fn print_line_range(snapshot: &StateSnapshot, range: &str) -> io::Result<()> {
         &snapshot.text,
         range,
     )
+}
+
+/// `minas get --brief` の出力。`events` / `activity`（履歴で数十 KB になりうる）
+/// を取り除いたスナップショットを compact JSON で返す（トークン削減 — rust2
+/// #5-3: 78 chars のバッファで 79KB の snapshot、内訳は events ~65KB + activity
+/// ~12KB）。残るのは text / checksum / dirty 等の現状態 — `get --lines` と
+/// 併用すれば「対象行 + checksum」を小刻みに取れる。
+fn print_brief_snapshot(snapshot: &StateSnapshot) -> io::Result<()> {
+    let mut value = serde_json::to_value(snapshot).map_err(|e| invalid(e.to_string()))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("events");
+        obj.remove("activity");
+    }
+    println!("{}", serde_json::to_string(&value).map_err(|e| invalid(e.to_string()))?);
+    Ok(())
 }
 
 /// [`print_line_range`] のテキスト直接版（ADR-0048 — `read` の `--lines`）。
@@ -1386,16 +1482,31 @@ async fn apply(
     hunks_stdin: bool,
     old_file: Option<PathBuf>,
     new_file: Option<PathBuf>,
+    pair: Vec<PathBuf>,
+    allow_empty: bool,
 ) -> io::Result<()> {
     // --hunks-stdin: 複数編集を 1 プロセス・1 接続で適用（ラウンドトリップ削減）。
     // 他入力指定と排他。
     if hunks_stdin {
-        if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() {
+        if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() || !pair.is_empty() {
             return Err(invalid("--hunks-stdin は他の入力指定と併用できません"));
         }
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
         let hunks = parse_hunks(&buf)?;
+        return apply_hunks(path, &hunks).await;
+    }
+
+    // --pair OLD_FILE NEW_FILE [x N]: テキストを JSON エスケープせずファイルで
+    // 渡す --hunks-stdin 相当（--old-file/--new-file の複数版。原子性は同じ）。
+    if !pair.is_empty() {
+        if old.is_some() || new.is_some() || whole.is_some() || old_file.is_some() || new_file.is_some() {
+            return Err(invalid("--pair は他の入力指定と併用できません"));
+        }
+        let hunks = pairs_to_hunks(&pair)?;
+        if hunks.is_empty() {
+            return Err(invalid("--pair は OLD_FILE NEW_FILE の組で指定してください"));
+        }
         return apply_hunks(path, &hunks).await;
     }
 
@@ -1414,6 +1525,12 @@ async fn apply(
     // 原因が見えなくなる。
     let mut created = false;
     if snapshot.status.is_some() && std::fs::metadata(&abs).is_err() {
+        // 新規作成: 親ディレクトリが無ければ作る（`apply src/domain/mod.rs
+        // --whole-stdin` で domain/ も無いケース — rust2 フィードバック #1-2）。
+        if let Some(parent) = std::path::Path::new(&abs).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| invalid(format!("親ディレクトリ作成失敗: {}: {e}", parent.display())))?;
+        }
         std::fs::write(&abs, "")
             .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
         created = true;
@@ -1424,6 +1541,20 @@ async fn apply(
         return Err(invalid(format!("Open 失敗: {status}")));
     }
     let text = snapshot.text.clone();
+
+    // 空全文置換のガード（rust2 #5-1）: `--whole-stdin` の stdin を繋ぎ忘れると
+    // 非空ファイルが 0 バイトに切り詰められる（exit 0 だった）— 破壊的。
+    // 空 text による truncate は `--allow-empty` で明示的にのみ許可する。
+    // （置換は必ず非空の old を持つのでこのガードは全文置換のみに効く。）
+    if !allow_empty && old_text.is_none() && new_text.is_empty() && !text.is_empty() {
+        rollback_created(&abs, created);
+        eprintln!(
+            "REFUSED: whole-file replacement with empty text would truncate {abs} \
+             ({} chars). If that is intended, pass --allow-empty.",
+            text.chars().count()
+        );
+        std::process::exit(2);
+    }
 
     // char インデックスで位置を計算する（DocumentEdit は char 単位）:
     // byte インデックスを渡すとマルチバイト文書でずれる。
@@ -1493,6 +1624,26 @@ fn find_range(text: &str, old: &str) -> Option<(usize, usize)> {
     Some((start, start + old.chars().count()))
 }
 
+/// 複数 hunk を順に適用した結果をバッファ内で事前再現し、全 old が検出できるか
+/// を検証する。失敗したら (hunk 番号, 見つからなかった old) を返し、成功なら
+/// `None`。
+///
+/// daemon 側の適用（最初の出現を置換・char 単位）と同一の規則で再現するため、
+/// これが通れば実適用も通る（`expected_text` 検証は同じ位置で一致する）。
+/// [`apply_hunks`] はこれを edit 送信前に回し、失敗なら 1 件も送らない —
+/// 「先行 hunk はバッファに適用済み・ディスクは無傷」の phantom 不整合を作らない。
+fn simulate_hunks(text: &str, hunks: &[Hunk]) -> Option<(usize, String)> {
+    let mut text = text.to_string();
+    for (i, hunk) in hunks.iter().enumerate() {
+        // byte 境界は find が保証（old は UTF-8 境界で一致する）。
+        let Some(start) = text.find(&hunk.old) else {
+            return Some((i, hunk.old.clone()));
+        };
+        text.replace_range(start..start + hunk.old.len(), &hunk.new);
+    }
+    None
+}
+
 /// `session apply` の入力モードを解決する。互いに排他な指定はエラーにする。
 /// 戻り値は (探索テキスト, 置換テキスト)。探索テキストが None なら全文置換。
 fn resolve_apply_args(
@@ -1554,17 +1705,41 @@ fn parse_hunks(input: &str) -> io::Result<Vec<Hunk>> {
     if hunks.is_empty() {
         return Err(invalid("--hunks-stdin は少なくとも 1 つの hunk が必要です"));
     }
-    if let Some(h) = hunks.iter().find(|h| h.old.is_empty()) {
+    if hunks.iter().any(|h| h.old.is_empty()) {
         return Err(invalid("hunk.old は空にできません (置換対象が必要)"));
     }
     Ok(hunks)
 }
 
-/// `--hunks-stdin` の実体: 複数編集を 1 接続で順次適用し、最後に一度だけ Save する。
-/// 途中で `old` 未発見や daemon 拒否なら exit 2（Save 前なのでディスクは無変更
-/// — 単発 apply の失敗契約を複数に一般化したもの。エージェントは state で再確認
-/// →修正→再試行）。成功時は generation を JSON で返し、続く `wait <generation>`
-/// を別プロセスなしで直接呼べるようにする（ラウンドトリップ削減 — e2e-01）。
+/// `--pair` のファイル群を hunk 列に変換する（偶数個の保証・ファイルの存在
+/// 検証は呼び出し側で行う — この関数は入力の整形だけ担う）。
+fn pairs_to_hunks(pair: &[PathBuf]) -> io::Result<Vec<Hunk>> {
+    if pair.len() % 2 != 0 {
+        return Err(invalid("--pair は OLD_FILE NEW_FILE の組で指定してください"));
+    }
+    let mut hunks = Vec::with_capacity(pair.len() / 2);
+    for chunk in pair.chunks_exact(2) {
+        let o = std::fs::read_to_string(&chunk[0])
+            .map_err(|e| invalid(format!("--pair old-file {:?}: {e}", chunk[0])))?;
+        let n = std::fs::read_to_string(&chunk[1])
+            .map_err(|e| invalid(format!("--pair new-file {:?}: {e}", chunk[1])))?;
+        if o.is_empty() {
+            return Err(invalid("--pair の old ファイルが空です（空 old は全文置換と区別できません）"));
+        }
+        hunks.push(Hunk { old: o, new: n });
+    }
+    Ok(hunks)
+}
+
+/// `--hunks-stdin` / `--pair` の実体: 複数編集を 1 接続で順次適用し、最後に
+/// 一度だけ Save する。途中で `old` 未発見や daemon 拒否なら exit 2（Save 前な
+/// のでディスクは無変更 — 単発 apply の失敗契約を複数に一般化したもの）。
+///
+/// 原子性はディスクだけでなくバッファにも及ぶ: 適用前に [`simulate_hunks`] で
+/// 全 hunk を検証し、1 つでも old が見つからなければ edit を 1 件も送らない。
+/// さもないと「先行 hunk はバッファに適用済み・ディスクは無傷」の不整合が残り、
+/// `minas read` が phantom テキストを返す（rust2 バグ報告 — read は ADR-0048 で
+/// 開文書優先・Open は #7 で既存文書を再読込しないため Close でも直らない）。
 async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
     let (mut write_half, mut reader) = open_one_shot().await?;
 
@@ -1579,6 +1754,11 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
     // 失敗経路では rollback_created で作成前（未存在）に戻す。
     let mut created = false;
     if snapshot.status.is_some() && std::fs::metadata(&abs).is_err() {
+        // 新規作成: 親ディレクトリが無ければ作る（apply 単発と同じ扱い）。
+        if let Some(parent) = std::path::Path::new(&abs).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| invalid(format!("親ディレクトリ作成失敗: {}: {e}", parent.display())))?;
+        }
         std::fs::write(&abs, "")
             .map_err(|e| invalid(format!("新規ファイル作成失敗: {abs}: {e}")))?;
         created = true;
@@ -1592,6 +1772,16 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
     if let Some(status) = &snapshot.status {
         rollback_created(&abs, created);
         return Err(invalid(format!("Open 失敗: {status}")));
+    }
+
+    // バッファ原子性（rust2 バグ報告）: edit を 1 件も送る前に、全 hunk の old が
+    // 順に検出できるかを検証する。途中で見つからない hunk があれば exit 2 で
+    // 何も送らない — 先行 hunk がバッファに適用済み・ディスクは無傷という
+    // phantom 状態を作らない（read/Open は開文書を返すため、Close でも直らない）。
+    if let Some((idx, missing)) = simulate_hunks(&snapshot.text, hunks) {
+        eprintln!("NOT FOUND: {:?} (hunk #{})", short(&missing), idx + 1);
+        rollback_created(&abs, created);
+        std::process::exit(2);
     }
 
     let mut applied = 0usize;
@@ -1725,6 +1915,44 @@ mod tests {
     }
 
     #[test]
+    fn simulate_hunks_verifies_all_hunks_before_apply() {
+        // 全 hunk の old が順に検出できるなら None。途中で見つからない hunk が
+        // あれば (番号, old) を返す — edit を送る前の事前検証（phantom 対応）。
+        let h = |old: &str, new: &str| Hunk { old: old.into(), new: new.into() };
+
+        let ok = simulate_hunks(
+            "fn a() {}\nfn b() {}\n",
+            &[h("fn a() {}", "fn a() { /* t */ }"), h("fn b() {}", "fn b() { /* t */ }")],
+        );
+        assert!(ok.is_none(), "全 hunk 検出可能なら成功");
+
+        // 同一 old の反復（rust2 #4-2: 5 箇所の同一リテラルを 5 hunk で置換）:
+        // 置換後テキストに対し順に検出されるので、出現数と同じ個数なら成功。
+        let dup = simulate_hunks(
+            "fn t() { x; x; x; }",
+            &[h("x", "y"), h("x", "y"), h("x", "y")],
+        );
+        assert!(dup.is_none(), "同一 old の反復は出現順に当たる");
+
+        // 2 番目の hunk が検出不可 → (1, old) を返す。
+        let miss = simulate_hunks(
+            "fn a() {}\nfn b() {}\n",
+            &[h("fn a() {}", "A"), h("NOT_PRESENT", "x")],
+        );
+        let (idx, old) = miss.expect("検出不可の hunk は失敗を返す");
+        assert_eq!(idx, 1);
+        assert_eq!(old, "NOT_PRESENT");
+
+        // 1 hunk 目から見つからない場合も同様。
+        let miss_first = simulate_hunks("abc", &[h("zzz", "x")]);
+        assert_eq!(miss_first.unwrap().0, 0);
+
+        // 置換で先行 hunk の old が消えた後の後続 hunk も検出される（適用順の再現）。
+        let chained = simulate_hunks("a", &[h("a", "b"), h("b", "c")]);
+        assert!(chained.is_none(), "置換結果に対する後続 hunk も検出");
+    }
+
+    #[test]
     fn parse_hunks_rejects_bad_input() {
         // 不正 JSON・空・空 old は拒否。有効な配列はそのまま解釈する。
         assert!(parse_hunks("not json").is_err());
@@ -1737,6 +1965,43 @@ mod tests {
         assert_eq!(hunks[0].new, "b");
         assert_eq!(hunks[1].old, "c");
         assert_eq!(hunks[1].new, "", "空 new は削除を意味し許容");
+    }
+
+    #[test]
+    fn pairs_to_hunks_reads_files_in_pairs() {
+        // --pair: 偶数個はファイル読み → 順序保持で hunk 列に。奇数個・空 old は拒否。
+        let dir = std::env::temp_dir();
+        let o1 = dir.join(format!("pairtest-o1-{}", std::process::id()));
+        let n1 = dir.join(format!("pairtest-n1-{}", std::process::id()));
+        let o2 = dir.join(format!("pairtest-o2-{}", std::process::id()));
+        let n2 = dir.join(format!("pairtest-n2-{}", std::process::id()));
+        std::fs::write(&o1, "old one").unwrap();
+        std::fs::write(&n1, "new one").unwrap();
+        std::fs::write(&o2, "old two").unwrap();
+        std::fs::write(&n2, "new two").unwrap();
+
+        let hunks =
+            pairs_to_hunks(&[o1.clone(), n1.clone(), o2.clone(), n2.clone()]).unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].old, "old one");
+        assert_eq!(hunks[0].new, "new one");
+        assert_eq!(hunks[1].old, "old two");
+        assert_eq!(hunks[1].new, "new two");
+
+        let odd = pairs_to_hunks(&[o1.clone(), n1.clone(), o2.clone()]);
+        assert!(odd.is_err(), "奇数個は拒否");
+
+        let empty = std::env::temp_dir().join(format!("pairtest-empty-{}", std::process::id()));
+        std::fs::write(&empty, "").unwrap();
+        let empty_old = pairs_to_hunks(&[empty.clone(), n1.clone()]);
+        assert!(empty_old.is_err(), "空 old は拒否");
+
+        let missing = std::env::temp_dir().join(format!("pairtest-missing-{}", std::process::id()));
+        assert!(pairs_to_hunks(&[missing, n1.clone()]).is_err(), "存在しないファイルは拒否");
+
+        for p in [o1, n1, o2, n2, empty] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]
