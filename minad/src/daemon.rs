@@ -183,6 +183,9 @@ pub struct Daemon {
     baselines: HashMap<PathBuf, DiskBaseline>,
     /// フォーカス文書が外部で削除され、Close を待っているパス（ADR-0015）。
     deleted: Option<String>,
+    /// 外部 truncate の警告（縮小リロード時に設定。次の snapshot の status に
+    /// 1 回だけ載ってクリアされる — rust2 #6: 軽量経路 get --brief でも見える）。
+    external_warning: Option<String>,
     /// 文書ごとの構文ハイライトキャッシュ（ADR-0016: Syntax は Daemon 所有）。
     ///
     /// スナップショット生成時にテキストの checksum が変わっていれば再計算
@@ -512,6 +515,7 @@ impl Daemon {
             events: VecDeque::new(),
             baselines: HashMap::new(),
             deleted: None,
+            external_warning: None,
             syntax: HashMap::new(),
             hints: HashMap::new(),
             hint_order: VecDeque::new(),
@@ -1185,18 +1189,23 @@ async fn watch_disk(
                     // 小さいファイルでも効くよう、絶対しきい値は最小限に留める
                     // （50% 未満への縮小を警告 — 外部 truncate の早期検知）。
                     if new_len * 2 < old_len {
-                        shrunk_note = Some(format!(
+                        let warning = format!(
                             "reloaded from disk (WARNING: file shrank {} -> {} chars; \
                              external truncate? undo already gone — apply to restore)",
                             old_len, new_len
-                        ));
-                        // activity にも記録し、ワンショット get からも見えるようにする
+                        );
+                        shrunk_note = Some(warning.clone());
+                        // activity にも記録（恒久ログ。--brief では落ちるので、
+                        // 検知の主経路は external_warning → 次 snapshot の status）。
                         d.record_activity(
                             "watch_disk".into(),
                             EventKind::ExternalChange,
                             true,
-                            shrunk_note.clone().unwrap(),
+                            warning.clone(),
                         );
+                        // 次の snapshot （get / --brief / apply 応答）の status に
+                        // 1 回だけ載せる（snapshot_from_view が take する）。
+                        d.external_warning = Some(warning);
                     }
                     if let Ok(md) = std::fs::metadata(path) {
                         d.baselines.insert(
@@ -5578,7 +5587,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         }
         Command::GetState => {
             daemon.metrics.get_state_total += 1;
-            (snapshot(daemon, None), false)
+            // 外部 truncate 警告（external_warning）は GetState でのみ 1 回消費
+            // する — ワンショット get で必ず見える（push が先に take して消える
+            // 競合を避ける。rust2 #6/#7）。
+            let warning = daemon.external_warning.take();
+            (snapshot(daemon, warning), false)
         }
         Command::Open { .. } | Command::Save => {
             unreachable!("I/O コマンドは接続ハンドラで処理される")

@@ -276,6 +276,16 @@ pub enum SessionCmd {
         /// — reason`) instead of the full JSON array. Exit codes are unchanged.
         #[arg(long)]
         summary: bool,
+        /// Check the whole crate in one call: expand `<path>` (a .rs file inside
+        /// the crate, e.g. src/lib.rs) to every .rs under its directory tree
+        /// (src/) plus, with --include-tests, the sibling tests/ dir. Compile
+        /// errors often span several files at once — this closes the
+        /// edit→verify loop in one round trip (rust2 #7).
+        #[arg(long, value_name = "PATH")]
+        crate_root: Option<PathBuf>,
+        /// With --crate-root: also check the sibling `tests/` directory.
+        #[arg(long)]
+        include_tests: bool,
     },
     /// List the daemon-held review comments for AI consumption (#50, read-only).
     /// Prints the full list (path, side, stored/resolved lines, stale flag,
@@ -582,7 +592,43 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             }
             println!("{}", serde_json::to_string(&outcome.symbols)?);
         }
-        SessionCmd::Check { paths, summary } => {
+        SessionCmd::Check {
+            paths,
+            summary,
+            crate_root,
+            include_tests,
+        } => {
+            // --crate-root: クレートを構成する .rs を列挙して 1 コールで検証する
+            // （rust2 #7: version 追加で src 4 ファイル + tests 2 ファイルが同時に
+            // 壊れ、手で列挙しきれなかった）。Rust の crate 構成はディレクトリ木と
+            // ほぼ同型（src/ の .rs + 任意で tests/）なので、LSP を使わず既存の
+            // check ループに流す。target や .hidden は除外。
+            let mut paths = paths;
+            if let Some(crate_root) = &crate_root {
+                let root_abs = conn::absolutize(&crate_root.to_string_lossy());
+                if !root_abs.ends_with(".rs") {
+                    return Err(invalid("--crate-root は .rs ファイルを指定してください (例: src/lib.rs)"));
+                }
+                let Some(crate_dir) = std::path::Path::new(&root_abs).parent() else {
+                    return Err(invalid("--crate-root の親ディレクトリを解決できません"));
+                };
+                let mut rs = Vec::new();
+                collect_rs_files(crate_dir, &mut rs);
+                rs.retain(|p| conn::absolutize(&p.to_string_lossy()) != root_abs);
+                rs.sort();
+                paths = vec![crate_root.clone()];
+                paths.extend(rs);
+                if include_tests {
+                    let tests_dir = crate_dir.join("..").join("tests");
+                    let mut ts = Vec::new();
+                    collect_rs_files(&tests_dir, &mut ts);
+                    ts.sort();
+                    paths.extend(ts);
+                }
+                if paths.len() <= 1 {
+                    eprintln!("check: no .rs files found under {}", crate_dir.display());
+                }
+            }
             // 成功: 各パスの診断を順に取得し、集約した compact JSON を出力する
             // （全文なし — ADR-0032/0046）。複数ファイルの変更を 1 コマンドで
             // 一括検証できる（第1回検証: 1ファイルずつしか渡せなかった）。
@@ -1624,6 +1670,31 @@ fn find_range(text: &str, old: &str) -> Option<(usize, usize)> {
     Some((start, start + old.chars().count()))
 }
 
+/// `dir` 配下の `.rs` ファイルを再帰収集する（check --crate-root 用）。
+/// `target` / `.git` / ドットディレクトリは除外（生成物・メタを混ぜない）。
+/// 並び順は探索順（read_dir の順） — 呼び出し側で必要ならソートする。
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_dir() {
+            if name != "target"
+                && name != ".git"
+                && !name.to_string_lossy().starts_with('.')
+            {
+                collect_rs_files(&path, out);
+            }
+        } else if !name.to_string_lossy().starts_with('.')
+            && path.extension().is_some_and(|e| e == "rs")
+        {
+            out.push(path);
+        }
+    }
+}
+
 /// 複数 hunk を順に適用した結果をバッファ内で事前再現し、全 old が検出できるか
 /// を検証する。失敗したら (hunk 番号, 見つからなかった old) を返し、成功なら
 /// `None`。
@@ -1912,6 +1983,40 @@ mod tests {
             matches!(&timed_out, WaitOutcome::TimedOut(s) if s.generation == 5),
             "タイムアウト時は現状スナップショットを返す: {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn collect_rs_files_walks_tree_and_skips_target() {
+        let dir = std::env::temp_dir().join(format!("collect-rs-{}", std::process::id()));
+        let sub = dir.join("src");
+        std::fs::create_dir_all(sub.join("domain")).unwrap();
+        std::fs::create_dir_all(sub.join("target")).unwrap();
+        std::fs::write(sub.join("lib.rs"), "").unwrap();
+        std::fs::write(sub.join("domain/mod.rs"), "").unwrap();
+        std::fs::write(sub.join("domain/todo.rs"), "").unwrap();
+        std::fs::write(sub.join("target/ignored.rs"), "").unwrap();
+        std::fs::write(sub.join(".hidden.rs"), "").unwrap();
+        std::fs::write(sub.join("main.txt"), "").unwrap();
+
+        let mut out = Vec::new();
+        collect_rs_files(&sub, &mut out);
+        out.sort();
+        let names: Vec<String> = out
+            .iter()
+            .map(|p| p.strip_prefix(&sub).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["domain/mod.rs", "domain/todo.rs", "lib.rs"],
+            "target / .dot は除外、非 .rs も除外"
+        );
+
+        // 空 / 存在しないディレクトリは空結果（クラッシュしない）
+        let mut none = Vec::new();
+        collect_rs_files(&dir.join("nope"), &mut none);
+        assert!(none.is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
