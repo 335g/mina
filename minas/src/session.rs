@@ -1882,6 +1882,16 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
     let mut applied = 0usize;
     let mut noops = 0usize;
     for (i, hunk) in hunks.iter().enumerate() {
+        // 恒等 hunk（old == new）はエージェントのミス（同じものを送った）— daemon
+        // に送る前にはっきり区別する（rust2 #10: 「unchanged」は「old==new で何も
+        // しない」と「置換して結果が同じ」の 2 意味に読めた。SKIPPED なら自明）。
+        // カウントは noops に含める（edits_noop > 0 で「何かが no-op だった」と
+        // 気づける — 適用漏れとの区別は SKIPPED 行が担う）。
+        if hunk.old == hunk.new {
+            noops += 1;
+            eprintln!("HUNK SKIPPED: #{} (old == new)", i + 1);
+            continue;
+        }
         // 直前の編集適用後の現在テキストに対し位置を再計算する（行揺れを踏む。char 単位）
         let text = snapshot.text.clone();
         let Some((start, end)) = find_range(&text, &hunk.old) else {
@@ -1902,12 +1912,13 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
             rollback_created(&abs, created);
             std::process::exit(2);
         }
-        // change しなかった hunk（old == new 等）は daemon が status に載せない
-        // （ADR-0012: no-op は世代を進めない）。一括適用では 1 件の静かな no-op が
-        // 「8 件適用」に埋もれるので、件数と該当 hunk を明示する。
+        // 置換後に変わらなかった（old != new なのに同一 = 理論上ほぼ起きない
+        // 防御。恒等 hunk は上の SKIPPED で捕捉済み — ADR-0012: no-op は世代を
+        // 進めない）。一括適用では 1 件の静かな no-op が「N 件適用」に埋もれる
+        // ので、件数と該当 hunk を明示する。
         if snapshot.text == text {
             noops += 1;
-            eprintln!("HUNK NO-OP: #{} (unchanged) {:?}", i + 1, short(&hunk.old));
+            eprintln!("HUNK NO-OP: #{} (changed nothing) {:?}", i + 1, short(&hunk.old));
         }
         applied += 1;
     }
