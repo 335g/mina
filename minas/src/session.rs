@@ -670,14 +670,38 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 // verdict は「確定クリーン」を決して言わない（pull は実在エラーを
                 // 取りこぼすため — クリーン判定は cargo）。エージェントは verdict で
                 // 分岐し、グリーン判定は実ビルドに落とす。
+                // severity 別に数える（rust2 #9: RA の Hint — #[cfg] の非活性分岐
+                // など — を「warnings」と表示すると存在しない rustc 警告を探す）。
+                // Hint/Info を含むファイルはまとめて「hints (n)」とする（warnings に
+                // 数えない — check が返すのは LSP 診断であって rustc lint ではない）。
                 let (verdict, has_errors) = if outcome.diagnostics.is_empty() {
-                    ("clean-unverified", false)
+                    ("clean-unverified".to_string(), false)
                 } else {
-                    let errors = outcome
+                    let n_e = outcome
                         .diagnostics
                         .iter()
-                        .any(|d| d.severity == Severity::Error);
-                    (if errors { "errors" } else { "warnings" }, errors)
+                        .filter(|d| d.severity == Severity::Error)
+                        .count();
+                    let n_w = outcome
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.severity == Severity::Warning)
+                        .count();
+                    let n_h = outcome
+                        .diagnostics
+                        .iter()
+                        .filter(|d| {
+                            matches!(d.severity, Severity::Hint | Severity::Info)
+                        })
+                        .count();
+                    let verdict = if n_e > 0 {
+                        format!("errors ({n_e})")
+                    } else if n_w > 0 {
+                        format!("warnings ({n_w})")
+                    } else {
+                        format!("hints ({n_h})")
+                    };
+                    (verdict, n_e > 0)
                 };
                 any_error |= has_errors;
                 if summary {
@@ -685,9 +709,9 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                         "{}: {}",
                         outcome.path,
                         if outcome.diagnostics.is_empty() {
-                            verdict.to_string()
+                            "clean-unverified".to_string()
                         } else {
-                            format!("{verdict} ({})", outcome.total)
+                            verdict.clone()
                         }
                     );
                 } else {
