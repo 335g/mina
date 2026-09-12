@@ -7,7 +7,7 @@
 
 1. [`latest.md`](./latest.md) — **最新の結果と次の課題設定（§4）**。ここから再開する
 2. [`method.md`](./method.md) — 回し方（2層ループ・指標・コマンド・落とし穴）
-3. 必要なら [`log.md`](./log.md)（全反復の生データ＋考察）/ `docs/adr/0051`・`0052`（設計判断）
+3. 必要なら [`log.md`](./log.md)（全反復の生データ＋考察）/ `docs/adr/0051`〜`0054`（設計判断）
 
 新しいセッションへの指示文は [`latest.md`](./latest.md) §5 にある。プロンプトテンプレート
 **`.pi/prompts/dev_minas.md`**（このリポジトリ内）に同じ内容を置いてあるので、`/dev_minas`
@@ -15,10 +15,11 @@
 
 ## 現在地（2026-09-12 時点）
 
-- 完了: **#1 計測器の構築 → #2 LSP 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定（ADR-0052）→ #4 初回 apply の内訳確定 → #5 編集後の固定 settle 撤去（ADR-0053）→ #6 意味的リトライ待ち 500ms 撤去（ADR-0054）**
-- 効果（L0 実測）: `check`（クリーン）**10154ms → 87ms（−99%）**。#6 で `symbol` 583→82ms・`rename` ~1594→~1150ms・`check` 589→87ms（500ms 待ちが毎回消えた）。`apply` は 1 回目 ~1.1s / 2 回目 ~107ms（残り 1.1s は RA の初回再解析。iteration #7 の課題）。cold の無言の誤り 0 件。`calls` / `equiv_B` は不変（回帰なし）
+- 完了: **#1 計測器の構築 → #2 LSP 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定（ADR-0052）→ #4 初回 apply の内訳確定 → #5 編集後の固定 settle 撤去（ADR-0053）→ #6 意味的リトライ待ち 500ms 撤去（ADR-0054）→ #7 apply の診断 pull 撤去（棄却。ADR-0053 追記）**
+- 効果（L0 実測）: `check`（クリーン）**10154ms → 87ms（−99%）**。#6 で `symbol` 583→82ms・`rename` ~1594→~1150ms・`check` 589→87ms（500ms 待ちが毎回消えた）。`apply` は 1 回目 ~1.1s / 2 回目 ~100ms。cold の無言の誤り 0 件。`calls` / `equiv_B` は不変（回帰なし）
 - **#6 の結末**: 「`SEMANTIC_RETRY_WAIT` 500ms は同じ答えをもう一度買うだけ」は**採用**（0ms。ADR-0054）。根拠は「LSP の意味的リクエストは解析完了までブロックしてから返る」（ADR-0052 と同じ性質）。2 回連続同一の確認ロジックは残す。
-- 次: **iteration #7**（warm の初回 `apply` の ~1.1s を「診断を返さない apply ＋ `check` への委譲」で削れるかの A/B）。詳細と受理・棄却条件は [`latest.md`](./latest.md) §4
+- **#7 の結末**: 「`apply` の診断 pull を外せば 1.1s が消える」は**棄却**。診断 pull を外しても hint pull が同じ解析を買うので `apply` は不変、両方外すと `apply` 153ms だが `check` が 1122ms を払う（トータル ±0）うえ、編集後追従の daemon テストが 3 件 fail。1.1s の正体は「pull が強制する RA 解析」。ただし **cargo 検証経路では −70〜80%** の余地があることを発見（apply-cargo 1344→268ms）。
+- 次: **iteration #8**（`sync_after_edit` の pull を背景化して Save 応答をブロックしない。契約＝編集後追従の 3 テストを保ったまま `apply` を ~150ms にできるかの A/B）。詳細と受理・棄却条件は [`latest.md`](./latest.md) §4
 
 ## 中身
 
@@ -39,8 +40,10 @@
 ```bash
 cd /Users/335g/dev/other/mina
 cargo build                                          # 計測対象は target/debug
+#                                                     # （cargo clean 後は l0.py が PATH の
+#                                                     #  minas/minad に黙って落ちるので注意）
 python3 docs/loop/l0.py --selftest                   # 計測器の健全性
-python3 docs/loop/l0.py -f verify -r 3 -v            # 現状の基準値（apply 初回/2回目・check 0.59s）
+python3 docs/loop/l0.py -f verify -r 3 -v            # 現状の基準値（apply 初回 ~1.1s・2回目 ~100ms・check 87ms）
 cargo test                                           # 462 passed が期待値
 ```
 

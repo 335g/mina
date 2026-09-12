@@ -896,3 +896,210 @@ verify   apply2-cargo          3       216         2       324       540    1487
 - **採用**: `SEMANTIC_RETRY_WAIT` = 0ms（リトライループと 2 回連続確認は残す）。
   `symbol` 583→82ms（−86%）、`rename` ~1594→~1150ms（−28%）、`check` 589→87ms（−85%）。
 - 効果確認: `calls`/`equiv_B` 不変・fails 0・462 test green。
+
+## 2026-09-12 17:33 — iteration #7 基準値（現行: apply は pull_after_edit で解析完了までブロック ~1.1s。warm r=3 中央値）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354    1227.6         0  True
+verify   apply-cargo           2       108         1       108       216    1343.9         0  True
+verify   hunks-cargo           2       154         1       154       308    1449.5         0  True
+verify   apply2-cargo          3       218         2       327       545    1524.2         0  True
+verify-broken check                 2       450         2       105       555     984.3         0  True
+verify-broken cargo                 2       105         1       105       210     994.6         0  True
+verify-blind check                 2       240         2       104       344     939.6         0  True
+verify-blind cargo                 2       104         1       104       208     903.3         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 18:08 — iteration #7 A/B(a): pull_after_edit から診断 pull のみ外す（hint pull は残す）→ ブロックはどちらの pull が持つか
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354     807.4         0  True
+verify   apply-cargo           2       108         1       108       216     860.3         0  True
+verify   hunks-cargo           2       154         1       154       308     870.8         0  True
+verify   apply2-cargo          3       218         2       327       545     950.8         0  True
+verify-broken check                 2       450         2       105       555     598.9         0  True
+verify-broken cargo                 2       105         1       105       210     601.1         0  True
+verify-blind check                 2       240         2       104       344     576.7         0  True
+verify-blind cargo                 2       104         1       104       208     949.7         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 18:15 — iteration #7 A/B(a) 再測: 診断 pull のみ外す（hint pull は残す）。前回 719ms は Open 時背景 settle との競合による揺れで、再測は baseline と同値（改善ゼロ）。契約は daemon テスト 2 件が fail
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354    1241.3         0  True
+verify   apply-cargo           2       108         1       108       216    1295.5         0  True
+verify   hunks-cargo           2       154         1       154       308    1316.4         0  True
+verify   apply2-cargo          3       218         2       327       545    1436.6         0  True
+verify-broken check                 2       450         2       105       555     867.4         0  True
+verify-broken cargo                 2       105         1       105       210     919.6         0  True
+verify-blind check                 2       240         2       104       344     879.1         0  True
+verify-blind cargo                 2       104         1       104       208     946.8         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 18:19 — iteration #7 A/B(b): pull_after_edit から診断+hint pull の両方を外す（apply は診断を返さない = settled:false 相当）→ コストは check へ移るか
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354    1310.1         0  True
+verify   apply-cargo           2       108         1       108       216     267.8         0  True
+verify   hunks-cargo           2       154         1       154       308     274.6         0  True
+verify   apply2-cargo          3       218         2       327       545     361.4         0  True
+verify-broken check                 2       450         2       105       555     607.8         0  True
+verify-broken cargo                 2       105         1       105       210     220.3         0  True
+verify-blind check                 2       240         2       104       344     841.3         0  True
+verify-blind cargo                 2       104         1       104       208     280.6         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## iteration #7 — 考察（「apply の診断 pull を外す」は棄却。1.1s は *pull が強制する解析* であって待ちではない。ただし cargo 検証経路では −70〜80% の余地）...
+
+> 課題（§4 で事前登録）: `apply` の `pull_after_edit` を外して `settled:false` 即返しに
+> すると apply が ~1.1s → ~150ms になり、トータル（apply + check）も下がるか。
+> 受理条件: apply ~150ms・check は前以下・トータルが下がる・`calls` 不変・
+> `verify-broken` の rc=2 維持・462 test green。
+> 棄却条件: (a) check が同じだけ増える（コストが移るだけ）(b) 検出性が壊れる
+> (c) `settled` の意味が壊れる。
+
+### 測り方 1 — 隔離の再確認（基準値）
+
+`-f verify -f verify-broken -f verify-blind -r 3 -v --log`（17:33 のログ）:
+`apply` 1179ms / `check` 87ms（apply-check）、`apply` 1211ms / `cargo check` 133ms
+（apply-cargo）、`verify-broken` apply 893ms / check 92ms（rc=2・345B）。
+§4 の前提どおり apply step と check step は分離している。
+
+### 測り方 2 — A/B(a): 診断 pull だけ外す（hint pull は残す）
+
+| 観測 | apply（apply-check） | apply（apply-broken） | check | daemon テスト |
+|---|---|---|---|---|
+| baseline | 1179ms | 893ms | 87ms | 462 green |
+| A/B(a) 1 回目（18:08） | **719ms** | 511ms | 87ms | — |
+| A/B(a) 再測（18:15） | **1155ms** | 782ms | 86ms | **2 fail** |
+
+同じバイナリで 719ms と 1155ms に割れた。原因は **Open 時の背景 settle**
+（`Open` は `tokio::spawn` で `settle_open_diagnostics` を投げる = Open 応答を
+ブロックしない）と、編集後の hint pull が**同じ解析を奪い合う**ためで、
+「どちらの要求が先に解析を起こしたか」で wall が変わる。**再測を採用**（1 回目は
+outlier。両方ログに残した）。
+
+再測の結論: **診断 pull を外しても apply は変わらない**（baseline と同値）。
+hint pull が同じ RA 解析を買っているため、`pull_diagnostics` の分は相乗りで消える。
+さらに daemon テストが 2 件 fail（`get_inlay_hints_serves_arbitrary_path_and_restores_focus`
+の「復元後の編集が同期される」= **編集後の診断追従**、`reopen_rs_path_respawns_lsp_and_reannounces_current_text`）。
+
+### 測り方 3 — A/B(b): 診断 pull と hint pull の両方を外す（apply は診断を返さない）
+
+| flow/arm | baseline wall | A/B(b) wall | 差 |
+|---|---|---|---|
+| `verify/apply-check` | 1228ms（1179+87） | 1275ms（**153**+1122） | **±0**（コストが check へ移動） |
+| `verify/apply-cargo` | 1344ms | **268ms** | −80% |
+| `verify/hunks-cargo` | 1450ms | **275ms** | −81% |
+| `verify/apply2-cargo` | 1524ms | **361ms** | −76% |
+| `verify-broken/check` | 984ms | **608ms** | −38% |
+| `verify-broken/cargo` | 995ms | **220ms** | −78% |
+| `verify-blind/check` | 940ms | **841ms** | −11% |
+| `verify-blind/cargo` | 903ms | **281ms** | −69% |
+
+- `apply` は 153ms（想定どおり ~150ms）。`calls` / `out_B` / `equiv_B` / `fails` は不変、
+  `verify-broken/check` は rc=2・345B のまま、`verify-blind` は `settled:false` 維持
+  → **L0 の契約指標では回帰なし**。
+- しかし **daemon テスト 3 件 fail**: `inlay_hints_follow_edits_and_snapshot`
+  （編集後のヒント追従）、`get_inlay_hints_serves_arbitrary_path_and_restores_focus`
+  （編集後の診断追従）、`reopen_rs_path_respawns_lsp_and_reannounces_current_text`。
+  = **「編集後のスナップショットは新しい診断・ヒントを反映する」という daemon の契約**が
+  テストで固定されている。`apply` が pull しないと、daemon は編集前の診断を表示し続ける。
+
+### 考察
+
+1. **1.1s の正体は「解析」であって「待ち」ではない**（#4/#5/#6 と同じ結論の再確認）。
+   診断 pull を外しても hint pull が同じ解析を買うので apply は変わらない（A/B(a)）。
+   両方外せば 1.1s は消えるが、その解析は **次に pull した者（`check`）が必ず払う**
+   （A/B(b) の apply-check は ±0）。§4 の棄却条件 (a) そのもの。
+2. **「apply は診断を返さない」は契約として成立しない**（棄却条件 (b) の変種）。
+   エージェント向けの `apply` 出力自体には診断は元から含まれていない（`applied: …` の
+   1 行だけ）。壊れるのは **daemon のスナップショット（TUI の下線・件数の出所）の
+   編集後追従**で、これはテストで固定された契約（表示の正しさ）。ADR-0045 の
+   `settled` とは別問題（あちらは「空をクリーンの根拠にしない」）。
+3. **ただし大きな発見が 1 つ**: pull を外すと **cargo 検証経路と複数編集経路が
+   −70〜80%** になる（apply-cargo 1344→268ms、apply2-cargo 1524→361ms）。
+   `apply` が先払いする RA 解析は、**cargo で検証するフローでは二重払いだった**
+   （RA の解析と rustc のコンパイルは別物。エージェントが受け取る `apply` の出力は
+   どちらでも `applied: …` の 1 行）。編集を N 回打つフロー（`apply2`・`rename/apply`）
+   では N 倍に効く。
+4. **残っている唯一のレバーは「ブロックしないこと」**: 契約（編集後追従）は
+   "pull が起きること" を要求するが、**Save 応答の前に起きること**は要求していない
+   （テストは snapshot を poll で最大 10 秒待つ）。`sync_after_edit` の pull を
+   背景タスクに移せば、A/B(b) の apply 153ms を取りつつ 3 テストは通る見込み。
+   エージェントの実フローでは次のターン（LLM 推論）が数秒あるので、その間に解析が
+   終わり `check` は 87ms のまま = **1 編集あたり ~1s がエージェントの待ち時間から消える**。
+   → #8 の課題。
+5. **計測の落とし穴（新規・重要）**: `apply` の wall は Open 時背景 settle と編集後 pull の
+   競合で **700ms / 1100ms に割れる**（同一バイナリで 807ms と 1241ms を観測）。
+   apply の wall を 1 回の観測で結論しない（`-r 3` 必須）。A/B は同一セッションで
+   交互に測るのが望ましい（#7 の A/B はセッションをまたいだが、baseline 17:33 /
+   A(a) 18:15 / A(b) 18:19 と連続で、A(b) の apply 153ms は 3 run とも 130〜153ms なので
+   結論は揺れていない）。
+
+### 結論（iteration #7）
+
+- **棄却**: 「`apply` の診断 pull を外せば 1.1s が消える」は成立しない。
+  (a) コストは次に pull した者へ移る（apply-check は ±0）、(b) 編集後の診断追従という
+  daemon の契約が壊れる（テスト 3 件 fail）。`settled` 契約（ADR-0045）は不変。
+- **採用**（収穫）: 計測上の事実として「apply の ~1.1s = pull が強制する RA 解析」を
+  A/B で分離して確定し、**cargo 検証経路ではこの先払いが二重払い**であることを示した
+  （−70〜80%）。ただし契約を壊さずに取り出すには背景化（#8）が要る。
+- 効果確認: baseline 復帰後に `cargo test` **462 passed**、L0 fails 0。
+- 参照: `docs/adr/0053`（追記。撤去できない理由 = 契約と解析）。

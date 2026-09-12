@@ -73,3 +73,34 @@ Status: accepted
 - 測定の記録: `docs/loop/log.md` iteration #4（加法の確定）/ iteration #5（撤去）
 - 判定の既存 ADR: ADR-0052（pull は 1 回目で最終集合を返す）、ADR-0045（空を
   クリーンの根拠にしない）、ADR-0020（inlay hint の所有と取得経路）
+
+## 追記（2026-09-12、iteration #7）
+
+Consequences に書いた「これを外すには『apply は診断を返さず `check` が pull で
+確定する』契約変更が要る」は、**A/B で測って棄却した**（`docs/loop/log.md`
+iteration #7）。実測（L0 warm r=3、小クレート）:
+
+| 案 | `apply` | `check` | apply+check | daemon テスト |
+|---|---|---|---|---|
+| 現行（診断 pull + hint pull） | ~1.18s | 87ms | ~1.27s | 462 green |
+| 診断 pull だけ外す | ~1.16s（変化なし） | 86ms | ~1.24s | **2 fail** |
+| 両方外す | **153ms** | 1122ms | ~1.28s（±0） | **3 fail** |
+
+分かったこと:
+
+1. **`apply` の ~1.1s は「待ち」ではなく「pull が強制する RA 解析」**。診断 pull を
+   外しても hint pull が同じ解析を買うので `apply` は変わらない。両方外せば消えるが、
+   その解析は次に pull した者（`check`）が必ず払う（apply-check のトータルは不変）。
+2. **編集後の pull は契約を担っている**: daemon のスナップショットが編集後の診断・
+   ヒントを反映することはテストで固定されている（`inlay_hints_follow_edits_and_snapshot`
+   / `get_inlay_hints_serves_arbitrary_path_and_restores_focus` /
+   `reopen_rs_path_respawns_lsp_and_reannounces_current_text`）。「apply は診断を
+   返さない」はこの契約と衝突する（TUI の下線・件数が編集前のまま残る）。
+3. ただし契約が要求するのは **pull が起きること** であって **Save 応答の前に起きること**
+   ではない（テストは snapshot を poll で待つ）。したがって残る唯一のレバーは
+   **ブロックしないこと**（pull の背景化）で、これは iteration #8 の課題。
+
+副次的な収穫: 診断 pull が無い状態では **cargo 検証経路が −70〜80%** になる
+（apply-cargo 1344→268ms、apply2-cargo 1524→361ms）。RA 解析は rustc のコンパイル
+とは別物なので、cargo で検証するフローでは `apply` の先払いが純粋な二重払いだった。
+背景化が入れば、cargo 経路ではこの先払いがエージェントの待ち時間に乗らなくなる。

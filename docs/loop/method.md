@@ -187,6 +187,15 @@ python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
   ブロックする。iteration #4 のトレースで確定、#5 で下調べ済み）。他のコマンド
   （`symbol` / `check`）が先に解析を起こしていれば `apply` は 100ms 台。
   編集処理自体は ~150ms（旧記述の「診断 + hint の pull の固定待ち」は #5 で撤去済み — ADR-0053）。
+  #7 で「pull を外しても hint pull が同じ解析を買うので `apply` は変わらない。両方外すと
+  153ms だが `check` が 1122ms を払い、編集後追従のテスト 3 件が落ちる」まで確定した
+  （ADR-0053 追記）。この 1.1s をエージェントの待ち時間から外す道は「ブロックしない」
+  （pull の背景化）で、それが iteration #8 の課題。
+- **`apply` の wall は 700ms / 1100ms に割れる**: `Open` は背景 settle を
+  `tokio::spawn` する（Open 応答をブロックしない）ので、その解析と編集後 pull の解析が
+  同じ RA の中で競合する。どちらが先に解析を起こしたかで `apply` の wall が変わる
+  （同一バイナリで 807ms と 1241ms を観測 — #7）。**`apply` を含む比較は `-r 3` 必須、
+  同一セッションで交互に測る**。1 回の観測で「改善した」と結論しない。
 - **1 アーム 1 回の観測**: `equiv_B` / `calls` は決定論的（同じ契約なら同じ値）、
   `wall_ms` は揺れる（`-r 3` で中央値）。
 - **`C_0`（システムプロンプト等の固定費）は測らない**: アーム間で同じなら比較に影響しない。
@@ -198,9 +207,9 @@ python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
   恒久的に測りたいなら計時ログの追加が要る（そのときは計測器側の課題として扱う）。
 - **同じ arm の中で複数回叩くと「初回 vs 2 回目」が分かる**: 初回だけ高いコスト
   （初回 pull・初回 didChange 後の解析など）はここで検出する。既知の例:
-  `apply` は初回 1.0〜1.4 秒（RA の初回再解析）/ 2 回目 約 100ms。
-  残っている固定待ちは `SEMANTIC_RETRY_WAIT` 500ms（`symbol` / `rename` / `check` が
-  毎回払う — iteration #6 の課題）。
+  `apply` は初回 ~1.1 秒（RA の初回再解析）/ 2 回目 約 100ms。
+  固定待ち（`PULL_SETTLE` 250ms・`SEMANTIC_RETRY_WAIT` 500ms）は #5 / #6 で 0 になり、
+  残っている待ちは無い（`apply` の 1.1s は計算そのもの — #7）。
 
 ## 8. 結果の書き先（どこに何を書くか）
 
