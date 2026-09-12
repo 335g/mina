@@ -1221,6 +1221,7 @@ async fn watch_disk(
                 // lsp_sync はフォーカス文書の場合にだけ設定される）。
                 snap = Some(sync_after_edit(
                     &daemon,
+                    push_tx.clone(),
                     Some((session, path.clone(), text.clone())),
                     snap.and_then(|s| s.status),
                     Some((ActivityKind::ReloadSync, "再読込同期中")),
@@ -3624,48 +3625,69 @@ async fn settle_open_diagnostics_loop(
 /// M1/ADR-0009: 編集後の LSP 全文同期 + pull を1経路に集約する（コマンド編集・
 /// DocumentEdit・外部リロード watch_disk の3箇所が同じ規律を個別に再現していた）。
 ///
+/// ADR-0055（iteration #8）: pull（`pull_after_edit`）とその反映は Save 応答の
+/// クリティカルパスから外し、背景タスク（`tokio::spawn`）で実行する。応答は現状の
+/// スナップショット（= pull 前の診断・ヒント）を即返し、背景タスク完了時に push で
+/// 全購読者へ編集後の診断・ヒントを配る。編集後追従の契約は「pull が起きること」
+/// のみで「応答前に起きること」ではない（テストは編集後の追従を poll で検証する。
+/// headless の apply 応答は診断を出力しないためエージェントへの影響は無い）。
+///
 /// ロック規律はこの関数だけが知る: 同期対象（セッション・パス・テキスト）の
 /// 取り出しは呼び出し側のロック内で済ませておき、ここでは LSP の await を
 /// ロック外で行い、結果を re-lock して反映してからスナップショットを返す。
-/// `target` が None でも drain_into（診断クリア・サーバ死亡時の古い診断除去）
-/// は実行される。`activity` は同期の前後で公開する Activity（ADR-0028。
-/// リロード時のみ使用）。
+/// 背景タスクは Open の背景 settle（`settle_open_diagnostics`）と同じ形 —
+/// daemon ロックを await またぎで持たず、LSP の await はロック外（
+/// `lsp::sync` / `pull_after_edit` はロック取得をタイムアウト付きで諦めるので
+/// 次のコマンドを待たせない）。`target` が None でも drain_into（診断クリア・
+/// サーバ死亡時の古い診断除去）は実行される。`activity` は同期の前後で公開する
+/// Activity（ADR-0028。リロード時のみ使用）。追加・除去とも背景タスク側で行う
+/// （応答に「同期中」が残らない）。
 async fn sync_after_edit(
-    daemon: &Mutex<Daemon>,
+    daemon: &Arc<Mutex<Daemon>>,
+    push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
     target: Option<(Arc<Mutex<LspSession>>, PathBuf, String)>,
     status: Option<String>,
     activity: Option<(ActivityKind, &'static str)>,
 ) -> StateSnapshot {
-    if let Some((kind, label)) = activity {
-        let path = target.as_ref().map(|(_, path, _)| path.as_path());
-        if let Some(path) = path {
-            let mut d = daemon.lock().await;
-            d.add_activity(path, kind, label);
-            drop(d);
-        }
-    }
     if let Some((session, path, text)) = &target {
-        lsp::sync(session, path, text).await;
-        let (pulled_diags, pulled_hints) = lsp::pull_after_edit(session, path, text).await;
-        let mut d = daemon.lock().await;
-        if let Some((kind, _)) = activity {
-            d.remove_activity(path, kind);
-        }
-        if let Some(diags) = pulled_diags {
-            // 編集は解析フォーカス文書に対してのみ pull される（current_uri 一致
-            // ゲート — lsp::sync / pull_after_edit）ため、ここでフォーカスも更新される。
-            d.set_focus_diagnostics(path, diags);
-        }
-        if let Some(hints) = pulled_hints {
-            d.cache_hints(path.clone(), text, hints);
-        }
-        drain_into(&mut d);
-        snapshot(&mut d, status)
-    } else {
-        let mut d = daemon.lock().await;
-        drain_into(&mut d);
-        snapshot(&mut d, status)
+        // 背景タスク: LSP 同期 + pull + 反映 + push（Save 応答をブロックしない）
+        let daemon_task = daemon.clone();
+        let session_task = session.clone();
+        let path_task = path.clone();
+        let text_task = text.clone();
+        tokio::spawn(async move {
+            if let Some((kind, label)) = activity {
+                let mut d = daemon_task.lock().await;
+                d.add_activity(&path_task, kind, label);
+                drop(d);
+            }
+            lsp::sync(&session_task, &path_task, &text_task).await;
+            let (pulled_diags, pulled_hints) =
+                lsp::pull_after_edit(&session_task, &path_task, &text_task).await;
+            let mut d = daemon_task.lock().await;
+            if let Some((kind, _)) = activity {
+                d.remove_activity(&path_task, kind);
+            }
+            if let Some(diags) = pulled_diags {
+                // 編集は解析フォーカス文書に対してのみ pull される（current_uri 一致
+                // ゲート — lsp::sync / pull_after_edit）ため、ここでフォーカスも更新される。
+                d.set_focus_diagnostics(&path_task, diags);
+            }
+            if let Some(hints) = pulled_hints {
+                d.cache_hints(path_task.clone(), &text_task, hints);
+            }
+            drain_into(&mut d);
+            let snap = snapshot(&mut d, None);
+            drop(d);
+            // 発信元はコマンドでない（背景 pull）ため None を包み、全購読者に届く
+            // （受信側は内容比較で再描画する — settle_open_diagnostics と同じ）。
+            let _ = push_tx.send((None, snap));
+        });
     }
+    // 応答は現状のスナップショット（= pull 前の診断・ヒント）を即返す
+    let mut d = daemon.lock().await;
+    drain_into(&mut d);
+    snapshot(&mut d, status)
 }
 
 /// 検索の継続状態（[`Command::Search`] の結果。`n`/`N` の前進元）。
@@ -4345,7 +4367,7 @@ async fn process_command(
                     None
                 };
                 drop(d);
-                sync_after_edit(daemon, sync_target, status, None).await
+                sync_after_edit(daemon, push_tx.clone(), sync_target, status, None).await
             }
             Err(_) => {
                 // ADR-0011: Command として解釈できなければ DocumentEdit を試す
@@ -4385,7 +4407,7 @@ async fn process_command(
                         if let Some(rejected) = rejected {
                             rejected
                         } else {
-                            sync_after_edit(daemon, sync_target, None, None).await
+                            sync_after_edit(daemon, push_tx.clone(), sync_target, None, None).await
                         }
                     }
                     Err(_) => {
@@ -8276,9 +8298,17 @@ root-markers = [".docsroot"]
         .await;
         assert!(!snap.diagnostics.is_empty(), "診断は残っている: {:?}", snap.diagnostics);
 
-        // 先頭に挿入して TODO を byte 13 へ移動（didChange で同期される）
+        // 先頭に挿入して TODO を byte 13 へ移動（didChange で同期される）。
+        // 応答の text は編集後（編集自体は同期対象外で即時反映）。診断の追従は
+        // 背景 pull（ADR-0055）の反映後（push / GetState）に確認する。
         let snap = request(&mut tui, &Command::Insert { text: "aaaa".into() }).await;
         assert_eq!(snap.text, "aaaafn f() { TODO }\n");
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| s.diagnostics.iter().any(|d| d.start == 13),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
         assert_eq!(snap.diagnostics[0].start, 13, "didChange 後に位置が追従する");
 
         // サーバを殺す（reader タスクが EOF を拾い is_dead になる）
@@ -10750,8 +10780,16 @@ root-markers = [".docsroot"]
         assert_eq!(snap.inlay_hints[0].position, 5, "x の直後");
         assert_eq!(snap.inlay_hints[0].text, ": i32");
 
-        // 編集 → pull: ヒントの位置が新テキストに追従する（"alet x = 5" の x は char 6）
-        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        // 編集 → 背景 pull（ADR-0055）: 応答は pull 前のスナップショットなので、
+        // 追従（"alet x = 5" の x は char 6）は背景タスクの反映後（push / GetState）
+        // に確認する。
+        let _ = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| s.inlay_hints.iter().any(|h| h.position == 6),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
         assert_eq!(snap.inlay_hints.len(), 1, "{:?}", snap.inlay_hints);
         assert_eq!(snap.inlay_hints[0].position, 6, "編集後の位置: {:?}", snap.inlay_hints);
         let _ = std::fs::remove_file(&sock);
@@ -10820,7 +10858,17 @@ root-markers = [".docsroot"]
 
         // 復元の実証: A への編集の didChange が mock に届く = セッションが A に
         // 戻っている（Q10-(c)）。"alet x = 5\nTODO\n" の TODO は byte 10。
-        let snap = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        // 追従は背景 pull（ADR-0055）の反映後（push / GetState）に確認する。
+        let _ = request(&mut tui, &Command::Insert { text: "a".into() }).await;
+        let snap = poll_snapshot(
+            &mut tui,
+            |s| {
+                s.diagnostics.iter().any(|d| d.start == 10)
+                    && s.inlay_hints.iter().any(|h| h.position == 6)
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .await;
         assert_eq!(snap.diagnostics[0].start, 10, "復元後の編集が同期される: {snap:?}");
         assert_eq!(snap.inlay_hints[0].position, 6, "ヒントも編集後テキストに追従");
 

@@ -188,6 +188,28 @@ FLOWS = {
             ],
         },
     },
+    # iteration #8 で追加: 背景化（ADR-0055）の効果確認用。エージェントの次ターン
+    # 推論遅延（数秒）を sleep 3 で代理し、apply（Save 応答）と後続 check の和が
+    # 下がるかを見る。指標は step 別 wall の apply + check の和（-v の値。ギャップは
+    # エージェントの待ちではないので flow の wall_ms は使わない — latest.md §4）。
+    "verify-gap": {
+        "goal": "背景化後: ギャップ（推論遅延の代理 = sleep 3）ありで apply + check の和が下がるか",
+        "fixture": "rust",
+        "warmup": True,
+        "verify": 'cargo check --offline && grep -q "timeout_ms: 30000" src/config.rs',
+        "arms": {
+            "apply-gap-check": [
+                'minas apply src/config.rs "timeout_ms: 5000" "timeout_ms: 30000"',
+                "sleep 3",
+                "minas check src/config.rs",
+            ],
+            "apply-gap-cargo": [
+                'minas apply src/config.rs "timeout_ms: 5000" "timeout_ms: 30000"',
+                "sleep 3",
+                "cargo check --offline",
+            ],
+        },
+    },
     "verify-broken": {
         "goal": "pull が見えるエラー（構文）を、早期確定後も検出できるか",
         "fixture": "rust",

@@ -1103,3 +1103,162 @@ hint pull が同じ RA 解析を買っているため、`pull_diagnostics` の�
   （−70〜80%）。ただし契約を壊さずに取り出すには背景化（#8）が要る。
 - 効果確認: baseline 復帰後に `cargo test` **462 passed**、L0 fails 0。
 - 参照: `docs/adr/0053`（追記。撤去できない理由 = 契約と解析）。
+
+## 2026-09-12 19:58 — 基準値: iteration #8 前
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354    1222.9         0  True
+verify   apply-cargo           2       108         1       108       216    1332.3         0  True
+verify   hunks-cargo           2       154         1       154       308    1351.7         0  True
+verify   apply2-cargo          3       218         2       327       545    1451.2         0  True
+verify-broken check                 2       450         2       105       555     856.3         0  True
+verify-broken cargo                 2       105         1       105       210     919.6         0  True
+verify-blind check                 2       240         2       104       344     832.0         0  True
+verify-blind cargo                 2       104         1       104       208     956.0         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 20:12 — iteration #8: sync_after_edit の pull を背景化（ADR-0055）。仮説: apply ~150ms、後続 check ~90ms（和が現行比 -70% 以上）。既存 verify は即時 check が背景プル完了を待ち ~1.2s のまま（非悪化）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354     585.2         0  True
+verify   apply-cargo           2       108         1       108       216     250.2         0  True
+verify   hunks-cargo           2       154         1       154       308     256.4         0  True
+verify   apply2-cargo          3       218         2       327       545     342.8         0  True
+verify-gap apply-gap-check         3       262         2       232       494    3238.5         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3271.6         0  True
+verify-broken check                 2       450         2       105       555     483.3         0  True
+verify-broken cargo                 2       105         1       105       210     217.4         0  True
+verify-blind check                 2       240         2       104       344     606.0         0  True
+verify-blind cargo                 2       104         1       104       208     266.3         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=187, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 20:14 — iteration #8 cold: 背景化後の cold 税確認（apply の cold 120-140ms が悪化しないか）
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354    8689.9         0  True
+verify   apply-cargo           2       108         1       108       216     425.0         0  True
+verify   hunks-cargo           2       154         1       154       308     428.9         0  True
+verify   apply2-cargo          3       218         2       327       545     509.5         0  True
+verify-gap apply-gap-check         3       262         2       232       494    8747.0         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3307.4         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=186, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 20:27 — iteration #8 回帰: 空 pull 回帰（編集後 pull が背景化で失われないか）-r 10
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify-broken check                 2       450         2       105       555     617.8         0  True
+verify-broken cargo                 2       105         1       105       210     215.0         0  True
+verify-blind check                 2       240         2       104       344     606.7         0  True
+verify-blind cargo                 2       104         1       104       208     274.7         0  True
+verify   apply-check           2       246         2       108       354    1023.5         0  True
+verify   apply-cargo           2       108         1       108       216     255.5         0  True
+verify   hunks-cargo           2       154         1       154       308     260.7         0  True
+verify   apply2-cargo          3       218         2       327       545     351.1         0  True
+```
+
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## iteration #8 考察（2026-09-12）— 背景化の採用
+
+**仮説の検証結果**: 採用。`sync_after_edit` の pull を背景タスク化（ADR-0055）。
+
+**なぜ想定どおりになったか**: 応答を待たせない形にしたので、apply の wall から
+「pull が強制する RA 解析」が消えた（130ms = 編集処理本体のみ。drain_into +
+snapshot は解析を買わない）。エージェントの次ターン（sleep 3 で代理）の間に
+背景 pull が解析を終え、後続 check は 92ms（温まった解析）。cargo 経路は
+#7 A/B(b) で見た「pull なし = −70〜80%」と同水準（apply-cargo −82%）。
+
+**§4 の前提誤り（本反復の最大の収穫）**: §4 は「テスト 3 件は snapshot を poll
+で待つ」と読んでいたが、実際は**編集コマンドの応答**で編集後の診断・ヒントを
+検証していた（`request()` は応答を返し途中の push は読み飛ばす）。背景化すると
+3 件とも落ちた。テストの意図（編集後に追従すること）は push/GetState でも満た
+されるため、検証ポイントを応答 → poll に移して 462 green を維持した
+（ADR-0055 に詳述）。「契約が要求するのは pull が起きることだけで、応答前に
+起きることではない」という §4 の解釈は、テストの実装（応答検証）と食い違い、
+**実装を経て確定できた**（= テストを実装に合わせたのではなく、意図を損なわず
+検証時点を正した）。
+
+**ギャップなし（即時 check）の帰結**: apply-check の和は 1228 → ~1020ms
+（apply ~130ms + check ~800ms）。didChange 直後の初回再解析を check 自身が買う
+ため。悪化はしない（受理条件 3 を満たす）が、「解析は誰かが買う」原則は
+ギャップなしでも不変。**エージェントの実フロー（apply 応答 → LLM 推論 → check）
+では背景 pull が推論中に解析を終えるので、check は 92ms で済む** — ここが
+ギャップあり flow を追加した理由であり、最大の改善点（エージェント待ち
+1.1s → 130ms、−88%）。
+
+**前回課題（#7 収穫）との関係**: 「cargo 検証経路では先払いが二重払い」は、
+背景化により pull が応答を待たせなくなったので、apply-cargo 1344 → 240ms で
+解消。pull 自体は背景で走るので、check 経路の契約（settled:false・rc=2 検出）も
+維持。
+
+**残る課題（次反復の候補）**:
+- ギャップなし check の ~800ms（= didChange 直後の解析を check が買う）は、
+  「apply 直後に check を打つエージェント」ではまだ払われる。背景 pull の
+  完了を check が待つ形にすると 1 往復増える。優先度は低い（実フローでは
+  LLM 推論が間に合う）が、L2 で実フローの分布を確認する価値はある。
+- 「apply の直前までに解析が温まっていたか」（#5 の下調べ）は背景化後も有効:
+  既に解析済みなら background の pull も check も速い。L2 向き。
+- 計時ログ（#7 の別候補）: apply の 10 回中央値は ~1.0s で安定（700/1100ms の
+  割れは解消。背景化で Open settle との競合が apply 応答から消えた）— ただし
+  check 側に同種の分散が出た（背景 pull との競合）。計時ログが無いと説明は
+  推測になる。
+
+**確定した事実（再測定は不要）**:
+- 背景化後、apply の wall は 800〜1200ms の割れから **~130ms で安定**。
+- ギャップありの apply + check の和は **222ms（現行 1228ms 比 −82%）**。
+- 編集後追従の 3 テストは、追従の検証を poll で行う形に変更した
+  （検証時点のみ。契約の意味は不変）。

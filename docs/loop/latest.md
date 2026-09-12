@@ -1,38 +1,40 @@
 # minas/minad ループエンジニアリング — 最新の検討結果（次のループの起点）
 
-> git 管理（`docs/loop/`）。更新: iteration #7 完了時（2026-09-12）。
+> git 管理（`docs/loop/`）。更新: iteration #8 完了時（2026-09-12）。
 > 入口は [`README.md`](./README.md)。検討方法は [`method.md`](./method.md)。
 > **このファイルと method.md を読めば次のループを回せる。**
 > 生データと全反復の考察は同じディレクトリの [`log.md`](./log.md)。
 > 設計判断は `docs/adr/0051`（索引完走ゲート）/ `0052`（check の空の早期確定）/
-> `0053`（編集後の settle を置かない ＋ **追記: pull は撤去できない**）/
-> `0054`（意味的リトライ待ち 0ms）/ `0045`（`settled` の意味）。
+> `0053`（編集後の settle を置かない ＋ 追記: pull は撤去できない）/
+> `0054`（意味的リトライ待ち 0ms）/ `0055`（編集後 pull の背景化 — **iteration #8**）/
+> `0045`（`settled` の意味）。
 
 ## 1. 現在の状態（30 秒サマリ）
 
 - 完了した反復: **#1 計測器 → #2 索引完走ゲート（ADR-0051）→ #3 check の空の早期確定
   （ADR-0052）→ #4 初回 apply の内訳確定 → #5 編集後の settle 撤去（ADR-0053）→
-  #6 SEMANTIC_RETRY_WAIT 撤去（ADR-0054）→ #7 apply の pull 撤去（棄却。ADR-0053 追記）**
+  #6 SEMANTIC_RETRY_WAIT 撤去（ADR-0054）→ #7 apply の pull 撤去（棄却。ADR-0053 追記）→
+  #8 編集後 pull の背景化（ADR-0055）**
 - 効果（L0 実測、warm r=3 中央値）:
-  - `check`（クリーン）**10154ms → 87ms（−99%）**（#3 + #6）
+  - `check`（クリーン）**10154ms → 87ms（−99%）**（#3 + #6 + #8 で維持）
   - `symbol`（explore 1 歩目）**583 → 82ms（−86%）**（#6）
   - `rename`（lsp）**1594 → ~1150ms（−28%）**（#6。残りは RA 側の WorkspaceEdit 計算）
-  - `apply` **1 回目 ~1.1s / 2 回目 ~100ms**（#5 以降不変）。#7 でこの 1.1s の正体が
-    **「pull が強制する RA 解析」**であることを A/B で確定（撤去はできない — §2）
+  - `apply` **~1.1s → ~130ms（−88%）**（#8。pull が応答をブロックしなくなった。
+    エージェントの Save 応答待ちが消えた。背景 pull は次ターン推論中に走る）
+  - ギャップありの **apply + check の和: ~1270ms → 222ms（−82%）**、cargo 経路も
+    **−77〜82%**（apply-cargo 1344→240ms・hunks-cargo 1450→256ms・apply2-cargo
+    1524→344ms）
 - cold の無言の誤り（空の `symbol`・部分 `rename`・`check` の LSP error）は 0 件のまま。
   `calls` / `out_B` / `equiv_B` は全 flow で不変（回帰なし）。`--cold` の完全性も維持。
 - 全 462 テスト green。`python3 docs/loop/l0.py --selftest` green。
-- **#7 の結論**: 「`apply` の診断 pull を外せば 1.1s が消える」は**棄却**（ADR-0053 追記）。
-  (a) 診断 pull を外しても hint pull が同じ解析を買うので `apply` は不変。
-  両方外すと `apply` は **153ms** になるが `check` が **1122ms** を払う（トータル ±0）。
-  (b) 編集後の pull は「daemon のスナップショットが編集後診断を反映する」契約を担っており、
-  外すと daemon テストが 3 件 fail（TUI が編集前の診断を表示し続ける）。
-  **収穫**: cargo 検証経路ではこの先払いが純粋な二重払いで、外すと **−70〜80%**
-  （apply-cargo 1344→268ms、apply2-cargo 1524→361ms）。取り出すには「ブロックしない」
-  形（背景化）が要る。
-- **次の課題（#8）は、`sync_after_edit` の pull を Save 応答のクリティカルパスから外す
-  （背景タスク化）**。契約（編集後追従の 3 テスト）を保ったまま `apply` を ~150ms に
-  できるかの A/B（§4）。
+- **#8 の結論**: 「`sync_after_edit` の pull は Save 応答のクリティカルパスから外せる
+  （背景タスク化）」は**採用**（ADR-0055）。pull を外す（#7）と次に pull した者が
+  解析を払うが、**応答を待たせない**形ならエージェントの次ターン（LLM 推論。
+  数秒）の間に背景 pull が解析を終える。編集後追従の契約（テスト 3 件）は維持。
+  **§4 の前提誤りも発見**（下記）: 「テストは snapshot を poll で待つ」は誤りで、
+  実際は編集コマンドの応答自体で検証していた。検証ポイントを poll に移し 462 green。
+- **次の課題（#9）は計測基盤の穴埋め: daemon に計時ログ（tracing）を足し、
+  ServerMetrics の穴（rename カウンタ）を埋める**。理由は §4。
 
 ## 2. 確定した事実（再測定は不要）
 
@@ -53,10 +55,12 @@
 | **`rename` の残り ~1150ms は RA 側の WorkspaceEdit 計算**（2 回目の確認を省いた案 B でも 1162ms = 1 回目の request 自体が ~1s） | iteration #6 の案 B 比較 |
 | **`hints` の 770ms は `pull_inlay_hints` の RA 側計算**。`request_with_loading_retry` を通らない（直接 request 1 回）ので 500ms 撤去の影響を受けない | iteration #6 |
 | **`apply` の ~1.1s は「pull が強制する RA 解析」そのもの**。診断 pull だけ外しても hint pull が同じ解析を買うので `apply` は不変（1155ms = 基準値）。両方外すと `apply` 153ms だが、その解析は次に pull した者（`check` 1122ms）が必ず払う | iteration #7 A/B(a)(b) |
-| **編集後の pull は契約**（daemon のスナップショットが編集後診断・ヒントを反映する）。外すと `inlay_hints_follow_edits_and_snapshot` / `get_inlay_hints_serves_arbitrary_path_and_restores_focus` / `reopen_rs_path_respawns_lsp_and_reannounces_current_text` が落ちる（計 3 件） | iteration #7（`cargo test`。診断 pull だけ外すとこのうち 2 件） |
+| **編集後の pull は契約**（daemon のスナップショットが編集後診断・ヒントを反映する）。外すと `inlay_hints_follow_edits_and_snapshot` / `get_inlay_hints_serves_arbitrary_path_and_restores_focus` / `reopen_rs_path_respawns_lsp_and_reannounces_current_text` が落ちる（計 3 件） | iteration #7（`cargo test`） |
 | **cargo 検証経路では `apply` の先払い解析が二重払い**（RA 解析と rustc コンパイルは別物）。pull を外すと apply-cargo **1344→268ms（−80%）**、apply2-cargo **1524→361ms（−76%）**、hunks-cargo **1450→275ms（−81%）** | iteration #7 A/B(b) |
-| **`apply` の wall は 700ms / 1100ms に割れる**（Open 時の背景 settle と編集後 pull が同じ解析を奪い合うため）。同一バイナリで 807ms と 1241ms の両方を観測 | iteration #7（A/B(a) の 1 回目と再測）。apply の wall を 1 回の観測で結論しない |
-| cold の支配項は**索引完走ゲート**（`symbol`/`hints`/`rename`/`check` が 8〜9 秒。`apply` は cold でも 120〜140ms） | L0 `--cold`（#2〜#6 で安定） |
+| **編集後 pull の背景化で Save 応答の解析待ちが消える**（ADR-0055）。apply の wall は **~130ms で安定**（#7 の 700/1100ms の割れは解消 — 「解析を買う」のが apply 応答から背景タスクに移った）。ギャップあり（sleep 3 = 推論遅延の代理）で apply + check の和 **222ms（現行比 −82%）**、check step 92ms | iteration #8（L0 `verify-gap` 追加。warm -r3） |
+| **ギャップなし（即時 check）では check が解析を買う**（apply ~130ms + check ~800ms = ~1.0s。現行 1.2s よりは速い・悪化なし）。「解析は誰かが買う」は背景化後も不変 — 差は「誰が・いつ買うか」だけ | iteration #8（`verify/apply-check` -r10: 904〜1047ms） |
+| **編集後追従のテスト 3 件は「応答時点」で検証していた**（§4 #8 の前提誤り）。`request()` は応答を返し途中の push は読み飛ばす。背景化で応答は pull 前の値になり 3 件が落ちた → 検証ポイントを「追従までの poll（最大 10 秒）」に移して 462 green を維持（テストの意図 = 編集後に追従することは不変） | iteration #8（`cargo test`。ADR-0055） |
+| cold の支配項は**索引完走ゲート**（`symbol`/`hints`/`rename`/`check` が 8〜9 秒。`apply` は cold でも 120〜140ms — 背景化後も 130〜136ms で不変） | L0 `--cold`（#2〜#8 で安定） |
 
 **棄却済み（同じ仮説を再試行しない）**:
 
@@ -69,169 +73,158 @@
 | 空 + 索引完走 = クリーン確定（`settled:true`） | pull が実在するエラーを取りこぼす（ADR-0045 追記） |
 | skill 参照が判断を変える | T6/T8（L2）: トークン +21〜61% で効果なし |
 | **`PULL_SETTLE` は「解析前の空」を避けるために要る**（削ると診断が消える） | iteration #5: 50ms・0ms のどちらでも空 pull 回帰が出ない。settle は買えるものが無い純粋な遅延だった → 撤去（ADR-0053） |
-| **「2 回連続同一」を捨て、loading（null / 空）のときだけリトライすれば 1 往復削れる** | iteration #6 の案 B: `symbol` 84ms（案 A 82ms）・`rename` 1162ms（案 A 1150ms）と差なし。2 回目の確認は同一クエリの再送でほぼ無料。代わりに loading 時 100ms 待つコードが残るだけ → 不採用 |
+| **「2 回連続同一」を捨て、loading（null / 空）のときだけリトライすれば 1 往復削れる** | iteration #6 の案 B: `symbol` 84ms（案 A 82ms）・`rename` 1162ms（案 A 1150ms）と差なし。代わりに loading 時 100ms 待つコードが残るだけ → 不採用 |
 | **`SEMANTIC_RETRY_WAIT` を 50ms・100ms 等に縮めて様子見する** | iteration #6: 0ms で回帰ゼロだったので二分探索の必要が無かった（ADR-0054）。0ms 一択 |
 | **`apply` の診断 pull を外せば 1.1s が消える**（`settled:false` 即返し・契約変更） | iteration #7: A/B(a) は `apply` 不変（1155ms）で daemon テスト 2 件 fail。A/B(b) は `apply` 153ms だが `check` 1122ms（apply-check のトータル ±0）でテスト 3 件 fail。1.1s は pull が強制する解析で、pull を外すと次に pull した者が払う。編集後追従の契約も壊れる（ADR-0053 追記） |
-| **診断 pull だけ外す（hint pull は残す）で `apply` が 720ms になる** | iteration #7: 同じバイナリの再測で 1155ms（基準値と同値）。719ms は Open 時背景 settle との競合で先に解析が済んでいた場合の観測だった（揺れ。§2 の「700ms / 1100ms に割れる」） |
+| **診断 pull だけ外す（hint pull は残す）で `apply` が 720ms になる** | iteration #7: 同じバイナリの再測で 1155ms（基準値と同値）。719ms は Open 時背景 settle との競合で先に解析が済んでいた場合の観測だった（揺れ。「700ms / 1100ms に割れる」） |
+| **背景化ではテスト 3 件（編集後追従）が落ちる = 契約が壊れる** | iteration #8: 素の背景化では落ちたが、テストが検証していたのは「応答時点の追従」= 実装の偶然（同期 pull が応答前に完了していた）。契約の本質（編集後に追従すること）は背景 pull + push でも満たされる。検証ポイントを poll に移して 462 green（ADR-0055） |
 
-## 3. 基準値（L0、iteration #7 で再測）— 次回の比較はここから
+## 3. 基準値（L0、iteration #8 で再測）— 次回の比較はここから
 
-### warm（r=3 中央値）
+### warm（r=3 中央値。verify 系 + verify-gap は #8 の実装後、explore/hints/rename は #6 の値）
 
 | flow/arm | calls | out_B | equiv_B | wall_ms | fails | ok |
 |---|---|---|---|---|---|---|
-| `verify/apply-check` | 2 | 246 | 354 | 1228 | 0 | True |
-| `verify/apply-cargo` | 2 | 108 | 216 | 1344 | 0 | True |
-| `verify/hunks-cargo` | 2 | 154 | 308 | 1450 | 0 | True |
-| `verify/apply2-cargo` | 3 | 218 | 545 | 1524 | 0 | True |
-| `verify-broken/check` | 2 | 450 | 555 | 984 | 0 | True |
-| `verify-broken/cargo` | 2 | 105 | 210 | 995 | 0 | True |
-| `verify-blind/check` | 2 | 240 | 344 | 940 | 0 | True |
-| `verify-blind/cargo` | 2 | 104 | 208 | 903 | 0 | True |
+| `verify/apply-check` | 2 | 246 | 354 | 1020 | 0 | True |
+| `verify/apply-cargo` | 2 | 108 | 216 | 240 | 0 | True |
+| `verify/hunks-cargo` | 2 | 154 | 308 | 256 | 0 | True |
+| `verify/apply2-cargo` | 3 | 218 | 545 | 344 | 0 | True |
+| `verify-gap/apply-gap-check` | 3* | 262 | 494 | 3239 | 0 | True |
+| `verify-gap/apply-gap-cargo` | 3* | 116 | 348 | 3272 | 0 | True |
+| `verify-broken/check` | 2 | 450 | 555 | 483 | 0 | True |
+| `verify-broken/cargo` | 2 | 105 | 210 | 217 | 0 | True |
+| `verify-blind/check` | 2 | 240 | 344 | 606 | 0 | True |
+| `verify-blind/cargo` | 2 | 104 | 208 | 266 | 0 | True |
 
-（#7 で再測したのは verify 系。`explore` / `hints` / `rename` は iteration #6 の値のまま —
-前回との差は 1〜4B の表示揺れで、契約の形は同じ:
-
-| flow/arm | calls | out_B | equiv_B | wall_ms |
-|---|---|---|---|---|
-| `explore/lsp` | 3 | 1014 | 1562 | 310 |
-| `explore/dump` | 2 | 4750 | 9260 | 178 |
-| `hints/hints` | 1 | 110 | 110 | 783 |
-| `rename/lsp` | 2 | 217 | 434 | 1364 |
-| `rename/apply` | 5 | 402 | 1410 | 1779 |
-
-）
+*verify-gap の calls=3 は計測 step の `sleep 3`（エージェントの次ターン推論遅延の
+代理）を含むため。契約の往復は apply + check/cargo の 2 回のまま
+（`out_B` / `equiv_B` も既存 verify と同値）。
 
 ステップ別（`-v`、1 run の観測。`calls` / `equiv_B` は決定論的、`wall` は揺れる）:
 
 ```
-explore/lsp        symbol 82ms → at 129ms → read 84ms          ← symbol は 583ms から −86%
-hints/hints        hints 770ms                                  ← RA 側計算（待ちではない。影響外）
-rename/lsp         rename 1150ms → cargo 168ms                 ← 残りは RA の WorkspaceEdit 計算
-rename/apply       apply 1199ms → 104ms → 104ms → 136ms → cargo 154ms
-verify/apply-check apply 1179ms → check 87ms                   ← apply の 1.1s は「pull が強制する RA 解析」（#7）
-verify/apply-cargo apply 1211ms → cargo 133ms                  ← cargo 経路ではこの先払いが二重払い（#7）
-verify/apply2-cargo apply 1回目 ~1376ms → 2回目 ~100ms → cargo ~164ms
-verify-broken/check apply 893ms → check 92ms（rc=2 / 345B = Syntax Error 2 件）
-verify-blind/check  apply 873ms → check 90ms（settled:false 契約を維持）
+verify/apply-check     apply 140ms → check 447ms     ← check が解析を買う（ギャップなし。和 ~1.0s）
+verify-gap/apply-gap-check  apply 130ms → sleep 3 → check 92ms   ← 背景 pull が推論中に解析を終える（和 222ms）
+verify/apply-cargo     apply 119ms → cargo 121ms     ← 先払い解析が応答から消えた（#7 の二重払い解消）
+verify/apply2-cargo    apply 132ms → apply 84ms → cargo 128ms
+verify-broken/check    apply 126ms → check 245ms（rc=2 / 345B = Syntax Error 2 件）
+verify-blind/check     apply 129ms → check 477ms（settled:false 契約を維持）
+explore/lsp            symbol 82ms → at 129ms → read 84ms
+hints/hints            hints 770ms（RA 側計算）
+rename/lsp             rename 1150ms → cargo 168ms（RA の WorkspaceEdit 計算）
 ```
 
-**注意（#7 で判明）**: `apply` の wall は **700ms / 1100ms に割れる**（Open 時の背景
-settle と編集後 pull が同じ解析を奪い合うため。同一バイナリで 807ms / 1241ms を観測）。
-`apply` を含む比較は `-r 3` を必須とし、A/B は**同一セッションで交互に**測る。
+**注意（#8 で確定）**: `apply` の wall は **~130ms で安定**（#7 の 700/1100ms の
+割れは解消）。代わりに**ギャップなしの check が解析を買う**（~800ms、和 ~1.0s）。
+「解析は誰かが買う」原則は不変。比較のときは `-r 3` 以上で、適用後すぐ check を
+打つケース（`verify/apply-check`）と、推論のギャップがあるケース
+（`verify-gap/apply-gap-check`）を分けて見る。
 
-### cold（1 回観測、iteration #6 で rename / explore を再測。他は #5 の値）
+### cold（1 回観測、iteration #8 で verify 系のみ再測。他は #6 の値）
 
 | flow/arm | calls | out_B | equiv_B | wall_ms | fails | ok |
 |---|---|---|---|---|---|---|
+| `verify/apply-check` | 2 | 246 | 354 | 8690 | 0 | True |
+| `verify/apply-cargo` | 2 | 108 | 216 | 425 | 0 | True |
+| `verify/hunks-cargo` | 2 | 154 | 308 | 429 | 0 | True |
+| `verify/apply2-cargo` | 3 | 218 | 545 | 510 | 0 | True |
+| `verify-gap/apply-gap-check` | 3 | 262 | 494 | 8747 | 0 | True |
+| `verify-gap/apply-gap-cargo` | 3 | 116 | 348 | 3307 | 0 | True |
 | `explore/lsp` | 3 | 1017 | 1568 | 8205 | 0 | True |
 | `explore/dump` | 2 | 4750 | 9260 | 169 | 0 | True |
 | `hints/hints` | 1 | 110 | 110 | 8067 | 0 | True |
 | `rename/lsp` | 2 | 219 | 438 | 9127 | 0 | True |
 | `rename/apply` | 5 | 406 | 1424 | 597 | 0 | True |
-| `verify/apply-check` | 2 | 246 | 354 | 8258 | 0 | True |
-| `verify/apply-cargo` | 2 | 108 | 216 | 419 | 0 | True |
-| `verify/hunks-cargo` | 2 | 154 | 308 | 426 | 0 | True |
-| `verify/apply2-cargo` | 3 | 218 | 545 | 498 | 0 | True |
 | `verify-blind/check` | 2 | 240 | 344 | 9095 | 0 | True |
 | `verify-blind/cargo` | 2 | 104 | 208 | 434 | 0 | True |
 | `verify-broken/check` | 2 | 450 | 555 | 8793 | 0 | True |
 | `verify-broken/cargo` | 2 | 105 | 210 | 338 | 0 | True |
 
-cold の支配項は**索引完走ゲート**（`symbol`/`hints`/`rename`/`check` が 8〜9 秒）。
-`apply` は cold でも 120〜140ms（ゲートは `apply` の pull には乗らない）。
-`rename/lsp`（9.1s）≒ `explore/lsp`（8.2s）なので、cold の主因は
-`open_workspace_files` ではなくゲート（§4 の別候補を参照）。
-#6 の 0ms 化・#7 の pull 撤去はゲート時間に影響しない（ゲートは別機構）。
+cold の支配項は**索引完走ゲート**（`symbol`/`hints`/`rename`/`check` が 8〜9 秒。
+`apply` は cold でも 130〜136ms — 背景化後も悪化なし）。ゲートは背景 pull と
+独立の機構。
 
 計測の内訳が知りたいとき: `python3 docs/loop/l0.py -f <flow> -v`。
 
-## 4. 次の課題設定（iteration #8）
+## 4. 次の課題設定（iteration #9）
 
-> **iteration #7 の結末（この課題の起点）**: 「`apply` の診断 pull を外せば 1.1s が消える」は
-> 棄却（ADR-0053 追記）。分かったのは (1) 1.1s は **pull が強制する RA 解析**そのもので、
-> pull を外すと次に pull した者（`check`）が必ず払う、(2) 編集後の pull は
-> **「daemon のスナップショットが編集後の診断・ヒントを反映する」契約**を担っている
-> （テスト 3 件で固定）、(3) ただし契約が要求するのは「**pull が起きること**」だけで、
-> 「**Save 応答の前に起きること**」ではない（テストは snapshot を poll で最大 10 秒待つ）、
-> (4) 診断 pull が無い状態では **cargo 検証経路が −70〜80%** になる（apply-cargo
-> 1344→268ms）= エージェントが cargo で検証するフローでは先払いが純粋な二重払い。
+> **iteration #8 の結末（この課題の起点）**: 「pull は Save 応答から外せる（背景化）」は
+> 採用（ADR-0055）。`apply` の wall が **~130ms で安定**し、ギャップありの
+> apply + check の和は **222ms（現行比 −82%）**、エージェントの Save 応答待ちは
+> **−88%**。編集後追従の契約（テスト 3 件）は検証ポイントを poll に移して維持。
+> 同時に分かったのは (1) 「解析は誰かが買う」原則は背景化後も不変（ギャップ
+> なしでは check が ~800ms を買う。実フローでは LLM 推論が間に合う）、
+> (2) **計時ログが無いので、コマンド内部の内訳は A/B 除去か一時トレースでしか
+> 測れない**（check の ~800ms が「背景 pull との競合」なのか「RA の再解析」なのか、
+> 今回も直接測れなかった）、(3) `ServerMetrics` に `rename` のカウンタが無い等、
+> 計測の穴が残っている（method.md §7）。
 
 ### 課題
 
-`sync_after_edit` の pull（`pull_after_edit` → `set_focus_diagnostics` / `cache_hints`
-/ `drain_into` / push）を **Save 応答のクリティカルパスから外す（背景タスク化）**。
-契約（編集後追従）は「pull が起きること」しか要求しないので、応答を待たせずに満たせる
-はず — その見込みを A/B で確かめ、実装する。
+**daemon に計時ログ（tracing）を足し、コマンド内部の内訳を恒久的に測れるようにする**。
+対象は (a) `sync_after_edit`（didChange → 診断 pull → ヒント pull の各フェーズ）、
+(b) `serve_check_diagnostics`（pull の待ち内訳）、(c) `request_with_loading_retry`
+（リトライ回数）、(d) `ServerMetrics` の穴（`rename` のカウンタ、
+`get_state_total` の bytes）。エージェントの動作は変えない（追加は観測のみ）。
 
 ### 仮説
 
-背景化すると `apply`（Save 応答）が **~1.1s → ~150ms** になり、エージェントの次ターン
-（LLM 推論。数秒）の間に解析が終わるので、後続の `check` は **87ms のまま**。
-エージェントの待ち時間は **~1.27s → ~0.24s（−80%）**、cargo 経路も −70〜80%
-（#7 A/B(b) と同じ）。daemon のスナップショットは背景 pull の完了時（push）に更新され、
-編集後追従の 3 テストは poll で待つので通る。
+計時ログがあれば:
+- ギャップなし check の ~800ms が「（背景 pull と並行して）RA が didChange 後の
+  再解析を 1 回だけ買う」ことを確定でき、削る手がかり（あるいは「削れない =
+  実フローでは推論が間に合うので問題ない」の確定）になる。
+- 将来の仮説（apply2 の 2 回目が 84ms なのに 1 回目が 130ms の差、hints の 770ms
+  の内訳等）を 1 回の計測で分解できる。A/B 除去のたびにコードを 2 本持つ作業
+  （#4〜#7 で毎回やった）が不要になる。
 
 ### 測り方（順序を守る）
 
-1. **実装（1 変更）**: `sync_after_edit` の第 1 引数を `&Arc<Mutex<Daemon>>` に変え
-   （3 呼び出し側 `daemon.rs:1222`（watch_disk 再読込）/ `4348`（Command 編集）/
-   `4388`（DocumentEdit）はすべて `Arc` を持つ）、pull とその反映を `tokio::spawn` に移す。
-   応答は現状のスナップショット（= 編集前の診断）を即返す。
-   - ロック規律: `Open` の背景 settle（`daemon.rs:3882` 付近）と同じ形にする
-     （daemon ロックを await またいで持たない・`LSP_LOCK_TIMEOUT` の外側で待たない）。
-   - `activity`（`ReloadSync` 等）の追加/除去も背景タスク側に移す（応答に
-     「同期中」が残らないように）。
-2. **L0 に計測用の flow を足す**: `apply` → `sleep 3`（**エージェントの次ターン推論遅延の
-   代理**）→ `check`（+ `apply` → `sleep 3` → `cargo check` の腕）。
-   - 指標は **step 別 wall の apply + check の和**（`-v` の値）。ギャップはエージェントの
-     待ちではないので flow の `wall_ms` を使わない（使うと sleep 分で比較が濁る）。
-   - 受理側の見込み: apply ~150ms + check ~90ms = ~240ms（現行 ~1270ms）
-3. **即時 check の非悪化を確認**: 既存 `verify/apply-check`（ギャップ無し）は
-   apply ~1.1s が背景に移り、check が背景タスクの完了を待つ（= ~1.2s のまま）。
-   「即座に check を打つエージェントを悪化させない」ことが受理の一部。
-4. **回帰**: `cargo test` **462 green**（編集後追従の 3 テストが通ることが主条件）、
-   L0 `-r 3` で fails 0、`verify-broken/check` の rc=2（345B）・`verify-blind` の
-   `settled:false` 維持、`calls`/`out_B`/`equiv_B` 不変。
-   `-r 10` で**空 pull 回帰**（背景化で編集後 pull が失われないか）と cold（`apply` の
-   cold 120〜140ms が悪化しないか）も見る。
-5. **→ 本採用の判断**: 採用なら ADR-0055（wire 形状は不変なので PROTOCOL_VERSION は
-   上げない）。棄却なら「1.1s は編集と解析が直列である限りエージェントが払う」と確定し、
-   別候補（`apply --no-diagnostics`）に切り替える。
+1. **実装（観測のみ・動作不変）**: `minad` に軽量の計時（`tracing` または
+   `ServerMetrics` へのカウンタ追加）を入れる。
+   - 方針は「どこに何を足すか」を先に書く（method.md §4 の計測の穴を埋める）。
+   - エージェントの wire 形状・応答・契約は変えない（PROTOCOL_VERSION 不変）。
+2. **回帰**: `cargo test` **462 green**、L0 `-r 3` で fails 0・
+   `calls`/`out_B`/`equiv_B` 不変（計時が wall を歪めないこと — 計時自体の
+   オーバーヘッドが同定できるなら、その分を考慮）。
+3. **効果確認**: 計時ログで (i) ギャップなし check の ~800ms の内訳、
+   (ii) apply の 130ms の内訳、(iii) rename の 1150ms の内訳（server 応答待ち vs
+   client 処理）を出す。**これが次反復（#10）の課題設定の入力になる** —
+   #9 自体は基盤整備で、エージェントのコストは（多少の計時オーバーヘッドを
+   除き）変わらない。
+4. **→ 次反復 #10 の課題設定**: #9 の内訳に基づき、(a) check の ~800ms を
+   削る / 許容するの判定、(b) rename の 1150ms をどう扱うか（非同期化は
+   次ステップの入力になるため難しい。エージェント側の使い分けの検証）、
+   (c) 実フロー（L2）での確認、のどれかを選ぶ。
 
 ### 受理条件 / 棄却条件
 
-- **受理**: ギャップありで apply step ~150ms・check step ~90ms（**和が現行比 −70% 以上**）、
-  462 test green、`calls` / `out_B` / `equiv_B` 不変（`apply` の出力は `applied: …` のまま）、
-  `verify-broken` が rc=2 を維持、空 pull 回帰 0、cold の `apply` が悪化しない。
-  **wall 単独の改善は受理しない**（method.md §7）— 編集後追従の契約が保たれること
-  （テスト 3 件 green）が主条件。
-- **棄却**: (a) 背景タスクのセッションロックが次のコマンドを待たせる（ギャップありでも
-  `check` が ~1.1s = コストが移るだけ）、(b) 編集後追従の 3 テストが落ちる（背景 pull では
-  daemon のスナップショットを更新できない / push が届かない）、(c) レースを入れる
-  （`Save` 直後の `check` が古い診断を返す・背景タスクが二重に走る・デッドロック）。
+- **受理**: 計時ログが (i)(ii)(iii) の内訳を出せる・462 test green・L0 で回帰なし
+  （wall が計時で有意に歪まない）。基盤として有用なら採用。
+- **棄却**: (a) 計時で wall が歪み、L0 の基準値が 10% 以上悪化する、
+  (b) 計時ログが内訳を出せない（tracing が機能しない・計測に使えない）、
+  (c) 実装が大きくなりすぎて 1 変更に収まらない（観測以外の動作を変えている）。
 
 ### 別候補（後回し）
 
-- **`apply --no-diagnostics`（エージェントが契約を選ぶ）**: 「cargo で検証する」と宣言した
-  呼び出しだけ pull を省く（#7 の収穫を最小の変更で取る）。背景化より単純で、
-  `settled` の意味も daemon の契約も変えない（呼び出し側が「診断はいらない」と言う）。
-  ただし既定の `apply` は 1.1s のまま（エージェントが明示的に選ぶ必要がある）。
-- `apply` の初回再解析が「前回の解析済み状態」から始まる件: `check`/`symbol` を先に
-  叩いた後の `apply` は 137ms / 98ms / 102ms（#5）。**L2 で「apply の直前までに解析が
-  温まっていたか」を確認**すると、実フローでは 1.1s が稀かもしれない（#8 の背景化が
-  効かないフローがあるかの判定にもなる）。
-- `open_workspace_files`（rename/references の前に全ファイル didOpen する回避策）が
-  索引完走ゲートの導入後も必要か。ただし cold の主因は**ゲート**（`explore/lsp`
-  8.2s ≒ `rename/lsp` 9.1s）で、fixture が小さいため L0 では didOpen 分の差が出ない
-  （規模の課題 = L2 向き）。
-- L2 での規模検証（fixture が小さいので `wall_ms` は外挿不可。`calls` / `equiv_B` は外挿可）。
-- `ServerMetrics` の穴（`rename` のカウンタ、`get_state_total` の bytes）。
+- **L2（実 LLM）で verify-gap 相当の実フロー確認**: 背景化の効果は wall（待ち）
+  なので L2 のトークン計測では見えない。L2 で確認できるのは「回帰なし
+  （calls/equiv_B 不変・無言の誤りなし）」だけ。tools/ab にタスク追加が必要。
+- **ギャップなし check の ~800ms の削減**: 「解析は誰かが買う」原則があるため、
+  削るには「apply 直後の check が背景 pull の結果を待つ」等の形になる
+  （= settle の再導入に近い。ADR-0052/0053 の精神と要調整）。実フローでは
+  推論が間に合うので優先度は低い。**#9 の内訳を見てから判断する**。
+- `apply --no-diagnostics`（#8 の別候補）: 背景化で既定 apply が 130ms になった
+  ので、必要度は下がった。
+- `open_workspace_files`（rename/references の前に全ファイル didOpen する回避策）
+  が索引完走ゲートの導入後も必要か。ただし cold の主因はゲートで、fixture が
+  小さいため L0 では didOpen 分の差が出ない（規模の課題 = L2 向き）。
+- L2 での規模検証（fixture が小さいので `wall_ms` は外挿不可。`calls` / `equiv_B`
+  は外挿可）。
 - 上位モデルでの再現（L2 は nano のみ）。
-- **計時ログが無い**のでコマンド内部の内訳は A/B 除去か一時トレースでしか測れない。
-  恒久的に測れるようにするなら daemon に計時ログを足す（計測の穴を埋める）。
-  特に #7 で見つかった「Open 時背景 settle と編集後 pull の競合」は、計時ログが無いと
-  700/1100ms の割れを説明できない（apply の wall の分散要因）。
+- 計時ログが無いことは「コマンド内部の内訳は A/B 除去か一時トレースでしか測れない」
+  ことを意味する（特に #7 の「Open 時背景 settle と編集後 pull の競合」は、
+  計時ログが無いと apply の wall 分散を説明できなかった → #8 の背景化で解消）。
+  **この穴を埋めるのが #9 本体**。
 
 ## 5. 次のセッションの起動手順
 
@@ -242,7 +235,7 @@ cold の支配項は**索引完走ゲート**（`symbol`/`hints`/`rename`/`check
 ```text
 minas/minad のループエンジニアリング（エージェントのコスト低減）の続きをやって。
 まず docs/loop/method.md と docs/loop/latest.md を読み、
-latest.md の §4（次の課題設定）から iteration #8 を回して。計測したら --log で
+latest.md の §4（次の課題設定）から iteration #9 を回して。計測したら --log で
 log.md に記録し、考察を追記し、latest.md を更新して。
 ```
 
@@ -258,7 +251,7 @@ cargo build                                  # 計測対象は target/debug。�
                                              #  l0.py は PATH の minas/minad に黙って落ちる）
 cargo test                                   # 期待値: 462 passed（毎回確認）
 python3 docs/loop/l0.py --selftest          # 計測器の健全性
-python3 docs/loop/l0.py -f verify -f verify-broken -f verify-blind -r 3 -v   # 現状確認（apply ~1.1s / check 87ms）
+python3 docs/loop/l0.py -f verify -f verify-gap -f verify-broken -f verify-blind -r 3 -v   # 現状確認（apply ~130ms / check 92ms / ギャップあり和 222ms）
 git log --oneline -5                         # 直前の変更を確認（auto-checkpoint が並ぶ）
 ```
 
@@ -266,6 +259,6 @@ git log --oneline -5                         # 直前の変更を確認（auto-c
 `--log` は必ず付ける（JSON は `tmp/loop/` に落ちるだけなので、付け忘れると生データが消える）。
 `apply` を含む比較は `-r 3` 必須・**同一セッションで交互に**測る（§3 の注意）。
 
-**反復番号の規則**: 今回の反復番号は §4 の見出しの番号（いまは **iteration #8**）。
-結果は `log.md` に「iteration #8」として書き、考察の要約をこの `latest.md` に反映したうえで、
-§4 を次の番号（#9）の課題設定に書き換える。§5 はこの手順のまま使う。
+**反復番号の規則**: 今回の反復番号は §4 の見出しの番号（いまは **iteration #9**）。
+結果は `log.md` に「iteration #9」として書き、考察の要約をこの `latest.md` に反映したうえで、
+§4 を次の番号（#10）の課題設定に書き換える。§5 はこの手順のまま使う。
