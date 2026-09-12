@@ -7,6 +7,7 @@
 mod daemon;
 mod languages;
 mod lsp;
+mod trace;
 
 use clap::{Parser, Subcommand};
 

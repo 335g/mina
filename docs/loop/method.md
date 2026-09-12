@@ -101,6 +101,16 @@ python3 $L0 -r 3 --log -n "仮説: …"
 # cold 税（LSP ワークスペースロード前）
 python3 $L0 --cold
 
+# 1 コマンドの内訳（計時ログ。ADR-0056）: MINAD_TRACE=1 を付けて測り、
+# アーム専用 TMPDIR の daemon ログを読む
+MINAD_TRACE=1 python3 $L0 -f verify -r 1
+rg 'minad.trace' tmp/loop/verify-apply-check-*/.tmp/minad.log   # span/phase/ms が 1 行ずつ
+#   write bytes=N / serialize / socket   … 応答の直列化 + 書き込み
+#   edit total / sync total / sync.bg total … apply のデーモン側内訳（背景 pull は sync.bg）
+#   check total = borrow + caps + pull + restore、check.pull round0/round1 … check の内訳
+#   rename total = prepare/resolve/request/convert/apply、lsp.retry attempt1/attempt2
+#   hints total = pull（RA の inlayHint 計算）
+
 # LSP 直叩き（daemon の挙動が曖昧なとき。§6）
 python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
 python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
@@ -109,7 +119,7 @@ python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
 python3 tools/ab/ab.py run t11 A 1 && python3 tools/ab/ab.py run t11 B 1
 
 # 回帰
-cargo test          # 全 462 テスト
+cargo test          # 全 463 テスト
 cargo build
 ```
 
@@ -167,7 +177,18 @@ L0 は「minas の契約」を測るが、「その背後で LSP が何を返し
 
 ```bash
 python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
+python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
 ```
+
+**クライアントの固定費を測る（iteration #9 の手法）**: `minas` 側に待ちがあると
+疑ったら、Python で同じプロトコルを直に喋って daemon の応答時間と比較する。
+`tmp/loop/probe-client/` の形（`fixture_rust` を生成 → `minad serve` を同じ
+コマンド内で起動 → socket に `Hello` + コマンドを送って 1 行読む）で、
+「単一接続」「probe 接続（接続→即 close）を挟む」「同一接続で 3 往復」を測る。
+iteration #9 はこれで **daemon の応答は 0.27ms、`minas` の 1 呼び出しに ~65ms
+の固定費**（捨て接続 + accept ループ内の peer uid 検査の sleep）を特定した。
+注意: 手で起動した daemon は呼び出し元シェルの終了で死ぬことがある（同じ
+コマンド内で起動と測定を行い、`pgrep -f 'minad serve'` で生存を確認する）。
 
 ## 7. 落とし穴（実際に踏んだもの）
 
@@ -201,15 +222,25 @@ python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
 - **`C_0`（システムプロンプト等の固定費）は測らない**: アーム間で同じなら比較に影響しない。
 - **計測の穴**: `minas info` の `ServerMetrics` に `rename` のカウンタが無く、
   `get_state_total` にも bytes が無い。サブコマンドを足すときはカウンタも足す。
-- **1 つのコマンドの内側の内訳は測れない**: `-v` は step の合計 wall までしか出さず、
-  daemon に計時ログが無い（`minad` に tracing が無い）。内訳を知りたいときは
-  **1 変更だけ入れて A/B する**（例: `pull_after_edit` の hint pull を外す）。
-  恒久的に測りたいなら計時ログの追加が要る（そのときは計測器側の課題として扱う）。
+  **ただし `ServerMetrics` は `ServerInfo` 応答の wire の一部**なので、追加は
+  ADR-0039 の bump 方針（v18 の `read_total`/`read_bytes` が前例）に従って
+  `PROTOCOL_VERSION` を上げる必要がある（loop 側の制約と衝突するときは、
+  次に wire を変える用事と束ねる — ADR-0056）。
+- **1 つのコマンドの内側の内訳は `MINAD_TRACE=1` で測る**（iteration #9 / ADR-0056）。
+  `minad.trace <span> <phase> <ms>` が stderr（daemon のログ）に出る。既定は無効
+  なので通常の計測には影響しない。span は `write` / `edit` / `sync` / `sync.bg` /
+  `sync.lock` / `sync.pull` / `didChange` / `didOpen` / `borrow` / `check` /
+  `check.pull` / `rename` / `hints` / `lsp.retry`。内訳が無いときは A/B 除去
+  （#4〜#7 のやり方）を最後の手段にする。
 - **同じ arm の中で複数回叩くと「初回 vs 2 回目」が分かる**: 初回だけ高いコスト
-  （初回 pull・初回 didChange 後の解析など）はここで検出する。既知の例:
-  `apply` は初回 ~1.1 秒（RA の初回再解析）/ 2 回目 約 100ms。
+  （初回 pull・初回 didChange 後の解析など）はここで検出する。既知の例: `apply` は
+  #8 の背景化で **~130ms で安定**（初回の RA 再解析は背景 pull が買う。内訳は #9 の
+  `edit total` 2ms + `sync.bg` の診断 pull ~900ms — 応答は待たない）。
   固定待ち（`PULL_SETTLE` 250ms・`SEMANTIC_RETRY_WAIT` 500ms）は #5 / #6 で 0 になり、
-  残っている待ちは無い（`apply` の 1.1s は計算そのもの — #7）。
+  応答経路に残っている待ちは無い。
+- **全 `minas` 呼び出しに ~65ms の固定費**（#9）: デーモンの応答は 0.27ms なので、
+  `wall_ms` を読むときは「実処理 + calls×65ms + 起動 12ms」と分けて考える
+  （例: `explore/lsp` 278ms のうち 234ms がこれ）。除去は iteration #10。
 
 ## 8. 結果の書き先（どこに何を書くか）
 

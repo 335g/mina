@@ -1262,3 +1262,235 @@ snapshot は解析を買わない）。エージェントの次ターン（sleep
 - ギャップありの apply + check の和は **222ms（現行 1228ms 比 −82%）**。
 - 編集後追従の 3 テストは、追従の検証を poll で行う形に変更した
   （検証時点のみ。契約の意味は不変）。
+
+## 2026-09-12 21:59 — iteration #9: MINAD_TRACE=1（計時 on・1 run ずつ）。内訳（minad.log）と契約の回帰確認（calls/equiv_B 不変・settled 維持）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1017        17       551      1568     269.5         0  True
+explore  dump                  2      4750       298      4510      9260     155.9         0  True
+hints    hints                 1       110         8         0       110     669.5         0  True
+rename   lsp                   2       219         3       219       438    1145.6         0  True
+rename   apply                 5       406         4      1018      1424     599.6         0  True
+verify   apply-check           2       246         2       108       354     963.2         0  True
+verify   apply-cargo           2       108         1       108       216     227.8         0  True
+verify   hunks-cargo           2       154         1       154       308     248.9         0  True
+verify   apply2-cargo          3       218         2       327       545     353.5         0  True
+verify-blind check                 2       240         2       104       344     602.8         0  True
+verify-blind cargo                 2       104         1       104       208     539.1         0  True
+verify-broken check                 2       450         2       105       555     566.2         0  True
+verify-broken cargo                 2       105         1       105       210     213.6         0  True
+verify-gap apply-gap-check         3       262         2       232       494    3232.3         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3270.2         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4942, read_total=1, symbol_range_bytes=249, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5340, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=187, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-12 22:08 — iteration #9: 計時ログ追加後の基準値（trace off・verify 4 arm・warm r=3）。次の trace on と同条件で wall を比較する
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354     775.6         0  True
+verify   apply-cargo           2       108         1       108       216     597.8         0  True
+verify   hunks-cargo           2       154         1       154       308     352.9         0  True
+verify   apply2-cargo          3       218         2       327       545     337.0         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## 2026-09-12 22:16 — iteration #9: trace on（MINAD_TRACE=1・verify 4 arm・warm r=3）。直前の trace off と同条件で wall を比較（計時のオーバーヘッドが 10% 未満であること）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354     885.1         0  True
+verify   apply-cargo           2       108         1       108       216     275.4         0  True
+verify   hunks-cargo           2       154         1       154       308     276.5         0  True
+verify   apply2-cargo          3       218         2       327       545     359.1         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## 2026-09-12 22:25 — iteration #9: trace off 反復（verify 4 arm・warm r=6）。trace on との wall 比較を n 倍にして揺れを絞る
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354     894.5         0  True
+verify   apply-cargo           2       108         1       108       216     272.8         0  True
+verify   hunks-cargo           2       154         1       154       308     285.4         0  True
+verify   apply2-cargo          3       218         2       327       545     594.0         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## 2026-09-12 22:31 — iteration #9: trace on 反復（MINAD_TRACE=1・verify 4 arm・warm r=6）。trace off（r=6）との wall 比較
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       246         2       108       354     846.0         0  True
+verify   apply-cargo           2       108         1       108       216     276.1         0  True
+verify   hunks-cargo           2       154         1       154       308     410.3         0  True
+verify   apply2-cargo          3       218         2       327       545     745.1         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+
+
+## iteration #9 考察（2026-09-12）— 計時ログ（MINAD_TRACE）の採用と、全コマンド ~65ms 固定費の発見
+
+**仮説の検証結果**: **採用**（ADR-0056）。`minad` に `src/trace.rs`（120 行）+
+各経路の mark を入れ、`MINAD_TRACE=1` のときだけ stderr に
+`minad.trace <span> <phase> <ms>` を出す。wire・応答・PROTOCOL_VERSION は不変。
+`--log` を付けた 5 回の L0（trace on r=1 全 flow / off r=3 / on r=3 / off r=6 /
+on r=6）の生データは上の 5 ブロック。
+
+**回帰**: 463 test green（462 + trace の形式テスト 1 件）。trace on の L0
+（全 15 arm）で `calls`/`out_B`/`equiv_B` が #8 の §3 と**全 arm 一致**・
+`fails` 0・`ok` True。`settled:false`（blind）/ rc=2・Syntax Error（broken）も
+維持。計時の wall への影響は、minas の step だけで構成される apply-check で
+trace off 893.7 → on 846.0ms（n=9 ずつの中央値、**−5.3%**）、apply-cargo で
+−2.2%。`cargo check` を含む arm（hunks/apply2）は同一セッション内でも cargo の
+wall が 124〜1555ms と振れ、~1ms/命令の計時コストを分解できないため比較から
+除外した（計時は既定 off = `Instant::now()` 1 回と分岐のみ）。棄却条件 (a) には
+該当しない。
+
+### 内訳の実測（§4 の (i)(ii)(iii)）
+
+**（i）ギャップなし check の ~800ms は「解析の二重買い」ではなくロック待ち**
+（`verify/apply-check`、trace on、n=12 中央値）:
+
+```
+minad.trace edit total 2           ← DocumentEdit の処理（apply_edit 0 + 応答構築 1）
+minad.trace sync.bg didChange 2
+minad.trace sync.pull diag 892     ← RA の textDocument/diagnostic（唯一の解析）
+minad.trace sync.pull hint 6
+minad.trace sync.bg total 902
+minad.trace check borrow 682       ← ensure の await_indexed が session.lock() を待つ
+minad.trace check.pull round0 0    ← 自分の pull は 0ms（解析は買っていない）
+minad.trace check.pull round1 2    ← 2 回連続同一の確認（settle）
+minad.trace check total 686
+```
+
+背景 pull が先に完了していれば `check total` は **3ms**（実測例あり）。
+ギャップあり（sleep 3）では `check total` **5ms**。つまり #8 の
+「ギャップなしでは check が解析を買う」は**言い過ぎ**で、正しくは
+「背景 pull が買った 1 回の解析を、check がセッションロック越しに待つ」。
+待ちは `ensure` の `await_indexed` の `session.lock().await`（タイムアウト無し）
+に現れる。check 自身が払うのは 2ms。**「解析は誰かが買う」原則は不変**で、
+ギャップなしの場合の和 ~0.9s は同じ 1 回の解析の下限。
+
+**（ii）apply の ~130ms はデーモンではなく minas クライアント**:
+デーモン側は `edit total` 2ms + `write` ~1ms（n=12）。残りはクライアントで、
+プローブ実測（`tmp/loop/probe-client/`、デバッグビルド）で分解できた:
+
+| 測定 | 実測 |
+|---|---|
+| `minas --help`（起動 + clap） | 12.4ms |
+| daemon の 1 往復（Python クライアント、GetServerInfo） | **0.27ms** |
+| `minas info` / `minas read` | 82.8 / 84.1ms |
+| `minas apply`（内訳つき一時計測） | Open 往復 59ms + DocumentEdit 往復 9ms + Save 往復 2ms → 計 91ms |
+| probe 接続（接続→即 close）を挟んだ往復 | **67.2ms**（挟まない場合は 0.27ms） |
+
+**原因（A/B で確定）**: (1) `minas` は「デーモンが生きているか」を確かめるために
+**捨てる接続**を 1 本開いて即 close する（`open_one_shot` の `conn::connect`）、
+(2) daemon の `accept_loop` は peer uid 検査を **accept ループ内**で行い、
+`stream.peer_cred()` が ENOTCONN（相手が既に閉じた）のとき `5ms × 最大 10 回`
+sleep する。その間 accept ループが止まるので、直後に来た本命接続は
+カーネルの backlog に座ったまま**最初の往復が ~65ms 遅れる**。Python で
+「単一接続 0.27ms / probe→本接続 67.2ms」を再現した。**すべての minas 呼び出しが
+この固定費を払っており、L0 の全 flow の wall に含まれていた**（例:
+`explore/lsp` 269.5ms = 3 呼び出し × 78ms + 実処理 ~25ms。`hints` 669.5ms の
+うち 78ms、`rename/lsp` 1145.6ms のうち 78ms）。
+
+**（iii）rename の ~1150ms の実体は RA の WorkspaceEdit 計算**（n=2 + 純計測）:
+
+```
+minad.trace rename prepare 2      ← didOpen
+minad.trace rename resolve 12     ← 識別子位置の解決（全ファイル didOpen 済み）
+minad.trace lsp.retry method=textDocument/rename
+minad.trace lsp.retry attempt1 912   ← RA の計算（ここが全部）
+minad.trace lsp.retry attempt2 2     ← 2 回目の安定確認は 2ms
+minad.trace rename request 898
+minad.trace rename convert 2 / apply 2
+minad.trace rename total 918
+```
+
+`minas rename` の step wall 965ms = 起動 12 + **固定費 65** + デーモン 918 −
+（重複計上分を除く）≈ 一致。ADR-0054 の「2 回連続同一の確認自体はほぼ無料」は
+**2ms と直接確認**できた（案 B「確認を省く」を採る価値は無い）。
+hints も同じ形: `hints total` 578ms = `pull` 578（RA の inlayHint 計算）。
+キャッシュヒット時は ~0ms。
+
+### 想定外の収穫と次の一手
+
+計時ログを入れた目的（内訳を恒久的に測れるようにする）は達成し、その最初の
+計測で**#10 の課題が「apply の内訳」ではなく「全コマンドの ~65ms 固定費」に
+変わった**。これは L0 の全 flow に効く最大の残存項で、修正は 2 箇所の小変更:
+
+- daemon: `accept_loop` の peer uid 検査（最大 50ms の sleep）を accept ループの
+  外（＝spawn した接続タスク側）へ移す。**accept ループを sleep で止めない**。
+  これは minas に限らず、即 close する接続（死活監視・TUI 再接続）すべてに
+  効く共有経路の修正。
+- minas: 死活確認のための捨て接続をやめ、`conn::connect` の結果をそのまま
+  セッションに使う（接続 1 本/コマンドに減る）。
+
+期待効果（L0 で測れる）: `explore/lsp` −~195ms、`verify/apply-check` −~130ms、
+`apply2-cargo` −~195ms、`rename/lsp` −~65ms、`hints` −~65ms。`calls`/`out_B`/
+`equiv_B` は不変（契約は触らない）。
+
+**保留した項目**: `ServerMetrics` の穴（rename カウンタ・`get_state_bytes`）。
+`ServerInfo` 応答の wire 変更なので ADR-0039 では version bump が要る（v18 の
+`read_total`/`read_bytes` 追加が前例）。§4 の制約「PROTOCOL_VERSION 不変」と
+衝突するため、次に wire を変える用事と束ねる（ADR-0056 に記載）。
+
+**確定した事実（再測定は不要）**:
+- `MINAD_TRACE=1` で 1 コマンドの内訳（span/phase/ms）が取れる（既定 off・
+  wire 不変・463 test green）。method.md §7 の「内訳は A/B 除去でしか測れない」
+  は解消。
+- ギャップなし check の ~700ms は **`ensure` の `await_indexed` が
+  背景 pull のセッションロックを待つ**時間。check 自身の pull は 2ms。
+- すべての `minas` 呼び出しに **~65ms の固定費**（捨て接続 + accept ループ内
+  peer uid 検査の sleep）。デーモンの応答は 0.27ms（Python 実測）。
+- rename の 2 回目（安定確認）は **2ms**。hints の 578ms は RA の inlayHint 計算。
+- `sync.bg` の `didChange` が 300–650ms になるのは前の背景 pull のロック待ち
+  （応答はブロックしない — ADR-0055 の設計どおり）。

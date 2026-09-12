@@ -17,3 +17,6 @@ tmp
 
 docs/verification
 docs/gitignore
+
+# Python スクラッチ（docs/loop の計測器を import すると生成される）
+__pycache__/

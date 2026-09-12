@@ -34,6 +34,7 @@ use tokio::time::{Duration, timeout};
 use crate::languages::LanguageTable;
 use crate::lsp;
 use crate::lsp::LspSession;
+use crate::trace::Trace;
 
 /// Open で受け入れる最大ファイルサイズ（ADR-0008）。
 ///
@@ -1679,13 +1680,18 @@ async fn write_message(
     conn_id: u64,
     message: ServerMessage,
 ) -> bool {
+    // 応答のシリアライズ + socket 書き込み（ADR-0056 の `write` スパン）。
+    // 計時ログが無効なら Instant 1 回だけで、wire は不変。
+    let mut trace = Trace::new("write");
     let mut out = serde_json::to_string(&message).expect("メッセージはシリアライズ可能");
     out.push('\n');
+    trace.note("bytes", out.len());
+    trace.mark("serialize");
     // MEDIUM-2: 応答を読まないクライアントが socket バッファを詰まらせて
     // 接続スロットを永久に占有しないよう、書き込みにタイムアウトを付ける。
     // タイムアウト・切断のいずれも接続を閉じて後始末に進む。
-    eprintln!("[conn {}] writing {} bytes", conn_id, out.len());
     let wrote = timeout(RESPONSE_WRITE_TIMEOUT, write_half.write_all(out.as_bytes())).await;
+    trace.mark("socket");
     if !matches!(wrote, Ok(Ok(()))) {
         eprintln!("[conn {}] write TIMED OUT: {:?}", conn_id, wrote);
         return false;
@@ -1734,8 +1740,12 @@ async fn prepare_borrowed_session(
     daemon: &Mutex<Daemon>,
     path: &str,
 ) -> Result<Borrowed, BorrowFail> {
+    // ADR-0056: borrow の内訳（normalize / text / languages / ensure / didOpen）。
+    // didOpen は入れ子の `didOpen` スパン（ロック待ち vs 送信）で分かる。
+    let mut trace = Trace::new("borrow");
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let path_str = path_buf.to_string_lossy().into_owned();
+    trace.mark("normalize");
     // 対象テキスト: Editor の開文書を優先し、なければディスク読み
     // （SEC-1 検証済み。ADR-0008 の read_open_target を再利用）。
     let text = {
@@ -1751,6 +1761,7 @@ async fn prepare_borrowed_session(
     let Some(text) = text else {
         return Err(BorrowFail::CannotOpen);
     };
+    trace.mark("text");
     // LSP 非対応パス（テーブルにサーバ割当なし）: サーバを spawn しない（ADR-0030）
     let lsp_supported = daemon
         .lock()
@@ -1761,6 +1772,7 @@ async fn prepare_borrowed_session(
     if !lsp_supported {
         return Err(BorrowFail::NoServer(path_str));
     }
+    trace.mark("languages");
     // 解析フォーカス文書（復元用 — v12: 借りたセッションの共有解析フォーカスを
     // 復元対象にする。per-view のフォーカス文書ではない）。テキストは復元時に最新を読む。
     let focused = {
@@ -1772,9 +1784,11 @@ async fn prepare_borrowed_session(
         Ok(s) => s,
         Err(e) => return Err(BorrowFail::SpawnFailed(e)),
     };
+    trace.mark("ensure");
     // 切り替え: 対象文書を didOpen（現在の文書にしか応えないため、対象を開く
     // ことは必須）。既に開いている場合の再 didOpen は無害。
     lsp::open_document(&session, &path_buf, &text).await;
+    trace.mark("didOpen");
     Ok(Borrowed {
         path: path_buf,
         path_str,
@@ -1817,6 +1831,8 @@ async fn resolve_symbol_lsp_pos(
 }
 
 async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    // ADR-0056: hints の内訳（RA の inlayHint 計算 vs 借用・復元）。
+    let mut trace = Trace::new("hints");
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let path_str = path_buf.to_string_lossy().into_owned();
     // 要求パスのテキスト: Editor の開文書を優先し、なければディスク読み
@@ -1902,6 +1918,7 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
     let hints = lsp::pull_hints_timeout(&session, &path_buf, &text)
         .await
         .unwrap_or_default();
+    trace.mark("pull");
     // キャッシュ更新（daemon ロックは短時間のみ）
     {
         let mut d = daemon.lock().await;
@@ -1910,6 +1927,7 @@ async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage 
     if borrows_focus_session {
         // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
         restore_focus_session(daemon, &session, &focused).await;
+        trace.mark("restore");
     }
     let d = daemon.lock().await;
     ServerMessage::Hints {
@@ -2668,6 +2686,9 @@ async fn serve_workspace_symbols(
 /// 失敗は `error: Some(…)`（LSP 非対応・
 /// spawn 失敗は exit 1、LSP エラーは再試行可能な exit 2）。
 async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    // ADR-0056: pull の待ち内訳（borrow = didOpen / pull = RA 解析待ち +
+    // settle / restore）。ギャップなし check の ~800ms がどのフェーズかを見る。
+    let mut trace = Trace::new("check");
     let err = |msg: String| ServerMessage::Check {
         path: path.to_string(),
         generation: 0,
@@ -2684,6 +2705,7 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
+    trace.mark("borrow");
     // サーバが pull 診断を提供していなければ即「not supported」（exit 1）。
     if !borrowed.session.lock().await.caps.pull_diagnostics {
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
@@ -2697,17 +2719,22 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         .lock()
         .await
         .borrows_focus_session(&borrowed.focused, &borrowed.path);
+    trace.mark("caps");
     let pulled =
         lsp::pull_diagnostics_settled(&borrowed.session, &borrowed.path, &borrowed.text).await;
+    trace.mark("pull");
     if borrows {
         // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+        trace.mark("restore");
     }
     let Some((diags, settled)) = pulled else {
         // 恒久的失敗（セッションロック待ち・サーバ死亡）: 空ではなく理由を返す
         return err("LSP error: diagnostics pull failed (server dead or session lock timeout)"
             .into());
     };
+    trace.note("settled", settled);
+    trace.note("diags", diags.len());
     // char インデックス → 1-origin 行番号・行内列（エージェントの住所）を付与
     let diagnostics = diags
         .iter()
@@ -2973,6 +3000,9 @@ fn err_refs(path: &str, msg: String) -> ServerMessage {
 ///    独立に保たれる — Q5）。開いていないファイルはディスク読み → 書換。
 /// 3. 開いている文書も含め全変更をディスクへ書き、世代を進める。
 async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) -> ServerMessage {
+    // ADR-0056: rename の内訳（prepare = didOpen / request = RA の WorkspaceEdit
+    // 計算 / convert = char 変換 / apply = 書込み + 復元同期）。
+    let mut trace = Trace::new("rename");
     // borrow 前の入力エラー（restore 不要）
     let err_input = |msg: String| ServerMessage::RenameResult {
         generation: 0,
@@ -3003,6 +3033,7 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         }
         Err(BorrowFail::SpawnFailed(e)) => return err_input(format!("LSP error: {e}")),
     };
+    trace.mark("prepare");
     // 中間エラー応答。エラー経路でも借用していたらフォーカス文書へ戻す — 戻さないと
     // current_uri が対象のまま残り、次回のフォーカス編集が sync スキップ・診断消失に
     // なる（敵対的検証 P2。err クロージャの各 return が自動的に restore する）。
@@ -3052,10 +3083,12 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
             Ok(v) => v,
             Err(e) => return err(e).await,
         };
+    trace.mark("resolve");
     let raw = match lsp::rename_at(&borrowed.session, &borrowed.path, line, character, new).await {
         Ok(v) => v,
         Err(e) => return err(e).await,
     };
+    trace.mark("request");
     // 各ファイルの編集を char インデックスへ変換・検証（適用前に全失敗を検出 —
     // 検証失敗ならディスク無変更で拒否）
     let enc = borrowed.session.lock().await.encoding();
@@ -3096,19 +3129,25 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         ))
         .await;
     }
+    trace.mark("convert");
+    trace.note("files", files.len());
+    trace.note("edits", files.iter().map(|f| f.edits.len()).sum::<usize>());
     match apply_and_save_rename(daemon, &borrowed.session, &borrowed.focused, &borrowed.path, &files)
         .await
     {
-        Ok(generation) => ServerMessage::RenameResult {
-            generation,
-            files: files.len(),
-            edits: files.iter().map(|f| f.edits.len()).sum(),
-            changed: files
-                .iter()
-                .map(|f| f.path.to_string_lossy().into_owned())
-                .collect(),
-            error: None,
-        },
+        Ok(generation) => {
+            trace.mark("apply");
+            ServerMessage::RenameResult {
+                generation,
+                files: files.len(),
+                edits: files.iter().map(|f| f.edits.len()).sum(),
+                changed: files
+                    .iter()
+                    .map(|f| f.path.to_string_lossy().into_owned())
+                    .collect(),
+                error: None,
+            }
+        }
         Err(msg) => err(msg).await,
     }
 }
@@ -3649,8 +3688,12 @@ async fn sync_after_edit(
     status: Option<String>,
     activity: Option<(ActivityKind, &'static str)>,
 ) -> StateSnapshot {
+    // ADR-0056: sync = 応答側（drain + snapshot）、sync.bg = 背景の
+    // didChange → 診断 pull → ヒント pull → 反映 → push。
+    let trace = Trace::new("sync");
     if let Some((session, path, text)) = &target {
         // 背景タスク: LSP 同期 + pull + 反映 + push（Save 応答をブロックしない）
+        let mut bg = Trace::new("sync.bg");
         let daemon_task = daemon.clone();
         let session_task = session.clone();
         let path_task = path.clone();
@@ -3662,8 +3705,10 @@ async fn sync_after_edit(
                 drop(d);
             }
             lsp::sync(&session_task, &path_task, &text_task).await;
+            bg.mark("didChange");
             let (pulled_diags, pulled_hints) =
                 lsp::pull_after_edit(&session_task, &path_task, &text_task).await;
+            bg.mark("pull");
             let mut d = daemon_task.lock().await;
             if let Some((kind, _)) = activity {
                 d.remove_activity(&path_task, kind);
@@ -3679,15 +3724,20 @@ async fn sync_after_edit(
             drain_into(&mut d);
             let snap = snapshot(&mut d, None);
             drop(d);
+            bg.mark("reflect");
             // 発信元はコマンドでない（背景 pull）ため None を包み、全購読者に届く
             // （受信側は内容比較で再描画する — settle_open_diagnostics と同じ）。
             let _ = push_tx.send((None, snap));
+            bg.mark("push");
         });
     }
     // 応答は現状のスナップショット（= pull 前の診断・ヒント）を即返す
     let mut d = daemon.lock().await;
     drain_into(&mut d);
-    snapshot(&mut d, status)
+    let snap = snapshot(&mut d, status);
+    drop(d);
+    drop(trace); // 応答側の合計（背景タスクは含まない）
+    snap
 }
 
 /// 検索の継続状態（[`Command::Search`] の結果。`n`/`N` の前進元）。
@@ -4375,6 +4425,9 @@ async fn process_command(
                 // JSON 形状で衝突しない）。
                 match serde_json::from_str(line.trim()) {
                     Ok(edit) => {
+                        // ADR-0056: minas の `apply`（DocumentEdit）の内訳。
+                        // edit = 適用（apply_edit + 記録）/ sync = 応答構築。
+                        let mut trace = Trace::new("edit");
                         let mut d = daemon.lock().await;
                         // 拒否（checksum 不一致）なら状態を変えず status を返す
                         let rejected = apply_edit(&mut d, &edit, conn_id, source);
@@ -4404,6 +4457,7 @@ async fn process_command(
                             None
                         };
                         drop(d);
+                        trace.mark("apply_edit");
                         if let Some(rejected) = rejected {
                             rejected
                         } else {

@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use crate::trace::Trace;
+
 /// 1回の publish で取り込む診断の上限（5c: 診断 flood 対策）。
 const MAX_DIAGNOSTICS: usize = 500;
 
@@ -1121,10 +1123,14 @@ pub async fn pull_diagnostics_settled(
     path: &Path,
     text: &str,
 ) -> Option<(Vec<Diagnostic>, bool)> {
+    // ADR-0056: pull の round 別所要（round0 = 初回解析を背負う回、以降は settle 確認）。
+    let mut trace = Trace::new("check.pull");
+    let mut round = 0;
     let mut prev: Option<usize> = None;
     let mut empty_rounds = 0;
     let mut last: Vec<Diagnostic> = Vec::new();
     for _ in 0..SEMANTIC_RETRIES {
+        round += 1;
         let pulled = {
             let Ok(mut s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
                 return None;
@@ -1134,6 +1140,7 @@ pub async fn pull_diagnostics_settled(
             }
             s.pull_diagnostics(path, text).await
         };
+        trace.mark(&format!("round{}", round - 1));
         let Some(diags) = pulled else {
             return None;
         };
@@ -1320,9 +1327,14 @@ async fn request_with_loading_retry(
     params: Value,
     is_loading: fn(&Value) -> bool,
 ) -> Result<Value, String> {
+    // ADR-0056: LSP 要求のリトライ回数と所要（どの要求が何回転んだか）。
+    let mut trace = Trace::new("lsp.retry");
+    trace.note("method", method);
     let mut prev: Option<Value> = None;
     let mut retried = 0;
+    let mut attempts = 0;
     loop {
+        attempts += 1;
         let result = {
             let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
                 return Err("LSP セッションのロックを取得できませんでした".into());
@@ -1336,11 +1348,15 @@ async fn request_with_loading_retry(
                 .await
                 .map_err(|e| format!("LSP エラー: {e}"))?
         };
+        // ADR-0056: 何回目の要求が高いか（1 回目 = RA の計算、2 回目 = 安定確認）。
+        trace.mark(&format!("attempt{}", attempts));
         let loading = is_loading(&result);
         if !loading && prev.as_ref() == Some(&result) {
+            trace.note("retries", retried);
             return Ok(result); // 2回連続で同一 = 解析が安定
         }
         if retried >= SEMANTIC_RETRIES {
+            trace.note("retries", retried);
             return Ok(result); // 予算切れ: 最後の結果（空/不完全の可能性）を返す
         }
         prev = Some(result);
@@ -1546,10 +1562,15 @@ fn b_alnum(b: u8) -> bool {
 /// MEDIUM-4: ロック取得にもタイムアウトを付け、他タスクが hung サーバの
 /// notify でロックを握り続けていても Open コマンドをブロックしない。
 pub async fn open_document(session: &Mutex<LspSession>, path: &Path, text: &str) {
+    // ADR-0056: セッションロック待ちと didOpen 送信を分ける（check の borrow が
+    // 「背景 pull のロック待ち」か「didOpen の費用」かを見分けるため）。
+    let mut trace = Trace::new("didOpen");
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
         return; // サーバが忙しい: didOpen は次回の .rs Open で送られる
     };
+    trace.mark("lock");
     session.did_open(path, text).await;
+    trace.mark("send");
 }
 
 /// 文書を「閉じずに」開いたことを LSP に通知する（`open_document` の keep 版。
@@ -1569,6 +1590,8 @@ pub async fn open_document_keep(session: &Mutex<LspSession>, path: &Path, text: 
 /// MEDIUM-4: ロック取得もタイムアウト付き（他タスクがロックを握っていても
 /// 編集の応答を待たせない — 全文同期なので次の編集の sync が最新テキストを運ぶ）。
 pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
+    // ADR-0056: ロック待ちと didChange 送信を分ける。
+    let mut trace = Trace::new("didChange");
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
         return;
     };
@@ -1579,7 +1602,9 @@ pub async fn sync(session: &Mutex<LspSession>, path: &Path, text: &str) {
     if session.current_uri() != Some(doc_uri.as_str()) {
         return; // 現在の文書は LSP 非対象（.rs 以外を編集中）
     }
+    trace.mark("lock");
     session.did_change(path, text).await;
+    trace.mark("send");
 }
 
 /// 未処理の LSP 通知を取り込み、daemon の診断を維持する。
@@ -1599,15 +1624,22 @@ pub async fn pull_after_edit(
     path: &Path,
     text: &str,
 ) -> (Option<Vec<Diagnostic>>, Option<Vec<InlayHint>>) {
+    // ADR-0056: セッションロック待ち（背景タスクとの競合）と 2 回の pull を分ける。
+    let mut trace = Trace::new("sync.lock");
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
         return (None, None);
     };
+    trace.mark("lock");
     if session.client.is_dead() {
         return (None, None);
     }
     // 診断とヒントを続けて pull する（同じテキスト・同じ解析状態に対して）。
+    // ADR-0056: どちらが解析を買っているかを分けて観る（ADR-0053/0055 の引き継ぎ）。
+    let mut trace = Trace::new("sync.pull");
     let diags = session.pull_diagnostics(path, text).await;
+    trace.mark("diag");
     let hints = session.pull_inlay_hints(path, text).await;
+    trace.mark("hint");
     (diags, hints)
 }
 
