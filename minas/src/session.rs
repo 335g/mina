@@ -388,8 +388,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
         SessionCmd::Exec { json } => {
             let command: Command = serde_json::from_str(&json)
                 .map_err(|e| invalid(format!("cannot parse the command JSON: {e}")))?;
-            let snapshot = execute(&command).await?;
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            exec_raw(&command).await?;
         }
         SessionCmd::Edit { json, brief } => {
             let edit: DocumentEdit = serde_json::from_str(&json)
@@ -1540,6 +1539,49 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
     conn::request(&mut write_half, &mut reader, &command).await
 }
 
+/// `minas exec` の生経路: 任意の [`Command`] を送り、返った [`ServerMessage`] を
+/// そのまま出力する。
+///
+/// - `Response`（スナップショット）は従来どおり snapshot 本体を pretty JSON で
+///   出力する（後方互換）
+/// - 軽量応答（Hints / Peek / ReviewComments / ServerInfo / Outline …）は応答
+///   JSON を出力する — rust2 #26: 許可リストにある `ListReviewComments` /
+///   `GetServerInfo` が汎用 `execute`（スナップショット前提）で
+///   "unexpected semantic response" になっていた
+/// - headless ゲート拒否は status にだけ載って exit 0 になっていたので、定数
+///   接頭辞を検出して exit 1（stderr に理由）にする
+async fn exec_raw(command: &Command) -> io::Result<()> {
+    let (mut write_half, mut reader) = open_one_shot().await?;
+    let command = absolutize_paths(command.clone());
+    let mut line = serde_json::to_string(&command).map_err(|e| invalid(e.to_string()))?;
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    let message: ServerMessage = serde_json::from_str(&response)
+        .map_err(|e| invalid(format!("invalid response: {e}")))?;
+    match message {
+        ServerMessage::Response { snapshot } => {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            if let Some(status) = snapshot.status.as_deref() {
+                if headless_gate_rejected(status) {
+                    eprintln!("exec: {status}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ServerMessage::Push { .. } => return Err(invalid("unexpected push response")),
+        other => println!("{}", serde_json::to_string_pretty(&other)?),
+    }
+    Ok(())
+}
+
+/// headless ゲート拒否の status か（[`mina_protocol::HEADLESS_GATE_STATUS_PREFIX`]）。
+fn headless_gate_rejected(status: &str) -> bool {
+    status.starts_with(mina_protocol::HEADLESS_GATE_STATUS_PREFIX)
+}
+
 /// パスを含むコマンドのパスを絶対化する（Open / GetInlayHints。他はそのまま）。
 ///
 /// [`mina_conn::absolutize`] を共通化して使う — daemon 側の cwd は spawn 時に
@@ -2079,6 +2121,17 @@ mod tests {
             matches!(&timed_out, WaitOutcome::TimedOut(s) if s.generation == 5),
             "タイムアウト時は現状スナップショットを返す: {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn headless_gate_rejection_is_detected() {
+        // rust2 #26: 拒否は status にだけ載っていた — exec は接頭辞を検出して exit 1。
+        assert!(headless_gate_rejected(&format!(
+            "{} GetState, Save",
+            mina_protocol::HEADLESS_GATE_STATUS_PREFIX
+        )));
+        assert!(!headless_gate_rejected("reloaded from disk"));
+        assert!(!headless_gate_rejected(""));
     }
 
     #[test]

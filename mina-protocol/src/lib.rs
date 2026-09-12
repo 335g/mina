@@ -57,6 +57,14 @@ use serde::{Deserialize, Serialize};
 /// `SurroundDelete` / `SurroundReplace` を追加。コマンドの追加のため bump。
 pub const PROTOCOL_VERSION: u32 = 19;
 
+/// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
+/// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
+///
+/// daemon と minas の両方がこの定数を使う — minas の `exec` はこの接頭辞を検出して
+/// exit 1 にする（rust2 #26: 以前は拒否が status にだけ載って exit 0 になっており、
+/// `set -e` や rc 分岐のエージェントが「成功」と誤認した）。
+pub const HEADLESS_GATE_STATUS_PREFIX: &str = "headless clients can only use";
+
 /// daemon が bind するソケットのパス。
 ///
 /// プロトコルバージョンをソケット名に埋める（`minae-{PROTOCOL_VERSION}.sock`）:

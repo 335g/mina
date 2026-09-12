@@ -3881,10 +3881,10 @@ async fn process_command(
                 let mut d = daemon.lock().await;
                 return snapshot(
                     &mut d,
-                    Some(
-                        "headless clients can only use GetState, Save, WaitFor, DocumentEdit, Open, Close, ListReviewComments, ClearReviewComments, RegisterBaseRoot, and UnregisterBaseRoot"
-                            .into(),
-                    ),
+                    Some(format!(
+                        "{} GetState, Save, WaitFor, DocumentEdit, Open, Close, ListReviewComments, ClearReviewComments, RegisterBaseRoot, and UnregisterBaseRoot",
+                        mina_protocol::HEADLESS_GATE_STATUS_PREFIX
+                    )),
                 );
             }
         }
