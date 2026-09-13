@@ -133,10 +133,12 @@ pub enum SessionCmd {
         word: bool,
     },
     /// Fetch the daemon build generation and metrics (printed as JSON, issue #27).
-    /// This is the DAEMON's build/metrics — not the LSP server list. The wire
-    /// command is `GetServerInfo`; `base_roots` lists only comparison roots
-    /// registered via `RegisterBaseRoot` (empty is normal — language servers are
-    /// resolved per file, not through base_roots; rust2 #27).
+    /// This is the DAEMON's build/metrics (the wire command is `GetServerInfo`),
+    /// and it ALSO lists the configured language servers — `servers:
+    /// [{id, languages, running_sessions}]` — plus `base_roots` (comparison
+    /// roots registered via `RegisterBaseRoot`; empty is normal, language
+    /// servers are resolved per file, not through base_roots). Use `servers`
+    /// when `check` said "no LSP server configured" (rust2 #49).
     Info,
     /// Run one `Command` (JSON is the wire [`Command`] as-is)
     Exec {

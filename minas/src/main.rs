@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "minas", version, about = "Headless agent CLI for minae")]
 struct Cli {
-    /// 自己申告ラベル（ADR-0038。activity の actor に載る）。既定は
-    /// MINAE_CLIENT_NAME 環境変数、それも無ければ "unknown"。
+    /// Self-reported label (ADR-0038 — it lands in activity's actor). Defaults
+    /// to the MINAE_CLIENT_NAME env var, then to "unknown".
     #[arg(long, global = true)]
     name: Option<String>,
     #[command(subcommand)]
