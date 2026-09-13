@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Client-side daemon connection and request plumbing for minae"
 
 [dependencies]
-mina-protocol = { path = "../mina-protocol", version = "0.0.5" }
+mina-protocol = { path = "../mina-protocol", version = "0.0.6" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
