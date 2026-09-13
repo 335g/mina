@@ -102,6 +102,10 @@ const WAIT_SETTLE: Duration = Duration::from_millis(120);
 const WAIT_CONTENT_FALLBACK: Duration = Duration::from_millis(500);
 const WAIT_HARD_CAP: Duration = Duration::from_secs(2);
 
+/// peek が「定義なし」を確定する前に、識別子の位置で 1 回だけ待つ時間（#5）。
+/// 実測（`zeta(1)` の最初の 1 要求）では次の要求で既に当たるので、短くてよい。
+const PEEK_RETRY_WAIT: Duration = Duration::from_millis(400);
+
 /// daemon が保持する編集状態。
 pub struct Daemon {
     pub(crate) editor: Editor,
@@ -712,8 +716,11 @@ impl Daemon {
             .find(|(r, _)| path.starts_with(r))
             .map(|(_, c)| c.commit.get(..7).unwrap_or(&c.commit))
             .unwrap_or("?");
+        // ドッグフーディング #12: エージェントが分岐できるよう、安定した
+        // ASCII コードを先頭に置く（prose の言語に依存しない。他の agent 向け
+        // 診断 — cannot open / NOT FOUND / file too large — も英語）。
         Some(format!(
-            "基準 {short} 配下は読取り専用です: {}",
+            "read-only-base: {} is under read-only base {short} (unregister the base root to edit)",
             path.display()
         ))
     }
@@ -2090,7 +2097,7 @@ async fn serve_peek_definition(daemon: &Mutex<Daemon>, conn_id: u64) -> ServerMe
                         d.diagnostics.remove(&path);
                     }
                 }
-                lsp::definition_peek_at_char(&session, &path, &text, head).await
+                lsp::definition_peek_at_char_settled(&session, &path, &text, head).await
             }
             Ok(_) => None, // definition 非対応サーバ: peek なし
             Err(_) => None, // サーバ spawn 失敗: peek なし
@@ -2143,9 +2150,8 @@ async fn serve_peek_definition_at(
         .lock()
         .await
         .borrows_focus_session(&borrowed.focused, &borrowed.path);
-    let peek =
-        lsp::definition_peek_at_line_col(&borrowed.session, &borrowed.path, &borrowed.text, line, col)
-            .await;
+    let peek = peek_definition_settled(&borrowed.session, &borrowed.path, &borrowed.text, line, col)
+        .await;
     if borrows {
         // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
@@ -2508,6 +2514,59 @@ fn expand_outline_modules<'a>(
     }
     truncated
     })
+}
+
+/// 指定位置（1-origin 行:列）の文字が識別子の一部か。
+///
+/// peek の再試行を「識別子の位置」に限るための判定。空白・演算子・キーワード
+/// の「定義なし」はよくある正常な答えなので、そこに待ちを払わない。
+fn is_identifier_position(text: &str, line: u32, col: u32) -> bool {
+    let idx = lsp::line_col_to_char_idx(text, line, col);
+    text.chars()
+        .nth(idx)
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// 定義が取れなかったとき、「まだ解決できない」窓なら確定せずに 1 回だけ粘る
+/// （ADR-0058 / ドッグフーディング #5）。
+///
+/// 実測した 2 つの窓:
+/// - ファイルが crates に入った直後の再解析中（`Progress` が not ready）→ 静まる
+///   まで待って引き直す。
+/// - **didOpen 直後の最初の 1 要求**が、識別子の位置でも null を返す
+///   （実測: `let v = zeta(1);` の `zeta` で col13='z' だけ空、同じスイープの
+///   col14..17 は当たる）。索引が静かでも起きるので、識別子の位置に限って
+///   短く待って引き直す。
+///
+/// 「本当に定義が無い」識別子（未定義名など）は 1 回余分に待つが、空を確定として
+/// 返してエージェントに「定義なし」と結論させるより安い（peek の空応答に理由を
+/// 付けるのは wire 変更を伴う backlog）。
+async fn peek_definition_settled(
+    session: &Mutex<lsp::LspSession>,
+    path: &Path,
+    text: &str,
+    line: u32,
+    col: u32,
+) -> Option<mina_protocol::Peek> {
+    let first = lsp::definition_peek_at_line_col(session, path, text, line, col).await;
+    if first.is_some() {
+        return first;
+    }
+    // セッションロックは握ったまま待たない（ADR-0051）。
+    let progress = match tokio::time::timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await {
+        Ok(s) => s.progress(),
+        Err(_) => return first,
+    };
+    if !progress.is_ready() {
+        let _ = progress.wait_ready(lsp::LSP_READY).await;
+    } else if !is_identifier_position(text, line, col) {
+        // 索引は静かで、位置も識別子ではない = 本当に定義なし（即返す）。
+        return first;
+    }
+    tokio::time::sleep(PEEK_RETRY_WAIT).await;
+    lsp::definition_peek_at_line_col(session, path, text, line, col)
+        .await
+        .or(first)
 }
 
 /// [`Command::ReadPath`] の処理（ADR-0048）: パス指定の軽量テキスト読み。
@@ -4498,8 +4557,25 @@ async fn process_command(
                     },
                 };
                 let mut d = daemon.lock().await;
+                // ドッグフーディング #12: 比較用 root が「いま編集中のツリー」を
+                // 含む場合、以後その配下の編集はすべて拒否される（read-only）。
+                // 失敗は次のコマンドで遠くに出るので、登録時にその場で警告する
+                // （警告であって拒否ではない — 同じパスを別 commit で登録する
+                // compare-review の使い方は正当）。
+                let blocked = d
+                    .editor
+                    .open_paths()
+                    .filter(|p| p.starts_with(&canon))
+                    .count();
                 d.register_base_root(canon, commit, canon_repo, source);
-                snapshot(&mut d, None)
+                let status = (blocked > 0).then(|| {
+                    format!(
+                        "warning: read-only-base — {blocked} open document(s) under this root \
+                         are now read-only (RegisterBaseRoot makes the whole subtree uneditable; \
+                         UnregisterBaseRoot the same root to edit again)"
+                    )
+                });
+                snapshot(&mut d, status)
             }
             // #49: 基準 root の登録解除。セッション破棄＋キャッシュ破棄。
             // 不在は無視（M1: 変化なし・世代不変）。worktree 削除後の順序にも
@@ -11551,7 +11627,7 @@ root-markers = [".docsroot"]
         assert_eq!(snap.text, "hello\nworld\n", "基準への編集は効かない");
         assert_eq!(snap.generation, 2, "拒否で世代は進まない");
         assert!(
-            snap.status.as_deref().unwrap_or("").contains("読取り専用"),
+            snap.status.as_deref().unwrap_or("").contains("read-only-base"),
             "拒否理由: {:?}",
             snap.status
         );
@@ -11560,7 +11636,7 @@ root-markers = [".docsroot"]
         let snap = request(&mut c, &Command::Save).await;
         assert_eq!(snap.generation, 2);
         assert!(
-            snap.status.as_deref().unwrap_or("").contains("読取り専用"),
+            snap.status.as_deref().unwrap_or("").contains("read-only-base"),
             "拒否理由: {:?}",
             snap.status
         );
@@ -11625,14 +11701,22 @@ root-markers = [".docsroot"]
             },
         )
         .await;
-        assert!(snap.status.is_none(), "headless 登録は通る: {:?}", snap.status);
+        // headless 登録: 拒否されず世代が進む。開いている文書が登録 root の
+        // 下にある場合は警告が戻る（ドッグフーディング #12: 失敗が 1 コマンド
+        // 後に遠くへ出るのをやめ、原因の位置で知らせる）。
+        let status = snap.status.as_deref().unwrap_or("");
+        assert!(
+            status.is_empty() || status.contains("read-only-base"),
+            "登録は通る（警告のみ可）: {:?}",
+            snap.status
+        );
         assert_eq!(snap.generation, gen0 + 1);
         assert!(snap.events.iter().any(|e| e.kind == EventKind::BaseRoot));
 
         // 基準配下への headless 自身の保存も拒否（ガードは発信元不問）。
         let snap = request(&mut agent, &Command::Save).await;
         assert!(
-            snap.status.as_deref().unwrap_or("").contains("読取り専用"),
+            snap.status.as_deref().unwrap_or("").contains("read-only-base"),
             "拒否理由: {:?}",
             snap.status
         );
@@ -11976,7 +12060,10 @@ root-markers = [".docsroot"]
         // コンポーネント単位: /r2 は /r の配下ではない。
         assert!(!d.is_base_path(Path::new("/r2/a.rs")));
         let msg = d.base_reject(Path::new("/r/a.rs")).unwrap();
-        assert!(msg.contains("abc1234") && msg.contains("読取り専用"), "{msg}");
+        assert!(
+            msg.contains("abc1234") && msg.contains("read-only-base"),
+            "安定コード + コミット: {msg}"
+        );
         assert!(d.base_reject(Path::new("/o/b.rs")).is_none());
         // キャッシュは prefix で捨てる（対象外は残る）。
         d.diagnostics.insert(PathBuf::from("/r/a.rs"), Vec::new());
@@ -12020,7 +12107,7 @@ root-markers = [".docsroot"]
                 files: 0,
                 edits: 0,
                 ..
-            } => assert!(e.contains("読取り専用"), "{e}"),
+            } => assert!(e.contains("read-only-base"), "{e}"),
             other => panic!("拒否のはず: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);

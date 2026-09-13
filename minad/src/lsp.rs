@@ -56,6 +56,17 @@ pub(crate) const LSP_READY: ReadyPolicy = ReadyPolicy {
     cap: Duration::from_millis(400),
 };
 
+/// peek が「定義なし」を確定する前の待ち（ADR-0058 / ドッグフーディング #5）。
+///
+/// ラウンドが進行中のときだけ使う（ready なら即返す）ので、上限は短くてよい —
+/// 実測では次に同じ列を引き直すと ~1s で当たる。待っても静まらなければ空を返す
+/// （peek の空応答に理由を付けるのは wire 変更を伴う backlog）。
+const DEFINITION_READY: ReadyPolicy = ReadyPolicy {
+    arm: Duration::from_millis(200),
+    quiesce: Duration::from_millis(300),
+    cap: Duration::from_secs(3),
+};
+
 /// LSP セッションの状態（1セッション = 1サーバ。言語テーブルは ADR-0030）。
 pub struct LspSession {
     /// pub(crate): daemon 統合（ensure / drain / settle）が生死判定に読む。
@@ -913,6 +924,41 @@ pub async fn definition_peek_at_char(
     definition_peek_at(session, path, text, line, character).await
 }
 
+/// [`definition_peek_at_char`] を「解析が静まっている」ときだけ確定する版（ADR-0058）。
+///
+/// 定義が取れなかったとき、索引/再ロードのラウンドが進行中なら**まだ確定しない**:
+/// ラウンドが終わるのを（上限付きで）待って 1 回だけ引き直す。
+/// 実測（ドッグフーディング #5）: 新規ファイルをモジュールツリーに繋いだ直後の
+/// スイープは全列が「定義なし」（line=0）になり、次のスイープは全列で当たる —
+/// ファイルが crates に入った直後の再解析中に `textDocument/definition` が null を
+/// 返すのが原因。待てば当たる空を「定義なし」として返さない（peek の空応答に
+/// 理由を付けるのは backlog — wire 変更を伴う）。
+///
+/// 索引が静かだった（= 本当に見た上での空）場合は待たずにそのまま返す。
+pub async fn definition_peek_at_char_settled(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    head: usize,
+) -> Option<mina_protocol::Peek> {
+    let peek = definition_peek_at_char(session, path, text, head).await;
+    if peek.is_some() {
+        return peek;
+    }
+    // 空のときだけ聞き直す。ready なら（本当に定義が無い）即返す。
+    // セッションロックは握ったまま待たない（ADR-0051 — didChange を締め出さない）。
+    let progress = match timeout(LSP_LOCK_TIMEOUT, session.lock()).await {
+        Ok(s) => s.progress(),
+        Err(_) => return peek,
+    };
+    if progress.is_ready() {
+        return peek;
+    }
+    let _ = progress.wait_ready(DEFINITION_READY).await;
+    let retried = definition_peek_at_char(session, path, text, head).await;
+    retried.or(peek)
+}
+
 /// [`definition_peek_at`] の位置解決のみの軽量版（ADR-0049）: 指定位置の
 /// `textDocument/definition` で最初の定義先の URI だけを返す（スニペット
 /// 取得なし — モジュール横断 outline が「モジュール名 → 定義ファイル」を
@@ -1178,6 +1224,30 @@ pub async fn pull_diagnostics_settled(
             return Ok((diags, true)); // 非空が2回連続で同数 = 安定
         }
         if n == 0 {
+            // 空の早期確定（ADR-0052）の前に「本当に見たのか」を確かめる。
+            // 索引/再ロードのラウンドが進行中なら、この空は「見た結果が空」では
+            // なく「まだ見ていない」（ドッグフーディング #3 の残り: 新規作成
+            // 直後の `check` が clean-unverified + exit 0 を返し、`cargo` は
+            // E0308 を報告した — 1/9 回）。索引が静まるまで待って引き直し、
+            // 待っても静まらなければ NotReady（= 再試行可能）を返す。
+            // 「見ていない空」をクリーンの根拠にしない（ADR-0045）。
+            //
+            // `wait_ready` を使うのは進捗を送らないサーバの逃げ道（`arm`）が
+            // 必要だから — `is_ready()` だけを見ると、進捗非対応のサーバで
+            // 永久に「未確認」になる。待ちの間セッションロックは持たない（ADR-0051）。
+            let progress = match timeout(LSP_LOCK_TIMEOUT, session.lock()).await {
+                Ok(s) => s.progress(),
+                Err(_) => return Err(PullFail::LockBusy),
+            };
+            if !progress.is_ready() {
+                progress.wait_ready(LSP_READY).await;
+                if !progress.is_ready() {
+                    return Err(PullFail::NotReady);
+                }
+                // 静まった: 本当の空かを確かめるために引き直す（この空はまだ
+                // 確定にしない）。
+                continue;
+            }
             empty_rounds += 1;
             if empty_rounds >= SEMANTIC_EMPTY_ROUNDS {
                 // 空: 未確認のまま返す（クリーン扱いはしない — ADR-0045）

@@ -40,6 +40,27 @@ Status: accepted
    `WAIT_TIMEOUT` = 90s、CLI が exit 2 で現状を返す）。
 4. **skill を更新**: `check` の verdict / exit の意味（0 と 2 の分岐点）と、
    `unlinked-unverified` が「新規作成直後に見えるもの」であることを明記。
+5. **空の `check` も「見たのか」を確かめる**（round 3 の残り）: 空が返ったとき、
+   索引/再ロードのラウンドが進行中なら `Progress::wait_ready` で静まるまで待って
+   引き直し、静まらなければ `PullFail::NotReady`（再試行可能）を返す。
+   driver の再検証で 9 回中 1 回、**pull が空を返し、unlinked-file Hint がまだ
+   現れていない窓**で `clean-unverified` + exit 0 が返った（`cargo` は E0308）。
+   修正後の実測: 新規ファイルを作って即 `check` × 5 回 → すべて exit 2
+   （`unlinked-unverified` / `errors (1)`）、`clean-unverified` + 0 は 0 件。
+6. **`peek` は「まだ解決できない」空を確定しない**（round 3 の残り）: 定義が
+   取れなかったとき、(a) 索引が not ready なら静まるまで待つ、(b) 索引が静かでも
+   **位置が識別子**なら短く待って 1 回だけ引き直す。実測: ファイルを crates に
+   繋いだ直後の最初のスイープは `let v = zeta(1);` の `z` だけ空（同じスイープの
+   `e`/`t`/`a` は当たる）、修正後は 5 列すべてが当たる。空白・演算子・キーワードの
+   「定義なし」（正常な答え）は待たない。
+7. **エージェントが分岐できる失敗の形にする**（#12）: 基準 root 配下の編集拒否は
+   `read-only-base:` で始まる安定 ASCII コード + 英語本文（他の agent 向け診断
+   — `cannot open` / `NOT FOUND` / `file too large` — と同じ言語に揃える。
+   prose を文字列マッチしないと分岐できない状態をやめる）。加えて
+   `RegisterBaseRoot` 時点で、登録 root 配下に**開いている文書**があれば警告を
+   返す（原因のコマンドで知らせる — 失敗は 1 コマンド後に遠くに出ていた）。
+   拒否ではなく警告なのは、同じパスを別 commit で登録する compare-review の
+   使い方が正当だから。
 
 ## Considered Options
 
@@ -65,6 +86,8 @@ Status: accepted
   延期 — 原因（未解決 vs 定義なし）の区別には LSP の応答だけでは足りず、
   「解決できなかった」を別の値として定義する必要がある。backlog
   （`.pi/todos`）に置き、wire 変更をまとめる回で扱う。
+  （decision 5/6 で「待てば当たる空」は減らしたが、「本当に定義なし」と
+  「サーバが null を返した理由」の区別は依然として値に無い。）
 
 ## Consequences
 
