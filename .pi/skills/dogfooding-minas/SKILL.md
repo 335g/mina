@@ -20,30 +20,42 @@ The loop only earns its cost if the driver actually reaches for minas every time
    herdr pane rename <driver_pane> <driver> ; herdr agent rename <driver_pane> <driver>
    herdr pane rename --current <implementer> ; herdr agent rename --current <implementer>
    ```
-3. No driver pane yet? Create and launch it **with the model credentials and the same
-   model as this pane** — a split inherits neither the caller's env nor its model:
-   without the key Pi boots with an unresolved model and cannot answer at all, and
-   without `--model` it picks its own default, so the two panes reason with different
-   weights (observed: default resolved to `deepseek-v4-flash` while the implementer
-   ran `deepseek-v4.1-flash`). This pane's own identity is in its env
-   (`PI_PROVIDER`, `PI_MODEL`, `PI_REASONING_LEVEL`):
+3. Pick the driver's workspace: `$1` if the user named a repo, otherwise a throwaway
+   under `/tmp` so the loop never dirties a real tree:
    ```bash
-   set -a; . ./.env; set +a          # implementer's credentials (value never printed)
-   herdr pane split --current --direction right --cwd <driver_repo> --no-focus \
+   DRIVER_REPO=${1:-$(mktemp -d /tmp/minas-dogfood-XXXXXX)}
+   ```
+   A `/tmp` scratch has no `.env`/`.envrc`, so credentials can only arrive through the
+   environment (step 4), and it does not survive a reboot — tell the driver it is scratch.
+4. Get a driver pane, then launch Pi in it with **the same model as this pane**. Reuse a
+   prepared empty pane if one exists (e.g. labelled `driver`); otherwise split one:
+   ```bash
+   set -a; . ./.env; set +a                      # implementer's credentials (never printed)
+   herdr pane split --current --direction right --cwd "$DRIVER_REPO" --no-focus \
      --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"
-   herdr agent start <driver> --kind pi --pane <new_pane> \
+   ```
+   A split inherits neither the caller's env nor its model: without the key Pi boots
+   with an unresolved model and cannot answer at all, and without `--model` it picks
+   its own default, so the panes reason with different weights (observed: default
+   `deepseek-v4-flash` vs the implementer's `deepseek-v4.1-flash`). This pane's identity
+   is in its env (`PI_PROVIDER`, `PI_MODEL`, `PI_REASONING_LEVEL`):
+   ```bash
+   # one command for either route (an existing pane needs the cd; a fresh split has it already)
+   herdr pane run <driver_pane> "cd $DRIVER_REPO && OPENCODE_API_KEY='$OPENCODE_API_KEY' \
+     pi --tui-mode fullscreen --model $PI_PROVIDER/$PI_MODEL --thinking $PI_REASONING_LEVEL"
+   # equivalent, Herdr-managed route (gives the agent a name up front):
+   herdr agent start <driver> --kind pi --pane <driver_pane> \
      -- --model "$PI_PROVIDER/$PI_MODEL" --thinking "$PI_REASONING_LEVEL"
    ```
-   args after `--` go to `pi` itself (`argv` in the response shows them).
-   Alternative with no secret in argv: give the driver repo its own `.env` +
-   `.envrc` (`dotenv`) and split without `--env` (still pass `--model`).
-4. Verify the driver is alive **and on the same model** before briefing: the intercom
+   `pane run` types the command into the pane's shell; `agent start` args after `--` go
+   to `pi` itself (`argv` in its response shows them).
+5. Verify the driver is alive **and on the same model** before briefing: the intercom
    list shows each session's model — it must equal this pane's (not `unknown`, not a
    different one), then ask it to say "pong" with the intercom tool (`action: ask`,
    `to: <driver session id>`). A non-answer is an auth/env failure — fix the
    credentials, do not send the activation yet.
-5. Send the activation (`## Activation`, below) with the intercom tool (`action: send`).
-6. The driver sends the baseline first; keep it — you will diff against it when a "fixed" claim is contested.
+6. Send the activation (`## Activation`, below) with the intercom tool (`action: send`).
+7. The driver sends the baseline first; keep it — you will diff against it when a "fixed" claim is contested.
 
 ## Activation (send only this)
 
@@ -110,4 +122,4 @@ State: <tests / installed / daemon restarted / socket vNN>.
 
 ## Close out
 
-When the user stops the loop, report: what shipped (grouped by theme), what was declined and why, the backlog still open, and the current build/daemon/test state. Leave the driver's tree clean and the daemon on the current socket version.
+When the user stops the loop, report: what shipped (grouped by theme), what was declined and why, the backlog still open, and the current build/daemon/test state. Leave the driver's tree clean and the daemon on the current socket version. Ask what to do with the driver workspace: a `/tmp` scratch can be deleted (`rm -rf`) or kept for re-verification — say which path it was either way, since a scratch dir has no other record of existing.
