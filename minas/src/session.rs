@@ -1286,8 +1286,26 @@ fn warn_leftover_mentions(
     let Some(dir) = path.parent() else {
         return;
     };
+    // 相対パスのままだと祖先の walk-up が空パスを踏んで走査範囲を失う（実測:
+    // `crates/b/src/lib.rs` で scan_root が空になり警告が出なかった）。
+    // まず絶対化してから祖先を辿る。
+    let abs_path = std::path::PathBuf::from(conn::absolutize(&path.to_string_lossy()));
+    let dir = abs_path.parent().unwrap_or(dir);
+    // 走査範囲（ドッグフーディング #16 の追試）: シンボルの**利用側は別の
+    // ディレクトリ（多くの場合別クレート）に居る**ので、対象ファイルの
+    // ディレクトリだけを走査するのは助けが要らない側を走査していた。
+    // 祖先を辿って**最も外側の Cargo.toml を持つディレクトリ**（workspace root）
+    // を探し、そこを走査する（見つからなければファイルのディレクトリ）。
+    let mut scan_root = dir.to_path_buf();
+    let mut probe = dir.to_path_buf();
+    while let Some(parent) = probe.parent() {
+        if parent.join("Cargo.toml").is_file() {
+            scan_root = parent.to_path_buf();
+        }
+        probe = parent.to_path_buf();
+    }
     let mut files = Vec::new();
-    collect_rs_files(dir, &mut files);
+    collect_rs_files(&scan_root, &mut files);
     let changed: std::collections::HashSet<String> = changed
         .iter()
         .map(|p| conn::absolutize(p))

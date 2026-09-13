@@ -42,6 +42,20 @@ re-read it and re-apply; the buffer was NOT written
 - 限界を明記する: `(size, mtime)` の比較なので、**同一サイズの外部書き込みが同じ
   mtime 刻みに収まる**と検知できない（APFS は ns、HFS+ は 1s）。内容ハッシュに
   すれば閉じるが、保存ごとに全文読みが増える。実測が要求したら別の反復で。
+- **追記（round 6、#17）** driver の追試で 2 つの残差が出たので両方塞いだ:
+  1. **`ctime` を比較に加える**（`baseline_ctime` = Unix の `ctime`/`ctime_nsec`）。
+     `size` + `mtime` だけだと「同一サイズで `os.utime` により mtime を復元した
+     外部書き込み」がすり抜ける（driver 実測: 5.2 MB で 4/6 lost update、guard 沈黙）。
+     `utime` は mtime を戻せても ctime は必ず動く。
+     実測（同一サイズ + mtime 復元、5.2 MB、書き込みを窓の 35〜60% に置く 6 試行）:
+     **refused 5 / lost 0**（旧: 4/6 lost）。
+  2. **write 直後にサイズを検算する**（`save-verify:`）。guard の stat と write の
+     間に外部が入るとこちらの write がそれを消す（driver 実測 1/14）。POSIX に
+     「変わっていたら書かない」は無いので**窓は閉じられない** — 代わりに、書いた
+     バイト数とディスクのサイズが違えば未保存扱いのまま
+     `save-verify: … another writer interleaved during the write — re-read the file
+     before trusting it` を返す（exit 2。黙って成功にしない）。
+     限界: **同一サイズの交錯**はこの検算でも分からない（内容読み戻しが要る）。
 - CLI の `SAVE FAILED:` は status をそのまま出す（`{:?}` の `Some("…")` は
   エージェントが読む行に Rust のデバッグ表現を混ぜるため。#15 で気づいた）。
 

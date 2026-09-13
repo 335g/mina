@@ -274,6 +274,39 @@ const MAX_HINT_CACHE: usize = 64;
 struct DiskBaseline {
     mtime: std::time::SystemTime,
     size: u64,
+    /// Unix ctime（秒, ナノ秒）。`size` + `mtime` だけでは、**同一サイズで mtime を
+    /// 復元した外部書き込み**を検知できない（ドッグフーディング #17(a): 5.2 MB で
+    /// 4/6 回 lost update し、guard は沈黙した。`os.utime` は mtime を戻せるが
+    /// ctime は必ず動く — 実測で ctime だけが変化した）。
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+fn baseline_ctime(md: &std::fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (md.ctime(), md.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn baseline_ctime(_md: &std::fs::Metadata) -> (i64, i64) {
+    (0, 0)
+}
+
+impl DiskBaseline {
+    fn of(md: &std::fs::Metadata) -> Self {
+        Self {
+            mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
+            size: md.len(),
+            ctime: baseline_ctime(md),
+        }
+    }
+
+    /// ディスクの現在の状態がこのベースラインと一致するか（= 外部に触られていない）。
+    fn matches(&self, md: &std::fs::Metadata) -> bool {
+        self.size == md.len()
+            && self.mtime == md.modified().unwrap_or(std::time::UNIX_EPOCH)
+            && self.ctime == baseline_ctime(md)
+    }
 }
 
 /// 接続 1 つ分の View（ADR-0037）。doc / selection / first_line は
@@ -1170,8 +1203,7 @@ async fn watch_disk(
             for (path, baseline) in &d.baselines {
                 match std::fs::metadata(path) {
                     Ok(md) => {
-                        let changed = md.len() != baseline.size
-                            || md.modified().unwrap_or(std::time::UNIX_EPOCH) != baseline.mtime;
+                        let changed = !baseline.matches(&md);
                         if changed {
                             reload_targets.push(path.clone());
                         }
@@ -1262,12 +1294,7 @@ async fn watch_disk(
                     if let Ok(md) = std::fs::metadata(path) {
                         d.baselines.insert(
                             path.clone(),
-                            DiskBaseline {
-                                mtime: md
-                                    .modified()
-                                    .unwrap_or(std::time::UNIX_EPOCH),
-                                size: md.len(),
-                            },
+                            DiskBaseline::of(&md),
                         );
                     }
                     d.record_event(
@@ -2204,6 +2231,47 @@ async fn resolve_doc_text(daemon: &Mutex<Daemon>, path_buf: &Path) -> Result<Str
                 (None, None) => Err(format!("cannot open {path}")),
             }
         }
+    }
+}
+
+/// 空の意味的結果を「確定」してよいか（ドッグフーディング #18）。
+///
+/// 構文層（`documentSymbol` = outline/at）は答えるのに、意味層
+/// (`textDocument/references` / `hover` / `rename` / `workspace/symbol`) が
+/// 全滅する状態が実在する — 実測（driver #18、`/tmp/drvp/ws2`）: `outline` は
+/// シンボルを返し、`at` も解決し、`check` は clean-unverified なのに、
+/// `references` は 0 件、その位置の `hover` は空、`symbol` は `[]`、`rename` は
+/// "symbol not found"。cargo metadata / ビルドは正常で、分かったのは
+/// 「そのセッションの crate graph が読めていない」ことだけ。
+///
+/// 0 件は API 削除の根拠にされる答えなので、空を確定する前に同じ位置へ hover を
+/// 投げて意味層の生存を確かめる（ホバーは「この位置に何かある」の最小の probe）。
+///
+/// 戻り値: 死んでいる疑いがあればエージェント向けの 1 行（呼び出し側が err にして
+/// exit 2 = 再試行可能に落とす）。hover 非対応サーバでは判定不能なので `None`
+/// （誤警告を出さない — 判定できないことを警告にしない）。
+async fn semantic_layer_unavailable(
+    session: &Mutex<lsp::LspSession>,
+    path: &Path,
+    text: &str,
+    line: u32,
+    character: u32,
+) -> Option<String> {
+    if !session.lock().await.caps.hover {
+        return None;
+    }
+    let hover = lsp::hover_at_line_col(session, path, text, line, character).await;
+    match hover {
+        Some(t) if !t.trim().is_empty() => None,
+        _ => Some(format!(
+            "LSP error: the semantic layer answered nothing for a symbol this file declares \
+             (hover at {}:{} is empty as well) — an empty references list here is NOT evidence \
+             that the symbol is unused. outline/at still work; the workspace may not be loaded \
+             in the daemon's language server (dogfooding #18: check `minas info` sessions, \
+             restart/rebuild the daemon, then retry)",
+            line + 1,
+            character + 1
+        )),
     }
 }
 
@@ -3255,6 +3323,15 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
         Ok(v) => v,
         Err(e) => return err(e).await,
     };
+    // ドッグフーディング #18: 空の参照リストは「本当に参照が無い」か「このファイルの
+    // 意味層が死んでいる」のどちらでもあり得る。後者を 0 件として返すと、
+    // エージェントは API 削除の根拠にする。位置は解決できているので、同じ位置への
+    // hover を liveness の probe に使う。
+    if locations.is_empty() {
+        if let Some(msg) = semantic_layer_unavailable(&borrowed.session, &borrowed.path, &borrowed.text, line, character).await {
+            return err(msg).await;
+        }
+    }
     // フォーカス文書を借りていたら復元（開き直し + 診断更新 — 自己修復）
     restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path).await;
     let mut out = Vec::with_capacity(locations.len());
@@ -3538,10 +3615,7 @@ async fn apply_and_save_rename(
         if let Ok(md) = std::fs::metadata(path) {
             d.baselines.insert(
                 path.clone(),
-                DiskBaseline {
-                    mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    size: md.len(),
-                },
+                DiskBaseline::of(&md),
             );
         }
         d.record_event(EventSource::Headless, EventKind::Save, None, None);
@@ -4256,13 +4330,16 @@ async fn process_command(
                         let mut d = daemon.lock().await;
                         // ベースライン更新（削除済みなら保持し、復活検知に使う）
                         if let Some((mtime, size)) = &stat {
-                            d.baselines.insert(
-                                path_buf.clone(),
-                                DiskBaseline {
+                            // ctime はここでは取れない（stat は (mtime, size) の組）ので、
+                            // ベースラインの更新は metadata から作り直す。
+                            let baseline = std::fs::metadata(&path_buf)
+                                .map(|md| DiskBaseline::of(&md))
+                                .unwrap_or(DiskBaseline {
                                     mtime: *mtime,
                                     size: *size,
-                                },
-                            );
+                                    ctime: (0, 0),
+                                });
+                            d.baselines.insert(path_buf.clone(), baseline);
                             d.deleted = None;
                         } else {
                             d.deleted = Some(path_str.clone());
@@ -4377,12 +4454,7 @@ async fn process_command(
                             if let Ok(md) = std::fs::metadata(&path_buf) {
                                 d.baselines.insert(
                                     path_buf.clone(),
-                                    DiskBaseline {
-                                        mtime: md
-                                            .modified()
-                                            .unwrap_or(std::time::UNIX_EPOCH),
-                                        size: md.len(),
-                                    },
+                                    DiskBaseline::of(&md),
                                 );
                             }
                             d.deleted = None;
@@ -4474,12 +4546,8 @@ async fn process_command(
                         // 「見えないまま上書きされる窓」を塞ぐ）。
                         let diverged = match std::fs::metadata(p) {
                             Ok(md) => {
-                                let size = md.len();
-                                let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
                                 let d = daemon.lock().await;
-                                d.baselines
-                                    .get(p)
-                                    .is_some_and(|b| b.size != size || b.mtime != mtime)
+                                d.baselines.get(p).is_some_and(|b| !b.matches(&md))
                             }
                             // 外部で削除された: 作成し直す（既存の「新規ファイル」
                             // 経路と同じ。ここでは拒否しない）。
@@ -4509,6 +4577,30 @@ async fn process_command(
                 }
                 match write_result {
                     Ok(()) => {
+                        // ドッグフーディング #17(b): write の後にもう一度 stat し、
+                        // 書いたバイト数と一致するかを確かめる。guard の stat と
+                        // この write の間に外部が書くと、こちらの write がそれを
+                        // 消す（実測 1/14 回。窓は閉じられない — POSIX に
+                        // 「変わっていたら書かない」は無い）。交錯を黙って成功に
+                        // せず、未保存扱いのまま警告で返す（内容は保証できない）。
+                        let interleaved = path
+                            .as_ref()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .is_some_and(|md| md.len() != text.len() as u64);
+                        if interleaved {
+                            let shown = path
+                                .as_ref()
+                                .expect("書き込み成功ならパスはある")
+                                .display();
+                            return snapshot(
+                                &mut d,
+                                Some(format!(
+                                    "save-verify: {shown} does not match the buffer right \
+                                     after saving (another writer interleaved during the \
+                                     write) — re-read the file before trusting it"
+                                )),
+                            );
+                        }
                         // 保存した文書そのものの dirty を消す。ただし書き込んだ
                         // テキストが現在のテキストと一致する場合のみ（H3: 書き込
                         // み中に他接続が Open してフォーカスが変わっても、保存対象
@@ -4527,12 +4619,7 @@ async fn process_command(
                             if let Ok(md) = std::fs::metadata(p) {
                                 d.baselines.insert(
                                     p.clone(),
-                                    DiskBaseline {
-                                        mtime: md
-                                            .modified()
-                                            .unwrap_or(std::time::UNIX_EPOCH),
-                                        size: md.len(),
-                                    },
+                                    DiskBaseline::of(&md),
                                 );
                             }
                             d.deleted = None;

@@ -10,7 +10,15 @@ command = "rust-analyzer"
 args = []
 # initializationOptions: rust-analyzer は inlay hints を明示 ON にしないと既定オフ
 # （ADR-0020 の型・パラメータヒントを維持。他はサーバ既定のまま）。
-config = { "rust-analyzer" = { inlayHints = { typeHints = { enable = true }, parameterHints = { enable = true } } } }
+# `files.watcher = "server"`: rust-analyzer の既定は "client" で、ワークスペースの
+# ファイル変更（Cargo.toml の編集・新規メンバー・未オープンの新規ファイル）を
+# **クライアントが通知する前提**になっている。daemon は didChangeWatchedFiles を
+# 実装していない（ADR-0015 で延期）ため、既定のままだと crate graph が
+# 古いまま/空のまま固まり、workspace/symbol・references・hover・rename が
+# 無言で空を返す（ドッグフーディング #18。実測: 新規メンバーを足しても
+# `minas symbol` が [] のままで、daemon 再起動で見えるようになった）。
+# "server" にすると rust-analyzer 自身が監視して再ロードする。
+config = { "rust-analyzer" = { inlayHints = { typeHints = { enable = true }, parameterHints = { enable = true } }, files = { watcher = "server" } } }
 
 [[language]]
 name = "rust"
