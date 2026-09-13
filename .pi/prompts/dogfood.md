@@ -7,10 +7,13 @@ minas のドッグフーディングループを回して。スキル `.agents/s
 
 1. 現在のペイン/セッションを確認（`herdr pane list`、`intercom list`）。driver ペインが無ければ
    `$1`（既定: `/Users/335g/dev/other/sample-rust2`）で分割して pi を起動し、両ペインに名前を付ける。
+   **分割は呼び出し側の環境を継承しない**ので、`. ./.env` してから
+   `herdr pane split ... --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"` で認証情報を渡す。
+   起動後 `intercom list` でモデルが `unknown` でないことを確認し、`intercom ask` で pong を取ってから次へ。
 2. 私（このペイン）を実装側、相手を driver として `intercom` で自己紹介し、スキルの Driver brief を
-   `$2`（既定: TODO HTTP API を作って壊れにくさを検証する）を埋めて送る。相手の返信で疎通確認。
+   `$2`（既定: TODO HTTP API を作って壊れにくさを検証する）を埋めて送る。
 3. 以降は driver からのフィードバックを 1 件ずつトリアージ（スキルの Triage policy）。バグは再現→修正または
-   issue 化、設計は回答、docs は修正、要望は実装か理由付き backlog。修正は必ず自分で検証し、
+   `.pi/todos` に起票、設計は回答、docs は修正、要望は実装か理由付き backlog（`.pi/todos`）。修正は必ず自分で検証し、
    コマンドと出力と exit code を添えて driver に返す。
 4. 私が止めるまでループを続けて。区切りごとに「何を直したか / 見送りと理由 / backlog / 現在のビルド・
    daemon・テスト状態」を短く報告して。

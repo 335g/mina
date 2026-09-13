@@ -12,20 +12,39 @@ The loop only earns its cost if the driver actually reaches for minas every time
 1. Confirm the pair exists and is connected:
    ```bash
    test "${HERDR_ENV:-}" = 1 && herdr pane list --workspace "$HERDR_WORKSPACE_ID"
-   intercom list
    ```
+   `intercom` is a **tool, not a shell command** (`intercom: command not found`) — list
+   peers with the intercom tool (`action: list`); it shows each session's cwd and model.
 2. Name both sides once (the driver pane keeps its own agent name):
    ```bash
    herdr pane rename <driver_pane> <driver> ; herdr agent rename <driver_pane> <driver>
    herdr pane rename --current <implementer> ; herdr agent rename --current <implementer>
    ```
-   Missing a driver pane? `herdr pane split --current --direction right --cwd <driver_repo>` then `herdr agent start <driver> --kind pi --pane <new_pane>`; read the new IDs from the command output.
-3. Send the driver brief (below) with `intercom send`, then verify two-way traffic with one `intercom ask` ("reply with pong").
-4. Record the baseline the driver will quote: `minas info` → `daemon_build_ts`, and the running `PROTOCOL_VERSION` (socket `minae-<version>.sock`).
+3. No driver pane yet? Create and launch it **with the model credentials** — a split
+   does not inherit the caller's env, and without the key Pi boots with an
+   unresolved model and cannot answer at all (observed: `intercom list` shows the
+   session's model as `unknown`):
+   ```bash
+   set -a; . ./.env; set +a          # implementer's credentials (value never printed)
+   herdr pane split --current --direction right --cwd <driver_repo> --no-focus \
+     --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"
+   herdr agent start <driver> --kind pi --pane <new_pane>   # IDs come from the output
+   ```
+   Alternative with no secret in argv: give the driver repo its own `.env` +
+   `.envrc` (`dotenv`) and split without `--env`.
+4. Verify the driver is alive before briefing: the intercom list must show a model
+   (not `unknown`), then ask it to say "pong" with the intercom tool
+   (`action: ask`, `to: <driver session id>`). A non-answer is an auth/env failure —
+   fix the credentials, do not send the brief yet.
+5. Send the driver brief (below) with the intercom tool (`action: send`).
+6. Record the baseline the driver will quote: `minas info` → `daemon_build_ts`, and the running `PROTOCOL_VERSION` (socket `minae-<version>.sock`).
 
 ## Driver brief (send verbatim, then fill the goal)
 
 The driver runs in another repo and cannot read this skill, so the brief is self-contained.
+It arrives as an intercom message — no human typing in the driver pane — and the
+driver agent starts working on it directly (verified: a fresh pane + `agent start`
++ one message produced a reply unprompted).
 
 ```
 You are the DRIVER in a minas dogfooding loop. Build <goal> in <repo> using minas
@@ -59,7 +78,7 @@ Route every report by kind, and answer the driver with the route:
 
 | Report | Action |
 |---|---|
-| Bug with a repro | Reproduce it yourself first. Fix it if the fix is small and safe; otherwise `gh issue create` (labels: `needs-triage`, then `ready-for-agent`/`ready-for-human`) and tell the driver the issue number. |
+| Bug with a repro | Reproduce it yourself first. Fix it if the fix is small and safe; otherwise record it as a task in `.pi/todos` (see below) and tell the driver its id. |
 | Design question ("should we…?") | Answer, not code. Give the rationale and the ADR/constraint it rests on; accept pushback when the driver's measurement beats it. |
 | Wrong/outdated doc or `--help` | Fix the text (skill or clap doc). The tool's own docs are part of the product. |
 | Feature request | Implement it, or decline with a reason and record it as backlog. Prefer the ladder: reuse a command, add a flag, or disclose in a skill before adding a command or a protocol field. |
@@ -69,6 +88,8 @@ Two habits that keep the loop cheap:
 
 - **Batch protocol changes.** A `PROTOCOL_VERSION` bump costs the driver a re-verification round. Collect small backlog items and ship them in one bump.
 - **Every fix leaves one runnable check** (a unit test, or a repro command in the reply) so the next round cannot silently regress it.
+
+Backlog lives in `.pi/todos` (one task per deferred item: what, why deferred, the repro, the driver's message id). Note it is gitignored — local to this machine. Promote an item to a GitHub issue only when it must outlive the machine or reach other people.
 
 ## Evidence bar
 
