@@ -7,6 +7,8 @@ Two panes, two roles, one loop: the **driver** uses minas to build something rea
 
 The loop only earns its cost if the driver actually reaches for minas every time instead of falling back to `rg`/`sed`/herdr-free editing — a driver that stops using the tool stops producing feedback.
 
+**Vary the driver, and measure the yield.** A loop that repeats the same project with the same model re-measures what is already measured. Each session picks a **profile** (what is being built — `§Driver profiles`) and may pick a **different model** for the driver (`DRIVER_MODEL`), and every session writes one row + one section into `docs/verification/dogfood-log.md` (finding classes, the six counts, the stop criterion). Read that file before starting: it says which profiles are still unexercised and whether the loop has already met its stopping rule.
+
 ## Setup (implementer)
 
 1. Confirm the pair exists and is connected:
@@ -27,8 +29,22 @@ The loop only earns its cost if the driver actually reaches for minas every time
    ```
    A `/tmp` scratch has no `.env`/`.envrc`, so credentials can only arrive through the
    environment (step 4), and it does not survive a reboot — tell the driver it is scratch.
-4. Get a driver pane, then launch Pi in it with **the same model as this pane**. Reuse a
-   prepared empty pane if one exists (e.g. labelled `driver`); otherwise split one:
+3b. Pick the **profile** and the **driver model** (see `§Driver profiles` and
+   `docs/verification/dogfood-log.md` §5 for the table and what each one stresses):
+   ```bash
+   # $2 = profile name (default: the first unexercised one in the log's table)
+   DRIVER_PROFILE=${2:-rust-api}
+   # $3 = model for the driver pane. Default = THIS pane's model (same weights both
+   # sides is the control condition). Set it when you want a different driver:
+   #   a cheaper/weaker model produces different findings (more fallbacks, more retries)
+   #   a stronger one stresses the contract instead of the ergonomics.
+   DRIVER_MODEL=${3:-$PI_PROVIDER/$PI_MODEL}
+   DRIVER_THINKING=${DRIVER_THINKING:-$PI_REASONING_LEVEL}
+   echo "profile=$DRIVER_PROFILE model=$DRIVER_MODEL"
+   ```
+   Record both in the session row — the log is unreadable if the model is not written down.
+4. Get a driver pane, then launch Pi in it with the chosen model. Reuse a prepared
+   empty pane if one exists (e.g. labelled `driver`); otherwise split one:
    ```bash
    set -a; . ./.env; set +a                      # implementer's credentials (never printed)
    herdr pane split --current --direction right --cwd "$DRIVER_REPO" --no-focus \
@@ -38,22 +54,24 @@ The loop only earns its cost if the driver actually reaches for minas every time
    with an unresolved model and cannot answer at all, and without `--model` it picks
    its own default, so the panes reason with different weights (observed: default
    `deepseek-v4-flash` vs the implementer's `deepseek-v4.1-flash`). This pane's identity
-   is in its env (`PI_PROVIDER`, `PI_MODEL`, `PI_REASONING_LEVEL`):
+   is in its env (`PI_PROVIDER`, `PI_MODEL`, `PI_REASONING_LEVEL`); pass `$DRIVER_MODEL`
+   explicitly either way:
    ```bash
    # one command for either route (an existing pane needs the cd; a fresh split has it already)
    herdr pane run <driver_pane> "cd $DRIVER_REPO && OPENCODE_API_KEY='$OPENCODE_API_KEY' \
-     pi --tui-mode fullscreen --model $PI_PROVIDER/$PI_MODEL --thinking $PI_REASONING_LEVEL"
+     pi --tui-mode fullscreen --model $DRIVER_MODEL --thinking $DRIVER_THINKING"
    # equivalent, Herdr-managed route (gives the agent a name up front):
    herdr agent start <driver> --kind pi --pane <driver_pane> \
-     -- --model "$PI_PROVIDER/$PI_MODEL" --thinking "$PI_REASONING_LEVEL"
+     -- --model "$DRIVER_MODEL" --thinking "$DRIVER_THINKING"
    ```
    `pane run` types the command into the pane's shell; `agent start` args after `--` go
    to `pi` itself (`argv` in its response shows them).
-5. Verify the driver is alive **and on the same model** before briefing: the intercom
-   list shows each session's model — it must equal this pane's (not `unknown`, not a
-   different one), then ask it to say "pong" with the intercom tool (`action: ask`,
-   `to: <driver session id>`). A non-answer is an auth/env failure — fix the
-   credentials, do not send the activation yet.
+5. Verify the driver is alive **and on the model you asked for** before briefing: the
+   intercom list shows each session's model — it must equal `$DRIVER_MODEL` (not
+   `unknown`, not a third value; an override that silently failed is worse than no
+   override, because the log would record the wrong condition). Then ask it to say
+   "pong" with the intercom tool (`action: ask`, `to: <driver session id>`). A non-answer
+   is an auth/env failure — fix the credentials, do not send the activation yet.
 6. Send the activation (`## Activation`, below) with the intercom tool (`action: send`).
 7. The driver sends the baseline first; keep it — you will diff against it when a "fixed" claim is contested.
 
@@ -65,12 +83,12 @@ driver repo). That file is the single source of truth for the format — do not 
 it here. The activation message therefore carries only the goal and the peer:
 
 ```
-You are the DRIVER in a minas dogfooding loop. Repo: <driver_repo>.
-Goal: <goal>.
+You are the DRIVER in a minas dogfooding loop. Repo: <driver_repo> (scratch).
+Profile: <driver_profile>. Goal: <goal>.
 Follow your `dogfooding-driver` skill (working rules, report format, evidence bar,
 escalation) and report to me — the implementer pane, session <implementer_id>
-(cwd = the mina repo). Send your First message (repo, goal, minas info build_ts,
-socket version) and start.
+(cwd = the mina repo). Send your First message (repo, goal, profile, minas info
+build_ts, socket version, your model) and start.
 ```
 
 It arrives as an intercom message — no human typing in the driver pane — and the
@@ -110,6 +128,48 @@ Hold the driver — and yourself — to these, and say so in the brief:
 - A claim made in a doc ("MSRV 1.89", "`--lines` saves 30%") gets verified against primary sources or a real run; stale claims are bugs.
 - Verify in the tool's own repo before telling the driver it is fixed.
 
+## Driver profiles
+
+The goal must change between sessions, or the loop keeps measuring the same surface. The
+profile table (what to build, what each one stresses, which are still unexercised) lives in
+**`docs/verification/dogfood-log.md` §5** — read it, pick an unexercised profile, and write the
+goal from that row's outline rather than inventing a new app shape each time. Two rules:
+
+- **One profile per session, and not the same one twice in a row.** The stop criterion counts
+two consecutive clean sessions *of different profiles*; the same profile twice is one measurement.
+- **Vary the model when the question is about the model.** Same model both sides is the control
+condition (it isolates the tool). A cheaper/weaker driver finds ergonomic and contract gaps
+(more fallbacks, more retries); a stronger one pushes the contract itself. Record which one you
+used in the session row.
+
+## Measurement (per session)
+
+Record one row + one section in **`docs/verification/dogfood-log.md`** (§3 table, §6 template).
+The six counts and their definitions are in that file (§2); do not invent new ones — the whole
+point is that session N is comparable with session N-1. In short: classify every finding into
+the fixed classes (§1), count `sw` (silent-wrong) / `dl` (data-loss) / `findings` /
+`new_class` / `fallbacks` / `reverify`, and note the driver's cost if the panes report it.
+
+Two habits that make the numbers trustworthy:
+
+- **`fallbacks` comes from the driver's own report** (its skill requires it to say when it left
+the tool and why). Ask for it explicitly in the round summary if a session did not mention it —
+a silent fallback is a missing row, not a zero.
+- **`new_class` is what the loop is actually buying.** Re-finding a known class in a new profile is
+worth a fix but is not new evidence of value; the first session that touches a class is.
+
+Cost is measured by the other instrument, not here: `docs/loop/l0.py` (deterministic:
+`calls` / `out_B` / `equiv_B` / `wall_ms`) for the flows the session exercised, and
+`tools/ab/ab.py` when a fix needs real-LLM confirmation.
+
+## Stop criterion
+
+`docs/verification/dogfood-log.md` §4 holds the rule (five conditions, plus the reset rule and the
+"declare remaining profiles out of scope" requirement). Read it **before** starting a session and
+say in your first report whether the loop has already met it — continuing past the criterion is
+allowed but must be a decision, not an accident. A session with `sw > 0` or `dl > 0` or
+`new_class > 0` resets the counter.
+
 ## Reply format
 
 Short, evidence-first, and always ends with state:
@@ -123,3 +183,5 @@ State: <tests / installed / daemon restarted / socket vNN>.
 ## Close out
 
 When the user stops the loop, report: what shipped (grouped by theme), what was declined and why, the backlog still open, and the current build/daemon/test state. Leave the driver's tree clean and the daemon on the current socket version. Ask what to do with the driver workspace: a `/tmp` scratch can be deleted (`rm -rf`) or kept for re-verification — say which path it was either way, since a scratch dir has no other record of existing.
+
+**Close out the session in `docs/verification/dogfood-log.md` before writing that report** — one row in the §3 table and one section from the §6 template, with the six counts and the finding classes. Then state the stop-criterion status explicitly (`§4`: met / not met, and which condition is missing). A loop that ends without a row leaves the next session unable to tell whether the last one was worth its cost — the numbers are the only durable product of a session whose fixes are already committed.
