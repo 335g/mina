@@ -7,7 +7,10 @@ use ropey::RopeBuilder;
 ///
 /// 位置・長さはすべて char インデックス。`Retain` は元の文書の文字を保持、
 /// `Delete` は元の文書の文字を削除、`Insert` は新たなテキストを挿入する。
-/// 操作列は文書全体を覆う（末尾に `Retain` が残る）ことが不変条件。
+/// 不変条件は「操作列が文書全体を覆うこと」（`apply` が debug_assert で検査する）。
+/// 末尾を `Retain` で締めるのは、その覆いを「触らない残り」で表現できる
+/// コンストラクタの書き方 — `replace_all` は全文を `Delete` するので残りが無く、
+/// `[Delete(全文), Insert(新)]` で覆いを満たす（末尾の `Retain` は付かない）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operation {
     /// 元の文書の文字を `usize` 文字分そのまま残す。
