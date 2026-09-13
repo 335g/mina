@@ -142,6 +142,28 @@ condition (it isolates the tool). A cheaper/weaker driver finds ergonomic and co
 (more fallbacks, more retries); a stronger one pushes the contract itself. Record which one you
 used in the session row.
 
+### `self-host` (the mina repo itself)
+
+This profile's workspace **is the mina repo**, not a throwaway — so it is the one profile where
+the driver could damage the product, and it runs in **ramped stages** (the ramp and its
+preconditions are in `docs/verification/dogfood-log.md` §5):
+
+- **Stage 1 — read-only.** The driver's goal must literally forbid edits (`apply` / `edit` /
+  `rename` / `delete`), and must say that *wanting* an edit is a finding, not an action. Reads
+  only: `read` / `search` / `outline` / `at` / `symbol` / `references` / `hover` / `peek` /
+  `check` / `info` / `wait`. Enforce it by audit, not by trust: before the session record the
+  current HEAD, and after it run `git log --oneline <recorded>..HEAD` and check the
+  `Checkpoint-Session:` trailer of any new commit — the auto-commit hook commits from the pane
+  that made the change, so a commit from the *driver's* session id is a write that must be
+  reverted and reported. This stage measures the tool at 400k lines / 10 crates (cold index,
+  big-file outline, `check` on a virtual workspace) — it is where `sw` at scale shows up.
+- **Stage 2 — leaf crates** (`mina-text`, `mina-view`, `mina-loader`: no daemon involvement).
+- **Stage 3 — `minad` / `minas` themselves** (the tool editing the tool: rebuild + restart the
+  daemon before judging any fix — see `docs/verification/dogfood-log.md` §5 precondition 4).
+
+Do not start a stage until the previous one's gate held: `sw = 0` and `fallbacks = 0` in the
+stage-1 session is what earns stage 2.
+
 ## Measurement (per session)
 
 Record one row + one section in **`docs/verification/dogfood-log.md`** (§3 table, §6 template).
