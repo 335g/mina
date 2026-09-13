@@ -1,5 +1,5 @@
 {
   "lang": "ja",
-  "enable": false,
+  "enable": true,
   "model": "opencode-go/deepseek-v4.1-flash"
 }
