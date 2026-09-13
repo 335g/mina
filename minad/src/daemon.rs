@@ -4461,7 +4461,45 @@ async fn process_command(
                     drop(d);
                 }
                 let write_result = match &path {
-                    Some(p) => tokio::fs::write(p, text.as_bytes()).await,
+                    Some(p) => {
+                        // ドッグフーディング #15: read→save の間に外部が書いたら、
+                        // その変更を丸ごと上書きしない（lost update）。保存は全文
+                        // write なので、外部の内容はマージされず消える。読み込み時の
+                        // ベースライン（size/mtime）と現在のディスク状態を比べ、
+                        // ずれていれば保存を拒否して再読み込みを促す。
+                        //
+                        // 2 秒周期の watch_disk（ADR-0015）が先に検知した場合は
+                        // リロード + 警告 + ベースライン更新が済んでいるので、ここでは
+                        // 引っかからない（= あちらは「見えた外部変更」、こちらは
+                        // 「見えないまま上書きされる窓」を塞ぐ）。
+                        let diverged = match std::fs::metadata(p) {
+                            Ok(md) => {
+                                let size = md.len();
+                                let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                                let d = daemon.lock().await;
+                                d.baselines
+                                    .get(p)
+                                    .is_some_and(|b| b.size != size || b.mtime != mtime)
+                            }
+                            // 外部で削除された: 作成し直す（既存の「新規ファイル」
+                            // 経路と同じ。ここでは拒否しない）。
+                            Err(_) => false,
+                        };
+                        if diverged {
+                            let mut d = daemon.lock().await;
+                            d.remove_activity(p, ActivityKind::Save);
+                            return snapshot(
+                                &mut d,
+                                Some(format!(
+                                    "save-rejected: {} changed on disk since it was read \
+                                     (another writer) — re-read it and re-apply; the buffer \
+                                     was NOT written",
+                                    p.display()
+                                )),
+                            );
+                        }
+                        tokio::fs::write(p, text.as_bytes()).await
+                    }
                     None => Err(io::Error::new(io::ErrorKind::NotFound, "no file name")),
                 };
                 let mut d = daemon.lock().await;
@@ -10217,6 +10255,50 @@ root-markers = [".docsroot"]
         assert_eq!(snap.text, "Xbase\n", "undo でリロードだけ戻る");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_when_the_file_changed_on_disk_since_read() {
+        // ドッグフーディング #15: read→save の窓で外部が書いた場合、全文 write で
+        // その変更を消してしまう（lost update）。読み込み時のベースラインと
+        // ディスク状態を比べて保存を拒否し、外部の書き込みを残す。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-lostupdate-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-lostupdate-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "v1 original\n").unwrap();
+        start_server(&sock).await;
+
+        let mut tui = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let snap = request(&mut tui, &Command::Open { path }).await;
+        assert_eq!(snap.text, "v1 original\n");
+        // バッファを編集（未保存）→ dirty。
+        let _ = request(
+            &mut tui,
+            &Command::Insert {
+                text: "MARKER-EDITED\n".into(),
+            },
+        )
+        .await;
+        // 外部の書き手が割り込む（サイズも mtime も変わる）。
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&file, "EXTERNAL-INSERT\n").unwrap();
+
+        let snap = request(&mut tui, &Command::Save).await;
+        let status = snap.status.as_deref().unwrap_or("");
+        assert!(
+            status.contains("save-rejected"),
+            "外部変更後の保存は拒否される: {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "EXTERNAL-INSERT\n",
+            "外部の書き込みが残る（上書きしない）"
+        );
+        assert!(snap.dirty, "未保存の編集は dirty のまま残す");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[tokio::test]

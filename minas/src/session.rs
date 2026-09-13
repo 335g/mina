@@ -569,6 +569,11 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             for f in &outcome.changed {
                 println!("changed: {f}");
             }
+            // ドッグフーディング #16: LSP の rename は**アクティブな cfg の範囲**だけを
+            // 書き換える（`#[cfg(feature = "x")]` の非活性モジュールは RA の解析対象外）。
+            // 「N files, M edits」を影響範囲として読むと、feature ビルドで E0425 になる。
+            // テキストレベルの網をかけて、変更されなかったのに名前が残るファイルを警告する。
+            warn_leftover_mentions(&path, &old, &outcome.changed, "rename");
         }
         SessionCmd::References { path, old } => {
             // 成功: `N references in M files:` に続けて `path:line`（1-origin。
@@ -587,6 +592,10 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             for loc in &outcome.locations {
                 println!("{}:{}", loc.path, loc.line + 1);
             }
+            // #16: 参照一覧も cfg 非活性のコードを見ない。同じ網をかけて警告する。
+            let changed: Vec<String> =
+                outcome.locations.iter().map(|l| l.path.clone()).collect();
+            warn_leftover_mentions(&path, &old, &changed, "references");
         }
         SessionCmd::Outline { path, recursive, depth } => {
             // 成功: シンボルの階層ツリーを JSON で出力する（全文なし — ADR-0031。
@@ -1250,6 +1259,92 @@ fn check_exit_code(e: &str) -> i32 {
 fn check_final_exit_code(any_error: bool, worst_failure: i32) -> i32 {
     if any_error { 2 } else { worst_failure }
 }
+
+/// LSP が見ないコードのテキスト網（ドッグフーディング #16）。
+///
+/// `rename` / `references` は言語サーバの解析結果なので、**アクティブな cargo
+/// 構成の外**（`#[cfg(feature = "x")]` の非活性モジュール、クレートグラフに入って
+/// いないファイル）は見えない。それでも「N files, M edits」は影響範囲として読まれる
+/// ので、feature ビルドで初めて E0425 が出る（driver #16 の実測: `cargo build` は
+/// green のまま `cargo build --features gated` が壊れた）。
+///
+/// 網は「対象ファイルと同じディレクトリ配下の .rs」を読み、LSP が触らなかった
+/// ファイルに旧名が単語として残っていれば stderr に列挙するだけ（exit は変えない —
+/// コメント/文字列の誤検出があり得るし、判断は読む側に残す）。
+///
+/// 上限: [`LEFTOVER_SCAN_MAX_FILES`] ファイル / 1 ファイル [`LEFTOVER_SCAN_MAX_BYTES`]。
+/// ディレクトリ走査なので、別クレート（crates/*）からの参照までは見えない。
+fn warn_leftover_mentions(
+    path: &std::path::Path,
+    old: &str,
+    changed: &[String],
+    what: &str,
+) {
+    if old.is_empty() {
+        return;
+    }
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let mut files = Vec::new();
+    collect_rs_files(dir, &mut files);
+    let changed: std::collections::HashSet<String> = changed
+        .iter()
+        .map(|p| conn::absolutize(p))
+        .collect();
+    let mut leftovers = Vec::new();
+    for f in files.into_iter().take(LEFTOVER_SCAN_MAX_FILES) {
+        let abs = conn::absolutize(&f.to_string_lossy());
+        if changed.contains(&abs) {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(&f) else {
+            continue;
+        };
+        if md.len() > LEFTOVER_SCAN_MAX_BYTES {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        if contains_whole_word(&text, old) {
+            leftovers.push(abs);
+        }
+    }
+    if leftovers.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {} file(s) still mention `{old}` but were not touched by the LSP {what} \
+         (inactive #[cfg] / not in the crate graph / comment or string) — verify manually:",
+        leftovers.len()
+    );
+    for f in leftovers {
+        eprintln!("  {f}");
+    }
+}
+
+/// `text` に `word` が識別子として（前後が識別子文字でない）現れるか。
+fn contains_whole_word(text: &str, word: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(idx) = text[from..].find(word) {
+        let start = from + idx;
+        let end = start + word.len();
+        let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_word(c));
+        let after_ok = text[end..].chars().next().is_none_or(|c| !is_word(c));
+        if before_ok && after_ok && bytes.len() >= end {
+            return true;
+        }
+        from = start + word.chars().next().map_or(1, |c| c.len_utf8());
+    }
+    false
+}
+
+/// 旧名の残留スキャンの上限（ファイル数 / 1 ファイルのサイズ）。
+const LEFTOVER_SCAN_MAX_FILES: usize = 500;
+const LEFTOVER_SCAN_MAX_BYTES: u64 = 1024 * 1024;
 
 /// daemon に接続し、シンボルの階層ツリーを軽量応答（[`ServerMessage::Outline`]）
 /// で受け取る（ADR-0031）。`recursive` ならファイル分割モジュールを辿る
@@ -1937,7 +2032,13 @@ async fn apply(
         .as_deref()
         .is_some_and(|s| s.starts_with("saved"));
     if !saved {
-        eprintln!("SAVE FAILED: {:?}", snapshot.status);
+        // 理由は daemon の status にそのまま入っている（コード付き: `save-rejected:`
+        // など）。`{:?}` で Some("…") に包むと、エージェントが読む行に Rust の
+        // デバッグ表現が混ざる（ドッグフーディング #15）。
+        match snapshot.status.as_deref() {
+            Some(s) => eprintln!("SAVE FAILED: {s}"),
+            None => eprintln!("SAVE FAILED: no status"),
+        }
         rollback_created(&abs, created);
         std::process::exit(2);
     }
@@ -2231,7 +2332,13 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
         .as_deref()
         .is_some_and(|s| s.starts_with("saved"));
     if !saved {
-        eprintln!("SAVE FAILED: {:?}", snapshot.status);
+        // 理由は daemon の status にそのまま入っている（コード付き: `save-rejected:`
+        // など）。`{:?}` で Some("…") に包むと、エージェントが読む行に Rust の
+        // デバッグ表現が混ざる（ドッグフーディング #15）。
+        match snapshot.status.as_deref() {
+            Some(s) => eprintln!("SAVE FAILED: {s}"),
+            None => eprintln!("SAVE FAILED: no status"),
+        }
         rollback_created(&abs, created);
         std::process::exit(2);
     }
