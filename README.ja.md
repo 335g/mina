@@ -1,6 +1,6 @@
 # mina
 
-> エージェントのためのターミナルエディタ。常駐デーモンがエディタ状態を保持し、すべてのフロントエンド —— ヘッドレス session CLI・エージェント・オプションの TUI —— はただのクライアントです。
+> エージェントに操作させるためのエディタ。常駐デーモンがエディタ状態 —— ドキュメント・undo・LSP —— を保持し、エージェントはファイルを書き換えるのではなく session 契約（検証付きの内容指定編集）を通して編集します。フロントエンド —— エージェントが呼ぶヘッドレス `minas` session CLI、人が使うオプションの TUI —— は、ただのクライアントです。
 
 **mina** = **min**imize cost for AI **a**gent（AI エージェントのためのコスト最小化）—— コストを最小化するエージェントエディタ。サフィックスで: mina**e** = editor（TUI）、mina**d** = daemon、mina**s** = session（ヘッドレス CLI）。
 
@@ -38,18 +38,45 @@ mina は daemon/client 分割のターミナルエディタです。エージェ
 ## はじめに
 
 ```console
-# エージェント向けツールのみ: daemon + session CLI + skill ガイド。TUI なし
+# 1. daemon + session CLI。エージェント向けツールのみで、TUI は別途
 $ cargo install minad minas
 
-# スクリプトやエージェントからヘッドレスに
-$ minas apply path/to/file.rs "old text" "new text"
+# 2. 言語サーバは同梱されない —— 使う言語のものを入れる
+$ rustup component add rust-analyzer
+$ npm install -g typescript-language-server typescript
+
+# 3. 何が見つかったか確認する: daemon の世代 + 設定済みサーバ
+$ minas info
 ```
 
-TUI は `minae [file ...]` で利用できます。出荷インターフェースは `minad` daemon と `minas` ヘッドレス CLI です。
+デーモンは最初のクライアントから必要に応じて起動されます。常駐させるには `minad serve` を実行します。言語サーバはワークスペースルート単位で起動されるため、`PATH` に通っていればすぐに `symbol` / `rename` / `check` が動きます。tree-sitter による構文ハイライトはそのまま動きます。
 
-ソースからは `cargo build --release` でもビルドできます。言語サーバ（rust-analyzer、typescript-language-server など）は同梱されないため、LSP 機能を使う場合は別途インストールしてください。tree-sitter による構文ハイライトはそのまま動きます。
+ソースからは `cargo build --release` でもビルドできます。TUI は `minae [file ...]` です。
 
-デーモンはクライアントから必要に応じて起動されます。常駐セッションを明示的に持つには `minad serve` を実行します。
+### エージェントに minas を使わせる
+
+`minas skill` は pull 型です。minas の存在を知らないエージェントは永遠に `minas skill` を呼びません。エージェントが指示を読む場所へ、引き金を一度だけ配ります:
+
+```console
+$ minas skill --md > ~/.claude/skills/minas/SKILL.md   # ~/.pi/agent/skills/minas/SKILL.md でも同じ
+$ minas skill --md >> AGENTS.md                         # リポジトリの指示文に直接追記してもよい
+```
+
+ラッパーは棚の写しを持たず（「`minas skill` を実行せよ」だけ）、トピックが増えても腐りません。ファイル末尾の刻印と `minas info` の `cli_generation` が違っていたら再生成してください。
+
+### 最初のセッション
+
+```console
+$ minas outline src/lib.rs              # 全文なしで構造を把握
+$ minas read src/lib.rs --lines 40:60   # 必要な番号付き行だけ
+$ minas apply src/lib.rs "old" "new"    # 検証付き編集（古ければ理由つきで拒否）
+$ minas check src/lib.rs                # LSP 診断 —— 最終ゲートは build
+```
+
+read / edit に設定は不要です。挙動を変えるファイルは 2 つだけ、どちらも任意です:
+
+- `~/.config/minae/languages.toml`（`$XDG_CONFIG_HOME/minae/`、デーモン側）: 言語サーバの追加・上書き。埋め込み既定にマージされ、サーバ起動時に読み直されます
+- `~/.config/minae/config.toml`（クライアント側、TUI のみ）: `colorscheme` と `agent_command`（TUI がレビューコメントから起動するエージェント）。ユーザーカラースキームは `~/.config/minae/colorschemes/` に TOML で置きます
 
 ## エージェント向け
 
@@ -80,13 +107,7 @@ $ minas skill read      # read 契約（session get --lines の番号付き出�
 
 ガイドはツール選択（read / apply / rename 契約）とエラー回復を扱います。エージェントがパースできるよう、出力は英語・成功は exit 0 に統一され、未知トピックは exit 1 で理由と利用可能トピック一覧を返します。編集が拒否されたら `minas skill errors` が最初の参照先です。
 
-ただし **minas の存在を知らないエージェントは `minas skill` を呼びません**（棚は pull 型）。`minas skill --md` はそれを渡すための薄いラッパーを出力します: YAML frontmatter ＋ `usage` ガイド（いつ `rg`/`sed` ではなく minas を使うか、最初の 1 コマンドから効かせる規則）＋ ビルド世代の刻印。
-
-```console
-$ minas skill --md > ~/.claude/skills/minas/SKILL.md   # エージェントがスキルを読む場所へ
-```
-
-置き場はエージェントが指示を読む場所ならどこでも: スキルディレクトリ（`~/.pi/agent/skills/minas/SKILL.md`、`~/.claude/skills/minas/SKILL.md`）でも、リポジトリの `AGENTS.md` / `CLAUDE.md` でも構いません。索引の写しは持たず（「`minas skill` を実行せよ」だけ）、トピックが増えても腐りません。`minas info` の `cli_generation` が刻印と違っていたら再生成してください。
+ただし **minas の存在を知らないエージェントは `minas skill` を呼びません**（棚は pull 型）。`minas skill --md` はそれを渡すための薄いラッパーを出力します: YAML frontmatter ＋ `usage` ガイド（いつ `rg`/`sed` ではなく minas を使うか、最初の 1 コマンドから効かせる規則）＋ ビルド世代の刻印。置き場は[エージェントに minas を使わせる](#エージェントに-minas-を使わせる)を参照してください。
 
 ## アーキテクチャ
 
@@ -98,7 +119,7 @@ $ minas skill --md > ~/.claude/skills/minas/SKILL.md   # エージェントが�
 - **mina-conn**: session CLI と TUI が共有するクライアント側の接続・リクエスト配線
 - **minad**: daemon バイナリ
 - **minas**: ヘッドレス session CLI と skill ガイド
-- **minae**: TUI（再構築中。現在は空のプレースホルダバイナリ）
+- **minae**: TUI（ratatui/crossterm、接続別 View）
 
 ## ドキュメント
 
