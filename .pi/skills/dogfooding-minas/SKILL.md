@@ -168,8 +168,9 @@ preconditions are in `docs/verification/dogfood-log.md` §5):
   reverted and reported. This stage measures the tool at 400k lines / 10 crates (cold index,
   big-file outline, `check` on a virtual workspace) — it is where `sw` at scale shows up.
 - **Stage 2 — leaf crates** (`mina-text`, `mina-view`, `mina-loader`: no daemon involvement).
-- **Stage 3 — `minad` / `minas` themselves** (the tool editing the tool: rebuild + restart the
-  daemon before judging any fix — see `docs/verification/dogfood-log.md` §5 precondition 4).
+- **Stage 3 — `minad` / `minas` themselves** (the tool editing the tool: `tools/dev-restart.sh`
+  installs and swaps the daemon, then proves a new pid answers — see
+  `docs/verification/dogfood-log.md` §5 precondition 4).
 
 Do not start a stage until the previous one's gate held: `sw = 0` **and every `fallback` in
 that session accounted for** (either fixed, or declined-with-disclosure in a skill — an
