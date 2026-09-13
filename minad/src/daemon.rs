@@ -22,8 +22,8 @@ use mina_protocol::{
     Activity, ActivityKind, ActivityRecord, BaseDiagnostic, BaseRootInfo, ChangeEvent,
     CheckDiagnostic, ClientKind, Command, Diagnostic, DocumentEdit, EventKind, EventSource,
     GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range, ReviewComment,
-    ReviewCommentView, ReviewSide, SearchMatch, ServerMessage, ServerMetrics, Severity,
-    StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
+    LspServerInfo, ReviewCommentView, ReviewSide, SearchMatch, ServerMessage, ServerMetrics,
+    Severity, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1599,10 +1599,11 @@ async fn handle_connection(
                     path,
                     query,
                     case_sensitive,
+                    word,
                 }) = serde_json::from_str::<Command>(line.trim())
                 {
                     let message =
-                        serve_search_matches(&daemon, &path, &query, case_sensitive).await;
+                        serve_search_matches(&daemon, &path, &query, case_sensitive, word).await;
                     if !write_message(&mut write_half, conn_id, message).await {
                         break; // 切断 or 書き込みタイムアウト
                     }
@@ -1763,6 +1764,26 @@ async fn serve_server_info(daemon: &Mutex<Daemon>) -> ServerMessage {
             v.sort_by(|a, b| a.root.cmp(&b.root));
             v
         },
+        // rust2 要望: 設定済みサーバと稼働セッション数（id / 言語 / 件数のみ）。
+        // 稼働数は `lsp_sessions` のキー（WorkspaceRoot, languageId）から言語別に
+        // 数える（`session_key` と同じ言語名を使う）。
+        servers: d
+            .languages
+            .configured_servers()
+            .into_iter()
+            .map(|(id, languages)| {
+                let running_sessions = d
+                    .lsp_sessions
+                    .keys()
+                    .filter(|(_, lang)| languages.contains(lang))
+                    .count();
+                LspServerInfo {
+                    id,
+                    languages,
+                    running_sessions,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -2519,6 +2540,7 @@ async fn serve_search_matches(
     path: &str,
     query: &str,
     case_sensitive: bool,
+    word: bool,
 ) -> ServerMessage {
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let path_str = path_buf.to_string_lossy().into_owned();
@@ -2537,7 +2559,7 @@ async fn serve_search_matches(
         Some(t) => t,
         None => return err(format!("cannot open {path}")),
     };
-    let (matches, total, truncated) = search_text(&text, query, case_sensitive);
+    let (matches, total, truncated) = search_text(&text, query, case_sensitive, word);
     ServerMessage::SearchMatches {
         path: path_str,
         generation: daemon.lock().await.generation,
@@ -2555,7 +2577,12 @@ async fn serve_search_matches(
 /// 大文字小文字を無視する場合は行とクエリを `to_lowercase` して照合する（
 /// 列番号は小文字化後テキスト基準 — 例外的な文字で元テキストと 1 char ずれる
 /// 可能性はあるが、検索用途では実害がない）。
-fn search_text(text: &str, query: &str, case_sensitive: bool) -> (Vec<SearchMatch>, usize, bool) {
+fn search_text(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    word: bool,
+) -> (Vec<SearchMatch>, usize, bool) {
     let len = query.chars().count() as u32;
     let mut matches = Vec::new();
     let mut total = 0usize;
@@ -2568,6 +2595,15 @@ fn search_text(text: &str, query: &str, case_sensitive: bool) -> (Vec<SearchMatc
         let mut from = 0usize;
         while let Some(pos) = hay[from..].find(&needle) {
             let byte_start = from + pos;
+            let byte_end = byte_start + needle.len();
+            if word && !word_bounded(line, byte_start, byte_end) {
+                // 境界なし（例: TOTAL_COUNT ⊂ TOTAL_COUNT_HEADER）— 次を探す。
+                from = byte_start + needle.len().max(1);
+                if from > hay.len() {
+                    break;
+                }
+                continue;
+            }
             total += 1;
             if matches.len() < MAX_SEARCH_MATCHES {
                 matches.push(SearchMatch {
@@ -2584,6 +2620,16 @@ fn search_text(text: &str, query: &str, case_sensitive: bool) -> (Vec<SearchMatc
     }
     let truncated = total > matches.len();
     (matches, total, truncated)
+}
+
+/// `--word` の境界判定: 一致の直前・直後が ASCII 識別子文字（`[A-Za-z0-9_]`）
+/// でないこと。ASCII 限定にすることで、日本語コメント・絵文字の隣接で
+/// 予測可能に振る舞う（rust2 要望）。byte 位置は元テキストのものを渡す。
+fn word_bounded(line: &str, byte_start: usize, byte_end: usize) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let before = line[..byte_start].chars().next_back();
+    let after = line[byte_end..].chars().next();
+    !before.is_some_and(is_word) && !after.is_some_and(is_word)
 }
 
 /// [`Command::EnclosingSymbol`] の処理（ADR-0031）: 指定位置（1-origin 行:列）
@@ -10751,7 +10797,7 @@ root-markers = [".docsroot"]
     fn search_text_finds_literal_matches_by_line_and_char_col() {
         // rust2 要望: 全文を読まずに一致位置だけを得る。1-origin 行 / char 列。
         let text = "fn a() {}\nlet x = a + a;\n// a\n";
-        let (m, total, truncated) = search_text(text, "a", true);
+        let (m, total, truncated) = search_text(text, "a", true, false);
         assert_eq!(total, 4, "行ごとの全出現を数える: {m:?}");
         assert!(!truncated);
         assert_eq!((m[0].line, m[0].col), (1, 4), "fn a() → 4 列目");
@@ -10760,29 +10806,55 @@ root-markers = [".docsroot"]
         assert_eq!(m[0].len, 1);
 
         // 大文字小文字を無視
-        let (m2, total2, _) = search_text("A a A\n", "a", false);
+        let (m2, total2, _) = search_text("A a A\n", "a", false, false);
         assert_eq!(total2, 3);
         assert_eq!(m2.len(), 3);
-        let (m3, total3, _) = search_text("A a A\n", "a", true);
+        let (m3, total3, _) = search_text("A a A\n", "a", true, false);
         assert_eq!(total3, 1);
         assert_eq!(m3[0].col, 3);
 
         // マルチバイト（char 列。日本語コメント・絵文字で byte とずれない）
-        let (m4, _, _) = search_text("// あい\nlet x = 1;\n", "x", true);
+        let (m4, _, _) = search_text("// あい\nlet x = 1;\n", "x", true, false);
         assert_eq!((m4[0].line, m4[0].col), (2, 5));
-        let (m5, _, _) = search_text("// 😀😀 target\n", "target", true);
+        let (m5, _, _) = search_text("// 😀😀 target\n", "target", true, false);
         assert_eq!(m5[0].col, 7, "絵文字 2 個（各 1 char）+ 空白 2 = 7 列目");
 
         // 一致なし
-        let (m6, total6, _) = search_text("abc\n", "zzz", true);
+        let (m6, total6, _) = search_text("abc\n", "zzz", true, false);
         assert!(m6.is_empty() && total6 == 0);
 
         // 上限で打ち切り（total は全数を報告する）
         let many = "a\n".repeat(MAX_SEARCH_MATCHES + 10);
-        let (m7, total7, truncated7) = search_text(&many, "a", true);
+        let (m7, total7, truncated7) = search_text(&many, "a", true, false);
         assert_eq!(m7.len(), MAX_SEARCH_MATCHES);
         assert_eq!(total7, MAX_SEARCH_MATCHES + 10);
         assert!(truncated7, "上限を超えたら truncated");
+    }
+
+    #[test]
+    fn search_word_boundary_excludes_prefix_hits() {
+        // rust2 要望: 旧名が新名の接頭辞のときの偽陽性を防ぐ。
+        let text = "TOTAL_COUNT_HEADER\nTOTAL_COUNT\nTOTAL_COUNT + 1\n";
+        let (plain, plain_total, _) = search_text(text, "TOTAL_COUNT", true, false);
+        assert_eq!(plain_total, 3, "部分文字列では 3 件（先頭行は接頭辞）");
+        let (w, w_total, _) = search_text(text, "TOTAL_COUNT", true, true);
+        assert_eq!(w_total, 2, "--word では接頭辞を除外: {w:?}");
+        assert_eq!(w[0].line, 2);
+        assert_eq!(w[1].line, 3);
+
+        // 前後の識別子文字で除外（前／後）
+        let (a, at, _) = search_text("xCount\nCount;\nCount\n", "Count", true, true);
+        assert_eq!(at, 2, "前方の識別子文字を除外: {a:?}");
+        assert_eq!(a[0].line, 2);
+        assert_eq!(a[1].line, 3);
+
+        // ASCII 限定なので日本語の隣接は境界として扱う（予測可能）
+        let (_j, jt, _) = search_text("日本語Count\n", "Count", true, true);
+        assert_eq!(jt, 1, "非 ASCII は識別子文字としない");
+
+        // 行頭・行末は境界
+        let (_e, et, _) = search_text("Count\n", "Count", true, true);
+        assert_eq!(et, 1);
     }
 
     #[tokio::test]

@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 /// コマンド・応答の追加のため bump。
 /// v19: Helix の surround（`ms` / `mr` / `md`）— `Command::SurroundAdd` /
 /// `SurroundDelete` / `SurroundReplace` を追加。コマンドの追加のため bump。
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
 /// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
@@ -266,6 +266,11 @@ pub enum Command {
         query: String,
         /// 大文字小文字を区別するか。
         case_sensitive: bool,
+        /// 単語境界で一致させるか（旧クライアントは省略 = 部分文字列）。
+        /// 真なら一致の直前・直後が ASCII 識別子文字（`[A-Za-z0-9_]`）でない
+        /// ものだけを返す（rust2 要望: 旧名が新名の接頭辞のときの偽陽性を防ぐ）。
+        #[serde(default)]
+        word: bool,
     },
     /// 指定位置を囲むシンボルの取得（読み取り専用。ADR-0031）。`line:col`
     /// （1-origin）から、その位置を含む最も深い記号の名前・種別・正確な範囲を
@@ -520,6 +525,11 @@ pub enum ServerMessage {
         metrics: ServerMetrics,
         /// 登録中の基準 root（#49・v13）。読取り専用・ライフサイクル管理対象。
         base_roots: Vec<BaseRootInfo>,
+        /// 設定済み LSP サーバと稼働状況（rust2 要望。`check` が
+        /// "no LSP server configured" と言った理由をエージェントが自己診断できる）。
+        /// `id` / 対象言語 / 稼働セッション数のみ — 実行コマンドやローカル root の
+        /// パスは開示しない。
+        servers: Vec<LspServerInfo>,
     },
     /// [`Command::GetInlayHints`] の応答（ADR-0020）。エージェントが全文
     /// テキストを読まずに型構造（type / parameter ヒント）を参照するための経路。
@@ -691,6 +701,19 @@ pub enum ServerMessage {
         /// コメント一覧（追加順）。
         comments: Vec<ReviewCommentView>,
     },
+}
+
+/// [`ServerMessage::ServerInfo`] に載る LSP サーバ 1 件（rust2 要望）。
+/// 設定（`languages.toml`）由来の識別子と対象言語、現在の稼働セッション数だけを
+/// 開示する — 実行コマンド・絶対パスは含めない。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspServerInfo {
+    /// `languages.toml` の `[language-server.<id>]` の id（例 `rust-analyzer`）。
+    pub id: String,
+    /// このサーバに割り当たっている言語名（`languages.toml` の `name`。安定順）。
+    pub languages: Vec<String>,
+    /// 現在稼働中のセッション数（workspace root × 言語）。0 なら未起動。
+    pub running_sessions: usize,
 }
 
 /// [`Command::SearchMatches`] の応答に含まれる一致位置 1 件。1-origin の行と
@@ -1381,6 +1404,11 @@ mod tests {
                 root: "/tmp/mina-base-abc".into(),
                 commit: "abc1234".into(),
             }],
+            servers: vec![LspServerInfo {
+                id: "rust-analyzer".into(),
+                languages: vec!["rust".into()],
+                running_sessions: 1,
+            }],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1516,6 +1544,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 query: "fn ".into(),
                 case_sensitive: true,
+                word: false,
             },
             Command::EnclosingSymbol {
                 path: "src/lib.rs".into(),

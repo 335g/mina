@@ -214,6 +214,27 @@ impl LanguageTable {
         }
     }
 
+    /// 設定済みの LSP サーバ一覧（`[language-server.<id>]` の id → 対象言語名の
+    /// 安定順リスト）。`ServerInfo.servers` の開示用 — 実行コマンドや config は
+    /// 含めない（rust2 要望）。言語名は元の順序（`languages.toml` の宣言順）。
+    pub(crate) fn configured_servers(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = self
+            .servers
+            .keys()
+            .map(|id| {
+                let langs: Vec<String> = self
+                    .languages
+                    .iter()
+                    .filter(|l| l.language_server.as_deref() == Some(id.as_str()))
+                    .map(|l| l.name.clone())
+                    .collect();
+                (id.clone(), langs)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// 任意の言語のサーバ定義を引く。サーバ共有の参照解決（将来の Stage で使用）。
     #[cfg(test)]
     pub(crate) fn server_by_id(&self, id: &str) -> Option<&ServerConfig> {

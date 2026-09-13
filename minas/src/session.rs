@@ -126,6 +126,11 @@ pub enum SessionCmd {
         /// Case-insensitive search
         #[arg(long, short = 'i')]
         ignore_case: bool,
+        /// Match only at word boundaries (ASCII identifiers). Use it when
+        /// sweeping a renamed OLD name that is a prefix of the NEW one
+        /// (e.g. TOTAL_COUNT vs TOTAL_COUNT_HEADER).
+        #[arg(long, short = 'w')]
+        word: bool,
     },
     /// Fetch the daemon build generation and metrics (printed as JSON, issue #27).
     /// This is the DAEMON's build/metrics — not the LSP server list. The wire
@@ -399,6 +404,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             path,
             query,
             ignore_case,
+            word,
         } => {
             // 全文を読まずに一致位置だけを得る（rust2 要望）。失敗は stderr + exit 1
             // （cannot open / empty query = 入力エラー、再試行不可）。
@@ -406,6 +412,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 &path.to_string_lossy(),
                 &query,
                 !ignore_case,
+                word,
             )
             .await?;
             if let Some(e) = &outcome.error {
@@ -1304,12 +1311,14 @@ async fn execute_search(
     path: &str,
     query: &str,
     case_sensitive: bool,
+    word: bool,
 ) -> io::Result<SearchOutcome> {
     let (mut write_half, mut reader) = open_one_shot().await?;
     let command = Command::SearchMatches {
         path: conn::absolutize(path),
         query: query.to_string(),
         case_sensitive,
+        word,
     };
     let mut line = serde_json::to_string(&command).expect("the command must be serializable");
     line.push('\n');
@@ -1615,6 +1624,7 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
             daemon_build_ts,
             metrics,
             base_roots,
+            servers,
         }) => Ok(serde_json::json!({
             "generation": generation,
             "daemon_build_ts": daemon_build_ts,
@@ -1628,6 +1638,9 @@ async fn execute_server_info() -> io::Result<serde_json::Value> {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0),
             "metrics": metrics,
+            // rust2 要望: 設定済み LSP サーバと稼働状況（id / 言語 / セッション数）。
+            // `check` が "no LSP server configured" と言った理由を自己診断できる。
+            "servers": servers,
         })),
         Ok(mina_protocol::ServerMessage::Response { .. })
         | Ok(mina_protocol::ServerMessage::Push { .. }) => {
