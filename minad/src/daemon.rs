@@ -2234,6 +2234,71 @@ async fn resolve_doc_text(daemon: &Mutex<Daemon>, path_buf: &Path) -> Result<Str
     }
 }
 
+/// 空の `workspace/symbol` を確定してよいか（ドッグフーディング #19）。
+///
+/// 言語サーバの再起動/再ロード窓では `workspace/symbol` が `[]` を返す
+/// （driver 実測: モジュール移動直後の `minas symbol <新パス> deep_fn` が
+/// `[]` + exit 0、4 秒後は正しい位置）。#18 の検出器は `references` 専用だったので、
+/// 同じ規則を `symbol` にも広げる: **クエリ名がアンカーファイルに宣言されている**
+/// （構文層の outline で見える）のに意味層が何も答えないなら、空は「見つからない」
+/// ではなく「見ていない」。
+///
+/// アンカーファイルに名前が無い場合（別クレートのシンボルを探している等）は
+/// 判定できないので `None`（空のまま返す — 誤警告を出さない）。
+async fn symbol_empty_is_unverified(
+    session: &Mutex<lsp::LspSession>,
+    path: &Path,
+    text: &str,
+    query: &str,
+) -> Option<String> {
+    let symbols = lsp::document_symbols_at(session, path, text).await.ok()?;
+    let probes = probe_positions(session, text, &symbols, Some(query)).await?;
+    semantic_layer_unavailable(session, path, text, &probes).await
+}
+
+/// 意味層の生存確認に使う位置を集める（最大 3 つ）。
+///
+/// `prefer`（問い合わせた名前）を先頭に、同じファイルの他の宣言で埋める。
+/// ファイルに宣言が無ければ `None`（判定不能 — 空を確定してよい）。
+async fn probe_positions(
+    session: &Mutex<lsp::LspSession>,
+    text: &str,
+    symbols: &[mina_protocol::OutlineSymbol],
+    prefer: Option<&str>,
+) -> Option<Vec<(u32, u32)>> {
+    let mut flat = Vec::new();
+    flatten_symbols(symbols, &mut flat);
+    if flat.is_empty() {
+        return None;
+    }
+    if let Some(name) = prefer {
+        if let Some(i) = flat.iter().position(|s| s.name == name) {
+            let s = flat.remove(i);
+            flat.insert(0, s);
+        }
+    }
+    let mut out = Vec::new();
+    for s in flat.into_iter().take(3) {
+        let pos = {
+            let locked = session.lock().await;
+            locked.char_to_lsp_pos(text, s.selection_range.anchor)
+        };
+        out.push(pos);
+    }
+    Some(out)
+}
+
+/// シンボルツリーを平坦化する（深さ優先・出現順）。
+fn flatten_symbols<'a>(
+    symbols: &'a [mina_protocol::OutlineSymbol],
+    out: &mut Vec<&'a mina_protocol::OutlineSymbol>,
+) {
+    for s in symbols {
+        out.push(s);
+        flatten_symbols(&s.children, out);
+    }
+}
+
 /// 空の意味的結果を「確定」してよいか（ドッグフーディング #18）。
 ///
 /// 構文層（`documentSymbol` = outline/at）は答えるのに、意味層
@@ -2254,25 +2319,38 @@ async fn semantic_layer_unavailable(
     session: &Mutex<lsp::LspSession>,
     path: &Path,
     text: &str,
-    line: u32,
-    character: u32,
+    probes: &[(u32, u32)],
 ) -> Option<String> {
-    if !session.lock().await.caps.hover {
+    if probes.is_empty() || !session.lock().await.caps.hover {
         return None;
     }
-    let hover = lsp::hover_at_line_col(session, path, text, line, character).await;
-    match hover {
-        Some(t) if !t.trim().is_empty() => None,
-        _ => Some(format!(
-            "LSP error: the semantic layer answered nothing for a symbol this file declares \
-             (hover at {}:{} is empty as well) — an empty references list here is NOT evidence \
-             that the symbol is unused. outline/at still work; the workspace may not be loaded \
-             in the daemon's language server (dogfooding #18: check `minas info` sessions, \
-             restart/rebuild the daemon, then retry)",
-            line + 1,
-            character + 1
-        )),
+    // 1 つでも hover が返れば意味層は生きている（問い合わせた記号が
+    // cfg 非活性 / クレートグラフ外なだけ）。**全部空**のときだけ死んだと判定する —
+    // 実測（自分のフィクスチャ）: `#[cfg(feature = "gated")] pub mod gated;` の
+    // 宣言は hover が空になるが、意味層は生きている（同ファイルの `model` は答える）。
+    // 1 記号だけを probe にすると、この正常ケースを誤警告する。
+    let mut all_empty = true;
+    for (line, character) in probes {
+        let hover = lsp::hover_at_line_col(session, path, text, *line, *character).await;
+        if matches!(hover, Some(t) if !t.trim().is_empty()) {
+            all_empty = false;
+            break;
+        }
     }
+    if !all_empty {
+        return None;
+    }
+    let (line, character) = probes[0];
+    Some(format!(
+        "LSP error: the semantic layer answered nothing for {} symbol(s) this file declares \
+         (hover at {}:{} is empty as well) — an empty result here is NOT evidence that the \
+         symbol is unused or missing. outline/at still work; the workspace may not be loaded \
+         in the daemon's language server (dogfooding #18/#19: check `minas info` sessions, \
+         restart/rebuild the daemon, then retry)",
+        probes.len(),
+        line + 1,
+        character + 1
+    ))
 }
 
 /// [`Command::Outline`] の処理（ADR-0031）: 任意パスのシンボル階層ツリーを
@@ -3033,6 +3111,28 @@ async fn serve_workspace_symbols(
         ),
         Err(e) => (Vec::new(), Some(e)),
     };
+    // ドッグフーディング #19: 空の `[]` + exit 0 は「見つからない」と「意味層が
+    // 答えていない」のどちらでもあり得る。後者を空として返すと、エージェントは
+    // モジュール移動でシンボルが消えたと結論する（driver 実測: 移動直後の
+    // `minas symbol <新パス> deep_fn` が `[]` exit=0、4 秒後は正しい位置）。
+    // クエリ名がアンカーファイルに宣言されているなら、空は確定できない。
+    let error = match error {
+        Some(e) => Some(e),
+        None if symbols.is_empty() => {
+            match symbol_empty_is_unverified(
+                &borrowed.session,
+                &borrowed.path,
+                &borrowed.text,
+                query,
+            )
+            .await
+            {
+                Some(msg) => Some(msg),
+                None => None,
+            }
+        }
+        None => None,
+    };
     // メッセージを先に組み立ててから計測（一時ガードのデッドロック回避 — hover と同じ）
     let msg = ServerMessage::WorkspaceSymbols {
         generation: daemon.lock().await.generation,
@@ -3328,8 +3428,22 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
     // エージェントは API 削除の根拠にする。位置は解決できているので、同じ位置への
     // hover を liveness の probe に使う。
     if locations.is_empty() {
-        if let Some(msg) = semantic_layer_unavailable(&borrowed.session, &borrowed.path, &borrowed.text, line, character).await {
-            return err(msg).await;
+        // 生存確認は「同じファイルの宣言を最大 3 つ」で行う（1 つだけだと
+        // cfg 非活性の宣言を「意味層が死んでいる」と誤判定する — 実測）。
+        if let Ok(symbols) =
+            lsp::document_symbols_at(&borrowed.session, &borrowed.path, &borrowed.text).await
+        {
+            if let Some(probes) = probe_positions(&borrowed.session, &borrowed.text, &symbols, None).await
+            {
+                let mut probes = probes;
+                probes.insert(0, (line, character));
+                if let Some(msg) =
+                    semantic_layer_unavailable(&borrowed.session, &borrowed.path, &borrowed.text, &probes)
+                        .await
+                {
+                    return err(msg).await;
+                }
+            }
         }
     }
     // フォーカス文書を借りていたら復元（開き直し + 診断更新 — 自己修復）

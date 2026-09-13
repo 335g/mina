@@ -62,6 +62,27 @@ Status: accepted
    拒否ではなく警告なのは、同じパスを別 commit で登録する compare-review の
    使い方が正当だから。
 
+8. **意味層の生存確認を `symbol` にも広げ、probe は複数記号で行う**（#19）:
+   モジュール移動の窓では `workspace/symbol` が `[]` + exit 0 を返し（4 秒後は正しい）、
+   同じ窓で「LSP サーバが停止しています」や「応答が配列ではありません」という
+   プロトコル詳細・日本語 prose が漏れていた。`symbol` が空のときも同じ規則で
+   「クエリ名がアンカーファイルに宣言されているか」を構文層（documentSymbol）で
+   確かめ、宣言があるのに意味層が答えないなら `LSP error: the semantic layer …`
+   + exit 2 にする。
+   **probe は最大 3 記号**（問い合わせた名前 + 同ファイルの他の宣言）で行い、
+   **全部空**のときだけ死んだと判定する — 1 記号だけで判定すると
+   `#[cfg(feature = "gated")] pub mod gated;` のような **cfg 非活性の宣言**を
+   誤警告する（自分でフィクスチャを作って実測。同ファイルの `model` の hover は
+   答えるので意味層は生きている）。修正後の実測: cfg 非活性の宣言は `[]` +
+   exit 0 + stderr 空、宣言の無い名前も同じ、アウトオブプロジェクトの
+   `references` は `LSP error: the semantic layer answered nothing for 2 symbol(s) …`
+   + exit 2。
+9. **エージェント向けの失敗文言を英語 + 安定コードに揃える**（#19）: 「LSP サーバが
+   停止しています（再起動を待つか再実行してください）」→
+   `LSP error: the language server has stopped (it is respawned on the next .rs Open /\n   command) — retry`、各「応答が配列ではありません」→
+   `LSP error: the server returned an unusable <method> response (not an array) — the\n   server may be restarting; retry`。prose の言語を混ぜない・プロトコル詳細を
+   そのまま見せない。
+
 ## Considered Options
 
 - **reload を待たずに「未検証」を返すだけ**（#3 を honest refusal にする）:

@@ -395,7 +395,11 @@ pub async fn document_symbols_at(
     )
     .await?;
     let Some(items) = result.as_array() else {
-        return Err("textDocument/documentSymbol の応答が配列ではありません".into());
+        return Err(
+            "LSP error: the server returned an unusable documentSymbol response (not an array) \
+             — the server may be restarting; retry"
+                .into(),
+        );
     };
     let enc = {
         let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
@@ -1131,7 +1135,11 @@ pub async fn workspace_symbols(
     )
     .await?;
     let Some(items) = result.as_array() else {
-        return Err("workspace/symbol の応答が配列ではありません".into());
+        return Err(
+            "LSP error: the server returned an unusable workspace/symbol response (not an array) \
+             — the server may be restarting; retry"
+                .into(),
+        );
     };
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -1440,7 +1448,11 @@ pub async fn references_at(
     )
     .await?;
     let Some(items) = result.as_array() else {
-        return Err("textDocument/references の応答が配列ではありません".into());
+        return Err(
+            "LSP error: the server returned an unusable references response (not an array) — \
+             the server may be restarting; retry"
+                .into(),
+        );
     };
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -1496,7 +1508,11 @@ async fn request_with_loading_retry(
                 return Err("LSP セッションのロックを取得できませんでした".into());
             };
             if session.client.is_dead() {
-                return Err("LSP サーバが停止しています（再起動を待つか再実行してください）".into());
+                return Err(
+                "LSP error: the language server has stopped (it is respawned on the next .rs \
+                 Open / command) — retry"
+                    .into(),
+            );
             }
             session
                 .client
