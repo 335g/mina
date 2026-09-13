@@ -71,14 +71,22 @@ Each command returns JSON. If an edit is rejected, re-read the affected range an
 
 #### Agent skills
 
-`minas skill` ships a load-on-demand skill shelf for agents: no arguments prints a thin index (one line per topic); `minas skill <topic>` prints just that topic's guide.
+`minas skill` ships a load-on-demand skill shelf for agents: no arguments prints a thin index (one line per topic); `minas skill <topic>` prints just that topic's guide. The shelf is compiled into the binary, so it always matches the installed build.
 
 ```console
-$ minas skill           # index: read, outline, at, edit, rename, references, persist, errors
+$ minas skill           # index: usage, read, search, wait, edit, check, rename, references, ...
 $ minas skill read      # the read contract (session get --lines, numbered output)
 ```
 
 The guides cover tool choice (read / apply / rename contracts) and error recovery. They are written for machine parsing: English text, exit 0 on success; an unknown topic exits 1 with the reason and the available topics. If an edit is rejected, `minas skill errors` is the first stop.
+
+An agent that does not know minas exists will never run `minas skill` — the shelf is pull-only. `minas skill --md` prints a thin wrapper to hand it over: YAML frontmatter, the `usage` guide (when to use minas instead of `rg`/`sed`, and the rules that hold from the first command), and the build stamp.
+
+```console
+$ minas skill --md > ~/.claude/skills/minas/SKILL.md   # or where your runner reads skills
+```
+
+Paste it where your agent reads instructions — a skill directory (`~/.pi/agent/skills/minas/SKILL.md`, `~/.claude/skills/minas/SKILL.md`), or your repo's `AGENTS.md` / `CLAUDE.md`. It carries no copy of the index (only "run `minas skill`"), so it cannot go stale as topics are added; if `minas info`'s `cli_generation` differs from the stamp, regenerate it.
 
 ## Architecture
 

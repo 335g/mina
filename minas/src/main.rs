@@ -30,6 +30,11 @@ enum Command {
     Skill {
         /// Topic to print (omit for the index)
         topic: Option<String>,
+        /// Print the paste-able wrapper (YAML frontmatter + topic body + the build stamp) for a
+        /// user's agent, instead of the raw topic — drop it where your runner reads skills
+        /// (pi: ~/.pi/agent/skills/minas/SKILL.md), or into AGENTS.md / CLAUDE.md
+        #[arg(long)]
+        md: bool,
     },
 }
 
@@ -63,6 +68,6 @@ async fn run() -> std::io::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Session(cmd) => session::run(cmd, cli.name).await,
-        Command::Skill { topic } => skill::run(topic),
+        Command::Skill { topic, md } => skill::run(topic, md),
     }
 }

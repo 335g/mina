@@ -15,6 +15,11 @@
 //! ADR-0029（rename / references）・ADR-0031（outline / at）・ADR-0032
 //! （hover / symbol / check）の実測・仕様に基づく。
 //!
+//! - `minas skill --md` = **配布用ラッパー**。ユーザのエージェントに「minas を使わせる」
+//!   ための薄いファイル（YAML frontmatter + トピック本文 + ビルド世代の刻印）を stdout に
+//!   出す。エージェントは `minas skill` を知らないと pull できないので、push 側の入口を
+//!   配る。索引は写さない（トピックを足すたびに腐るため。本文と『索引を引け』だけを持つ）。
+//!
 //! データは `minas/skills.json`（`[{"name","description","body"}, ...]`）に置き
 //! `include_str!` で同梱する。配列順が索引の表示順、`body` が `minas skill <name>`
 //! の出力全文。文言とトピック追加は JSON だけで完結し、Rust のソースを触らない。
@@ -37,8 +42,54 @@ static SKILLS: LazyLock<Vec<Skill>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../skills.json")).expect("embedded skills.json is valid")
 });
 
-/// `minas skill [topic]` の本体。daemon は必要としない（静的コンテンツ）。
-pub fn run(topic: Option<String>) -> std::io::Result<()> {
+/// トピック名で引く。未知なら候補一覧つきの理由（`run` が exit 1 にする）。
+fn lookup(name: &str) -> Result<&'static Skill, String> {
+    SKILLS.iter().find(|s| s.name == name).ok_or_else(|| {
+        let known: Vec<&str> = SKILLS.iter().map(|s| s.name.as_str()).collect();
+        format!(
+            "unknown skill topic: {name:?} (known topics: {})",
+            known.join(", ")
+        )
+    })
+}
+
+/// `--md` が出す配布用ラッパー（frontmatter + 本文 + ビルド世代の刻印）。
+///
+/// 正本は `skills.json` のままで、ラッパーは本文を写すだけ。刻印は「ユーザが一度貼った
+/// きりで古い文言を使い続ける」事故を検出するため（`minas info` の cli_generation と比較）。
+fn markdown(topic: Option<&str>) -> Result<String, String> {
+    let name = topic.unwrap_or("usage");
+    let skill = lookup(name)?;
+    let skill_name = if name == "usage" {
+        "minas".to_string()
+    } else {
+        format!("minas-{name}")
+    };
+    let generation = option_env!("MINA_GIT_HASH").unwrap_or("unknown");
+    let ts = option_env!("MINA_BUILD_TS").unwrap_or("0");
+    Ok(format!(
+        "---\nname: {skill_name}\ndescription: {}\n---\n\n{}\n\nGenerated from minas {generation} \
+         (build_ts {ts}) by `minas skill --md`. If `minas info` reports a different \
+         cli_generation, regenerate.\n",
+        skill.description,
+        skill.body.trim_end()
+    ))
+}
+
+/// `minas skill [topic] [--md]` の本体。daemon は必要としない（静的コンテンツ）。
+pub fn run(topic: Option<String>, md: bool) -> std::io::Result<()> {
+    if md {
+        return match markdown(topic.as_deref()) {
+            Ok(text) => {
+                print!("{text}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
     match topic {
         None => {
             // 索引: 1トピック1行。薄く保つことが設計要件（常時ロードしても軽い）。
@@ -47,18 +98,14 @@ pub fn run(topic: Option<String>) -> std::io::Result<()> {
             }
             Ok(())
         }
-        Some(t) => match SKILLS.iter().find(|s| s.name == t) {
-            Some(s) => {
+        Some(t) => match lookup(&t) {
+            Ok(s) => {
                 println!("{}", s.body);
                 Ok(())
             }
-            None => {
+            Err(e) => {
                 // 未知トピック: stderr に理由＋候補（エージェントは $?=1 で修正できる）
-                let known: Vec<&str> = SKILLS.iter().map(|s| s.name.as_str()).collect();
-                eprintln!(
-                    "unknown skill topic: {t:?} (known topics: {})",
-                    known.join(", ")
-                );
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         },
@@ -94,6 +141,27 @@ mod tests {
             assert!(s.body.len() > 100, "{}: 内容が短すぎる", s.name);
             assert!(!s.body.trim().is_empty() && !s.body.contains('\0'));
         }
+    }
+
+    /// 配布用ラッパー: 貼れる形（frontmatter）で、本文は正本のままで、世代が刻まれている。
+    #[test]
+    fn markdown_wrapper_is_pasteable_and_stamped() {
+        let md = markdown(None).unwrap();
+        let usage = SKILLS.iter().find(|s| s.name == "usage").unwrap();
+        assert!(md.starts_with("---\nname: minas\ndescription: "), "frontmatter");
+        assert_eq!(md.matches("\n---\n").count(), 1, "frontmatter は 1 つ");
+        assert!(md.contains(usage.body.trim_end()), "本文は正本のまま");
+        assert!(md.contains("Generated from minas"), "世代の刻印");
+        assert!(!md.contains("\nread "), "索引の写しを埋め込まない");
+    }
+
+    /// トピック指定のラッパーは frontmatter 以外（name）が分かれ、未知トピックは理由を返す。
+    #[test]
+    fn markdown_takes_a_topic_and_rejects_unknown() {
+        let read = markdown(Some("read")).unwrap();
+        assert!(read.starts_with("---\nname: minas-read\ndescription: "), "name を分ける");
+        let err = markdown(Some("nope")).unwrap_err();
+        assert!(err.contains("unknown skill topic") && err.contains("usage"), "{err}");
     }
 
     #[test]

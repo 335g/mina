@@ -167,3 +167,7 @@ _Avoid_: popup, panel, window
 **Help Overlay**:
 The Overlay opened with `?` from Normal or Select, listing every mode's keybindings in a centered half-size window. Scrollable; Esc or `?` closes it.
 _Avoid_: help window, keybind popup
+
+**Skill shelf**:
+The agent-facing guides for using the headless Client, compiled into the `minas` binary from `skills.json` and read on demand: `minas skill` prints the index (one line per topic), `minas skill <topic>` prints that topic's contract. The shelf is the single source for *how* — the docs an agent parses live here, not in a hand-written file. Its `usage` topic carries *when* to reach for the tool (instead of `rg`/`sed`) and the rules that must hold from the first command; `minas skill --md` prints that topic as a paste-able skill file (YAML frontmatter, the body, and a build stamp) for handing the trigger to a user's agent.
+_Avoid_: help page, prompt, agent instructions (for the shelf itself)

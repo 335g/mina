@@ -71,14 +71,22 @@ $ minas rename src/lib.rs "USD" "JPY"
 
 #### Agent skills（エージェント向けスキル）
 
-`minas skill` はエージェント向けのオンデマンド型スキル棚です: 無引数なら薄い索引（1トピック1行）を、`minas skill <topic>` ならそのトピックの内容だけを返します。
+`minas skill` はエージェント向けのオンデマンド型スキル棚です: 無引数なら薄い索引（1トピック1行）を、`minas skill <topic>` ならそのトピックの内容だけを返します。棚はバイナリに同梱されているため、常にインストール済みビルドと一致します。
 
 ```console
-$ minas skill           # 索引: read, outline, at, edit, rename, references, persist, errors
+$ minas skill           # 索引: usage, read, search, wait, edit, check, rename, references, ...
 $ minas skill read      # read 契約（session get --lines の番号付き出力）
 ```
 
 ガイドはツール選択（read / apply / rename 契約）とエラー回復を扱います。エージェントがパースできるよう、出力は英語・成功は exit 0 に統一され、未知トピックは exit 1 で理由と利用可能トピック一覧を返します。編集が拒否されたら `minas skill errors` が最初の参照先です。
+
+ただし **minas の存在を知らないエージェントは `minas skill` を呼びません**（棚は pull 型）。`minas skill --md` はそれを渡すための薄いラッパーを出力します: YAML frontmatter ＋ `usage` ガイド（いつ `rg`/`sed` ではなく minas を使うか、最初の 1 コマンドから効かせる規則）＋ ビルド世代の刻印。
+
+```console
+$ minas skill --md > ~/.claude/skills/minas/SKILL.md   # エージェントがスキルを読む場所へ
+```
+
+置き場はエージェントが指示を読む場所ならどこでも: スキルディレクトリ（`~/.pi/agent/skills/minas/SKILL.md`、`~/.claude/skills/minas/SKILL.md`）でも、リポジトリの `AGENTS.md` / `CLAUDE.md` でも構いません。索引の写しは持たず（「`minas skill` を実行せよ」だけ）、トピックが増えても腐りません。`minas info` の `cli_generation` が刻印と違っていたら再生成してください。
 
 ## アーキテクチャ
 
