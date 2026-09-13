@@ -123,8 +123,23 @@ struct Inner {
     outstanding: HashSet<String>,
     /// `$/progress` を 1 つでも見たか（進捗を使わないサーバの判定）。
     seen: bool,
-    /// 索引完走を確認済みか（一旦確認したら待たない — 待ちはセッションごとに 1 回）。
+    /// 索引完走を確認済みか。**新しい分析ラウンドが始まると false に戻る** —
+    /// ワークスペースは 1 回ロードして終わりではなく、ファイル集合が変わると
+    /// (mod 宣言の追加・新規ファイル)rust-analyzer は cargo を再ロードする。
+    /// 一発だけの待機だと 2 回目以降のラウンドを「準備完了」と誤認し、
+    /// その窓の応答（空の peek・エラーのない check・部分的な rename）を
+    /// 確定として返してしまう（ドッグフーディング #3/#4/#5）。
     ready: bool,
+}
+
+/// 分析側のラウンドか（= 索引完走を待つ対象か）。
+///
+/// flycheck（`rust-analyzer/flycheck/N`、cargo check を背景で回す別系統）は
+/// **分析能力と無関係**で、待つと save のたびに cargo check 1 回分の遅延を
+/// 要求ごとに払うことになる。ADR-0051 の対象（Fetching / Building CrateGraph /
+/// Roots Scanned / cachePriming）だけを待つ。
+fn is_analysis_round(token: &str) -> bool {
+    !token.contains("flycheck")
 }
 
 impl Default for Progress {
@@ -144,7 +159,14 @@ impl Progress {
     pub(crate) fn begin(&self, token: &str) {
         let mut inner = self.lock();
         inner.seen = true;
+        let was_idle = inner.outstanding.is_empty();
         inner.outstanding.insert(token.to_string());
+        // 新しい分析ラウンド（静止後の begin）= 前回の完走確認は無効。
+        // 相次ぐ phase の begin（Fetching → Building CrateGraph …）では
+        // outstanding が空でないので、これはラウンドの先頭でだけ発火する。
+        if was_idle && is_analysis_round(token) {
+            inner.ready = false;
+        }
     }
 
     pub(crate) fn end(&self, token: &str) {
@@ -161,8 +183,8 @@ impl Progress {
     /// 索引完走を待つ。`true` = 完走と確認できた、`false` = 上限まで待って未確認。
     ///
     /// 判定は「進捗が 1 つも無く、静止確認 `quiesce` の後も無い」— 進捗を 1 つも
-    /// 通知しないサーバは `arm` で諦める。一旦確認したら以後は即返る（飛行場に
-    /// 毎回 300ms 払わない）。
+    /// 通知しないサーバは `arm` で諦める。確認済みは**次のラウンドまで**有効で、
+    /// 新しい分析ラウンドが始まると（[`Progress::begin`]）待ち直す。
     pub async fn wait_ready(&self, policy: ReadyPolicy) -> bool {
         if self.is_ready() {
             return true;

@@ -429,6 +429,9 @@ fn convert_symbol_list(
                     kind: lsp_symbol_kind(item.get("kind")).unwrap_or_default(),
                     range,
                     selection_range,
+                    // 1 ファイル分の変換なので帰属は常に呼び出し元のファイル。
+                    // 別ファイルからの inline は daemon 側が印を付ける（ADR-0057）。
+                    path: String::new(),
                     children,
                 })
             })
@@ -446,6 +449,7 @@ fn convert_symbol_list(
                     kind: lsp_symbol_kind(item.get("kind")).unwrap_or_default(),
                     range,
                     selection_range: range,
+                    path: String::new(),
                     children: Vec::new(),
                 })
             })
@@ -2556,6 +2560,7 @@ fn capabilities_of_parses_initialize_response() {
                 kind: SymbolKind::Function,
                 range: Range { anchor, head },
                 selection_range: Range { anchor, head },
+                path: String::new(),
                 children,
             }
         };

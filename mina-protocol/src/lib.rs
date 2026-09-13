@@ -55,7 +55,9 @@ use serde::{Deserialize, Serialize};
 /// コマンド・応答の追加のため bump。
 /// v19: Helix の surround（`ms` / `mr` / `md`）— `Command::SurroundAdd` /
 /// `SurroundDelete` / `SurroundReplace` を追加。コマンドの追加のため bump。
-pub const PROTOCOL_VERSION: u32 = 21;
+/// v22: `OutlineSymbol` に `path`（別ファイルから inline した記号の帰属
+/// ファイル。ADR-0057）。応答 wire の変更のため bump。
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
 /// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
@@ -792,6 +794,16 @@ pub struct OutlineSymbol {
     pub kind: SymbolKind,
     pub range: Range,
     pub selection_range: Range,
+    /// `range` / `selection_range` が属するファイル（ADR-0057）。**親と別の
+    /// ファイルから inline された直下の記号にだけ**入る（recursive outline の
+    /// モジュール展開。ADR-0049）。
+    ///
+    /// 解決規則: ノードのファイル = 自身の `path` → 無ければ親のファイル →
+    /// トップレベルなら応答の `path`。同一ファイル内で全ノードに繰り返すと
+    /// 情報が増えないまま応答が膨らむため、**ファイルが変わる境界にだけ**置く。
+    /// 空文字は「親と同一ファイル」を意味し、JSON には出ない。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
     pub children: Vec<OutlineSymbol>,
 }
 
@@ -1509,6 +1521,7 @@ mod tests {
                 anchor: 3,
                 head: 13,
             },
+            path: String::new(),
             children: vec![OutlineSymbol {
                 name: "inner".into(),
                 kind: SymbolKind::Variable,
@@ -1520,6 +1533,7 @@ mod tests {
                     anchor: 14,
                     head: 19,
                 },
+                path: String::new(),
                 children: Vec::new(),
             }],
         };
@@ -1527,6 +1541,10 @@ mod tests {
         let back: OutlineSymbol = serde_json::from_str(&json).unwrap();
         assert_eq!(back, symbol);
         assert!(json.contains("\"kind\":\"function\""));
+        assert!(
+            !json.contains("\"path\""),
+            "空 path は JSON に出さない（非再帰応答を膨らませない）: {json}"
+        );
 
         // Outline / EnclosingSymbol コマンドの round-trip
         for cmd in [

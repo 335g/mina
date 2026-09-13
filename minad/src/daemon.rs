@@ -2163,7 +2163,7 @@ async fn serve_peek_definition_at(
 /// outline キャッシュの高速経路（ADR-0031）: テキストのチェックサムが一致する
 /// エントリがあればクローンを返す（LSP 不問）。不一致・不在は `None`。
 async fn cached_outline(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<Vec<OutlineSymbol>> {
-    let text = resolve_doc_text(daemon, path_buf).await?;
+    let text = resolve_doc_text(daemon, path_buf).await.ok()?;
     let checksum = fnv1a64(text.as_bytes());
     daemon
         .lock()
@@ -2176,7 +2176,12 @@ async fn cached_outline(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<Vec<O
 
 /// 対象テキストの解決（開文書優先・ディスク読み）。`prepare_borrowed_session` の
 /// 前半と同じ形（ADR-0008 の `read_open_target` を再利用）。キャッシュヒット判定用。
-async fn resolve_doc_text(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<String> {
+///
+/// `Err` はディスク fallback の失敗理由（
+/// [`read_open_target`] の「存在しない」「ディレクトリ」「非 UTF-8（バイナリ）」
+/// 「大きすぎる」等をそのまま運ぶ）。理由を捨てて `cannot open` に潰すと呼び出し側で
+/// 「存在しない」とバイナリが区別できなくなる。
+async fn resolve_doc_text(daemon: &Mutex<Daemon>, path_buf: &Path) -> Result<String, String> {
     let in_memory = {
         let d = daemon.lock().await;
         d.editor
@@ -2184,8 +2189,15 @@ async fn resolve_doc_text(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<Str
             .map(|id| d.editor.document(id).text().to_string())
     };
     match in_memory {
-        Some(t) => Some(t),
-        None => read_open_target(&path_buf.to_string_lossy()).await.0,
+        Some(t) => Ok(t),
+        None => {
+            let path = path_buf.to_string_lossy();
+            match read_open_target(&path).await {
+                (Some(t), _) => Ok(t),
+                (None, Some(e)) => Err(e),
+                (None, None) => Err(format!("cannot open {path}")),
+            }
+        }
     }
 }
 
@@ -2459,6 +2471,13 @@ fn expand_outline_modules<'a>(
                 *budget -= used;
             }
             if !child_symbols.is_empty() {
+                // 帰属ファイルの明示（ADR-0057）: 別ファイルから inline した直下の
+                // 子にだけ `path` を付ける。子孫は「親と同じファイル」で解決でき、
+                // 同一ファイル内の繰り返しは情報を増やさず応答を膨らませるだけ
+                // （非再帰応答は完全に不変）。
+                for child in child_symbols.iter_mut() {
+                    child.path = target_path_str.clone();
+                }
                 // さらに深いモジュールへ再帰。
                 truncated |= expand_outline_modules(
                     daemon,
@@ -2501,13 +2520,14 @@ async fn serve_read_path(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let path_str = path_buf.to_string_lossy().into_owned();
     let text = match resolve_doc_text(daemon, &path_buf).await {
-        Some(t) => t,
-        None => {
+        Ok(t) => t,
+        // 理由は daemon 側で区別済み（存在しない / ディレクトリ / バイナリ / 大きすぎる）。
+        Err(e) => {
             return ServerMessage::ReadPath {
                 path: path_str,
                 generation: 0,
                 text: String::new(),
-                error: Some(format!("cannot open {path}")),
+                error: Some(e),
             }
         }
     };
@@ -2556,8 +2576,8 @@ async fn serve_search_matches(
         return err("query must not be empty".into());
     }
     let text = match resolve_doc_text(daemon, &path_buf).await {
-        Some(t) => t,
-        None => return err(format!("cannot open {path}")),
+        Ok(t) => t,
+        Err(e) => return err(e),
     };
     let (matches, total, truncated) = search_text(&text, query, case_sensitive, word);
     ServerMessage::SearchMatches {
@@ -2659,7 +2679,7 @@ async fn serve_enclosing_symbol(
     // 同一ファイルへ at を連打する場合の大半をこの経路が吸う。
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     if let Some(symbols) = cached_outline(daemon, &path_buf).await {
-        let Some(text) = resolve_doc_text(daemon, &path_buf).await else {
+        let Ok(text) = resolve_doc_text(daemon, &path_buf).await else {
             return err(format!("cannot open {path}"));
         };
         let char_idx = lsp::line_col_to_char_idx(&text, line, col);
@@ -4059,13 +4079,23 @@ async fn process_command(
             //   - 内容変化が来ない超過（Open だけ等）は待ち続け、WAIT_CONTENT_FALLBACK
             //     経過で旧契約（ADR-0014 の即応）を守って返す。
             //   - 連続編集で際限なく伸びないよう WAIT_HARD_CAP で打ち切る。
+            //
+            // ドッグフーディング #10: 上の 3 つの締切は「世代が target を超えた」
+            // あとの話。**超えていない間はここで返してはいけない** — 以前は
+            // 未到達でも deadline（fallback）でタイムアウトして現状を返しており、
+            // `minas wait 999999` が 0.53s / exit 0 で「待った」ことにしていた
+            // （偽成功。呼び出し側は古い状態を最新と誤認する）。未到達の間は
+            // fallback 窓ごとに再評価して待ち続ける（上限は呼び出し側の
+            // WAIT_TIMEOUT）。
             let started = tokio::time::Instant::now();
             loop {
                 let now = tokio::time::Instant::now();
                 let mut deadline = started + WAIT_CONTENT_FALLBACK;
+                let mut reached = false;
                 {
                     let mut d = daemon.lock().await;
                     if d.generation > generation {
+                        reached = true;
                         if d.content_changed_since(generation) {
                             // 内容変化あり: 最後の変化から settle 窓が過ぎていれば
                             // 即返す。進行中なら静まるまで待つ（後続変化で延びる）。
@@ -4086,17 +4116,26 @@ async fn process_command(
                 // 締切（settle または fallback / hard cap）まで次の変化を待つ。
                 let deadline = deadline.min(started + WAIT_HARD_CAP);
                 let now = tokio::time::Instant::now();
-                if now >= deadline {
+                if now >= deadline && reached {
                     let mut d = daemon.lock().await;
                     return snapshot(&mut d, None);
                 }
-                match tokio::time::timeout(deadline - now, rx.changed()).await {
+                // 未到達の間は fallback 窓を「次の再評価までの待ち区切り」として使う。
+                let wait_until = if reached {
+                    deadline
+                } else {
+                    now + WAIT_CONTENT_FALLBACK
+                };
+                match tokio::time::timeout(wait_until - now, rx.changed()).await {
                     // 次の変化が来た: 条件を再評価する
                     Ok(Ok(())) => {}
                     // 締切: settle 完了（または fallback）で確定
                     Err(_) => {
-                        let mut d = daemon.lock().await;
-                        return snapshot(&mut d, None);
+                        if reached {
+                            let mut d = daemon.lock().await;
+                            return snapshot(&mut d, None);
+                        }
+                        // まだ target 世代に達していない: 待ち続ける（偽成功を作らない）。
                     }
                     // push 送信元が消えた（daemon 終了）
                     Ok(Err(_)) => {
@@ -4808,9 +4847,11 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 /// Open 対象を検証して読み込む。
 ///
-/// 非正規ファイルは `cannot open`、[`MAX_FILE_SIZE`] 超は `file too large`、
-/// 非 UTF-8 等の読み込み失敗は `cannot read` を status で報告する（SEC-1 /
-/// ADR-0008）。
+/// 失敗理由は**区別できる形**で返す（存在しない / 非正規ファイル（ディレクトリ・
+/// FIFO 等）/ [`MAX_FILE_SIZE`] 超 / 非 UTF-8（バイナリ））。非正規・読み取り不可・
+/// 非 UTF-8 は `cannot open {path}: <理由>`、サイズ超過は `file too large` を status
+/// で報告する（SEC-1 / ADR-0008。「cannot open」接頭辞は入力エラー分類に使われる
+/// ため維持する — minas/src/session.rs の `starts_with("cannot open")`）。
 ///
 /// TOCTOU 対策: サイズ検証は open した fd の fstat で行い、その fd から
 /// バイト上限付きで読む（metadata と read が別々の path を辿らない）。
@@ -4824,12 +4865,21 @@ async fn read_open_target(path: &str) -> (Option<String>, Option<String>) {
         Ok(m) if m.len() > MAX_FILE_SIZE => {
             return (None, Some(format!("file too large: {path}")))
         }
-        Ok(m) if !m.is_file() => return (None, Some(format!("cannot open {path}"))),
+        Ok(m) if !m.is_file() => {
+            let what = if m.is_dir() {
+                "not a file, is a directory"
+            } else {
+                "not a regular file"
+            };
+            return (None, Some(format!("cannot open {path}: {what}")));
+        }
         _ => {}
     }
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        Err(_) => return (None, Some(format!("cannot open {path}"))),
+        // 理由をそのまま運ぶ（No such file or directory / Permission denied …）。
+        // 「存在しない」と「権限がない」を同じ文言にしない。
+        Err(e) => return (None, Some(format!("cannot open {path}: {e}"))),
     };
     // 同一 fd の fstat で再検証（検証後に巨大化したファイルを丸読みしない）
     match file.metadata().await {
@@ -4845,14 +4895,23 @@ async fn read_open_target(path: &str) -> (Option<String>, Option<String>) {
                     (None, Some(format!("file too large: {path}")))
                 }
                 Ok(_) => (Some(contents), None),
-                // 非 UTF-8 など decode 失敗も status で報告する（修正前は
-                // 握り潰して「空文書が開けた」ように見えていた）
-                Err(e) => (None, Some(format!("cannot read {path}: {e}"))),
+                // 非 UTF-8 などの decode 失敗も理由付きで報告する（修正前は
+                // 握り潰して「空文書が開けた」ように見えていた）。
+                // バイナリは特に紛らわしい — 「存在しない」と同じ文言にしない。
+                Err(e) => (
+                    None,
+                    Some(if e.kind() == std::io::ErrorKind::InvalidData {
+                        format!("cannot open {path}: not valid UTF-8 (binary file?)")
+                    } else {
+                        format!("cannot open {path}: {e}")
+                    }),
+                ),
             }
         }
         Ok(m) if m.len() > MAX_FILE_SIZE => (None, Some(format!("file too large: {path}"))),
-        Ok(_) => (None, Some(format!("cannot open {path}"))),
-        Err(_) => (None, Some(format!("cannot open {path}"))),
+        // fstat 再検証で非正規ファイルと判明した場合（open 前に差し替えられた）。
+        Ok(_) => (None, Some(format!("cannot open {path}: not a regular file"))),
+        Err(e) => (None, Some(format!("cannot open {path}: {e}"))),
     }
 }
 
@@ -6868,8 +6927,9 @@ root-markers = [".docsroot"]
     }
 
     #[tokio::test]
-    async fn open_reports_non_utf8_as_cannot_read() {
+    async fn open_reports_non_utf8_distinctly() {
         // 非 UTF-8 ファイルを無言で空文書にせず、status で報告する
+        // （修正後: 「存在しない」と同じ cannot open でも理由が付く）
         let dir = std::env::temp_dir();
         let path = dir.join(format!("minae-sec-nonutf8-{}.txt", std::process::id()));
         // 無効な UTF-8 バイト列（UTF-16 BOM に使われる 0xFF 0xFE を含む）
@@ -6879,7 +6939,10 @@ root-markers = [".docsroot"]
         let (contents, status) = read_open_target(&path_str).await;
         assert!(contents.is_none());
         let msg = status.expect("拒否メッセージが出る");
-        assert!(msg.starts_with("cannot read"), "{msg}");
+        assert!(
+            msg.starts_with("cannot open") && msg.contains("not valid UTF-8"),
+            "バイナリは「存在しない」と区別できる理由で報告する: {msg}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -10891,6 +10954,19 @@ root-markers = [".docsroot"]
         .await;
         assert!(pending.is_err(), "編集前は WaitFor がブロックしている");
 
+        // ドッグフーディング #10: 未到達のまま fallback 窓（500ms）を過ぎても
+        // 返ってはいけない（以前は 500ms で現状を返し、`wait 999999` が
+        // 「待った」ことにしていた）。1.2s 後もまだブロックしていること。
+        let still_pending = tokio::time::timeout(
+            std::time::Duration::from_millis(1200),
+            &mut wait,
+        )
+        .await;
+        assert!(
+            still_pending.is_err(),
+            "未到達の世代では fallback 窓を過ぎてもブロックし続ける"
+        );
+
         // tui の編集で世代が進む → 待機が完了して最新状態が返る
         let _ = request(&mut tui, &Command::Insert { text: "X".into() }).await;
         let snap = wait.await.unwrap();
@@ -11139,6 +11215,7 @@ root-markers = [".docsroot"]
             kind: SymbolKind::Function,
             range: Range { anchor: 0, head: 10 },
             selection_range: Range { anchor: 3, head: 4 },
+            path: String::new(),
             children: Vec::new(),
         };
         let p = PathBuf::from("/tmp/outline-cache.rs");
@@ -12077,6 +12154,10 @@ root-markers = [".docsroot"]
             .find(|s| s.name == "model")
             .expect("mod model; が Module として返る");
         assert!(model_flat.children.is_empty(), "非再帰では children 空: {model_flat:?}");
+        assert!(
+            flat.iter().all(|s| s.path.is_empty()),
+            "非再帰応答の wire は不変（path は JSON に出ない）: {flat:?}"
+        );
 
         // 再帰（OutlineRecursive depth 1）: model.rs のシンボルが children に埋まる。
         let mut line =
@@ -12102,6 +12183,19 @@ root-markers = [".docsroot"]
                     names.contains(&"Task") && names.contains(&"make"),
                     "model.rs のシンボルが children に埋まる: {names:?}"
                 );
+                // ADR-0057: 別ファイルから inline した直下の子は帰属ファイルを持つ。
+                // 親の `model` 自身の range は lib.rs のままなので path を持たない
+                // （空 = 親と同一ファイル）。子孫は「親と同じファイル」で解決できる。
+                assert!(
+                    model.path.is_empty(),
+                    "親自身は lib.rs のままで帰属ファイルを持たない: {model:?}"
+                );
+                for child in &model.children {
+                    assert!(
+                        child.path.ends_with("model.rs"),
+                        "inline した子は定義ファイルを指す: {child:?}"
+                    );
+                }
             }
             other => panic!("想定外の応答: {other:?}"),
         }

@@ -258,7 +258,9 @@ pub enum SessionCmd {
         #[arg(long, short)]
         recursive: bool,
         /// Maximum module depth for recursion (default 3, must be >= 1).
-        /// 1 = direct child modules only. Implies --recursive.
+        /// 1 = direct child modules only. Implies --recursive. Counts MODULE
+        /// hops (file to file), not symbol nesting: a direct child module is
+        /// inlined whole at --depth 1.
         #[arg(long)]
         depth: Option<u32>,
     },
@@ -608,7 +610,17 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             if outcome.truncated {
                 // ADR-0049: シンボル総数上限で打ち切った旨を stderr に出す
                 // （exit は変えない — 部分結果は成功扱い）。
-                eprintln!("outline: truncated at {} symbols (use --depth to limit depth or per-file outline)", MAX_RECURSIVE_OUTLINE_SYMBOLS);
+                //
+                // ドッグフーディング #9: 「--depth で制限しろ」は**直接の子
+                // モジュールが巨大な場合には効かない**（--depth 1 でもその
+                // モジュールは丸ごと inline されるので、同じ 500 で切れる）。
+                // 実際に効く逃げ道だけを案内する。
+                eprintln!(
+                    "outline: truncated at {} symbols — one module expanded to more than the cap. \
+                     --depth does NOT help when a direct child module is this large; \
+                     use a per-file `minas outline <file>` (no --recursive) for the big module",
+                    MAX_RECURSIVE_OUTLINE_SYMBOLS
+                );
             }
             // compact JSON で出力する（トークン削減が目的の経路なので、pretty の
             // 空白を省く。262 記号で ~40% 削減 — ADR-0031 検証の実測）。
@@ -743,7 +755,16 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 // など — を「warnings」と表示すると存在しない rustc 警告を探す）。
                 // Hint/Info を含むファイルはまとめて「hints (n)」とする（warnings に
                 // 数えない — check が返すのは LSP 診断であって rustc lint ではない）。
-                let (verdict, has_errors) = if outcome.diagnostics.is_empty() {
+                let unlinked = outcome.diagnostics.iter().any(is_unlinked_file);
+                let (verdict, not_clean) = if unlinked {
+                    // 「どのクレートにも属していない」= 解析対象になっていない。
+                    // 新規作成の直後（cargo 再ロードの窓）ではこの Hint だけが返り、
+                    // 本物のエラーはリンク後に現れる（ドッグフーディング #3）。
+                    // `hints (n)` + exit 0 で「警告だけのクリーン」に見せると
+                    // create → check → commit のループが偽グリーンで通る。
+                    // 検証できていないので exit 2 に倒す（クリーンでもエラーでもない）。
+                    ("unlinked-unverified".to_string(), true)
+                } else if outcome.diagnostics.is_empty() {
                     // プロジェクト外（マーカーなし）なら LSP は解析対象を持たず、
                     // 空は「クリーン」でも「未 settle」でもなく「対象外」（rust2 #21）。
                     let v = if in_project(&outcome.path) {
@@ -751,7 +772,9 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                     } else {
                         "unlinked-unverified"
                     };
-                    (v.to_string(), false)
+                    // 対象外も「見ていない」ので exit 2（未検証を exit 0 にしない）。
+                    let not_clean = !in_project(&outcome.path);
+                    (v.to_string(), not_clean)
                 } else {
                     let n_e = outcome
                         .diagnostics
@@ -779,7 +802,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                     };
                     (verdict, n_e > 0)
                 };
-                any_error |= has_errors;
+                any_error |= not_clean;
                 if summary {
                     println!("{}: {}", outcome.path, verdict);
                 } else {
@@ -1013,7 +1036,7 @@ const MAX_RECURSIVE_OUTLINE_SYMBOLS: usize = 500;
 /// invalid input）は再試行しても通らないので 1、それ以外（シンボル未解決・
 /// LSP エラー・保存失敗）は再試行可能なので 2。
 fn rename_exit_code(e: &str) -> i32 {
-    if e.starts_with("rename not supported") || e.starts_with("invalid input") {
+    if lsp_input_error(e) {
         1
     } else {
         2
@@ -1022,7 +1045,7 @@ fn rename_exit_code(e: &str) -> i32 {
 
 /// references の失敗の exit コード分類（rename と同型）。
 fn references_exit_code(e: &str) -> i32 {
-    if e.starts_with("references not supported") || e.starts_with("invalid input") {
+    if lsp_input_error(e) {
         1
     } else {
         2
@@ -1129,7 +1152,7 @@ async fn execute_references(path: &str, old: &str) -> io::Result<ReferencesOutco
 /// invalid）は再試行しても通らないので 1、それ以外（LSP エラー等）は再試行可能
 /// なので 2。
 fn outline_exit_code(e: &str) -> i32 {
-    if e.starts_with("outline not supported") || e.starts_with("invalid input") {
+    if lsp_input_error(e) {
         1
     } else {
         2
@@ -1138,7 +1161,7 @@ fn outline_exit_code(e: &str) -> i32 {
 
 /// symbol range（`session at`）の失敗の exit コード分類（outline と同型）。
 fn symbol_at_exit_code(e: &str) -> i32 {
-    if e.starts_with("symbol range not supported") || e.starts_with("invalid input") {
+    if lsp_input_error(e) {
         1
     } else {
         2
@@ -1149,7 +1172,7 @@ fn symbol_at_exit_code(e: &str) -> i32 {
 /// （not supported / invalid）は再試行しても通らないので 1、それ以外（LSP エラー）
 /// は再試行可能なので 2。
 fn hover_exit_code(e: &str) -> i32 {
-    if e.starts_with("hover not supported") || e.starts_with("invalid input") {
+    if lsp_input_error(e) {
         1
     } else {
         2
@@ -1158,11 +1181,45 @@ fn hover_exit_code(e: &str) -> i32 {
 
 /// symbol search（`session symbol`）の失敗の exit コード分類（hover と同型）。
 fn symbol_exit_code(e: &str) -> i32 {
-    if e.starts_with("symbol search not supported") || e.starts_with("invalid input") {
+    if lsp_input_error(e) {
         1
     } else {
         2
     }
+}
+
+/// rust-analyzer が「このファイルはどのクレートにも属していない」と言っているか
+/// （`unlinked-file` 診断）。
+///
+/// 重要: これは**新規作成直後の cargo 再ロード窓**にも出る。実測（ドッグ
+/// フーディング #3、`tests/cold.rs` を書いて直後に `check`）:
+///   1 回目: severity=Hint, "This file is not included in any crates … adding
+///            \"unlinked-file\" to rust-analyzer.diagnostics.disabled" → hints (1), exit 0
+///   3 秒後: severity=Error, "expected u64, found &'static str" → errors (1), exit 2
+/// つまり本物のエラーが「リンク後に」現れる。メッセージ本文はバージョンで
+/// 揺れるため、rust-analyzer 自身の設定キー名（unlinked-file）と既知の文言の
+/// 両方で照合する。
+fn is_unlinked_file(d: &mina_protocol::CheckDiagnostic) -> bool {
+    d.message.contains("unlinked-file")
+        || d.message.contains("not included in any crates")
+        || d.message.contains("not included anywhere in the module tree")
+}
+
+/// LSP コマンド共通の「入力エラー（再試行しても通らない）」判定。
+///
+/// 再試行しても結果が変わらない失敗だけを 1 に落とす: 対象外（LSP 非対応）・
+/// 不正入力・開けないパス・大きすぎるファイル。LSP の一時的な失敗（索引中・
+/// ロック競合）は 2 のまま。
+///
+/// 「cannot open」を入力エラーに含めるのが要点 — 存在しないパス・ディレクトリ・
+/// バイナリは何度投げても同じで、exit code だけで分岐するエージェントが無限
+/// 再試行してしまう（rust2 #23 の check だけが例外だったのを全コマンドに揃える。
+/// ドッグフーディング #2 と同根: 「見れなかった」と「壊れている」を混同しない）。
+fn lsp_input_error(e: &str) -> bool {
+    e.starts_with("invalid input")
+        || e.starts_with("cannot open")
+        || e.starts_with("file too large")
+        || e.contains("not supported")
 }
 
 /// check の失敗の exit コード分類（ADR-0032。outline と同型）: 入力エラー
@@ -1172,10 +1229,7 @@ fn check_exit_code(e: &str) -> i32 {
     // 再試行不可（usage / 対象外 / 開けない）は 1。LSP の再試行可能失敗は 2。
     // rust2 #23: outline と同型に揃える（exit code だけで分岐するエージェントが
     // `check README.md` を無限再試行しない）。
-    if e.starts_with("check not supported")
-        || e.starts_with("invalid input")
-        || e.starts_with("cannot open")
-    {
+    if lsp_input_error(e) {
         1
     } else {
         2
@@ -2290,6 +2344,61 @@ mod tests {
         assert_eq!(check_final_exit_code(false, 1), 1, "not supported は 1 のまま");
         assert_eq!(check_final_exit_code(false, 2), 2);
         assert_eq!(check_final_exit_code(true, 1), 2, "error 診断があれば 2");
+    }
+
+    #[test]
+    fn every_lsp_command_treats_unopenable_path_as_input_error() {
+        // ドッグフーディング #2: 存在しない / ディレクトリ / バイナリは「開けない」で
+        // 何度投げても同じ。check だけが 1 で他が 2 だった（エージェントは
+        // 存在しないパスを無限再試行する）。全コマンドで 1 に揃える。
+        let classifiers: [(&str, fn(&str) -> i32); 7] = [
+            ("rename", rename_exit_code),
+            ("references", references_exit_code),
+            ("outline", outline_exit_code),
+            ("at", symbol_at_exit_code),
+            ("hover", hover_exit_code),
+            ("symbol", symbol_exit_code),
+            ("check", check_exit_code),
+        ];
+        for (name, f) in classifiers {
+            for msg in [
+                "cannot open /x/missing.rs",
+                "cannot open /x/dir: not a file, is a directory",
+                "cannot open /x/bin.dat: not valid UTF-8 (binary file?)",
+                "file too large: /x/big.rs",
+                "invalid input: depth must be >= 1",
+            ] {
+                assert_eq!(f(msg), 1, "{name} は入力エラーを 1 にする: {msg}");
+            }
+            // LSP の一時的な失敗は再試行可能な 2 のまま。
+            assert_eq!(f("LSP error: request timed out"), 2, "{name}: LSP 失敗は 2");
+        }
+    }
+
+    #[test]
+    fn unlinked_file_hint_is_detected_in_both_wordings() {
+        // ドッグフーディング #3: 新規作成直後の窓では rust-analyzer は
+        // 「どのクレートにも属していない」Hint だけを返す。verdict を hints (n) に
+        // すると exit 0 = 偽グリーンになるので、unlinked として検出する。
+        let d = |msg: &str| mina_protocol::CheckDiagnostic {
+            severity: Severity::Hint,
+            line: 1,
+            col: 1,
+            start: 0,
+            end: 1,
+            message: msg.to_string(),
+        };
+        assert!(is_unlinked_file(&d(
+            "This file is not included in any crates, so rust-analyzer can't offer IDE \
+             services.\n\nIf you're intentionally working on unowned files, you can silence \
+             this warning by adding \"unlinked-file\" to rust-analyzer.diagnostics.disabled"
+        )));
+        assert!(is_unlinked_file(&d(
+            "This file is not included anywhere in the module tree, so rust-analyzer can't \
+             offer IDE services."
+        )));
+        assert!(!is_unlinked_file(&d("expected u64, found &'static str")));
+        assert!(!is_unlinked_file(&d("unused variable: `x`")));
     }
 
     #[test]
