@@ -57,7 +57,9 @@ use serde::{Deserialize, Serialize};
 /// `SurroundDelete` / `SurroundReplace` を追加。コマンドの追加のため bump。
 /// v22: `OutlineSymbol` に `path`（別ファイルから inline した記号の帰属
 /// ファイル。ADR-0057）。応答 wire の変更のため bump。
-pub const PROTOCOL_VERSION: u32 = 22;
+/// v23: `Command::DeletePath`（ファイル削除。ADR-0060）を追加。コマンドの
+/// 追加のため bump。
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
 /// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
@@ -258,6 +260,16 @@ pub enum Command {
     /// スナップショットを運ばない軽量 [`ServerMessage::ReadPath`]。`--lines` の
     /// 範囲切出しは CLI 側で行う。
     ReadPath { path: String },
+    /// 任意パスの削除（編集面の一操作。ADR-0060）。モジュール移動や probe の掃除で
+    /// shell の `rm` に落ちないために追加した。daemon 側で開いている文書を閉じ、
+    /// outline / diagnostics / hints のキャッシュを破棄し、`deleted` 状態を立てる
+    /// （外部変更検知と同じ経路）。応答は通常のスナップショットで、`status` に
+    /// `deleted: <path>` を載せる。
+    ///
+    /// 拒否する場合（書込みと同じ規律）: 基準 root 配下（`read-only-base`）、
+    /// 正規ファイルでない（ディレクトリ等）、未保存編集のある開文書
+    /// （`delete-rejected`）。不在は `rm -f` と同じく成功扱い（`NO-OP` を CLI が表示）。
+    DeletePath { path: String },
     /// 任意パスのテキスト一致検索（読み取り専用）。全文を読まずに一致位置だけを
     /// 得る — 開文書優先・未保存編集込み・ディスク fallback（[`Command::ReadPath`]
     /// と同じ解決）。応答は軽量 [`ServerMessage::SearchMatches`]（rust2 要望）。
@@ -936,7 +948,10 @@ pub enum EventKind {
     Rename,
     /// 基準 root の登録/解除（#49 比較閲覧 Mode 1・v13）。
     BaseRoot,
-    /// レビューコメントの追加/更新/削除・全消し（#50・v14）。
+    /// ファイル削除（[`Command::DeletePath`]。ADR-0060）。テキスト編集の
+/// [`EventKind::Delete`] とは別種別（文書内の削除ではなくパスの削除）。
+DeletePath,
+/// レビューコメントの追加/更新/削除・全消し（#50・v14）。
     ReviewComment,
 }
 

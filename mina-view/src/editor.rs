@@ -232,7 +232,15 @@ impl Editor {
     /// （パス順で最初）へ移す。残りが無ければスクラッチ（空画面）へ戻す。
     /// ファイルに紐づいていない文書（スクラッチ）は閉じず `false`。
     pub fn close_focused_document(&mut self) -> bool {
-        let doc_id = self.view().doc;
+        self.close_document(self.view().doc)
+    }
+
+    /// 指定した文書を閉じる（DeletePath 用 — ADR-0060）。フォーカスが別の文書に
+    /// あってもよい（削除はフォーカスを動かさない）。
+    ///
+    /// 表示していた View だけを次の文書（無ければスクラッチ）へ移す。
+    /// 未オープン・スクラッチ（パスなし）は `false`。
+    pub fn close_document(&mut self, doc_id: DocumentId) -> bool {
         if !self.paths.contains_key(&doc_id) {
             return false;
         }

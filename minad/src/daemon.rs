@@ -23,7 +23,7 @@ use mina_protocol::{
     CheckDiagnostic, ClientKind, Command, Diagnostic, DocumentEdit, EventKind, EventSource,
     GotoTarget, Hello, HighlightRange, InlayHint, OutlineSymbol, Range, ReviewComment,
     LspServerInfo, ReviewCommentView, ReviewSide, SearchMatch, ServerMessage, ServerMetrics,
-    Severity, StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
+    StateSnapshot, SymbolKind, WorkspaceSymbol, fnv1a64,
 };
 use mina_view::{DocumentId, Editor, ViewId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -2353,6 +2353,76 @@ async fn semantic_layer_unavailable(
     ))
 }
 
+/// 変更されたパスを、影響を受ける LSP セッションへ通知する（ADR-0061）。
+///
+/// セッションの鍵は `(workspace_root, language_id)`（ADR-0030 Stage 4）で、
+/// `workspace_root` は**最も近い manifest** を返す（`languages.rs`）ため、
+/// cargo workspace のメンバーごとにセッションが分かれる。したがって:
+///
+/// - **manifest（Cargo.toml 等）の変更は全セッションへ broadcast** する。
+///   新しいメンバーは「どのセッションの root 配下でもない」ので、含まれる
+///   セッションだけに送っても誰も気づかない（実測: `crates/c` を minas で
+///   作っても `symbol` が `[]` のままだった）。どのセッションが同じ cargo
+///   workspace に属するかは daemon からは見えない（`cargo metadata` を回さない
+///   限り）ので、manifest は broadcast が正しい。manifest の変更は稀。
+/// - 通常のファイルは root 配下のセッションだけに送る（new .rs は新しい
+///   ディレクトリに作られない限り所属セッションがある）。
+///
+/// **セッションが無ければ何もしない** — 通知のために LSP を spawn しない。
+async fn notify_watched_files(daemon: &Mutex<Daemon>, changes: &[(PathBuf, lsp::FileChange)]) {
+    let targets: Vec<(Arc<Mutex<lsp::LspSession>>, PathBuf, lsp::FileChange)> = {
+        let mut d = daemon.lock().await;
+        let languages = d.languages_refresh();
+        let mut out = Vec::new();
+        for (path, kind) in changes {
+            let is_manifest = is_manifest_path(path);
+            // manifest は拡張子で LSP に紐づかない（`Cargo.toml` に `server_for` は
+            // None を返す）ので、拡張子チェックは非 manifest にだけ適用する。
+            // ここで manifest を弾いていたのが最初の実装のバグ（通知が 1 件も
+            // 出ず、新メンバーが見えないままだった）。
+            if !is_manifest && languages.server_for(path).is_none() {
+                continue; // LSP 非対応の拡張子は通知先が無い
+            }
+            for ((root, _lang), session) in &d.lsp_sessions {
+                if watcher_wants(is_manifest, path, root) {
+                    out.push((session.clone(), path.clone(), *kind));
+                }
+            }
+        }
+        out
+    };
+    for (session, path, kind) in targets {
+        let Ok(mut s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
+            continue; // 他の解析タスクが保持中: 次の書き込みで再通知される
+        };
+        s.did_change_watched_files(&[(path, kind)]).await;
+    }
+}
+
+/// 通知先の判定（純関数 — テスト可能）: manifest は**全セッション**（新しい
+/// メンバーはどの root 配下でもないため）、通常ファイルは root 配下だけ。
+fn watcher_wants(is_manifest: bool, path: &Path, session_root: &Path) -> bool {
+    is_manifest || path.starts_with(session_root)
+}
+
+/// manifest（cargo / node / python / go のワークスペース定義）か。
+/// これらは「新しいディレクトリがワークスペースに入る」合図になるので、
+/// 変更は全セッションへ broadcast する（上のコメント参照）。
+fn is_manifest_path(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(
+            "Cargo.toml"
+                | "Cargo.lock"
+                | "package.json"
+                | "tsconfig.json"
+                | "jsconfig.json"
+                | "pyproject.toml"
+                | "go.mod"
+        )
+    )
+}
+
 /// [`Command::Outline`] の処理（ADR-0031）: 任意パスのシンボル階層ツリーを
 /// 全文なしの軽量応答（[`ServerMessage::Outline`]）で返す。読み取り専用 —
 /// 世代・push・イベントは進めない。
@@ -4275,6 +4345,9 @@ async fn process_command(
                     | Command::WaitFor { .. }
                     | Command::Open { .. }
                     | Command::Close
+                    // ADR-0060: ファイル削除も headless に許可する（`minas delete`）。
+                    // 書込みガードはパス基準で発信元を問わない。
+                    | Command::DeletePath { .. }
                     // #50: コメント抽出は headless の読み取り経路（`minas review`）。
                     // 全消しも headless に許可する（TUI 死後の掃除用。編集状態
                     // ではなくレビュー状態の管理のため #13 の趣旨と衝突しない）。
@@ -4292,7 +4365,7 @@ async fn process_command(
                 return snapshot(
                     &mut d,
                     Some(format!(
-                        "{} GetState, Save, WaitFor, DocumentEdit, Open, Close, ListReviewComments, ClearReviewComments, RegisterBaseRoot, and UnregisterBaseRoot",
+                        "{} GetState, Save, WaitFor, DocumentEdit, Open, Close, DeletePath, ListReviewComments, ClearReviewComments, RegisterBaseRoot, and UnregisterBaseRoot",
                         mina_protocol::HEADLESS_GATE_STATUS_PREFIX
                     )),
                 );
@@ -4619,8 +4692,88 @@ async fn process_command(
                     snapshot(&mut d, open_status)
                 }
             }
-            Ok(Command::Save) => {
-                // #49: 基準配下への保存を拒否する。
+            // ADR-0060: ファイル削除（`minas delete`）。モジュール移動の孤児を
+            // shell の `rm` に落ちずに消すための編集面。拒否の規律は書込みと同じ。
+            Ok(Command::DeletePath { path }) => {
+                let path_buf = normalize_open_path(PathBuf::from(&path)).await;
+                let path_str = path_buf.to_string_lossy().into_owned();
+                // 比較用の基準 root 配下は読み取り専用（編集と同じガード）。
+                let blocked = {
+                    let d = daemon.lock().await;
+                    d.base_reject(&path_buf)
+                };
+                if let Some(msg) = blocked {
+                    let mut d = daemon.lock().await;
+                    return snapshot(&mut d, Some(msg));
+                }
+                // 未保存編集を黙って捨てない（#15/#17 と同じ規律）。
+                let dirty_doc = {
+                    let d = daemon.lock().await;
+                    d.editor
+                        .doc_id_for_path(&path_buf)
+                        .filter(|i| d.editor.is_doc_dirty(*i))
+                };
+                if dirty_doc.is_some() {
+                    let mut d = daemon.lock().await;
+                    return snapshot(
+                        &mut d,
+                        Some(format!(
+                            "delete-rejected: {path_str} has unsaved edits in the daemon's \
+                             buffer (save them, or close the document with `minas exec \
+                             '\"Close\"'`, then retry)"
+                        )),
+                    );
+                }
+                match std::fs::symlink_metadata(&path_buf) {
+                    Ok(md) if !md.is_file() => {
+                        let mut d = daemon.lock().await;
+                        return snapshot(
+                            &mut d,
+                            Some(format!("cannot delete {path_str}: not a regular file")),
+                        );
+                    }
+                    // 不在は `rm -f` と同じく成功扱い（何度も走るスクリプトを失敗させない）。
+                    // ただし黙って成功にせず status で区別する。
+                    Err(_) => {
+                        let mut d = daemon.lock().await;
+                        return snapshot(
+                            &mut d,
+                            Some(format!("no-op: {path_str} was already absent")),
+                        );
+                    }
+                    Ok(_) => {}
+                }
+                if let Err(e) = std::fs::remove_file(&path_buf) {
+                    let mut d = daemon.lock().await;
+                    return snapshot(
+                        &mut d,
+                        Some(format!("cannot delete {path_str}: {e}")),
+                    );
+                }
+                let mut d = daemon.lock().await;
+                // 開いていたら閉じ、パス単位のキャッシュを破棄する（閉じた文書の
+                // syntax キャッシュは次の syntax_highlights が live 判定で落とす）。
+                if let Some(id) = d.editor.doc_id_for_path(&path_buf) {
+                    d.editor.close_document(id);
+                }
+                d.outlines.remove(&path_buf);
+                d.hints.remove(&path_buf);
+                d.diagnostics.remove(&path_buf);
+                d.baselines.remove(&path_buf);
+                d.deleted = Some(path_str.clone());
+                d.record_event(source, EventKind::DeletePath, None, None);
+                if source == EventSource::Headless {
+                    let actor = d.actor_for(conn_id);
+                    d.record_activity(actor, EventKind::DeletePath, true, path_str.clone());
+                }
+                let msg = snapshot(&mut d, Some(format!("deleted: {path_str}")));
+                drop(d);
+                // ADR-0061: 消えたファイルを LSP に通知する（モジュール削除で
+                // crate graph を再ロードさせる。lock 外で）。
+                notify_watched_files(daemon, &[(path_buf.clone(), lsp::FileChange::Deleted)]).await;
+                msg
+            }
+            Ok(Command::Save) => {                // #49: 基準配下への保存を拒否する。
                 let blocked = {
                     let d = daemon.lock().await;
                     d.editor.focused_path().and_then(|p| d.base_reject(p))
@@ -4753,7 +4906,21 @@ async fn process_command(
                                 .unwrap_or_else(|| "(no file)".into());
                             d.record_activity(actor, EventKind::Save, true, detail);
                         }
-                        snapshot(&mut d, Some(status))
+                        let msg = snapshot(&mut d, Some(status));
+                        // ADR-0061: 書いたファイルを LSP に通知する（ロック外で）。
+                        // **これが無いと新しいモジュールディレクトリや新メンバーが
+                        // crate graph に入らず、workspace/symbol・references・rename が
+                        // 黙って空を返す**（ドッグフーディング #18/#19）。保存では
+                        // Created と Changed を区別しない（CLI の apply は新規ファイルを
+                        // touch→Open してから保存するため、daemon から見ると既知の
+                        // ファイルと区別できない。RA はどちらの通知でも読み直し、
+                        // manifest なら cargo metadata を再実行する）。
+                        drop(d);
+                        if let Some(p) = &path {
+                            notify_watched_files(daemon, &[(p.clone(), lsp::FileChange::Changed)])
+                                .await;
+                        }
+                        msg
                     }
                     Err(e) => {
                         // ADR-0038: 保存失敗も記録する（失敗率評価用）
@@ -5747,6 +5914,11 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
             // ADR-0048）。ここに来ることはないが網羅性のため。
             (snapshot(daemon, None), false)
         }
+        Command::DeletePath { .. } => {
+            // process_command で専用処理される（async なパス正規化 + fs 削除。
+            // ADR-0060）。ここに来ることはないが網羅性のため。
+            (snapshot(daemon, None), false)
+        }
         Command::HoverAt { .. } | Command::WorkspaceSymbol { .. } | Command::CheckDiagnostics { .. } => {
             // handle_connection で専用処理される（ServerMessage::Hover /
             // WorkspaceSymbols / Check 応答。ADR-0032）。ここに来ることはないが網羅性のため。
@@ -6369,6 +6541,7 @@ fn convert_mode_back(m: mina_view::Mode) -> mina_protocol::Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mina_protocol::Severity;
     use mina_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
 
     #[test]
@@ -10456,6 +10629,122 @@ root-markers = [".docsroot"]
         assert_eq!(snap.text, "Xbase\n", "undo でリロードだけ戻る");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn watcher_notification_targets_manifests_and_owning_sessions() {
+        // ADR-0061: manifest は全セッションへ（新メンバーはどの root 配下でも
+        // ない）、通常ファイルは root 配下のセッションだけへ。
+        let root = Path::new("/ws/crates/a");
+        assert!(watcher_wants(true, Path::new("/ws/crates/c/Cargo.toml"), root));
+        assert!(watcher_wants(false, Path::new("/ws/crates/a/src/lib.rs"), root));
+        assert!(!watcher_wants(false, Path::new("/other/src/lib.rs"), root));
+        assert!(!watcher_wants(false, Path::new("/ws/crates/b/src/lib.rs"), root));
+        // manifest の判定（拡張子で LSP に紐づかないファイル名）。
+        assert!(is_manifest_path(Path::new("/ws/Cargo.toml")));
+        assert!(is_manifest_path(Path::new("/ws/package.json")));
+        assert!(!is_manifest_path(Path::new("/ws/src/lib.rs")));
+        assert!(!is_manifest_path(Path::new("/ws/Cargo.toml.bak")));
+    }
+
+    #[tokio::test]
+    async fn delete_path_removes_the_file_and_is_idempotent() {
+        // ADR-0060: ファイル削除。開いている文書を閉じ、キャッシュを落とし、
+        // 不在の 2 回目は NO-OP（成功扱いだが status で区別する）。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-delete-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-delete-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "bye\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        // 開いてから削除する（開文書のクローズ経路を通す）。
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        let snap = request(
+            &mut c,
+            &Command::DeletePath {
+                path: path.clone(),
+            },
+        )
+        .await;
+        let status = snap.status.as_deref().unwrap_or("");
+        assert!(status.starts_with("deleted: "), "削除成功: {status:?}");
+        assert!(!std::path::Path::new(&path).exists(), "ファイルが消える");
+        assert!(
+            snap.text.is_empty(),
+            "開いていた文書は閉じられる（空のスクラッチへ戻る）"
+        );
+
+        // 2 回目: 不在は NO-OP（exit 0 相当。黙って成功にせず status で区別）。
+        let snap = request(
+            &mut c,
+            &Command::DeletePath {
+                path: path.clone(),
+            },
+        )
+        .await;
+        let status = snap.status.as_deref().unwrap_or("");
+        assert!(
+            status.starts_with("no-op:") && status.contains("already absent"),
+            "不在は no-op: {status:?}"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn delete_path_refuses_unsaved_buffer_edits_and_directories() {
+        // 未保存編集を黙って捨てない（#15/#17 と同じ規律）／非正規ファイルは拒否。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-delete2-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-delete2-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "v1\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        let _ = request(
+            &mut c,
+            &Command::Insert {
+                text: "dirty\n".into(),
+            },
+        )
+        .await;
+        let snap = request(
+            &mut c,
+            &Command::DeletePath {
+                path: path.clone(),
+            },
+        )
+        .await;
+        let status = snap.status.as_deref().unwrap_or("");
+        assert!(
+            status.starts_with("delete-rejected:") && status.contains("unsaved edits"),
+            "未保存編集がある間は拒否する: {status:?}"
+        );
+        assert!(std::path::Path::new(&path).exists(), "ファイルは残る");
+
+        // ディレクトリは拒否（誤って木を消さない）。
+        let sub = dir.join(format!("minae-delete2-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&sub).unwrap();
+        let snap = request(
+            &mut c,
+            &Command::DeletePath {
+                path: sub.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        let status = snap.status.as_deref().unwrap_or("");
+        assert!(
+            status.starts_with("cannot delete") && status.contains("not a regular file"),
+            "ディレクトリは cannot delete: {status:?}"
+        );
+        let _ = std::fs::remove_dir_all(&sub);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[tokio::test]

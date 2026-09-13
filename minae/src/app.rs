@@ -3599,6 +3599,9 @@ mod tests {
                         commit: "abc".into(),
                     },
                 ],
+                // 言語サーバ一覧（rust2 #49 で追加）。このテストは base root の
+                // sweep だけを見るので空でよい（フィールドの存在が要求される）。
+                servers: Vec::new(),
             };
             let (a, mut b) = tokio::net::UnixStream::pair().unwrap();
             let (ar, aw) = a.into_split();

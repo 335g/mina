@@ -113,6 +113,16 @@ pub enum SessionCmd {
         #[arg(long)]
         lines: Option<String>,
     },
+    /// Delete a file (ADR-0060) — the editing surface covers creation (`apply`)
+    /// and modification but a module move needs the old file GONE; without this
+    /// the agent falls back to the shell's `rm`. Refuses (never silently
+    /// succeeds) when the path is under a read-only base root, is not a regular
+    /// file, or has unsaved edits in the daemon's buffer. An already-absent path
+    /// is a NO-OP (exit 0) so repeated scripts do not fail.
+    Delete {
+        /// File to delete (relative to the agent's cwd, like `Open`)
+        path: PathBuf,
+    },
     /// Find literal matches in any file without reading it in full (read-only).
     /// Prints `{path, generation, total, truncated, matches:[{line,col,len}]}`
     /// (1-origin line, 1-origin CHAR column, char length). Buffer-first: the open
@@ -403,6 +413,25 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 Some(range) => print_text_lines(&outcome.path, outcome.generation, &outcome.text, &range)?,
                 None => print!("{}", outcome.text),
             }
+        }
+        SessionCmd::Delete { path } => {
+            // ADR-0060: ファイル削除。成功は `deleted: <path>`、不在は NO-OP
+            // （どちらも exit 0 — `rm -f` と同じで、繰り返し走るスクリプトを
+            // 失敗させない）。拒否は理由ごとに分類する:
+            //   cannot delete / read-only-base … 入力エラー（1、再試行不可）
+            //   delete-rejected（未保存編集）… 呼び出し側が直せる（2）
+            let status = execute_delete(&path.to_string_lossy()).await?;
+            let status = status.unwrap_or_else(|| "no status".into());
+            if let Some(rest) = status.strip_prefix("deleted: ") {
+                println!("deleted: {rest}");
+                return Ok(());
+            }
+            if let Some(rest) = status.strip_prefix("no-op: ") {
+                eprintln!("NO-OP: {rest}");
+                return Ok(());
+            }
+            eprintln!("delete failed: {status}");
+            std::process::exit(delete_exit_code(&status));
         }
         SessionCmd::Search {
             path,
@@ -1233,6 +1262,8 @@ fn is_unlinked_file(d: &mina_protocol::CheckDiagnostic) -> bool {
 fn lsp_input_error(e: &str) -> bool {
     e.starts_with("invalid input")
         || e.starts_with("cannot open")
+        || e.starts_with("cannot delete")
+        || e.starts_with("read-only-base")
         || e.starts_with("file too large")
         || e.contains("not supported")
 }
@@ -1422,6 +1453,28 @@ struct ReadOutcome {
     error: Option<String>,
 }
 
+/// daemon に `Command::DeletePath` を送り、応答の status を返す（ADR-0060）。
+/// 成功・拒否・NO-OP はすべて status の 1 行で表される（応答は通常のスナップショット）。
+async fn execute_delete(path: &str) -> io::Result<Option<String>> {
+    let (mut write_half, mut reader) = open_one_shot().await?;
+    let command = Command::DeletePath {
+        path: conn::absolutize(path),
+    };
+    let snapshot = conn::request(&mut write_half, &mut reader, &command).await?;
+    Ok(snapshot.status)
+}
+
+/// `delete` の失敗分類（ADR-0060）: 入力エラー（cannot delete / read-only-base /
+/// not supported）は再試行しても通らないので 1、それ以外（未保存編集の拒否など、
+/// 呼び出し側が直せるもの）は 2。
+fn delete_exit_code(status: &str) -> i32 {
+    if lsp_input_error(status) {
+        1
+    } else {
+        2
+    }
+}
+
 /// daemon に接続し、パス指定の軽量テキスト読み（[`ServerMessage::ReadPath`]）で
 /// 受け取る（ADR-0048）。LSP 非依存・バッファ非依存 — フォーカス・世代を動かさず
 /// 任意パスのテキストだけを返す（開文書優先・未保存編集込み・ディスク fallback）。
@@ -1531,7 +1584,6 @@ async fn execute_search(
         | Ok(ServerMessage::Check { .. })
         | Ok(ServerMessage::ReviewComments { .. })
         | Ok(ServerMessage::ReadPath { .. })
-        | Ok(ServerMessage::SearchMatches { .. })
         | Ok(ServerMessage::EnclosingSymbol { .. }) => {
             Err(invalid("SearchMatches: unexpected lightweight response"))
         }
@@ -2530,6 +2582,23 @@ mod tests {
         )));
         assert!(!is_unlinked_file(&d("expected u64, found &'static str")));
         assert!(!is_unlinked_file(&d("unused variable: `x`")));
+    }
+
+    #[test]
+    fn delete_exit_codes_distinguish_input_errors() {
+        // ADR-0060: cannot delete / read-only-base は再試行不可（1）、
+        // delete-rejected（未保存編集）は呼び出し側が直せる（2）。
+        assert_eq!(delete_exit_code("cannot delete /x.rs: not a regular file"), 1);
+        assert_eq!(
+            delete_exit_code("read-only-base: /x.rs is under read-only base abc1234 …"),
+            1
+        );
+        assert_eq!(
+            delete_exit_code("delete-rejected: /x.rs has unsaved edits in the daemon's buffer …"),
+            2,
+            "未保存編集の拒否は、閉じれば通るので再試行可能"
+        );
+        assert_eq!(delete_exit_code("no such thing"), 2);
     }
 
     #[test]

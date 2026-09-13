@@ -270,6 +270,8 @@ impl Conn {
             | Ok(ServerMessage::ReviewComments { .. })
             // ADR-0048/0049: ReadPath 応答もこの CLI では使わない
             | Ok(ServerMessage::ReadPath { .. })
+            // rust2: Search 応答（軽量・読み取り専用）もこの CLI では使わない
+            | Ok(ServerMessage::SearchMatches { .. })
             | Ok(ServerMessage::Check { .. }) => {
                 Err(std::io::Error::new(
                     ErrorKind::InvalidData,

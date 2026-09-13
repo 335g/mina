@@ -17,6 +17,20 @@ use tokio::time::timeout;
 
 use crate::trace::Trace;
 
+/// watcher 通知の種別（LSP の FileChangeType に対応: 2=Changed / 3=Deleted）。
+/// daemon が自分で書いた/消したファイルを `workspace/didChangeWatchedFiles` で
+/// 伝えるために使う（ADR-0061）。
+///
+/// LSP の 1 (Created) は使わない — `Save` の時点で「この書き込みがファイルを
+/// 作ったのか既存を変えたのか」を daemon は知らない（CLI の `apply` は新規ファイルを
+/// touch → Open → 保存するので、既知のファイルと区別できない）。RA はどちらでも
+/// 読み直すため、`Changed` を送れば足りる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Changed,
+    Deleted,
+}
+
 /// 1回の publish で取り込む診断の上限（5c: 診断 flood 対策）。
 const MAX_DIAGNOSTICS: usize = 500;
 
@@ -254,6 +268,39 @@ impl LspSession {
         });
         let _ = self.client.notify("textDocument/didOpen", params).await;
         self.current_uri = Some(doc_uri);
+    }
+
+    /// `workspace/didChangeWatchedFiles` を送る（ADR-0061）。
+    ///
+    /// なぜ必要か: rust-analyzer の既定 `files.watcher` は `"client"`（変更の通知は
+    /// クライアントの責任）で、埋め込み既定を `"server"` に変えても**新しい
+    /// ディレクトリ**（= 新しいワークスペースメンバーや新しいモジュールディレクトリ）は
+    /// crate graph に無いので watcher の対象にもならない。daemon 自身が書いた/消した
+    /// ファイルを通知して再ロード（新メンバーなら cargo metadata の再実行）を起こす。
+    ///
+    /// 外部の書き込み（shell の `cargo new` 等）は daemon が知らないので、これだけでは
+    /// 覆わない — 残る穴は ADR-0061 の「Considered Options」参照。
+    pub async fn did_change_watched_files(&mut self, changes: &[(PathBuf, FileChange)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let items: Vec<Value> = changes
+            .iter()
+            .map(|(path, kind)| {
+                json!({
+                    "uri": uri(path),
+                    "type": match kind {
+                        FileChange::Changed => 2,
+                        FileChange::Deleted => 3,
+                    },
+                })
+            })
+            .collect();
+        let params = json!({ "changes": items });
+        let _ = self
+            .client
+            .notify("workspace/didChangeWatchedFiles", params)
+            .await;
     }
 
     /// 前の文書を閉じずに didOpen する（バッチ用）。
