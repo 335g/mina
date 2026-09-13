@@ -1378,31 +1378,36 @@ async fn accept_loop(
     let daemon_uid = unsafe { libc::getuid() };
     loop {
         let (stream, _) = listener.accept().await?;
-        // MEDIUM-3: peer uid が取れない（エラー）場合も含め、daemon の uid と
-        // 一致しない接続は即切断する（fail closed）。ただし macOS の getpeereid
-        // は accept 直後の短い間 ENOTCONN を返すことがあるため、数回リトライ
-        // してから判断する（リトライせず fail closed だと正当な接続が落ちる）。
-        let mut peer_uid = stream.peer_cred().map(|c| c.uid());
-        for _ in 0..10 {
-            if peer_uid.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            peer_uid = stream.peer_cred().map(|c| c.uid());
-        }
-        if peer_uid.map_or(true, |uid| !is_peer_allowed(uid, daemon_uid)) {
-            drop(stream);
-            continue;
-        }
-        let permit = match connections.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return Ok(()), // セマフォが閉じられた（起きない）
-        };
         let daemon = daemon.clone();
         let push_tx = push_tx.clone();
-        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let connections = connections.clone();
+        // ADR-0071: peer uid 検査を accept ループから接続タスクの先頭へ移す。
+        // 従来は accept ループ内で 5ms×10 のリトライ sleep を行うため、クライアントが
+        // 捨てる接続（connect→即 close）を accept すると ENOTCONN で最大 50ms 止まり、
+        // 直後の本命接続の最初の往復が ~65ms 遅れた。spawn 内に移しても fail closed
+        // （不一致なら即 close）でセキュリティ契約（MEDIUM-3）は変わらない。
         tokio::spawn(async move {
+            // MEDIUM-3: peer uid が取れない（エラー）場合も含め、daemon の uid と
+            // 一致しない接続は即切断する（fail closed）。ただし macOS の getpeereid
+            // は accept 直後の短い間 ENOTCONN を返すことがあるため、数回リトライ
+            // してから判断する（リトライせず fail closed だと正当な接続が落ちる）。
+            let mut peer_uid = stream.peer_cred().map(|c| c.uid());
+            for _ in 0..10 {
+                if peer_uid.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                peer_uid = stream.peer_cred().map(|c| c.uid());
+            }
+            if peer_uid.map_or(true, |uid| !is_peer_allowed(uid, daemon_uid)) {
+                return; // stream は drop される（fail closed）
+            }
+            let permit = match connections.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return, // セマフォが閉じられた（起きない）
+            };
             let _permit = permit; // 接続処理中は許可を保持
+            let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
             handle_connection(stream, daemon, conn_id, push_tx).await;
         });
     }

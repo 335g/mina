@@ -119,7 +119,7 @@ python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
 python3 tools/ab/ab.py run t11 A 1 && python3 tools/ab/ab.py run t11 B 1
 
 # 回帰
-cargo test          # 全 463 テスト
+cargo test          # 全 485 テスト
 cargo build
 ```
 
@@ -136,6 +136,10 @@ cargo build
   `--cold` は起動直後。cold でしか出ない失敗は「契約の欠陥」として課題に上げる。
 - **非決定な step は複数回測る**（`-r 3`）。1 回の観測で結論を出さない。
 - `expect` は **stdout + stderr** を見る。期待と違えば `silent` として `fails` に乗る。
+- **step・warmup プローブの `minas` は解決済みのバイナリへ置換する**（`run()` が
+  `^minas` と `| minas` を `MINAS` = `target/debug` → `L0_MINAS` に置き換える）。
+  iteration #10 以前は step が PATH のインストール済み `minas` を実行しており、
+  **クライアント側の変更が L0 で測られていなかった**（計測器の欠陥）。
 - 期待する非 0 exit は `ok_rc` で宣言する（エラー検出を検証する flow 用）。
 
 ### L0 の構造（仮説の足し方）
@@ -185,10 +189,13 @@ python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
 `tmp/loop/probe-client/` の形（`fixture_rust` を生成 → `minad serve` を同じ
 コマンド内で起動 → socket に `Hello` + コマンドを送って 1 行読む）で、
 「単一接続」「probe 接続（接続→即 close）を挟む」「同一接続で 3 往復」を測る。
-iteration #9 はこれで **daemon の応答は 0.27ms、`minas` の 1 呼び出しに ~65ms
-の固定費**（捨て接続 + accept ループ内の peer uid 検査の sleep）を特定した。
-注意: 手で起動した daemon は呼び出し元シェルの終了で死ぬことがある（同じ
-コマンド内で起動と測定を行い、`pgrep -f 'minad serve'` で生存を確認する）。
+iteration #9 はこれで **daemon の応答は 0.27ms、`minas` の 1 呼び出しに ~68ms
+の固定費**（捨て接続 + accept ループ内の peer uid 検査の sleep）を特定し、
+iteration #10 で**除去した**（ADR-0071。`minas info` 76.6 → 9.1ms、probe→本接続
+68.4 → 0.52ms）。注意: 手で起動した daemon は**残ることがある**（`minas` の自動起動は
+`setsid` で切り離すので、スクリプト終了後も rust-analyzer ごと生き残る）。測る前に
+`ps aux | grep -E "minad serve|rust-analyzer" | wc -l` が 0 であることを確認し、
+残っていれば `kill -9` する（macOS の `pgrep` に `-c` は無い）。
 
 ## 7. 落とし穴（実際に踏んだもの）
 
@@ -238,9 +245,16 @@ iteration #9 はこれで **daemon の応答は 0.27ms、`minas` の 1 呼び出
   `edit total` 2ms + `sync.bg` の診断 pull ~900ms — 応答は待たない）。
   固定待ち（`PULL_SETTLE` 250ms・`SEMANTIC_RETRY_WAIT` 500ms）は #5 / #6 で 0 になり、
   応答経路に残っている待ちは無い。
-- **全 `minas` 呼び出しに ~65ms の固定費**（#9）: デーモンの応答は 0.27ms なので、
-  `wall_ms` を読むときは「実処理 + calls×65ms + 起動 12ms」と分けて考える
-  （例: `explore/lsp` 278ms のうち 234ms がこれ）。除去は iteration #10。
+- **`minas` の接続経路の固定費は #10 で除去済み**（ADR-0071。`minas info` 76.6 →
+  9.1ms、`explore/lsp` 310 → 82ms）。残っているのは `minas` 起動の ~12ms × calls と、
+  `apply` の 3 往復。`wall_ms` を読むときは「実処理 + calls×12ms + 往復数×~10ms」と分ける。
+- **L0 の step・warmup は解決済みのビルド済みバイナリを実行する**（#10 で `l0.py` を
+  修正。以前は `minas` が PATH 解決でインストール済みバイナリを実行していた）。
+  **コードを触ったら `cargo build` を先に行う**（忘れると古いバイナリを測る）。`l0.py` は
+  `MINAS = target/debug → L0_MINAS` の順で解決し、デーモンは `target/debug/minad`。
+- **手動テストの daemon / rust-analyzer が残ると wall が汚染される**（実測で +60ms。
+  `minas symbol` が 12ms のはずが 90ms になった）。測る前に
+  `ps aux | grep -E "minad serve|rust-analyzer" | wc -l` が 0 であることを確認する。
 
 ## 8. 結果の書き先（どこに何を書くか）
 

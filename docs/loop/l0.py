@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -305,7 +306,15 @@ def start_daemon(cwd: Path, env: dict) -> subprocess.Popen:
     raise RuntimeError("daemon socket did not appear in 10s")
 
 
+# FLOWS の step・warmup プローブは `minas` を名前で書く。計測対象は L0_MINAS /
+# target-debug の**ビルド済みバイナリ**なので、実行時に絶対パスへ解決する
+# （iteration #10 で修正: 以前は PATH の minas が使われ、クライアント側の変更が
+#  L0 の step で一切測られていなかった。`| minas` のパイプ形も同じ）。
+_MINAS_IN_CMD = re.compile(r"(^|\|\s*)minas\s")
+
+
 def run(cmd: str, cwd: Path, env: dict) -> dict:
+    cmd = _MINAS_IN_CMD.sub(lambda m: f"{m.group(1)}{MINAS} ", cmd)
     t0 = time.perf_counter()
     p = subprocess.run(cmd, shell=True, cwd=cwd, env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)

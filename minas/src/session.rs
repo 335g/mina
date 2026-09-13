@@ -62,23 +62,33 @@ static CLIENT_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 async fn open_one_shot() -> io::Result<(OwnedWriteHalf, BufReader<OwnedReadHalf>)> {
     let socket = mina_protocol::socket_path();
-    if conn::connect(&socket).await.is_err() {
-        let exe = conn::daemon_exe().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "minad not found (cargo install minad, or set MINAD_EXE)",
-            )
-        })?;
-        conn::spawn_daemon(&exe, &["serve"])?;
-        conn::wait_ready(&socket, 50).await?;
-    }
-    conn::open_session(
-        &socket,
+    // ADR-0071: 死活確認に開いた接続をそのまま本命に使う（従来は確認用の
+    // 捨て接続を閉じて open_session で張り直していた）。捨て接続をやめると
+    // daemon の accept が ENOTCONN で 5ms×10 止まらず、1 呼び出しの固定費
+    // ~65ms が消える（接続は元々 1 コマンド 1 本）。
+    let stream = match conn::connect(&socket).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            let exe = conn::daemon_exe().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "minad not found (cargo install minad, or set MINAD_EXE)",
+                )
+            })?;
+            conn::spawn_daemon(&exe, &["serve"])?;
+            conn::wait_ready(&socket, 50).await?;
+            conn::connect(&socket).await?
+        }
+    };
+    let (read_half, mut write_half) = stream.into_split();
+    conn::send_hello(
+        &mut write_half,
         ClientKind::Headless,
         true,
         CLIENT_NAME.get().map(String::as_str).unwrap_or("unknown"),
     )
-    .await
+    .await?;
+    Ok((write_half, BufReader::new(read_half)))
 }
 
 /// `minas` のサブコマンド。引数・型は clap が検証する。

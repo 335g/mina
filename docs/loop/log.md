@@ -1494,3 +1494,229 @@ hints も同じ形: `hints total` 578ms = `pull` 578（RA の inlayHint 計算�
 - rename の 2 回目（安定確認）は **2ms**。hints の 578ms は RA の inlayHint 計算。
 - `sync.bg` の `didChange` が 300–650ms になるのは前の背景 pull のロック待ち
   （応答はブロックしない — ADR-0055 の設計どおり）。
+
+## 2026-09-13 22:42 — iteration #10 baseline: 固定費除去前（a/b とも未適用）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       275         2       108       383    1222.8         0  True
+verify   apply-cargo           2       108         1       108       216    1268.4         0  True
+verify   hunks-cargo           2       169         1       169       338    1315.7         0  True
+verify   apply2-cargo          3       218         2       327       545     917.9         0  True
+explore  lsp                   3      1085        18       587      1672     299.0         0  True
+explore  dump                  2      4750       298      4510      9260     163.5         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `explore/lsp` daemon 計測: read_bytes=4974, read_total=1, symbol_range_bytes=281, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5403, read_total=2
+
+
+## 2026-09-13 23:54 — iteration #10: 固定費（~65ms/呼び出し）除去後（a: daemon の peer uid 検査を accept ループ外へ + b: minas の捨て接続をやめて接続を再利用）。l0.py の step が PATH の minas を使っていたバグも修正済み
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1082        18       584      1666      88.5         0  True
+explore  dump                  2      4750       298      4510      9260      29.1         0  True
+hints    hints                 1       110         8         0       110     640.0         0  True
+rename   lsp                   2       307         3       307       614    1348.6         0  True
+rename   apply                 5       402         4      1008      1410    1285.5         0  True
+verify   apply-check           2       273         2       107       380    1056.9         0  True
+verify   apply-cargo           2       107         1       107       214    1237.8         0  True
+verify   hunks-cargo           2       168         1       168       336    1259.8         0  True
+verify   apply2-cargo          3       216         2       324       540    1242.0         0  True
+verify-blind check                 2       267         2       103       370     649.9         0  True
+verify-blind cargo                 2       103         1       103       206     811.2         0  True
+verify-broken check                 2       471         2       104       575     645.9         0  True
+verify-broken cargo                 2       104         1       104       208     753.4         0  True
+verify-gap apply-gap-check         3       289         2       230       519    4022.0         0  True
+verify-gap apply-gap-cargo         3       115         1       230       345    3758.0         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4973, read_total=1, symbol_range_bytes=280, symbol_range_total=1, symbol_search_bytes=199, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5401, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=177, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=175, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=384, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=186, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-14 00:03 — iteration #10 回帰確認: -r 10（fails 0・必須文字列の取りこぼし 0・calls/out_B 不変の確認）
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+verify   apply-check           2       273         2       107       380    1042.8         0  True
+verify   apply-cargo           2       107         1       107       214    1170.0         0  True
+verify   hunks-cargo           2       168         1       168       336    1167.3         0  True
+verify   apply2-cargo          3       216         2       324       540    1194.4         0  True
+explore  lsp                   3      1082        18       584      1666      82.6         0  True
+explore  dump                  2      4750       298      4510      9260      28.5         0  True
+```
+
+- `verify/apply-check` daemon 計測: check_bytes=177, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `explore/lsp` daemon 計測: read_bytes=4973, read_total=1, symbol_range_bytes=280, symbol_range_total=1, symbol_search_bytes=199, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5401, read_total=2
+
+
+## 2026-09-14 00:04 — iteration #10 cold 確認: 索引完走ゲート支配（無言の誤り 0・cold 税は接続経路の修正と独立）
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1085        18       587      1672    7397.3         0  True
+explore  dump                  2      4750       298      4510      9260      31.6         0  True
+hints    hints                 1       110         8         0       110    7878.7         0  True
+rename   lsp                   2       309         3       309       618    9202.8         0  True
+rename   apply                 5       406         4      1018      1424     444.6         0  True
+verify   apply-check           2       275         2       108       383    8576.3         0  True
+verify   apply-cargo           2       108         1       108       216     329.8         0  True
+verify   hunks-cargo           2       169         1       169       338     326.5         0  True
+verify   apply2-cargo          3       218         2       327       545     356.3         0  True
+verify-blind check                 2       269         2       104       373    6444.1         0  True
+verify-blind cargo                 2       104         1       104       208     354.3         0  True
+verify-broken check                 2       271         2       105       376    6312.1         1  True
+verify-broken cargo                 2       105         1       105       210     287.4         0  True
+verify-gap apply-gap-check         3       291         2       232       523    8106.9         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3220.2         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4974, read_total=1, symbol_range_bytes=281, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5403, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=177, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` 失敗 step (silent): `/Users/335g/dev/other/mina/target/debug/minas check src/main.rs` rc=0 
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=186, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## iteration #10 考察（2026-09-14）— 接続経路の ~68ms 固定費を除去（ADR-0071）
+
+**仮説の検証結果**: **採用**（ADR-0071）。仮説 (a)「peer uid 検査を accept ループの外へ」と
+(b)「minas の捨て接続をやめて接続を再利用」の**両方**を入れた。測定上はどちらか片方で
+固定費は消える（下の A/B）が、(a) は他のクライアント（古い minas・TUI・将来の接続）の
+connect→close でも accept が止まらない**位置の修正**、(b) は 1 コマンド 1 接続という
+契約の整理。`calls`/`out_B`/`equiv_B` は不変（契約は触っていない）。
+
+### 測り方 1（原因の再確認 — Python プローブ、`tmp/loop/probe-client/probe10.py`）
+
+| 接続パターン | デーモン 修正前 | デーモン 修正後 |
+|---|---|---|
+| 単一接続（Hello + GetServerInfo） | min 0.34 / med 0.71 / max 6.78ms | 0.43 / 0.46 / 2.16ms |
+| 捨て接続 → 本命接続 | 66.5 / **68.4** / 68.9ms | 0.39 / **0.52** / 0.93ms |
+| 差 | **67.7ms** | **0.06ms** |
+
+#9 の 0.27ms vs 67.2ms を再現（n=5）。原因の見立ては正しい。
+
+### 測り方 2（A/B — 同一セッションで交互、`-f explore -r 3` × 2 ラウンド）
+
+まず**計測器の穴**が見つかった: L0 の flow の step コマンドは `minas` と**名前で**書いて
+あり、実行は **PATH の minas**（インストール済み 0.0.5）だった。`L0_MINAS` は
+`server_metrics`（`{MINAS} info`）にしか効いておらず、**クライアント側の変更は L0 の
+step で一度も測られていなかった**。`l0.py` の `run()` で `minas` を解決済みパスへ
+置換するよう修正（`| minas` のパイプ形も同様）。修正後の A/B:
+
+| arm | `explore/lsp`（3 calls） | `explore/dump`（2 calls） |
+|---|---|---|
+| baseline（両方 未修正） | 310.0 / 299.2ms | 163.5 / 168.0ms |
+| (a) daemon のみ修正 | 82.0 / 82.3ms | 28.5 / 27.7ms |
+| (b) minas のみ修正 | 81.6 / 82.8ms | 28.1 / 29.5ms |
+| (c) 両方修正 | 84.8 / 83.6ms | 29.3 / 30.2ms |
+
+固定費 **−228ms（3 calls ≈ 3×76ms）** / **−136ms（2 calls ≈ 2×68ms）**。
+(a)(b)(c) が同等 = 同じ 1 個の固定費への冗長な対策。(b) が単独で効くのは
+**接続を 1 本にするので accept ループを sleep させる引き金そのものが無くなる**ため、
+(a) が単独で効くのは **捨て接続を accept してもループが止まらない**ため。
+修正前の測定で (b) が効かなかったのは、step が PATH の minas（捨て接続あり）を
+実行していたから（計測器の穴）。
+
+### 測り方 3（契約の確認）
+
+- `cargo test`: **485 passed**（0 failed。latest.md の「463」は古い。HEAD が進んで
+  テストが 22 件増えていた）。
+- L0 全 flow（`-r 3`・両修正後・`--log`）: **fails 0 / ok True**。
+  `calls`/`out_B`/`equiv_B` は arm 間で一致（baseline 1082/1666 → 修正後 1082/1666）。
+- `verify-blind/check`: `settled:false`（偽クリーンを主張しない）。
+  `verify-broken/*`: `cargo check` rc=101（構文エラーを検出）。
+- peer uid の fail closed は不変（検査は接続タスクの先頭で、不一致なら stream を
+  drop）。`peer_uid_mismatch_is_rejected`（純関数）は green。uid 不一致の
+  統合テストは uid を偽装できないため無し（既存も無し）。
+
+### 測り方 4（cold と `-r 10`）
+
+- `-r 10`（verify + explore）: **fails 0**、`out_B`/`equiv_B` は `-r 3` と同値
+  （`explore/lsp` 1082/1666、`apply-check` 273/380）。
+- `--cold`: 索引完走ゲート支配で不変（`explore/lsp` 7397ms、`hints` 7879ms、
+  `rename/lsp` 9203ms、`apply-check` 8576ms — #2〜#9 の cold 値と同水準）。
+  固定費は cold でも同じだけ効くが、8〜9 秒の中に埋もれる。
+
+### 効果確認
+
+- `minas info`（baseline デーモン相手）: **76.6ms → 9.1ms**（PATH の 0.0.5 も 78.5ms
+  = 同じ旧経路）。
+- L0 `explore/lsp`: **310 → 82ms（−74%）**、`dump`: **164 → 28ms（−83%）**。
+- §3 の旧参照値（PATH minas 0.0.5 で測定）とは out_B もずれる（例 `explore/lsp`
+  1017 → 1082 バイト）。**§3 の表を新参照値に置き換えた**（latest.md §3）。
+
+### 落とし穴（今回踏んだもの）
+
+- **手動テストの daemon が残ると wall が +60ms 汚染される**: `minas` の自動起動は
+  `setsid` で daemon を切り離すため、スクリプト終了後も rust-analyzer ごと生き残る
+  （`(… &)` で起動したものも同様）。実際に 3 個の stray daemon が残り、`minas symbol`
+  が 12ms のはずが 90ms に見えた。**測る前に `ps aux | grep -E "minad serve|rust-analyzer" | wc -l` が 0 であることを確認する**
+  （macOS の `pgrep` に `-c` は無く、エラーを握り潰すと「0 個」に見えるので注意 —
+  今回これで 1 回空振りした）。
+- **L0 の step は PATH の minas だった**（上記）。`--log` の過去の数値もこの経路で
+  測られているため、クライアント側のコードを触った反復では参照値の意味が変わる。
+
+### 発見（この反復の回帰ではない。iteration #11 の候補）
+
+- **cold の `verify-broken/check` が rc=0 の `clean-unverified` を返す**: 構文エラーを
+  入れた直後（warmup なし）に `minas check src/main.rs` を打つと、~6.3 秒待って
+  `{"diagnostics":[],"settled":false,"verdict":"clean-unverified"}` と rc=0 を返す
+  （期待は rc=2 + Syntax Error）。**修正前後のバイナリで同一**（4/4 再現）なので
+  #10 の回帰ではないが、§3 の cold 表（`verify-broken/check` 8793ms・fails 0）とは
+  食い違う = #9 の後に HEAD へ入った変更で cold のゲートが「未確認を返す」側に
+  倒れた。契約上は「未確認」を明示しているので嘘ではないが、cold では構文エラーすら
+  確定できない（索引ゲートの予算切れ）。warm の `verify-broken/check` は rc=2 で
+  通る（fails 0）。
+
+### iteration #11 の課題設定（→ latest.md §4）
+
+1. **cold の `check` が `clean-unverified` に落ちる**（上記）。cold でも構文エラーを
+   確定できるようにする（ゲートの予算・pull の再試行・`settled` の意味の見直し）。
+   L0 の `--cold -f verify-broken` が計器。受理は「cold で rc=2 + Syntax Error」、
+   棄却は「warm の値が悪化する」「cold が伸びる（索引ゲートの意味が無くなる）」。
+2. 効果確認の結果、次の固定費の候補: `minas` 起動 12ms × calls（`explore/lsp` 82ms の
+   うち ~36ms）、`apply` の 3 往復、`ServerMetrics` の穴（v20 bump と束ねる）、
+   L2（実 LLM）での確認。
