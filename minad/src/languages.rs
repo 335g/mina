@@ -33,6 +33,56 @@ pub(crate) fn config_dir() -> std::path::PathBuf {
 /// 埋め込み既定テーブル（検証済みサーバのみ。ADR-0030 の規定サーバ方針）。
 pub(crate) const DEFAULT_LANGUAGES_TOML: &str = include_str!("default_languages.toml");
 
+/// manifest の種別（`session_root` の判定用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceKind {
+    /// `[workspace]` を持たない単独パッケージ。
+    Package,
+    /// `[workspace]` を持つ。`excludes` は `exclude` を宣言しているか。
+    Workspace { excludes: bool },
+}
+
+/// `dir` にあるその言語の manifest のパス（無ければ `None`）。
+fn manifest_in(dir: &Path, language: Option<&Language>) -> Option<PathBuf> {
+    match language.and_then(|l| l.root_markers.as_deref()) {
+        Some(markers) => markers
+            .iter()
+            .map(|m| dir.join(m))
+            .find(|p| p.is_file()),
+        None => GENERIC_ROOT_MARKERS
+            .iter()
+            .map(|m| dir.join(m))
+            .find(|p| p.is_file()),
+    }
+}
+
+/// manifest の種別を読む（cargo のみ `[workspace]` を見る。他の言語は `Package`）。
+///
+/// パース失敗（読めない・壊れている）は `None` — 呼び出し側は「分からない」を
+/// 「共有しない」側に倒す。
+fn manifest_kind(manifest: &Path) -> Option<WorkspaceKind> {
+    if manifest.file_name().and_then(|n| n.to_str()) != Some("Cargo.toml") {
+        return Some(WorkspaceKind::Package);
+    }
+    #[derive(Deserialize)]
+    struct Manifest {
+        workspace: Option<Workspace>,
+    }
+    #[derive(Deserialize)]
+    struct Workspace {
+        #[serde(default)]
+        exclude: Vec<String>,
+    }
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let parsed: Manifest = toml::from_str(&text).ok()?;
+    Some(match parsed.workspace {
+        Some(w) => WorkspaceKind::Workspace {
+            excludes: !w.exclude.is_empty(),
+        },
+        None => WorkspaceKind::Package,
+    })
+}
+
 /// 1 サーバの定義。`config` は LSP `initializationOptions` としてそのまま送る
 /// 不透明 JSON（スキーマはサーバ固有）。
 #[derive(Debug, Clone, Deserialize)]
@@ -187,6 +237,54 @@ impl LanguageTable {
             .and_then(mina_loader::language_by_name)
     }
 
+    /// **セッションのキーに使う root**（ADR-0062 / self-host #5）。
+    ///
+    /// 既定は [`Self::workspace_root`]（最も近いマーカー）。ただし cargo では、
+    /// **どのメンバーの manifest を root にしても rust-analyzer はワークスペース
+    /// 全体をロードする**（実測: `cargo metadata` は workspace root と 10 メンバーを
+    /// 返し、`references` はそのクレートの依存グラフ外にも当たる）。メンバーごとに
+    /// セッションを作ると、10 メンバーのワークスペースで 10 個の rust-analyzer が
+    /// 同じ 10 クレートを索引する（実測: 6 クレートで 6 セッション / 12 プロセス /
+    /// ~4.9 GB、cold 6.7〜10.0 s/クレート）。
+    ///
+    /// 解決規則:
+    /// 1. 最も近い manifest が `[workspace]` を持つ → それ（入れ子ワークスペースは
+    ///    内側が勝つ。cargo と同じ）。
+    /// 2. そうでなければ祖先を辿り、最初の `[workspace]` を持つ manifest → それ。
+    /// 3. ただしそのワークスペースが `exclude` を宣言していたら **1 に戻す**
+    ///    （cargo のメンバー判定を再現できないので、共有して解析されないより
+    ///    セッションを分ける方を選ぶ）。
+    /// 4. どの manifest も `[workspace]` を持たなければ最も近いマーカー。
+    ///
+    /// 入れ子の独立 root（ADR-0010）は保たれる: 内側に `[workspace]` があれば
+    /// そこで止まり、無ければ別々の manifest が別々の root になる。
+    pub(crate) fn session_root(&self, path: &Path) -> PathBuf {
+        let nearest = self.workspace_root(path);
+        let Some(nearest_manifest) = manifest_in(&nearest, self.language_for_path(path)) else {
+            return nearest;
+        };
+        let nearest_kind = manifest_kind(&nearest_manifest);
+        if matches!(nearest_kind, Some(WorkspaceKind::Workspace { .. })) {
+            return nearest;
+        }
+        // 祖先の workspace manifest を探す（外側優先 = 最も遠い workspace）。
+        let mut best: Option<PathBuf> = None;
+        let mut dir = nearest.parent().map(Path::to_path_buf);
+        while let Some(d) = dir {
+            if let Some(m) = manifest_in(&d, self.language_for_path(path)) {
+                match manifest_kind(&m) {
+                    Some(WorkspaceKind::Workspace { excludes: false }) => best = Some(d.clone()),
+                    // exclude あり: cargo のメンバー判定が再現できないので保守的に
+                    // 共有しない（最も近い manifest を使う）。
+                    Some(WorkspaceKind::Workspace { excludes: true }) => return nearest,
+                    _ => {}
+                }
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        best.unwrap_or(nearest)
+    }
+
     /// 開いたファイルを包含する最小の解析単位（WorkspaceRoot）を求める。
     ///
     /// ファイルの親から上方探索し、言語が `root-markers` を明示していれば
@@ -276,6 +374,83 @@ mod tests {
         // 未知の拡張子・言語サーバなし
         assert!(table.server_for(Path::new("/tmp/notes.md")).is_none());
         assert!(table.server_for(Path::new("/tmp/noext")).is_none());
+    }
+
+    #[test]
+    fn session_root_shares_a_cargo_workspace() {
+        // ADR-0062 / self-host #5: cargo workspace のメンバーは同じセッションを
+        // 共有する（どのメンバーの manifest を root にしても rust-analyzer は
+        // ワークスペース全体をロードするので、分けると同じ索引の重複になる）。
+        let base = std::env::temp_dir().join(format!("minae-sessionroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["ws", "ws/a", "ws/b", "ws/a/src", "ws/b/src"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::fs::write(
+            base.join("ws/Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        for member in ["a", "b"] {
+            std::fs::write(
+                base.join(format!("ws/{member}/Cargo.toml")),
+                format!(
+                    "[package]\nname = \"m{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(base.join(format!("ws/{member}/src/lib.rs")), "").unwrap();
+        }
+        let table = LanguageTable::from_strings(DEFAULT_LANGUAGES_TOML, None);
+        let a = table.session_root(&base.join("ws/a/src/lib.rs"));
+        let b = table.session_root(&base.join("ws/b/src/lib.rs"));
+        assert_eq!(canon(&a), canon(&base.join("ws")), "メンバー a の root は workspace ルート");
+        assert_eq!(b, a, "メンバー b も同じ root（セッションを共有する）");
+
+        // 入れ子の独立 root（ADR-0010）は保たれる: 外側に [workspace] が無ければ別 root。
+        std::fs::create_dir_all(base.join("plain/c/src")).unwrap();
+        std::fs::write(
+            base.join("plain/Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("plain/c/Cargo.toml"),
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(base.join("plain/c/src/lib.rs"), "").unwrap();
+        assert_eq!(
+            canon(&table.session_root(&base.join("plain/c/src/lib.rs"))),
+            canon(&base.join("plain/c")),
+            "workspace 宣言が無ければ最も近い manifest（別セッション）"
+        );
+
+        // exclude を宣言しているワークスペースは保守的に共有しない。
+        std::fs::create_dir_all(base.join("ex/keep/src")).unwrap();
+        std::fs::write(
+            base.join("ex/Cargo.toml"),
+            "[workspace]\nmembers = [\"keep\"]\nexclude = [\"vendor\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("ex/keep/Cargo.toml"),
+            "[package]\nname = \"keep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(base.join("ex/keep/src/lib.rs"), "").unwrap();
+        assert_eq!(
+            canon(&table.session_root(&base.join("ex/keep/src/lib.rs"))),
+            canon(&base.join("ex/keep")),
+            "exclude ありは cargo のメンバー判定を再現できないので共有しない"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// テスト用の正規化（macOS の /tmp → /private/tmp を吸収）。
+    fn canon(p: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
     }
 
     #[test]

@@ -629,7 +629,7 @@ impl Daemon {
     fn session_key(&self, path: &Path) -> Option<(PathBuf, String)> {
         let lang = self.languages.language_for_path(path)?;
         lang.language_server.as_ref()?;
-        Some((self.languages.workspace_root(path), lang.name.clone()))
+        Some((self.languages.session_root(path), lang.name.clone()))
     }
 
     /// フォーカス文書と同じ (WorkspaceRoot, languageId) で LSP 対応のときだけセッションを
@@ -1806,15 +1806,21 @@ async fn serve_server_info(daemon: &Mutex<Daemon>) -> ServerMessage {
             .configured_servers()
             .into_iter()
             .map(|(id, languages)| {
-                let running_sessions = d
+                // ADR-0062 / self-host #5: 数だけでなく root も開示する
+                // （1 クレート触るごとにセッションが増える事実に気づけるように）。
+                let mut roots: Vec<String> = d
                     .lsp_sessions
                     .keys()
                     .filter(|(_, lang)| languages.contains(lang))
-                    .count();
+                    .map(|(root, _)| root.to_string_lossy().into_owned())
+                    .collect();
+                roots.sort();
+                roots.dedup();
                 LspServerInfo {
                     id,
                     languages,
-                    running_sessions,
+                    running_sessions: roots.len(),
+                    roots,
                 }
             })
             .collect(),
@@ -1978,7 +1984,7 @@ async fn resolve_symbol_lsp_pos(
     };
     let (line, character) = {
         let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, session.lock()).await else {
-            return Err("LSP セッションのロックを取得できませんでした".into());
+            return Err("LSP error: could not acquire the session lock — retry".into());
         };
         s.char_to_lsp_pos(text, char_idx)
     };
@@ -2202,7 +2208,12 @@ async fn serve_peek_definition_at(
 
 /// outline キャッシュの高速経路（ADR-0031）: テキストのチェックサムが一致する
 /// エントリがあればクローンを返す（LSP 不問）。不一致・不在は `None`。
-async fn cached_outline(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<Vec<OutlineSymbol>> {
+/// 戻り値は `(symbols, checksum)` — checksum は応答の revision にそのまま使う
+/// （ADR-0063: 位置の答えはどの内容に対するものかを言える必要がある）。
+async fn cached_outline(
+    daemon: &Mutex<Daemon>,
+    path_buf: &Path,
+) -> Option<(Vec<OutlineSymbol>, u64)> {
     let text = resolve_doc_text(daemon, path_buf).await.ok()?;
     let checksum = fnv1a64(text.as_bytes());
     daemon
@@ -2211,7 +2222,7 @@ async fn cached_outline(daemon: &Mutex<Daemon>, path_buf: &Path) -> Option<Vec<O
         .outlines
         .get(path_buf)
         .filter(|c| c.text_checksum == checksum)
-        .map(|c| c.symbols.clone())
+        .map(|c| (c.symbols.clone(), checksum))
 }
 
 /// 対象テキストの解決（開文書優先・ディスク読み）。`prepare_borrowed_session` の
@@ -2430,6 +2441,13 @@ fn is_manifest_path(path: &Path) -> bool {
     )
 }
 
+/// 応答に載せる内容 revision（ADR-0063 / self-host #3）: テキストの fnv1a64。
+/// 位置（`--lines` / `range` / `line`）は内容に依存するので、別の呼び出しが返した
+/// 位置をこの値で照合できる。テキストが無い経路（エラー）は 0。
+fn checksum_of(text: &str) -> u64 {
+    fnv1a64(text.as_bytes())
+}
+
 /// [`Command::Outline`] の処理（ADR-0031）: 任意パスのシンボル階層ツリーを
 /// 全文なしの軽量応答（[`ServerMessage::Outline`]）で返す。読み取り専用 —
 /// 世代・push・イベントは進めない。
@@ -2441,6 +2459,7 @@ fn is_manifest_path(path: &Path) -> bool {
 /// 空ツリーは「0 件」として正直に返す（`error: None`）。
 async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     let err = |msg: String| ServerMessage::Outline {
+            checksum: 0,
         path: path.to_string(),
         generation: 0,
         symbols: Vec::new(),
@@ -2451,8 +2470,9 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     // LSP に触れずに返す（実測: セマンティック要求は毎回の再解析で数秒かかる）。
     // 正規化とテキスト解決は prepare_borrowed_session の前半と同じ形。
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
-    if let Some(symbols) = cached_outline(daemon, &path_buf).await {
+    if let Some((symbols, checksum)) = cached_outline(daemon, &path_buf).await {
         let msg = ServerMessage::Outline {
+            checksum,
             generation: daemon.lock().await.generation,
             path: path_buf.to_string_lossy().into_owned(),
             symbols,
@@ -2476,7 +2496,7 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
         return err(format!(
-            "outline not supported for {} (LSP server が documentSymbolProvider を advertise していません)",
+            "outline not supported for {} (the LSP server does not advertise documentSymbolProvider)",
             borrowed.path_str
         ));
     }
@@ -2497,6 +2517,7 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
         Err(e) => (Vec::new(), Some(e)),
     };
     let msg = ServerMessage::Outline {
+        checksum: checksum_of(&borrowed.text),
         generation: daemon.lock().await.generation,
         path: borrowed.path_str,
         symbols,
@@ -2527,6 +2548,7 @@ async fn serve_outline_recursive(
     depth: u32,
 ) -> ServerMessage {
     let err = |msg: String| ServerMessage::Outline {
+            checksum: 0,
         path: path.to_string(),
         generation: 0,
         symbols: Vec::new(),
@@ -2548,7 +2570,7 @@ async fn serve_outline_recursive(
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
         return err(format!(
-            "outline not supported for {} (LSP server が documentSymbolProvider を advertise していません)",
+            "outline not supported for {} (the LSP server does not advertise documentSymbolProvider)",
             borrowed.path_str
         ));
     }
@@ -2585,6 +2607,7 @@ async fn serve_outline_recursive(
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
     }
     let msg = ServerMessage::Outline {
+            checksum: 0,
         generation: daemon.lock().await.generation,
         path: borrowed.path_str,
         symbols,
@@ -2806,6 +2829,7 @@ async fn serve_read_path(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
         // 理由は daemon 側で区別済み（存在しない / ディレクトリ / バイナリ / 大きすぎる）。
         Err(e) => {
             return ServerMessage::ReadPath {
+            checksum: 0,
                 path: path_str,
                 generation: 0,
                 text: String::new(),
@@ -2814,6 +2838,7 @@ async fn serve_read_path(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
         }
     };
     let msg = ServerMessage::ReadPath {
+        checksum: checksum_of(&text),
         path: path_str,
         generation: daemon.lock().await.generation,
         text,
@@ -2847,6 +2872,7 @@ async fn serve_search_matches(
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
     let path_str = path_buf.to_string_lossy().into_owned();
     let err = |msg: String| ServerMessage::SearchMatches {
+            checksum: 0,
         path: path_str.clone(),
         generation: 0,
         total: 0,
@@ -2863,6 +2889,7 @@ async fn serve_search_matches(
     };
     let (matches, total, truncated) = search_text(&text, query, case_sensitive, word);
     ServerMessage::SearchMatches {
+        checksum: checksum_of(&text),
         path: path_str,
         generation: daemon.lock().await.generation,
         total,
@@ -2948,6 +2975,7 @@ async fn serve_enclosing_symbol(
     col: u32,
 ) -> ServerMessage {
     let err = |msg: String| ServerMessage::EnclosingSymbol {
+            checksum: 0,
         path: path.to_string(),
         name: String::new(),
         kind: SymbolKind::Other,
@@ -2960,7 +2988,7 @@ async fn serve_enclosing_symbol(
     // 位置解決だけで済ませる。実測: LSP 要求は再解析込みで数秒 — エージェントが
     // 同一ファイルへ at を連打する場合の大半をこの経路が吸う。
     let path_buf = normalize_open_path(PathBuf::from(path)).await;
-    if let Some(symbols) = cached_outline(daemon, &path_buf).await {
+    if let Some((symbols, _)) = cached_outline(daemon, &path_buf).await {
         let Ok(text) = resolve_doc_text(daemon, &path_buf).await else {
             return err(format!("cannot open {path}"));
         };
@@ -2968,6 +2996,7 @@ async fn serve_enclosing_symbol(
         let found = lsp::enclosing_symbol(&symbols, char_idx).cloned();
         let msg = match found {
             Some(sym) => ServerMessage::EnclosingSymbol {
+                checksum: checksum_of(&text),
                 path: path_buf.to_string_lossy().into_owned(),
                 name: sym.name,
                 kind: sym.kind,
@@ -2977,6 +3006,7 @@ async fn serve_enclosing_symbol(
                 error: None,
             },
             None => ServerMessage::EnclosingSymbol {
+                checksum: checksum_of(&text),
                 path: path_buf.to_string_lossy().into_owned(),
                 name: String::new(),
                 kind: SymbolKind::Other,
@@ -3002,7 +3032,7 @@ async fn serve_enclosing_symbol(
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
         return err(format!(
-            "symbol range not supported for {} (LSP server が documentSymbolProvider を advertise していません)",
+            "symbol range not supported for {} (the LSP server does not advertise documentSymbolProvider)",
             borrowed.path_str
         ));
     }
@@ -3029,6 +3059,7 @@ async fn serve_enclosing_symbol(
     }
     let msg = match (enclosing, fetched) {
         (Some(sym), _) => ServerMessage::EnclosingSymbol {
+            checksum: checksum_of(&borrowed.text),
             path: borrowed.path_str,
             name: sym.name,
             kind: sym.kind,
@@ -3038,6 +3069,7 @@ async fn serve_enclosing_symbol(
             error: None,
         },
         (None, Ok(_)) => ServerMessage::EnclosingSymbol {
+            checksum: checksum_of(&borrowed.text),
             path: borrowed.path_str,
             name: String::new(),
             kind: SymbolKind::Other,
@@ -3047,6 +3079,7 @@ async fn serve_enclosing_symbol(
             error: None,
         },
         (None, Err(e)) => ServerMessage::EnclosingSymbol {
+            checksum: 0,
             path: borrowed.path_str,
             name: String::new(),
             kind: SymbolKind::Other,
@@ -3071,6 +3104,7 @@ async fn serve_enclosing_symbol(
 /// 入力不正・LSP 非対応・spawn 失敗は `error: Some(…)`（exit 1、再試行不可）。
 async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32) -> ServerMessage {
     let err = |msg: String| ServerMessage::Hover {
+            checksum: 0,
         path: path.to_string(),
         generation: 0,
         text: String::new(),
@@ -3097,7 +3131,7 @@ async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32)
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
         return err(format!(
-            "hover not supported for {} (LSP server が hoverProvider を advertise していません)",
+            "hover not supported for {} (the LSP server does not advertise hoverProvider)",
             borrowed.path_str
         ));
     }
@@ -3115,6 +3149,7 @@ async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32)
     // 一時ガードがステートメント末（record_agent_metric の .await の後）まで生き、
     // 内部の再ロックが自分自身に待たされるデッドロックになる（実測でハング）。
     let msg = ServerMessage::Hover {
+        checksum: checksum_of(&borrowed.text),
         path: borrowed.path_str,
         generation: daemon.lock().await.generation,
         text: hovered.unwrap_or_default(),
@@ -3160,7 +3195,7 @@ async fn serve_workspace_symbols(
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
         return err(format!(
-            "symbol search not supported for {} (LSP server が workspaceSymbolProvider を advertise していません)",
+            "symbol search not supported for {} (the LSP server does not advertise workspaceSymbolProvider)",
             borrowed.path_str
         ));
     }
@@ -3255,7 +3290,7 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
         restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path)
             .await;
         return err(format!(
-            "check not supported for {} (LSP server が diagnosticProvider を advertise していません)",
+            "check not supported for {} (the LSP server does not advertise diagnosticProvider)",
             borrowed.path_str
         ));
     }
@@ -3461,7 +3496,7 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
         return err_refs(
             path,
             format!(
-                "references not supported for {} (LSP server が references を advertise していません)",
+                "references not supported for {} (the LSP server does not advertise references)",
                 borrowed.path_str
             ),
         );
@@ -3638,7 +3673,7 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
             edits: 0,
             changed: Vec::new(),
             error: Some(format!(
-                "rename not supported for {} (LSP server が rename を advertise していません)",
+                "rename not supported for {} (the LSP server does not advertise rename)",
                 borrowed.path_str
             )),
         };
@@ -3902,7 +3937,11 @@ async fn ensure(
     let spec = languages
         .server_for(path)
         .ok_or_else(|| format!("LSP 非対応のパスです: {}", path.display()))?;
-    let root = languages.workspace_root(path);
+    // ADR-0062 / self-host #5: キーは `session_root`（cargo workspace のメンバーは
+    // workspace ルートを共有する）。`workspace_root`（最も近いマニフェスト）で
+    // 分けると、10 メンバーのワークスペースで 10 個の rust-analyzer が同じ
+    // 10 クレートを索引する。
+    let root = languages.session_root(path);
     // セッションキーは (WorkspaceRoot, languageId)（ADR-0030 Stage 4）:
     // 同一 root に複数言語が混在しても言語ごとにセッションを分ける。
     let key = (root.clone(), spec.language_id.to_string());
@@ -3996,7 +4035,9 @@ async fn open_workspace_files(
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return;
     };
-    let root = daemon.lock().await.languages.workspace_root(path);
+    // 事前 didOpen の範囲もセッション root に合わせる（ADR-0062: 共有された
+    // セッションでは、その root 配下＝ワークスペース全体が同じ索引に入る）。
+    let root = daemon.lock().await.languages.session_root(path);
     let mut files = Vec::new();
     collect_workspace_files(&root, ext, &mut files, 0);
     // ディスクから読む（上限付き）。開文書の未保存編集は後で優先する。
@@ -4953,7 +4994,7 @@ async fn process_command(
                     Ok(p) => p,
                     Err(_) => {
                         let mut d = daemon.lock().await;
-                        return snapshot(&mut d, Some(format!("基準 root がありません: {root}")));
+                        return snapshot(&mut d, Some(format!("base root not found: {root}")));
                     }
                 };
                 let canon_repo = match repo {
@@ -4964,7 +5005,7 @@ async fn process_command(
                             let mut d = daemon.lock().await;
                             return snapshot(
                                 &mut d,
-                                Some(format!("対応リポジトリがありません: {r}")),
+                                Some(format!("base root repo not found: {r}")),
                             );
                         }
                     },
@@ -10115,9 +10156,7 @@ root-markers = [".docsroot"]
         line.push('\n');
         c.send(line.as_bytes()).await;
         match c.recv_message().await {
-            ServerMessage::EnclosingSymbol {
-                found, error, ..
-            } => {
+            ServerMessage::EnclosingSymbol { found, error, .. } => {
                 assert_eq!(error, None);
                 assert!(!found, "範囲外は記号なし");
             }
@@ -12611,8 +12650,11 @@ root-markers = [".docsroot"]
         .unwrap();
         let snap = process_command(&daemon, &tx, 0, EventSource::Interactive, &line).await;
         assert!(
-            snap.status.as_deref().unwrap_or("").contains("ありません"),
-            "{:?}",
+            snap.status
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("base root not found:"),
+            "英語 + 安定コード（agent 向け文言の規律）: {:?}",
             snap.status
         );
         assert_eq!(daemon.lock().await.generation, before);

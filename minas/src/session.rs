@@ -410,7 +410,13 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             }
             match lines {
                 // --lines: get と同じ番号付き行契約（read→apply の old にそのまま使える）。
-                Some(range) => print_text_lines(&outcome.path, outcome.generation, &outcome.text, &range)?,
+                Some(range) => print_text_lines(
+                    &outcome.path,
+                    outcome.generation,
+                    outcome.checksum,
+                    &outcome.text,
+                    &range,
+                )?,
                 None => print!("{}", outcome.text),
             }
         }
@@ -457,6 +463,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 serde_json::to_string(&serde_json::json!({
                     "path": outcome.path,
                     "generation": outcome.generation,
+                    "checksum": outcome.checksum,
                     "total": outcome.total,
                     "truncated": outcome.truncated,
                     "matches": outcome.matches,
@@ -602,7 +609,15 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // 書き換える（`#[cfg(feature = "x")]` の非活性モジュールは RA の解析対象外）。
             // 「N files, M edits」を影響範囲として読むと、feature ビルドで E0425 になる。
             // テキストレベルの網をかけて、変更されなかったのに名前が残るファイルを警告する。
-            warn_leftover_mentions(&path, &old, &outcome.changed, "rename");
+            // rename は改名後に走査するので、ヒットしたファイルに残る旧名は
+            // すべて「LSP が変えなかった言及」（文字列・コメント）。差し引き不要。
+            warn_leftover_mentions(
+                &path,
+                &old,
+                &outcome.changed,
+                &std::collections::HashMap::new(),
+                "rename",
+            );
         }
         SessionCmd::References { path, old } => {
             // 成功: `N references in M files:` に続けて `path:line`（1-origin。
@@ -621,10 +636,21 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             for loc in &outcome.locations {
                 println!("{}:{}", loc.path, loc.line + 1);
             }
-            // #16: 参照一覧も cfg 非活性のコードを見ない。同じ網をかけて警告する。
-            let changed: Vec<String> =
-                outcome.locations.iter().map(|l| l.path.clone()).collect();
-            warn_leftover_mentions(&path, &old, &changed, "references");
+            // #16 / self-host #4: 参照一覧も cfg 非活性のコードを見ない。同じ網を
+            // かけて警告し、さらに**一覧に載ったファイルの中**の未列挙言及
+            // （文字列・コメント）を件数で報告する。LSP が挙げた件数をファイル別に
+            // 数えて差し引くので、二重計上しない。
+            let mut touched: Vec<String> = Vec::new();
+            let mut listed: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for loc in &outcome.locations {
+                let abs = conn::absolutize(&loc.path);
+                if !listed.contains_key(&abs) {
+                    touched.push(abs.clone());
+                }
+                *listed.entry(abs).or_insert(0) += 1;
+            }
+            warn_leftover_mentions(&path, &old, &touched, &listed, "references");
         }
         SessionCmd::Outline { path, recursive, depth } => {
             // 成功: シンボルの階層ツリーを JSON で出力する（全文なし — ADR-0031。
@@ -663,6 +689,13 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // compact JSON で出力する（トークン削減が目的の経路なので、pretty の
             // 空白を省く。262 記号で ~40% 削減 — ADR-0031 検証の実測）。
             println!("{}", serde_json::to_string(&outcome.symbols)?);
+            // ADR-0063 / self-host #3: 単一ファイルの outline は「どの内容に対する
+            // 範囲か」を revision で言える（`read --lines` の "checksum" と同じ値）。
+            // --recursive はツリーが複数ファイルにまたがるので出さない（ノードごとの
+            // `path` と、そのファイルの read の checksum で照合する）。
+            if !recursive {
+                eprintln!("outline: revision {}", outcome.checksum);
+            }
         }
         SessionCmd::At { path, pos } => {
             // 成功: 囲む記号（名前・種別・正確な範囲）を JSON で出力する —
@@ -696,6 +729,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "path": outcome.path,
+                    "checksum": outcome.checksum,
                     "text": outcome.text,
                 }))?
             );
@@ -710,6 +744,8 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 std::process::exit(symbol_exit_code(e));
             }
             println!("{}", serde_json::to_string(&outcome.symbols)?);
+            // self-host #2: 依存ソースなどプロジェクト外のヒットを注記する。
+            note_out_of_project_hits(&path, &outcome.symbols);
         }
         SessionCmd::Check {
             paths,
@@ -744,7 +780,15 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 paths = vec![crate_root.clone()];
                 paths.extend(rs);
                 if include_tests {
-                    let tests_dir = crate_dir.join("..").join("tests");
+                    // tests/ は crate_dir の兄弟。`join("..")` で組み立てると
+                    // 展開結果に `..` が残り、**失敗経路**（daemon が入力をそのまま
+                    // 返す）と**成功経路**（文書を開いて正規化される）で同じファイルが
+                    // 別の綴りになる（driver #7: `src/../tests/x.rs` vs
+                    // `tests/x.rs`）。パス文字列で突き合わせる呼び出し側が壊れる。
+                    let tests_dir = crate_dir
+                        .parent()
+                        .map(|p| p.join("tests"))
+                        .unwrap_or_else(|| crate_dir.join("tests"));
                     let mut ts = Vec::new();
                     collect_rs_files(&tests_dir, &mut ts);
                     ts.sort();
@@ -866,6 +910,12 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // （1 = 再試行不可 / 2 = 再試行可能）を最大値で返す。以前は
             // `2.max(worst_failure)` で常に 2 以上になり、1 分類が握り潰されていた
             // （rust2 #23: `check README.md` が exit 2 になっていた）。
+            // self-host #7 の「別プロジェクトのファイルが同じ verdict 文言で返る」は
+            // 注記を試して撤回した: cargo workspace の**メンバー**と、ツリー内の
+            // 無関係なパッケージ（gitignore されたスクラッチ等）を、cargo の
+            // メンバー判定なしには区別できない（`members` グロブ + path 依存の
+            // 自動メンバー）。区別できない警告は、正しい使い方（メンバー crate を
+            // ルートから check する）で誤爆するだけなので、skill の記述で扱う。
             let code = check_final_exit_code(any_error, worst_failure);
             if code != 0 {
                 std::process::exit(code);
@@ -916,6 +966,7 @@ fn print_line_range(snapshot: &StateSnapshot, range: &str) -> io::Result<()> {
     print_text_lines(
         &snapshot.path.clone().unwrap_or_default(),
         snapshot.generation,
+        snapshot.checksum,
         &snapshot.text,
         range,
     )
@@ -939,7 +990,13 @@ fn print_brief_snapshot(snapshot: &StateSnapshot) -> io::Result<()> {
 /// [`print_line_range`] のテキスト直接版（ADR-0048 — `read` の `--lines`）。
 /// スナップショットを介さず `path`/`generation`/`text` から同じ番号付き
 /// 出力を作る。
-fn print_text_lines(path: &str, generation: u64, text: &str, range: &str) -> io::Result<()> {
+fn print_text_lines(
+    path: &str,
+    generation: u64,
+    checksum: u64,
+    text: &str,
+    range: &str,
+) -> io::Result<()> {
     let (start, end) = parse_line_range(range)?;
     let r = slice_lines(text, start, end);
     let end_str = end.map_or(String::new(), |e| e.to_string());
@@ -947,6 +1004,9 @@ fn print_text_lines(path: &str, generation: u64, text: &str, range: &str) -> io:
     obj.insert("path".into(), path.into());
     obj.insert("generation".into(), generation.into());
     obj.insert("line_count".into(), (r.line_count as u64).into());
+    // ADR-0063: この窓がどの内容に対するものか。outline / at が返す revision と
+    // 比べれば、位置が古いテキストを指していないか確認できる。
+    obj.insert("checksum".into(), checksum.into());
     if r.out_of_range {
         // Q3: 「空の成功」ではなく理由付きのゼロ結果。エージェントは次の範囲指定を
         // 根拠を持って決められる（無駄な再試行をしない）。
@@ -1066,6 +1126,9 @@ struct ReferencesOutcome {
 
 /// `session outline` の結果（[`ServerMessage::Outline`] の展開形）。
 struct OutlineOutcome {
+    /// ルートファイルの内容 revision（fnv1a64。ADR-0063）。--recursive では
+    /// ツリーが複数ファイルにまたがるので、これはルートファイルの分だけ。
+    checksum: u64,
     symbols: Vec<OutlineSymbol>,
     error: Option<String>,
     /// ADR-0049: 再帰横断時にシンボル総数上限で打ち切られたか。
@@ -1308,7 +1371,10 @@ fn check_final_exit_code(any_error: bool, worst_failure: i32) -> i32 {
 fn warn_leftover_mentions(
     path: &std::path::Path,
     old: &str,
-    changed: &[String],
+    touched: &[String],
+    // LSP がそのファイルで挙げた件数（`references` のみ。`rename` は空 — 改名後は
+    // 旧名が「一覧に載っていない言及」だけになるため差し引き不要）。
+    listed: &std::collections::HashMap<String, usize>,
     what: &str,
 ) {
     if old.is_empty() {
@@ -1337,16 +1403,18 @@ fn warn_leftover_mentions(
     }
     let mut files = Vec::new();
     collect_rs_files(&scan_root, &mut files);
-    let changed: std::collections::HashSet<String> = changed
+    let touched: std::collections::HashSet<String> = touched
         .iter()
         .map(|p| conn::absolutize(p))
         .collect();
     let mut leftovers = Vec::new();
+    // ヒットしたファイルの中にも、LSP が改名しない言及（文字列リテラル・コメント）が
+    // 残る。ファイル単位の警告だけだと、その差分が「完全な影響範囲」に見える
+    // （ドッグフーディング self-host #4: daemon.rs の in-file recall 87%、5 件の
+    // assert メッセージ文字列が不可視）。件数だけを 1 行で報告する。
+    let mut in_touched_mentions = 0usize;
     for f in files.into_iter().take(LEFTOVER_SCAN_MAX_FILES) {
         let abs = conn::absolutize(&f.to_string_lossy());
-        if changed.contains(&abs) {
-            continue;
-        }
         let Ok(md) = std::fs::metadata(&f) else {
             continue;
         };
@@ -1356,39 +1424,52 @@ fn warn_leftover_mentions(
         let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
         };
-        if contains_whole_word(&text, old) {
+        let n = count_whole_word(&text, old);
+        if n == 0 {
+            continue;
+        }
+        if touched.contains(&abs) {
+            let already = *listed.get(&abs).unwrap_or(&0);
+            in_touched_mentions += n.saturating_sub(already);
+        } else {
             leftovers.push(abs);
         }
     }
-    if leftovers.is_empty() {
-        return;
+    if !leftovers.is_empty() {
+        eprintln!(
+            "warning: {} file(s) still mention `{old}` but were not touched by the LSP {what} \
+             (inactive #[cfg] / not in the crate graph / comment or string) — verify manually:",
+            leftovers.len()
+        );
+        for f in leftovers {
+            eprintln!("  {f}");
+        }
     }
-    eprintln!(
-        "warning: {} file(s) still mention `{old}` but were not touched by the LSP {what} \
-         (inactive #[cfg] / not in the crate graph / comment or string) — verify manually:",
-        leftovers.len()
-    );
-    for f in leftovers {
-        eprintln!("  {f}");
+    if in_touched_mentions > 0 {
+        eprintln!(
+            "note: {in_touched_mentions} more textual mention(s) of `{old}` inside the \
+             file(s) the LSP {what} did touch (string literals / comments) — the LSP does \
+             not rename those; `minas search <file> {old}` or rg to see them"
+        );
     }
 }
 
-/// `text` に `word` が識別子として（前後が識別子文字でない）現れるか。
-fn contains_whole_word(text: &str, word: &str) -> bool {
+/// `text` に `word` が識別子として（前後が識別子文字でない）現れる回数。
+fn count_whole_word(text: &str, word: &str) -> usize {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let bytes = text.as_bytes();
+    let mut count = 0;
     let mut from = 0;
     while let Some(idx) = text[from..].find(word) {
         let start = from + idx;
         let end = start + word.len();
         let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_word(c));
         let after_ok = text[end..].chars().next().is_none_or(|c| !is_word(c));
-        if before_ok && after_ok && bytes.len() >= end {
-            return true;
+        if before_ok && after_ok {
+            count += 1;
         }
         from = start + word.chars().next().map_or(1, |c| c.len_utf8());
     }
-    false
+    count
 }
 
 /// 旧名の残留スキャンの上限（ファイル数 / 1 ファイルのサイズ）。
@@ -1418,8 +1499,13 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
         Ok(ServerMessage::Outline {
-            symbols, error, truncated, ..
+            symbols,
+            checksum,
+            error,
+            truncated,
+            ..
         }) => Ok(OutlineOutcome {
+            checksum,
             symbols,
             error,
             truncated,
@@ -1449,6 +1535,9 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
 struct ReadOutcome {
     path: String,
     generation: u64,
+    /// このテキストの revision（fnv1a64。ADR-0063）。位置（`--lines`）は内容に
+    /// 依存するので、別の呼び出しの位置をこの値で照合できる。
+    checksum: u64,
     text: String,
     error: Option<String>,
 }
@@ -1493,11 +1582,13 @@ async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
         Ok(ServerMessage::ReadPath {
             path,
             generation,
+            checksum,
             text,
             error,
         }) => Ok(ReadOutcome {
             path,
             generation,
+            checksum,
             text,
             error,
         }),
@@ -1526,6 +1617,8 @@ async fn execute_read(path: &str) -> io::Result<ReadOutcome> {
 struct SearchOutcome {
     path: String,
     generation: u64,
+    /// 検索対象テキストの revision（fnv1a64。ADR-0063）。
+    checksum: u64,
     total: usize,
     truncated: bool,
     matches: Vec<mina_protocol::SearchMatch>,
@@ -1558,6 +1651,7 @@ async fn execute_search(
         Ok(ServerMessage::SearchMatches {
             path,
             generation,
+            checksum,
             total,
             truncated,
             matches,
@@ -1565,6 +1659,7 @@ async fn execute_search(
         }) => Ok(SearchOutcome {
             path,
             generation,
+            checksum,
             total,
             truncated,
             matches,
@@ -1618,6 +1713,7 @@ async fn execute_enclosing(
             range,
             selection_range,
             found,
+            checksum,
             error,
         }) => Ok(serde_json::json!({
             "path": path,
@@ -1626,6 +1722,7 @@ async fn execute_enclosing(
             "range": range,
             "selection_range": selection_range,
             "found": found,
+            "checksum": checksum,
             "error": error,
         })),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
@@ -1652,6 +1749,8 @@ async fn execute_enclosing(
 /// `session hover` の結果（[`ServerMessage::Hover`] の展開形。ADR-0032）。
 struct HoverOutcome {
     path: String,
+    /// このテキストの revision（fnv1a64。ADR-0063）。
+    checksum: u64,
     text: String,
     error: Option<String>,
 }
@@ -1688,7 +1787,18 @@ async fn execute_hover(path: &str, line: u32, col: u32) -> io::Result<HoverOutco
     let mut response = String::new();
     reader.read_line(&mut response).await?;
     match serde_json::from_str::<ServerMessage>(&response) {
-        Ok(ServerMessage::Hover { path, text, error, .. }) => Ok(HoverOutcome { path, text, error }),
+        Ok(ServerMessage::Hover {
+            path,
+            checksum,
+            text,
+            error,
+            ..
+        }) => Ok(HoverOutcome {
+            path,
+            checksum,
+            text,
+            error,
+        }),
         Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => Err(invalid(
             "Hover returned a snapshot response (old daemon: rebuild)",
         )),
@@ -2150,6 +2260,22 @@ fn find_range(text: &str, old: &str) -> Option<(usize, usize)> {
 /// languages.toml で独自 root-markers を設定した場合は偽陰性になり得るが、
 /// verdict は「未検証」で安全側。
 fn in_project(path: &str) -> bool {
+    project_root(path).is_some()
+}
+
+/// そのパスが属するプロジェクトの root（最も近いマーカーのディレクトリ）を返す。
+/// マーカーが無ければ `None`（プロジェクト外）。
+///
+/// `in_project` の真偽だけでなく**どのプロジェクトか**が要る場面のために分けた
+/// （self-host #2/#7: ワークスペース外の依存ソースや別プロジェクトのファイルを
+/// 「自分のプロジェクトの答え」として返さないため）。
+fn project_root(path: &str) -> Option<String> {
+    project_root_of_dir(std::path::Path::new(path).parent()?)
+}
+
+/// ディレクトリ**自身**から上方探索してプロジェクト root を返す（`project_root` の
+/// ファイル版と、cwd のような「ディレクトリを渡したい」場面の両方に使う）。
+fn project_root_of_dir(dir: &std::path::Path) -> Option<String> {
     const MARKERS: &[&str] = &[
         "Cargo.toml",
         "package.json",
@@ -2157,14 +2283,41 @@ fn in_project(path: &str) -> bool {
         "go.mod",
         ".git",
     ];
-    let mut dir = std::path::Path::new(path).parent();
-    while let Some(d) = dir {
-        if MARKERS.iter().any(|m| d.join(m).exists()) {
-            return true;
+    let mut d = Some(dir.to_path_buf());
+    while let Some(cur) = d {
+        if MARKERS.iter().any(|m| cur.join(m).exists()) {
+            return Some(conn::absolutize(&cur.to_string_lossy()));
         }
-        dir = d.parent();
+        d = cur.parent().map(std::path::Path::to_path_buf);
     }
-    false
+    None
+}
+
+/// `symbol` のヒットがアンカーファイルのプロジェクト外なら stderr で注記する
+/// （self-host #2: `minas symbol <daemon.rs> save` が `~/.cargo/registry/…/smallvec`
+/// を返し、docs は「workspace root 内」と読めた。パスが唯一の手掛かりなので、
+/// 黙って返さない）。
+fn note_out_of_project_hits(anchor: &std::path::Path, symbols: &[mina_protocol::WorkspaceSymbol]) {
+    let Some(root) = project_root(&anchor.to_string_lossy()) else {
+        return;
+    };
+    let outside: Vec<&str> = symbols
+        .iter()
+        .map(|s| s.path.as_str())
+        .filter(|p| !conn::absolutize(p).starts_with(&root))
+        .collect();
+    if outside.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: {} of {} hit(s) are outside the project root {root} (dependency sources?) — \
+         check the path before trusting them:",
+        outside.len(),
+        symbols.len()
+    );
+    for p in outside.iter().take(5) {
+        eprintln!("  {p}");
+    }
 }
 
 /// `dir` 配下の `.rs` ファイルを再帰収集する（check --crate-root 用）。

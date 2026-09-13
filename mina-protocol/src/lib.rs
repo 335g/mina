@@ -59,7 +59,10 @@ use serde::{Deserialize, Serialize};
 /// ファイル。ADR-0057）。応答 wire の変更のため bump。
 /// v23: `Command::DeletePath`（ファイル削除。ADR-0060）を追加。コマンドの
 /// 追加のため bump。
-pub const PROTOCOL_VERSION: u32 = 23;
+/// v24: `read` / `search` / `outline` / `at` / `hover` の応答に `checksum`
+/// （内容 revision。ADR-0063）を追加、`LspServerInfo` に `roots`（稼働中
+/// セッションの root。ADR-0062）を追加。応答 wire の変更のため bump。
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
 /// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
@@ -602,6 +605,12 @@ pub enum ServerMessage {
         generation: u64,
         /// シンボルの階層ツリー（位置昇順）。
         symbols: Vec<OutlineSymbol>,
+        /// この応答が計算された**内容の revision**（テキストの fnv1a64。ADR-0063 /
+        /// self-host #3）。位置（`--lines` / `range` / `line`）は内容に依存するので、
+        /// 別の呼び出しの位置をこの値で照合できる。開文書なら文書チェックサムと
+        /// 同じ値、ディスク読みならその時点のファイル内容のハッシュ。
+        #[serde(default)]
+        checksum: u64,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
         /// 再帰横断時（ADR-0049）、シンボル総数上限（500）に達して途中で
@@ -620,6 +629,12 @@ pub enum ServerMessage {
         generation: u64,
         /// hover テキスト（空 = hover なし）。
         text: String,
+        /// この応答が計算された**内容の revision**（テキストの fnv1a64。ADR-0063 /
+        /// self-host #3）。位置（`--lines` / `range` / `line`）は内容に依存するので、
+        /// 別の呼び出しの位置をこの値で照合できる。開文書なら文書チェックサムと
+        /// 同じ値、ディスク読みならその時点のファイル内容のハッシュ。
+        #[serde(default)]
+        checksum: u64,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
@@ -667,6 +682,12 @@ pub enum ServerMessage {
         generation: u64,
         /// ファイルのテキスト（開文書優先・未保存編集込み、なければディスク読み）。
         text: String,
+        /// この応答が計算された**内容の revision**（テキストの fnv1a64。ADR-0063 /
+        /// self-host #3）。位置（`--lines` / `range` / `line`）は内容に依存するので、
+        /// 別の呼び出しの位置をこの値で照合できる。開文書なら文書チェックサムと
+        /// 同じ値、ディスク読みならその時点のファイル内容のハッシュ。
+        #[serde(default)]
+        checksum: u64,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
@@ -683,6 +704,12 @@ pub enum ServerMessage {
         truncated: bool,
         /// 一致位置（上限まで）。
         matches: Vec<SearchMatch>,
+        /// この応答が計算された**内容の revision**（テキストの fnv1a64。ADR-0063 /
+        /// self-host #3）。位置（`--lines` / `range` / `line`）は内容に依存するので、
+        /// 別の呼び出しの位置をこの値で照合できる。開文書なら文書チェックサムと
+        /// 同じ値、ディスク読みならその時点のファイル内容のハッシュ。
+        #[serde(default)]
+        checksum: u64,
         /// 失敗理由（成功時は None）。
         error: Option<String>,
     },
@@ -701,6 +728,12 @@ pub enum ServerMessage {
         range: Range,
         /// 名前トークンの範囲（char インデックス）。
         selection_range: Range,
+        /// この応答が計算された**内容の revision**（テキストの fnv1a64。ADR-0063 /
+        /// self-host #3）。位置（`--lines` / `range` / `line`）は内容に依存するので、
+        /// 別の呼び出しの位置をこの値で照合できる。開文書なら文書チェックサムと
+        /// 同じ値、ディスク読みならその時点のファイル内容のハッシュ。
+        #[serde(default)]
+        checksum: u64,
         /// 位置を囲む記号が見つかったか（`error` が None のときだけ意味を持つ）。
         found: bool,
         /// 失敗理由（成功時は None。`error` が Some なら `found` は false）。
@@ -718,8 +751,8 @@ pub enum ServerMessage {
 }
 
 /// [`ServerMessage::ServerInfo`] に載る LSP サーバ 1 件（rust2 要望）。
-/// 設定（`languages.toml`）由来の識別子と対象言語、現在の稼働セッション数だけを
-/// 開示する — 実行コマンド・絶対パスは含めない。
+/// 設定（`languages.toml`）由来の識別子と対象言語、現在の稼働セッション数とその
+/// root を開示する — 実行コマンドは含めない。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LspServerInfo {
     /// `languages.toml` の `[language-server.<id>]` の id（例 `rust-analyzer`）。
@@ -728,6 +761,14 @@ pub struct LspServerInfo {
     pub languages: Vec<String>,
     /// 現在稼働中のセッション数（workspace root × 言語）。0 なら未起動。
     pub running_sessions: usize,
+    /// 稼働中のセッションの root（ソート済み。ADR-0062 / self-host #5）。
+    ///
+    /// セッションは root ごとに 1 つなので、この配列がそのまま「いま何個の
+    /// 言語サーバがどのディレクトリを見ているか」になる。数だけでは、1 クレート
+    /// 触るごとに増えていく事実に気づけない（実測: 6 クレートで 6 セッション /
+    /// 12 プロセス / ~4.9 GB、cold 6.7-10.0 s/クレート）。
+    #[serde(default)]
+    pub roots: Vec<String>,
 }
 
 /// [`Command::SearchMatches`] の応答に含まれる一致位置 1 件。1-origin の行と
@@ -1432,6 +1473,7 @@ mod tests {
                 commit: "abc1234".into(),
             }],
             servers: vec![LspServerInfo {
+                roots: Vec::new(),
                 id: "rust-analyzer".into(),
                 languages: vec!["rust".into()],
                 running_sessions: 1,
@@ -1613,6 +1655,7 @@ mod tests {
 
         // Outline 応答を phrase として round-trip する
         let msg = ServerMessage::Outline {
+            checksum: 0,
             path: "src/lib.rs".into(),
             generation: 3,
             symbols: vec![symbol],
@@ -1627,6 +1670,7 @@ mod tests {
         assert!(json.contains("\"truncated\":false"));
         let truncated: ServerMessage = serde_json::from_str(
             &serde_json::to_string(&ServerMessage::Outline {
+                checksum: 0,
                 path: "src/lib.rs".into(),
                 generation: 3,
                 symbols: vec![],
@@ -1639,6 +1683,7 @@ mod tests {
         assert_eq!(
             truncated,
             ServerMessage::Outline {
+                checksum: 0,
                 path: "src/lib.rs".into(),
                 generation: 3,
                 symbols: vec![],
@@ -1649,6 +1694,7 @@ mod tests {
 
         // ReadPath 応答の round-trip（ADR-0048）
         let read_msg = ServerMessage::ReadPath {
+            checksum: 0,
             path: "src/lib.rs".into(),
             generation: 4,
             text: "fn main() {}\n".into(),
@@ -1659,6 +1705,7 @@ mod tests {
         assert_eq!(read_back, read_msg);
 
         let msg = ServerMessage::EnclosingSymbol {
+            checksum: 0,
             path: "src/lib.rs".into(),
             name: "frobnicate".into(),
             kind: SymbolKind::Function,
@@ -1680,6 +1727,7 @@ mod tests {
 
         // Hover / WorkspaceSymbols / Check 応答の round-trip（ADR-0032）
         let hover = ServerMessage::Hover {
+            checksum: 0,
             path: "src/lib.rs".into(),
             generation: 3,
             text: "fn frobnicate() -> i32".into(),

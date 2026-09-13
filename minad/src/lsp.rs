@@ -450,7 +450,7 @@ pub async fn document_symbols_at(
     };
     let enc = {
         let Ok(s) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
-            return Err("LSP セッションのロックを取得できませんでした".into());
+            return Err("LSP error: could not acquire the session lock — retry".into());
         };
         s.encoding
     };
@@ -1552,7 +1552,7 @@ async fn request_with_loading_retry(
         attempts += 1;
         let result = {
             let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
-                return Err("LSP セッションのロックを取得できませんでした".into());
+                return Err("LSP error: could not acquire the session lock — retry".into());
             };
             if session.client.is_dead() {
                 return Err(
@@ -1565,7 +1565,11 @@ async fn request_with_loading_retry(
                 .client
                 .request(method, params.clone())
                 .await
-                .map_err(|e| format!("LSP エラー: {e}"))?
+                // agent 向けの文言は英語 + 再試行可否を明示する（日本語 prose を
+                // 混ぜない — ドッグフーディング #12/#19 と同じ規律。self-host #3 の
+                // 観測: cold の references が「LSP エラー: LSP 応答タイムアウト」を返し、
+                // exit code を捕れないと再試行可能か判断できなかった）。
+                .map_err(|e| format!("LSP error: {e} — retry (the server may be busy or restarting)"))?
         };
         // ADR-0056: 何回目の要求が高いか（1 回目 = RA の計算、2 回目 = 安定確認）。
         trace.mark(&format!("attempt{}", attempts));
