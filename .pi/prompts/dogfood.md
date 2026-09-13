@@ -2,14 +2,19 @@
 description: minas のドッグフーディングループを開始/再開する（実装側=このペイン、相手=driver ペイン）
 argument-hint: "[driver_repo] [goal]"
 ---
-minas のドッグフーディングループを回して。スキル `.agents/skills/dogfooding-minas/SKILL.md` を読み、
+minas のドッグフーディングループを回して。スキル `.pi/skills/dogfooding-minas/SKILL.md` を読み、
 その手順どおりに:
 
 1. 現在のペイン/セッションを確認（`herdr pane list`、`intercom list`）。driver ペインが無ければ
-   `$1`（既定: `/Users/335g/dev/other/sample-rust2`）で分割して pi を起動し、両ペインに名前を付ける。
-   **分割は呼び出し側の環境を継承しない**ので、`. ./.env` してから
-   `herdr pane split ... --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"` で認証情報を渡す。
-   起動後 `intercom list` でモデルが `unknown` でないことを確認し、`intercom ask` で pong を取ってから次へ。
+   `$1`（既定: `/Users/335g/dev/other/sample-rust2`）で分割し、そのペインで
+   `pi --tui-mode fullscreen --model "$PI_PROVIDER/$PI_MODEL" --thinking "$PI_REASONING_LEVEL"` を実行して
+   pi を起動、両ペインに名前を付ける（Herdr 管理下のエージェントとして登録したい場合は
+   `herdr agent start` でも可 — 起動方法の検証記録はスキル参照）。
+   **分割は呼び出し側の環境もモデルも継承しない**ので、`. ./.env` してから
+   `herdr pane split ... --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"` で認証情報を渡し、
+   `--model` で**このペインと同じモデル**にする。
+   起動後 `intercom list` でモデルが自分と一致すること（`unknown` や別モデルでないこと）を確認し、
+   `intercom ask` で pong を取ってから次へ。
 2. 私（このペイン）を実装側、相手を driver として `intercom` で自己紹介し、スキルの「Activation」文面を
    `$2`（既定: TODO HTTP API を作って壊れにくさを検証する）を埋めて送る。driver 側の働き方・報告形式は
    グローバルスキル `dogfooding-driver` が持っているので、ここでは goal と宛先だけを渡す（重複させない）。

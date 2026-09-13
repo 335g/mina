@@ -20,22 +20,28 @@ The loop only earns its cost if the driver actually reaches for minas every time
    herdr pane rename <driver_pane> <driver> ; herdr agent rename <driver_pane> <driver>
    herdr pane rename --current <implementer> ; herdr agent rename --current <implementer>
    ```
-3. No driver pane yet? Create and launch it **with the model credentials** — a split
-   does not inherit the caller's env, and without the key Pi boots with an
-   unresolved model and cannot answer at all (observed: `intercom list` shows the
-   session's model as `unknown`):
+3. No driver pane yet? Create and launch it **with the model credentials and the same
+   model as this pane** — a split inherits neither the caller's env nor its model:
+   without the key Pi boots with an unresolved model and cannot answer at all, and
+   without `--model` it picks its own default, so the two panes reason with different
+   weights (observed: default resolved to `deepseek-v4-flash` while the implementer
+   ran `deepseek-v4.1-flash`). This pane's own identity is in its env
+   (`PI_PROVIDER`, `PI_MODEL`, `PI_REASONING_LEVEL`):
    ```bash
    set -a; . ./.env; set +a          # implementer's credentials (value never printed)
    herdr pane split --current --direction right --cwd <driver_repo> --no-focus \
      --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"
-   herdr agent start <driver> --kind pi --pane <new_pane>   # IDs come from the output
+   herdr agent start <driver> --kind pi --pane <new_pane> \
+     -- --model "$PI_PROVIDER/$PI_MODEL" --thinking "$PI_REASONING_LEVEL"
    ```
+   args after `--` go to `pi` itself (`argv` in the response shows them).
    Alternative with no secret in argv: give the driver repo its own `.env` +
-   `.envrc` (`dotenv`) and split without `--env`.
-4. Verify the driver is alive before briefing: the intercom list must show a model
-   (not `unknown`), then ask it to say "pong" with the intercom tool
-   (`action: ask`, `to: <driver session id>`). A non-answer is an auth/env failure —
-   fix the credentials, do not send the brief yet.
+   `.envrc` (`dotenv`) and split without `--env` (still pass `--model`).
+4. Verify the driver is alive **and on the same model** before briefing: the intercom
+   list shows each session's model — it must equal this pane's (not `unknown`, not a
+   different one), then ask it to say "pong" with the intercom tool (`action: ask`,
+   `to: <driver session id>`). A non-answer is an auth/env failure — fix the
+   credentials, do not send the activation yet.
 5. Send the activation (`## Activation`, below) with the intercom tool (`action: send`).
 6. The driver sends the baseline first; keep it — you will diff against it when a "fixed" claim is contested.
 
