@@ -137,6 +137,16 @@ goal from that row's outline rather than inventing a new app shape each time. Tw
 
 - **One profile per session, and not the same one twice in a row.** The stop criterion counts
 two consecutive clean sessions *of different profiles*; the same profile twice is one measurement.
+- **Write the round's hypotheses BEFORE the driver starts, and make them falsifiable.** When the
+profile's purpose is to press an unexercised path (a new language, a new project shape, a new
+scale), the activation should carry 2-4 concrete predictions of the form "if this gap is real,
+you will observe X" (measured stage 2 example: `.tsx` absent from `file-types` → `check
+<file>.tsx` says "not supported"; a non-BMP char through the TS path → columns/positions shift
+by one if the UTF-16↔char conversion is missing; a JS monorepo → one session per package if the
+sharing fix is Rust-shaped). Two reasons, both from this loop's data: a clean round then counts
+as *evidence* rather than absence (the stop criterion's `new_class = 0` sessions only mean
+something if the round had something to find), and a false hypothesis is as useful as a true one
+(it names the thing that IS handled). Put the hypotheses in the session row with their outcome.
 - **Vary the model when the question is about the model.** Same model both sides is the control
 condition (it isolates the tool). A cheaper/weaker driver finds ergonomic and contract gaps
 (more fallbacks, more retries); a stronger one pushes the contract itself. Record which one you

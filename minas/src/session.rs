@@ -608,7 +608,22 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 eprintln!("rename failed: {e}");
                 std::process::exit(rename_exit_code(e));
             }
-            println!("renamed: {old} -> {new} ({} files, {} edits)", outcome.files, outcome.edits);
+            // ADR-0067 / self-host #12: LSP は**1 セッション分の視界**しか見ない
+            // （同一 root でも languageId が違えば別セッション）。stdout の
+            // 「N files, M edits」を影響範囲の全体として読ませないため、テキスト網が
+            // 残りを見つけたら**stdout の行自体**に INCOMPLETE と書く。
+            let leftovers = leftover_mentions(&path, &old, &outcome.changed, &std::collections::HashMap::new(), "rename");
+            let impact = if leftovers == 0 {
+                String::new()
+            } else {
+                format!(
+                    " — INCOMPLETE: {leftovers} file(s) still mention `{old}` and were NOT changed (see stderr)"
+                )
+            };
+            println!(
+                "renamed: {old} -> {new} ({} files, {} edits){impact}",
+                outcome.files, outcome.edits
+            );
             for f in &outcome.changed {
                 println!("changed: {f}");
             }
@@ -616,15 +631,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // 書き換える（`#[cfg(feature = "x")]` の非活性モジュールは RA の解析対象外）。
             // 「N files, M edits」を影響範囲として読むと、feature ビルドで E0425 になる。
             // テキストレベルの網をかけて、変更されなかったのに名前が残るファイルを警告する。
-            // rename は改名後に走査するので、ヒットしたファイルに残る旧名は
-            // すべて「LSP が変えなかった言及」（文字列・コメント）。差し引き不要。
-            warn_leftover_mentions(
-                &path,
-                &old,
-                &outcome.changed,
-                &std::collections::HashMap::new(),
-                "rename",
-            );
+
         }
         SessionCmd::References { path, old } => {
             // 成功: `N references in M files:` に続けて `path:line`（1-origin。
@@ -639,14 +646,6 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             for loc in &outcome.locations {
                 files.insert(loc.path.as_str());
             }
-            println!("{} references in {} files:", outcome.total, files.len());
-            for loc in &outcome.locations {
-                println!("{}:{}", loc.path, loc.line + 1);
-            }
-            // #16 / self-host #4: 参照一覧も cfg 非活性のコードを見ない。同じ網を
-            // かけて警告し、さらに**一覧に載ったファイルの中**の未列挙言及
-            // （文字列・コメント）を件数で報告する。LSP が挙げた件数をファイル別に
-            // 数えて差し引くので、二重計上しない。
             let mut touched: Vec<String> = Vec::new();
             let mut listed: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
@@ -657,7 +656,25 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 }
                 *listed.entry(abs).or_insert(0) += 1;
             }
-            warn_leftover_mentions(&path, &old, &touched, &listed, "references");
+            // ADR-0067: この一覧は 1 セッション分の視界。テキスト網が「一覧に無い
+            // ファイルに名前が残っている」と見つけたら、件数の行に INCOMPLETE と書く。
+            let leftovers = leftover_mentions(&path, &old, &touched, &listed, "references");
+            let impact = if leftovers == 0 {
+                String::new()
+            } else {
+                format!(
+                    " — INCOMPLETE: {leftovers} file(s) still mention `{old}` and are not listed (see stderr)"
+                )
+            };
+            println!(
+                "{} references in {} files:{impact}",
+                outcome.total,
+                files.len()
+            );
+            for loc in &outcome.locations {
+                println!("{}:{}", loc.path, loc.line + 1);
+            }
+
         }
         SessionCmd::Outline { path, recursive, depth } => {
             // 成功: シンボルの階層ツリーを JSON で出力する（全文なし — ADR-0031。
@@ -1375,7 +1392,7 @@ fn check_final_exit_code(any_error: bool, worst_failure: i32) -> i32 {
 ///
 /// 上限: [`LEFTOVER_SCAN_MAX_FILES`] ファイル / 1 ファイル [`LEFTOVER_SCAN_MAX_BYTES`]。
 /// ディレクトリ走査なので、別クレート（crates/*）からの参照までは見えない。
-fn warn_leftover_mentions(
+fn leftover_mentions(
     path: &std::path::Path,
     old: &str,
     touched: &[String],
@@ -1383,12 +1400,12 @@ fn warn_leftover_mentions(
     // 旧名が「一覧に載っていない言及」だけになるため差し引き不要）。
     listed: &std::collections::HashMap<String, usize>,
     what: &str,
-) {
+) -> usize {
     if old.is_empty() {
-        return;
+        return 0;
     }
     let Some(dir) = path.parent() else {
-        return;
+        return 0;
     };
     // 相対パスのままだと祖先の walk-up が空パスを踏んで走査範囲を失う（実測:
     // `crates/b/src/lib.rs` で scan_root が空になり警告が出なかった）。
@@ -1400,16 +1417,24 @@ fn warn_leftover_mentions(
     // ディレクトリだけを走査するのは助けが要らない側を走査していた。
     // 祖先を辿って**最も外側の Cargo.toml を持つディレクトリ**（workspace root）
     // を探し、そこを走査する（見つからなければファイルのディレクトリ）。
+    // 走査の起点: その言語の manifest を持つ最も外側の祖先（Rust は workspace の
+    // Cargo.toml、TS/JS は workspace の package.json）。manifest が無ければ
+    // アンカーのディレクトリ（ADR-0065）。
+    let manifests = scan_manifests(&abs_path);
     let mut scan_root = dir.to_path_buf();
     let mut probe = dir.to_path_buf();
     while let Some(parent) = probe.parent() {
-        if parent.join("Cargo.toml").is_file() {
+        if manifests.iter().any(|m| parent.join(m).is_file()) {
             scan_root = parent.to_path_buf();
         }
         probe = parent.to_path_buf();
     }
+    // 走査する拡張子もアンカーの言語ファミリに合わせる（`.rs` 固定だと TS では
+    // 何も走査せず、警告が無言で出ない — driver #6）。
+    let exts = scan_extensions(&abs_path);
+    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
     let mut files = Vec::new();
-    collect_rs_files(&scan_root, &mut files);
+    collect_source_files(&scan_root, &ext_refs, &mut files);
     let touched: std::collections::HashSet<String> = touched
         .iter()
         .map(|p| conn::absolutize(p))
@@ -1442,11 +1467,12 @@ fn warn_leftover_mentions(
             leftovers.push(abs);
         }
     }
-    if !leftovers.is_empty() {
+    let n_leftovers = leftovers.len();
+    if n_leftovers > 0 {
         eprintln!(
-            "warning: {} file(s) still mention `{old}` but were not touched by the LSP {what} \
-             (inactive #[cfg] / not in the crate graph / comment or string) — verify manually:",
-            leftovers.len()
+            "warning: {n_leftovers} file(s) still mention `{old}` and were NOT seen by the LSP \
+             {what} — the answer above is a PARTIAL view (another language/session for the same \
+             root, a file outside the project's file set, or a comment/string). Verify manually:"
         );
         for f in leftovers {
             eprintln!("  {f}");
@@ -1455,10 +1481,12 @@ fn warn_leftover_mentions(
     if in_touched_mentions > 0 {
         eprintln!(
             "note: {in_touched_mentions} more textual mention(s) of `{old}` inside the \
-             file(s) the LSP {what} did touch (string literals / comments) — the LSP does \
-             not rename those; `minas search <file> {old}` or rg to see them"
+             file(s) the LSP {what} did touch — the LSP left them (string literals, comments, \
+             or text its own edit introduced). An IDENTIFIER among them is a real leftover: \
+             `minas search <file> {old}` to see them"
         );
     }
+    n_leftovers
 }
 
 /// `text` に `word` が識別子として（前後が識別子文字でない）現れる回数。
@@ -2331,6 +2359,14 @@ fn note_out_of_project_hits(anchor: &std::path::Path, symbols: &[mina_protocol::
 /// `target` / `.git` / ドットディレクトリは除外（生成物・メタを混ぜない）。
 /// 並び順は探索順（read_dir の順） — 呼び出し側で必要ならソートする。
 fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    collect_source_files(dir, &["rs"], out);
+}
+
+/// `dir` 配下から指定拡張子のファイルを再帰収集する（`collect_rs_files` の一般形）。
+///
+/// `target` / `node_modules` / `.git` / ドットディレクトリは除外する — 生成物と
+/// 依存ツリーを混ぜない（TS では `node_modules` を歩くとファイル上限が一瞬で埋まる）。
+fn collect_source_files(dir: &std::path::Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2339,16 +2375,52 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         if path.is_dir() {
             if name != "target"
+                && name != "node_modules"
                 && name != ".git"
                 && !name.to_string_lossy().starts_with('.')
             {
-                collect_rs_files(&path, out);
+                collect_source_files(&path, exts, out);
             }
         } else if !name.to_string_lossy().starts_with('.')
-            && path.extension().is_some_and(|e| e == "rs")
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| exts.contains(&e))
         {
             out.push(path);
         }
+    }
+}
+
+/// アンカーファイルの言語ファミリで走査する拡張子（ADR-0065 / ドッグフーディング #6）。
+///
+/// テキスト網は `.rs` 固定だったため、TS プロジェクトでは**何も走査せず何も警告しない**
+/// （driver 実測: `rename` が文字列リテラルの残りを見落としたまま exit 0 / stderr 空）。
+fn scan_extensions(anchor: &std::path::Path) -> Vec<String> {
+    match anchor.extension().and_then(|e| e.to_str()) {
+        Some("rs") => vec!["rs".into()],
+        // TS/JS は相互参照する（.ts が .js を import する等）ので 1 ファミリとして走査する。
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs") => [
+            "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs",
+        ]
+        .iter()
+        .map(|e| e.to_string())
+        .collect(),
+        // 未知の言語: アンカーと同じ拡張子だけ（推測しない）。
+        Some(other) => vec![other.to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// 走査の起点にする「その言語のプロジェクト root」を探す manifest 名
+/// （ADR-0065）。見つからなければアンカーのディレクトリ。
+fn scan_manifests(anchor: &std::path::Path) -> &'static [&'static str] {
+    match anchor.extension().and_then(|e| e.to_str()) {
+        Some("rs") => &["Cargo.toml"],
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs") => {
+            &["package.json", "tsconfig.json"]
+        }
+        _ => &[],
     }
 }
 

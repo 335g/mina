@@ -1143,6 +1143,7 @@ mod tests {
             false,
         );
         app.snapshot = StateSnapshot {
+            diagnostics_unavailable: false,
             text: "fn main() {\n    let x = 1;\n}\n".into(),
             checksum: 0,
             selection: vec![Range { anchor: 0, head: 0 }],

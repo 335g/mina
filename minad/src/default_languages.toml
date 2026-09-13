@@ -31,8 +31,35 @@ command = "typescript-language-server"
 args = ["--stdio"]
 # init options（inlay hints 等）は t9 風 A/B 検証で確定してから足す（規定サーバ方針）
 
+# TS/JS のファイル種別は **languageId 単位**で分ける（ADR-0064）。tsserver は
+# `languageId` から scriptKind を決めるので、.tsx を "typescript" として開くと
+# JSX として解析されない（実測: 既定表は "ts" のみで、.tsx/.jsx/.js は
+# 「no LSP server configured」で全コマンドが拒否されていた — ドッグフーディング #1）。
+# 4 エントリは同じ grammar（tree-sitter typescript）を共有する。
+# 代償: 同一プロジェクトに .ts と .tsx があると languageId ごとにセッションが
+# 分かれる（ADR-0030 Stage 4 の設計）。tsserver は 1 プロセスで 4 言語を扱えるので、
+# 「root × languageId」より「root × server」で共有する方が正しい可能性がある —
+# 別の設計課題として残す（ADR-0064 の Considered Options）。
 [[language]]
 name = "typescript"
-file-types = ["ts"]
+file-types = ["ts", "mts", "cts"]
+language-server = "typescript-language-server"
+grammar = "typescript"
+
+[[language]]
+name = "typescriptreact"
+file-types = ["tsx"]
+language-server = "typescript-language-server"
+grammar = "typescript"
+
+[[language]]
+name = "javascript"
+file-types = ["js", "mjs", "cjs"]
+language-server = "typescript-language-server"
+grammar = "typescript"
+
+[[language]]
+name = "javascriptreact"
+file-types = ["jsx"]
 language-server = "typescript-language-server"
 grammar = "typescript"

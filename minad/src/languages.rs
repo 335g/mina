@@ -61,6 +61,23 @@ fn manifest_in(dir: &Path, language: Option<&Language>) -> Option<PathBuf> {
 /// パース失敗（読めない・壊れている）は `None` — 呼び出し側は「分からない」を
 /// 「共有しない」側に倒す。
 fn manifest_kind(manifest: &Path) -> Option<WorkspaceKind> {
+    // npm/yarn のワークスペース（ADR-0065 / self-host #5）: `workspaces` を持つ
+    // package.json がルート。npm に cargo の `exclude` 相当は無いので excludes: false
+    // （`workspaces` の否定パターン `!pkg` は未対応 — ADR-0065 に限界として記載）。
+    // pnpm の `pnpm-workspace.yaml` は YAML パーサが依存に無いため未対応。
+    if manifest.file_name().and_then(|n| n.to_str()) == Some("package.json") {
+        #[derive(Deserialize)]
+        struct Pkg {
+            #[serde(default)]
+            workspaces: Option<serde_json::Value>,
+        }
+        let text = std::fs::read_to_string(manifest).ok()?;
+        let parsed: Pkg = serde_json::from_str(&text).ok()?;
+        return Some(match parsed.workspaces {
+            Some(_) => WorkspaceKind::Workspace { excludes: false },
+            None => WorkspaceKind::Package,
+        });
+    }
     if manifest.file_name().and_then(|n| n.to_str()) != Some("Cargo.toml") {
         return Some(WorkspaceKind::Package);
     }
@@ -374,6 +391,49 @@ mod tests {
         // 未知の拡張子・言語サーバなし
         assert!(table.server_for(Path::new("/tmp/notes.md")).is_none());
         assert!(table.server_for(Path::new("/tmp/noext")).is_none());
+    }
+
+    #[test]
+    fn default_table_covers_ts_and_js_with_the_right_language_ids() {
+        // ADR-0064 / ドッグフーディング #1: 既定表は "ts" だけだったので
+        // .tsx/.jsx/.js が「no LSP server configured」で全コマンド拒否されていた。
+        // languageId は tsserver の scriptKind を決めるので、拡張子ごとに正しい id を
+        // 持つ必要がある（.tsx を "typescript" として開くと JSX として解析されない）。
+        let table = LanguageTable::from_strings(DEFAULT_LANGUAGES_TOML, None);
+        for (path, expected_id) in [
+            ("/tmp/a.ts", "typescript"),
+            ("/tmp/a.mts", "typescript"),
+            ("/tmp/a.cts", "typescript"),
+            ("/tmp/a.tsx", "typescriptreact"),
+            ("/tmp/a.js", "javascript"),
+            ("/tmp/a.mjs", "javascript"),
+            ("/tmp/a.cjs", "javascript"),
+            ("/tmp/a.jsx", "javascriptreact"),
+        ] {
+            let lang = table
+                .language_for_path(Path::new(path))
+                .unwrap_or_else(|| panic!("{path} が言語に解決される"));
+            assert_eq!(lang.name, expected_id, "{path} の languageId");
+            assert_eq!(
+                lang.language_server.as_deref(),
+                Some("typescript-language-server"),
+                "{path} にサーバが割り当たっている"
+            );
+        }
+        // 4 エントリすべてが同じサーバを指す（サーバ数は増えない）。
+        let servers: Vec<String> = table
+            .configured_servers()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            servers
+                .iter()
+                .filter(|id| id.as_str() == "typescript-language-server")
+                .count(),
+            1,
+            "TS/JS の 4 言語は 1 サーバ定義を共有する: {servers:?}"
+        );
     }
 
     #[test]

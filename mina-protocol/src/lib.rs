@@ -59,10 +59,12 @@ use serde::{Deserialize, Serialize};
 /// ファイル。ADR-0057）。応答 wire の変更のため bump。
 /// v23: `Command::DeletePath`（ファイル削除。ADR-0060）を追加。コマンドの
 /// 追加のため bump。
+/// v25: `StateSnapshot` に `diagnostics_unavailable`（push 専用サーバの診断は
+/// 取得不能。ADR-0066）。応答 wire の変更のため bump。
 /// v24: `read` / `search` / `outline` / `at` / `hover` の応答に `checksum`
 /// （内容 revision。ADR-0063）を追加、`LspServerInfo` に `roots`（稼働中
 /// セッションの root。ADR-0062）を追加。応答 wire の変更のため bump。
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// headless ゲート拒否の status 接頭辞（[`Command`] の許可リスト外のコマンドを
 /// headless クライアントが送ったとき、daemon が snapshot.status に載せる）。
@@ -1120,6 +1122,12 @@ pub struct ActivityRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub text: String,
+    /// フォーカス文書の診断が**取得不能**か（ADR-0066 / ドッグフーディング #7）。
+    /// push 専用サーバ（tsserver 等）は pull 診断を持たないので、`diagnostics` が
+    /// 空でも「診断なし」を意味しない。一回限りの status と違い、これは何度読んでも
+    /// 残る（空集合をクリーンと誤読させないため）。
+    #[serde(default)]
+    pub diagnostics_unavailable: bool,
     /// 全文の FNV-1a 64（[`DocumentEdit`] の checksum 検証用）。エージェントは
     /// これをそのまま edit に渡すだけでよい（FNV-1a の再実装不要。ADR-0012 #12）。
     pub checksum: u64,
@@ -1193,6 +1201,7 @@ impl Default for StateSnapshot {
         Self {
             text: String::new(),
             checksum: fnv1a64(b""),
+            diagnostics_unavailable: false,
             selection: vec![Range { anchor: 0, head: 0 }],
             primary_index: 0,
             mode: Mode::Normal,
@@ -1266,6 +1275,7 @@ mod tests {
     #[test]
     fn state_snapshot_round_trip() {
         let snapshot = StateSnapshot {
+            diagnostics_unavailable: false,
             text: "hello\nworld".to_string(),
             checksum: fnv1a64(b"hello\nworld"),
             selection: vec![Range { anchor: 2, head: 5 }],

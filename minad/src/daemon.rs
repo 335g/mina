@@ -197,7 +197,12 @@ pub struct Daemon {
     deleted: Option<String>,
     /// 外部 truncate の警告（縮小リロード時に設定。次の snapshot の status に
     /// 1 回だけ載ってクリアされる — rust2 #6: 軽量経路 get --brief でも見える）。
-    external_warning: Option<String>,
+    pending_warning: Option<String>,
+    /// 診断を pull できないサーバ（push 専用。tsserver 等）で解析しているパス
+    /// （ADR-0066 / self-host #7）。スナップショットの `diagnostics_unavailable` に
+    /// 反映する — 空の `diagnostics` をクリーンと誤読させないため、一回限りの
+    /// status と違って何度読んでも残る。
+    push_only_paths: std::collections::HashSet<PathBuf>,
     /// 最後に「内容（テキスト）を変えた」世代（rust2 #16）。WaitFor の起床判定に
     /// 使う — Open/Save/SetMode などの非内容変化では進めない（apply の Open
     /// 段階で古いテキストを返す早起床を避ける）。
@@ -590,7 +595,8 @@ impl Daemon {
             events: VecDeque::new(),
             baselines: HashMap::new(),
             deleted: None,
-            external_warning: None,
+            pending_warning: None,
+            push_only_paths: std::collections::HashSet::new(),
             last_content_generation: 0,
             last_content_change_at: None,
             syntax: HashMap::new(),
@@ -1289,7 +1295,7 @@ async fn watch_disk(
                         );
                         // 次の snapshot （get / --brief / apply 応答）の status に
                         // 1 回だけ載せる（snapshot_from_view が take する）。
-                        d.external_warning = Some(warning);
+                        d.pending_warning = Some(warning);
                     }
                     if let Ok(md) = std::fs::metadata(path) {
                         d.baselines.insert(
@@ -3265,6 +3271,13 @@ async fn serve_workspace_symbols(
 /// 失敗は `error: Some(…)`（LSP 非対応・
 /// spawn 失敗は exit 1、LSP エラーは再試行可能な exit 2）。
 async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
+    // メトリクスは**入口で**数える（ドッグフーディング self-host #9: 失敗した
+    // check が check_total を動かさず、検証の試行そのものが観測から消えていた —
+    // ドッグフーディングのループが最も見たい信号）。成功・失敗どちらも 1 回。
+    {
+        let mut d = daemon.lock().await;
+        d.metrics.check_total += 1;
+    }
     // ADR-0056: pull の待ち内訳（borrow = didOpen / pull = RA 解析待ち +
     // settle / restore）。ギャップなし check の ~800ms がどのフェーズかを見る。
     let mut trace = Trace::new("check");
@@ -3442,7 +3455,8 @@ async fn record_agent_metric(daemon: &Mutex<Daemon>, msg: ServerMessage) -> Serv
             d.metrics.symbol_search_bytes += bytes;
         }
         ServerMessage::Check { .. } => {
-            d.metrics.check_total += 1;
+            // check_total は serve_check_diagnostics の入口で数える（失敗も含めるため）。
+            // ここでは応答サイズだけ加算する。
             d.metrics.check_bytes += bytes;
         }
         _ => {}
@@ -3848,6 +3862,17 @@ async fn apply_and_save_rename(
     }
     let generation = d.generation;
     drop(d);
+    // フェーズ3b（ロック外）: **rename が書き換えた全ファイル**をセッションへ
+    // 反映する（ADR-0068 / self-host #14）。以前はフォーカス文書しか戻さなかった
+    // ため、rename が別ファイルを書き換えてもサーバはその古いテキストを持ち続け、
+    // **次の rename が古い座標で計算されてファイルを壊した**（実測: 2 回目の
+    // rename が 2 回前の名前を import specifier に書き戻し、exit 0 で破壊）。
+    {
+        let mut s = session.lock().await;
+        for (path, text) in &to_write {
+            s.did_open_keep(path, text).await;
+        }
+    }
     // フェーズ4（ロック外）: フォーカス文書へセッションを戻し、診断を追従させる
     // （borrows の場合と target==focus の場合の両方を扱う — open_workspace_files
     // が current_uri を動かすため、対象がフォーカス文書でも開き直しが必要）。
@@ -3994,8 +4019,27 @@ async fn ensure(
     }
     // M3/ADR-0009: 既存が死亡済みなら新セッションで置き換える
     // （修正前は無条件に既存を返し、再 spawn が毎回破棄されていた）
-    d.lsp_sessions.insert(key, arc.clone());
+    d.lsp_sessions.insert(key.clone(), arc.clone());
+    // ADR-0065 / self-host #5 state B: 新しい root の**子孫 root** のセッションは
+    // 不要になる（親のセッションがそのサブツリー全体を見る）。manifest が後から
+    // 現れた場合（package.json を `npm init` で作る等）に古い子 root が生き残り、
+    // **どのセッションが答えるかが `minas info` から見えない**まま file 集合の
+    // 違う答え（部分的な references）を返す原因になっていた。
+    let subsumed: Vec<(PathBuf, String)> = d
+        .lsp_sessions
+        .keys()
+        .filter(|(r, _)| r != &key.0 && r.starts_with(&key.0))
+        .cloned()
+        .collect();
+    let killed: Vec<Arc<Mutex<lsp::LspSession>>> = subsumed
+        .iter()
+        .filter_map(|k| d.lsp_sessions.remove(k))
+        .collect();
     drop(d);
+    // ロック外でプロセスを落とす（既存の UnregisterBaseRoot と同じ規律）。
+    for session in killed {
+        session.lock().await.client.kill().await;
+    }
     // 索引完走を待ってから返す（ADR-0051）。新しいセッションは上のロックで先に
     // map へ登録済み — 待つ間の並行 ensure が 2 匹目のサーバを spawn しない。
     await_indexed(&arc).await;
@@ -4197,6 +4241,13 @@ async fn settle_open_diagnostics_loop(
     path: PathBuf,
     push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
 ) {
+    // ADR-0066 / self-host #7: pull を持たないサーバ（tsserver 等）は settle する
+    // 対象が無い。以前は `pull_diagnostics` が空集合を返し、ループが「安定した空」を
+    // 診断として確定させていた（活動が正常終了する = クリーンのように見える）。
+    // ここで抜け、活動の除去は呼び出し側（wrapper）が行う。
+    if !session.lock().await.caps.pull_diagnostics {
+        return;
+    }
     let mut prev: Option<usize> = None;
     for i in 0..120 {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4620,6 +4671,26 @@ async fn process_command(
                         tokio::spawn(async move {
                             match ensure(&daemon_task, &path_task).await {
                                 Ok(session) => {
+                                    // ADR-0066 / self-host #7: pull 診断を持たないサーバ
+                                    // （tsserver 等）は settle する対象が無い。活動を
+                                    // 立てたまま「安定した空」を確定させると、診断が
+                                    // 取れていないことがクリーンと区別できない。settle を
+                                    // 走らせず、1 回だけ status で「未取得」と告げる。
+                                    if !session.lock().await.caps.pull_diagnostics {
+                                        let mut d = daemon_task.lock().await;
+                                        d.remove_activity(
+                                            &path_task,
+                                            ActivityKind::DiagnosticsSettle,
+                                        );
+                                        d.pending_warning = Some(format!(
+                                            "{}: diagnostics unavailable (the LSP server does \
+                                             not support pull diagnostics) — use the \
+                                             project's own check (tsc / vitest / cargo)",
+                                            path_task.display()
+                                        ));
+                                        d.push_only_paths.insert(path_task.clone());
+                                        return;
+                                    }
                                     lsp::open_document(&session, &path_task, &text_task).await;
                                     settle_open_diagnostics(
                                         &daemon_task,
@@ -4707,6 +4778,24 @@ async fn process_command(
                         tokio::spawn(async move {
                             match ensure(&daemon_task, &path_task).await {
                                 Ok(session) => {
+                                    // ADR-0066 / self-host #7: pull 診断を持たない
+                                    // サーバは settle せず、1 回だけ status で未取得を告げる
+                                    // （既存文書の再 Open 経路。新規 Open 側にも同じ分岐がある）。
+                                    if !session.lock().await.caps.pull_diagnostics {
+                                        let mut d = daemon_task.lock().await;
+                                        d.remove_activity(
+                                            &path_task,
+                                            ActivityKind::DiagnosticsSettle,
+                                        );
+                                        d.pending_warning = Some(format!(
+                                            "{}: diagnostics unavailable (the LSP server does \
+                                             not support pull diagnostics) — use the \
+                                             project's own check (tsc / vitest / cargo)",
+                                            path_task.display()
+                                        ));
+                                        d.push_only_paths.insert(path_task.clone());
+                                        return;
+                                    }
                                     lsp::open_document(&session, &path_task, &text_task).await;
                                     settle_open_diagnostics(
                                         &daemon_task,
@@ -6419,10 +6508,10 @@ fn apply_from(daemon: &mut Daemon, command: Command, conn_id: u64) -> (StateSnap
         }
         Command::GetState => {
             daemon.metrics.get_state_total += 1;
-            // 外部 truncate 警告（external_warning）は GetState でのみ 1 回消費
+            // 保留中の警告（pending_warning: 外部 truncate / 診断未取得 等）は GetState でのみ 1 回消費
             // する — ワンショット get で必ず見える（push が先に take して消える
             // 競合を避ける。rust2 #6/#7）。
-            let warning = daemon.external_warning.take();
+            let warning = daemon.pending_warning.take();
             (snapshot(daemon, warning), false)
         }
         Command::Open { .. } | Command::Save => {
@@ -6466,7 +6555,13 @@ pub(crate) fn snapshot_from_view(
     let checksum = fnv1a64(text.as_bytes());
     let highlights =
         daemon.syntax_highlights(doc_id, &text, checksum, view.first_line, viewport_height);
+    // ADR-0066: この文書のサーバが pull 診断を持たないなら、`diagnostics` が空でも
+    // 「診断なし」ではない（何度読んでも残るマーカー）。
+    let diagnostics_unavailable = path
+        .as_ref()
+        .is_some_and(|p| daemon.push_only_paths.contains(p));
     StateSnapshot {
+        diagnostics_unavailable,
         activity: daemon.activity_log.iter().cloned().collect(),
         // ADR-0012 #12: 全文の FNV-1a を同梱し、エージェントが edit の
         // checksum を再実装せずに済ませる。応答は既に全文をシリアライズ

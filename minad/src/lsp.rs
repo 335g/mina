@@ -91,6 +91,14 @@ pub struct LspSession {
     encoding: PositionEncoding,
     version: i64,
     current_uri: Option<String>,
+    /// サーバが **didOpen 済み**の URI 集合（ADR-0068 / self-host #14）。
+    ///
+    /// LSP では、既に開いている文書の更新は `didChange` で送る。以前は
+    /// `current_uri` しか持たず、開き直しのたびに `didOpen` を再送していたため、
+    /// tsserver は 2 回目の didOpen を無視して**古いテキストを持ち続けた**。
+    /// 実測: rename を 2 回続けると 2 回目が 2 回前の名前を import specifier に
+    /// 書き戻し、ファイルを壊したまま exit 0（/tmp/renprobe の repro）。
+    open_uris: std::collections::HashSet<String>,
     /// initialize 応答で advertise された pull 診断の identifier。
     diagnostic_identifier: Option<String>,
     /// `textDocument.languageId`（spawn 元ファイルの言語。ADR-0030）。
@@ -241,6 +249,7 @@ impl LspSession {
             encoding,
             version: 0,
             current_uri: None,
+            open_uris: std::collections::HashSet::new(),
             diagnostic_identifier,
             language_id: language_id.to_string(),
         })
@@ -256,17 +265,25 @@ impl LspSession {
                     .client
                     .notify("textDocument/didClose", json!({ "textDocument": { "uri": prev } }))
                     .await;
+                self.open_uris.remove(&prev);
             }
         }
-        let params = json!({
-            "textDocument": {
-                "uri": doc_uri,
-                "languageId": self.language_id,
-                "version": self.version,
-                "text": text,
-            }
-        });
-        let _ = self.client.notify("textDocument/didOpen", params).await;
+        if self.open_uris.contains(&doc_uri) {
+            // 既にサーバが持っている文書: didOpen の再送は無視され得る（ADR-0068）。
+            // 正しい更新は didChange（全文同期）。
+            self.did_change(path, text).await;
+        } else {
+            let params = json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": self.language_id,
+                    "version": self.version,
+                    "text": text,
+                }
+            });
+            let _ = self.client.notify("textDocument/didOpen", params).await;
+            self.open_uris.insert(doc_uri.clone());
+        }
         self.current_uri = Some(doc_uri);
     }
 
@@ -312,16 +329,22 @@ impl LspSession {
     /// 要求後にフォーカス文書を開き直して戻す）。
     pub async fn did_open_keep(&mut self, path: &Path, text: &str) {
         let doc_uri = uri(path);
-        self.version += 1;
-        let params = json!({
-            "textDocument": {
-                "uri": doc_uri,
-                "languageId": self.language_id,
-                "version": self.version,
-                "text": text,
-            }
-        });
-        let _ = self.client.notify("textDocument/didOpen", params).await;
+        if self.open_uris.contains(&doc_uri) {
+            // 既に開いている文書は didChange で更新する（ADR-0068）。
+            self.did_change(path, text).await;
+        } else {
+            self.version += 1;
+            let params = json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": self.language_id,
+                    "version": self.version,
+                    "text": text,
+                }
+            });
+            let _ = self.client.notify("textDocument/didOpen", params).await;
+            self.open_uris.insert(doc_uri.clone());
+        }
         self.current_uri = Some(doc_uri);
     }
 
@@ -363,7 +386,12 @@ impl LspSession {
     /// 診断を提供しないサーバとして正しく空にする（要求しない。Stage 3）。
     pub async fn pull_diagnostics(&mut self, path: &Path, text: &str) -> Option<Vec<Diagnostic>> {
         if !self.caps.pull_diagnostics {
-            return Some(Vec::new());
+            // push 専用サーバ（typescript-language-server 等）: pull は**存在しない**。
+            // 以前は `Some(vec![])`（空の成功）を返していたため、呼び出し側が
+            // 「空 = 診断なし（settle 済み）」と読めた — 実測（self-host #7）: 本物の
+            // TS2322 があるファイルで settle 活動が正常終了し、`get` の diagnostics が
+            // `[]` のまま「クリーン」と区別できなかった。`None` = 取得不能。
+            return None;
         }
         let doc_uri = uri(path);
         if self.current_uri.as_deref() != Some(doc_uri.as_str()) {
