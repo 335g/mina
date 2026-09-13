@@ -444,4 +444,62 @@ mod tests {
         // 空文字挿入でも選択範囲があれば置換として実変更
         assert!(!Transaction::insert(&doc, &sel(vec![(1, 4)], 0), "").is_noop());
     }
+
+    /// 型ドキュメントの不変条件（`Operation` の列が文書全体を覆う）を、4つの
+    /// コンストラクタすべてで固定する。`apply` の debug_assert と同じ検査を、
+    /// 適用せずに操作列だけで行う — 末尾の `Retain` を落とした実装はここで落ちる。
+    #[test]
+    fn operations_cover_the_whole_document() {
+        let doc = Document::from("hello world");
+        let cases = [
+            Transaction::insert(&doc, &Selection::point(0), "X"),
+            Transaction::insert(&doc, &sel(vec![(0, 5), (6, 11)], 0), "Y"),
+            Transaction::delete(&doc, &sel(vec![(2, 8)], 0)),
+            Transaction::replace_all(&doc, "new"),
+            Transaction::replace_ranges(
+                &doc,
+                &[(0, 5, "A".to_string()), (6, 11, "B".to_string())],
+            ),
+        ];
+        for (i, tx) in cases.iter().enumerate() {
+            let covered: usize = tx
+                .operations()
+                .iter()
+                .map(|op| match op {
+                    Operation::Retain(n) | Operation::Delete(n) => *n,
+                    Operation::Insert(_) => 0,
+                })
+                .sum();
+            assert_eq!(
+                covered,
+                doc.len_chars(),
+                "case {i}: 操作列が文書全体を覆っていない"
+            );
+            // 適用しても apply 内の debug_assert（同じ不変条件）が通ること
+            let _ = tx.apply(&doc);
+        }
+    }
+
+    /// コアの約束（`lib.rs`: 操作は新しい状態を返し、元を壊さない）を固定する。
+    #[test]
+    fn operations_leave_their_inputs_unchanged() {
+        let doc = Document::from("hello world");
+        let doc_before = doc.clone();
+        let selection = sel(vec![(0, 5)], 0);
+        let selection_before = selection.clone();
+
+        let tx = Transaction::insert(&doc, &selection, "X");
+        let new_doc = tx.apply(&doc);
+        assert_eq!(new_doc.text().to_string(), "X world");
+
+        assert_eq!(doc, doc_before, "元の文書が変更された");
+        assert_eq!(selection, selection_before, "元の選択が変更された");
+
+        // map_* と invert も入力を変更しない
+        let _ = tx.map_selection(&selection, true);
+        let _ = tx.map_pos(3, false);
+        let _ = tx.invert();
+        assert_eq!(doc, doc_before, "写像・逆転が元の文書を変更した");
+        assert_eq!(selection, selection_before, "写像が元の選択を変更した");
+    }
 }

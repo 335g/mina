@@ -207,7 +207,6 @@ pub fn extend_to(doc: &Document, selection: &Selection, char_idx: usize) -> Sele
     Selection::new(ranges, selection.primary_index())
 }
 
-/// `pos` を含む単語（英数字 + アンダースコアの連続）の char 範囲を返す。/// `pos` が空白・改行・記号の上なら `None`。`*`（全一致選択）と rename の
 /// `pos` を含む単語（英数字 + アンダースコアの連続）の char 範囲を返す。
 /// `pos` が空白・改行・記号の上なら `None`。`*`（全一致選択）と rename の
 /// 「カーソル位置のシンボル」取り出しに使う。
