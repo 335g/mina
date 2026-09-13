@@ -36,41 +36,31 @@ The loop only earns its cost if the driver actually reaches for minas every time
    (not `unknown`), then ask it to say "pong" with the intercom tool
    (`action: ask`, `to: <driver session id>`). A non-answer is an auth/env failure —
    fix the credentials, do not send the brief yet.
-5. Send the driver brief (below) with the intercom tool (`action: send`).
-6. Record the baseline the driver will quote: `minas info` → `daemon_build_ts`, and the running `PROTOCOL_VERSION` (socket `minae-<version>.sock`).
+5. Send the activation (`## Activation`, below) with the intercom tool (`action: send`).
+6. The driver sends the baseline first; keep it — you will diff against it when a "fixed" claim is contested.
 
-## Driver brief (send verbatim, then fill the goal)
+## Activation (send only this)
 
-The driver runs in another repo and cannot read this skill, so the brief is self-contained.
+The driver's working rules and report format live in
+**`~/.pi/agent/skills/dogfooding-driver/SKILL.md`** (user scope, so it loads in any
+driver repo). That file is the single source of truth for the format — do not restate
+it here. The activation message therefore carries only the goal and the peer:
+
+```
+You are the DRIVER in a minas dogfooding loop. Repo: <driver_repo>.
+Goal: <goal>.
+Follow your `dogfooding-driver` skill (working rules, report format, evidence bar,
+escalation) and report to me — the implementer pane, session <implementer_id>
+(cwd = the mina repo). Send your First message (repo, goal, minas info build_ts,
+socket version) and start.
+```
+
 It arrives as an intercom message — no human typing in the driver pane — and the
-driver agent starts working on it directly (verified: a fresh pane + `agent start`
-+ one message produced a reply unprompted).
-
-```
-You are the DRIVER in a minas dogfooding loop. Build <goal> in <repo> using minas
-as your primary tool, and send feedback to <implementer> over intercom as you go.
-
-Use these instead of shell tools — that is the experiment:
-- read before edit: `minas read <path> --lines a:b`, `minas outline`, `minas at`,
-  `minas search` (literal, `-i`, `-w`), `minas symbol`, `minas hover`
-- edit: `minas apply` (content-addressed; `--pair old.txt new.txt` for batches,
-  `--whole-stdin` for new files) — never compute positions, never `edit` without
-  expected_text
-- refactor: `minas rename` / `minas references`
-- verify: `minas check --crate-root src/lib.rs --include-tests --summary`; the real
-  build/clippy stays the final gate (`minas check` is an error-detector, not a
-  warning detector)
-- wait/sync: `minas wait --brief <generation>`
-
-Report each finding with: exact command, output, exit code, and what you expected.
-One finding per message, numbered, so each can be triaged on its own. Say "no
-feedback this round" when a round was clean. Say explicitly when a fix you were
-asked to verify still fails.
-
-Run `minas skill <topic>` for the tool's own rules (read, search, edit, check,
-wait, rename, references, errors, exec, ...). Do not file minas issues yourself —
-report to <implementer>.
-```
+driver starts working on it directly (verified: a fresh pane + `agent start` + one
+message produced a reply unprompted). If the driver's environment has no
+`dogfooding-driver` skill (different machine, or skills disabled), inline that file's
+contents in the message instead — the driver stops producing feedback when it has to
+guess the format.
 
 ## Triage policy (implementer)
 
@@ -81,6 +71,7 @@ Route every report by kind, and answer the driver with the route:
 | Bug with a repro | Reproduce it yourself first. Fix it if the fix is small and safe; otherwise record it as a task in `.pi/todos` (see below) and tell the driver its id. |
 | Design question ("should we…?") | Answer, not code. Give the rationale and the ADR/constraint it rests on; accept pushback when the driver's measurement beats it. |
 | Wrong/outdated doc or `--help` | Fix the text (skill or clap doc). The tool's own docs are part of the product. |
+| The driver fell back to `rg`/`sed` | Treat it as a minas gap: find which command failed them and fix the command or the skill text. |
 | Feature request | Implement it, or decline with a reason and record it as backlog. Prefer the ladder: reuse a command, add a flag, or disclose in a skill before adding a command or a protocol field. |
 | Praise / confirmation | Acknowledge in one line; do not re-litigate. |
 

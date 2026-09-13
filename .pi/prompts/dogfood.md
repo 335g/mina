@@ -10,8 +10,9 @@ minas のドッグフーディングループを回して。スキル `.agents/s
    **分割は呼び出し側の環境を継承しない**ので、`. ./.env` してから
    `herdr pane split ... --env "OPENCODE_API_KEY=$OPENCODE_API_KEY"` で認証情報を渡す。
    起動後 `intercom list` でモデルが `unknown` でないことを確認し、`intercom ask` で pong を取ってから次へ。
-2. 私（このペイン）を実装側、相手を driver として `intercom` で自己紹介し、スキルの Driver brief を
-   `$2`（既定: TODO HTTP API を作って壊れにくさを検証する）を埋めて送る。
+2. 私（このペイン）を実装側、相手を driver として `intercom` で自己紹介し、スキルの「Activation」文面を
+   `$2`（既定: TODO HTTP API を作って壊れにくさを検証する）を埋めて送る。driver 側の働き方・報告形式は
+   グローバルスキル `dogfooding-driver` が持っているので、ここでは goal と宛先だけを渡す（重複させない）。
 3. 以降は driver からのフィードバックを 1 件ずつトリアージ（スキルの Triage policy）。バグは再現→修正または
    `.pi/todos` に起票、設計は回答、docs は修正、要望は実装か理由付き backlog（`.pi/todos`）。修正は必ず自分で検証し、
    コマンドと出力と exit code を添えて driver に返す。
@@ -19,4 +20,5 @@ minas のドッグフーディングループを回して。スキル `.agents/s
    daemon・テスト状態」を短く報告して。
 
 driver が minas を使い続けているか（`rg`/`sed` に逃げていないか）を時々確認し、逃げていたら
-skill の不足を疑って補う。
+skill の不足を疑って補う。driver 側を手動で始めるときは、driver ペインで `/drive [goal]` を打ってもよい
+（同じ `dogfooding-driver` スキルに従う）。
