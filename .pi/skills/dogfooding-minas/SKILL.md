@@ -161,8 +161,12 @@ preconditions are in `docs/verification/dogfood-log.md` §5):
 - **Stage 3 — `minad` / `minas` themselves** (the tool editing the tool: rebuild + restart the
   daemon before judging any fix — see `docs/verification/dogfood-log.md` §5 precondition 4).
 
-Do not start a stage until the previous one's gate held: `sw = 0` and `fallbacks = 0` in the
-stage-1 session is what earns stage 2.
+Do not start a stage until the previous one's gate held: `sw = 0` **and every `fallback` in
+that session accounted for** (either fixed, or declined-with-disclosure in a skill — an
+unexplained fallback is what blocks the next stage). Measured on stage 1: `sw = 0` with two
+fallbacks that were both declined-and-disclosed (directory enumeration, cross-file text search),
+so `fallbacks = 0` is the wrong bar — it would block stage 2 forever on tool-scope boundaries
+that are deliberate.
 
 ## Measurement (per session)
 

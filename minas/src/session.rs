@@ -417,7 +417,14 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                     &outcome.text,
                     &range,
                 )?,
-                None => print!("{}", outcome.text),
+                None => {
+                    // ADR-0063 / self-host #10: 生テキスト経路も revision を stderr に出す。
+                    // stdout は `minas apply <new> --whole-stdin` にそのまま流せる形のまま
+                    // （skill は小さいファイルでは --lines より素の read を勧めているので、
+                    // そこだけ revision が無いと identity が途切れる）。
+                    print!("{}", outcome.text);
+                    eprintln!("read: revision {}", outcome.checksum);
+                }
             }
         }
         SessionCmd::Delete { path } => {
