@@ -695,6 +695,12 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 };
                 let mut rs = Vec::new();
                 collect_rs_files(crate_dir, &mut rs);
+                // 警告は「ディレクトリに .rs が 1 つも無い」場合だけ。以前は
+                // 「ルート以外に .rs が無い」で出していたため、**単一ファイル
+                // クレート**（新規ライブラリの普通の形）で
+                // 「no .rs files found」と言いながら直下でそのファイルを check
+                // していた（dogfooding #14: stderr と stdout が矛盾する）。
+                let dir_has_rs = !rs.is_empty();
                 rs.retain(|p| conn::absolutize(&p.to_string_lossy()) != root_abs);
                 rs.sort();
                 paths = vec![crate_root.clone()];
@@ -706,7 +712,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                     ts.sort();
                     paths.extend(ts);
                 }
-                if paths.len() <= 1 {
+                if !dir_has_rs {
                     eprintln!("check: no .rs files found under {}", crate_dir.display());
                 }
             }

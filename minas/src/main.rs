@@ -35,10 +35,27 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    restore_sigpipe_default();
     if let Err(e) = run().await {
         // エラーは「Error: <message>」で stderr に、終了コード 1（agent は $? で判定）
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// SIGPIPE を既定動作に戻す（ドッグフーディング #13）。
+///
+/// Rust は起動時に SIGPIPE を無視するため、読み手が先に死んだパイプへの
+/// `println!` は EPIPE になり **panic（exit 101 + panic banner）** する。
+/// `minas check … | head -1` のように応答がパイプバッファを超える普通の使い方で
+/// 起き、エージェントには「ツールの内部障害」に見える（`if minas … | head -1` を
+/// 使うスクリプトも壊れる）。既定動作に戻すと SIGPIPE で静かに終わる（exit 141 —
+/// Unix のフィルタの慣習どおりで、stderr に何も出さない）。
+fn restore_sigpipe_default() {
+    #[cfg(unix)]
+    // SAFETY: 起動直後に 1 回だけ、プロセス全体のシグナル設定を既定値に戻す。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

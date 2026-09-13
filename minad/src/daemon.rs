@@ -4562,17 +4562,23 @@ async fn process_command(
                 // 失敗は次のコマンドで遠くに出るので、登録時にその場で警告する
                 // （警告であって拒否ではない — 同じパスを別 commit で登録する
                 // compare-review の使い方は正当）。
-                let blocked = d
-                    .editor
-                    .open_paths()
-                    .filter(|p| p.starts_with(&canon))
-                    .count();
+                //
+                // シグナルは「開いている文書」だけでは足りない（#12 round 4: `apply`
+                // の Save 後に開集合から外れることがあり、live なバッファがあっても
+                // 警告が出なかった）。daemon が**最近触った**ファイル（診断キャッシュ・
+                // outline キャッシュ）も含める。
+                let mut watched: std::collections::HashSet<&Path> =
+                    d.editor.open_paths().map(|p| p.as_path()).collect();
+                watched.extend(d.diagnostics.keys().map(|p| p.as_path()));
+                watched.extend(d.outlines.keys().map(|p| p.as_path()));
+                let blocked = watched.iter().filter(|p| p.starts_with(&canon)).count();
                 d.register_base_root(canon, commit, canon_repo, source);
                 let status = (blocked > 0).then(|| {
                     format!(
-                        "warning: read-only-base — {blocked} open document(s) under this root \
-                         are now read-only (RegisterBaseRoot makes the whole subtree uneditable; \
-                         UnregisterBaseRoot the same root to edit again)"
+                        "warning: read-only-base — {blocked} file(s) this daemon has open or \
+                         recently checked are under this root and are now read-only \
+                         (RegisterBaseRoot makes the whole subtree uneditable; UnregisterBaseRoot \
+                         the same root to edit again)"
                     )
                 });
                 snapshot(&mut d, status)
