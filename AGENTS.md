@@ -20,4 +20,13 @@ Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agent
 
 ### Development
 
-When referencing or editing rust files, use the installed `minas` (headless session CLI) and `minad` (daemon) for operations. For usage instructions, refer to `minas skill`.
+Use the installed `minas` (with `minad` as its daemon) for the operations where it beats the
+shell, and the harness tools for plain reads and single-hunk edits:
+
+- **rename across files** — `minas rename <path> <old> <new>`, then `minas references` to verify
+- **semantics, not text** — `minas symbol` / `references` / `at` / `hover` / `outline` to find where a name lives and what it resolves to
+- **reads inside huge files** (thousands of lines) — `minas read <path> --lines a:b`
+- **diagnostics** — `minas check <path>...` before claiming a change is green (`cargo` stays the final gate)
+
+Contracts for every command, including the rejection and retry rules: `minas skill` (index) and
+`minas skill <topic>`.
