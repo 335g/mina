@@ -103,7 +103,11 @@ pub struct LspSession {
     diagnostic_identifier: Option<String>,
     /// `textDocument.languageId`（spawn 元ファイルの言語。ADR-0030）。
     /// セッション生成後に変わらない（root+言語キーの拡張は Stage 4）。
-    language_id: String,
+    /// 既定の `textDocument.languageId`（このセッションを spawn したファイルの言語）。
+    /// **文書ごとに上書きできる**（ADR-0069: 1 サーバ = 1 セッションにしたため、
+    /// tsserver のように複数 languageId を扱うサーバでは didOpen ごとに変わる）。
+    /// 静的な `String` ではなく `did_open*` の引数が正で、これは保険の既定値。
+    default_language_id: String,
 }
 
 /// initialize 応答の capabilities から導出したサーバ能力（ADR-0030 Stage 3）。
@@ -251,12 +255,24 @@ impl LspSession {
             current_uri: None,
             open_uris: std::collections::HashSet::new(),
             diagnostic_identifier,
-            language_id: language_id.to_string(),
+            default_language_id: language_id.to_string(),
         })
     }
 
     /// 文書を開いたことを通知する（別の文書が開いていたら閉じる）。
-    pub async fn did_open(&mut self, path: &Path, text: &str) {
+    ///
+    /// `language_id` は**この文書の** `textDocument.languageId`（ADR-0069）。
+    /// セッションは (root, server) 単位なので、同じサーバでも文書ごとに変わる
+    /// （`.ts` → `typescript` / `.tsx` → `typescriptreact` …）。`None` は spawn 時の
+    /// 既定値。
+    pub async fn did_open(&mut self, path: &Path, text: &str, language_id: Option<&str>) {
+        let language_id = language_id
+            .unwrap_or(self.default_language_id.as_str())
+            .to_string();
+        self.did_open_inner(path, text, language_id).await
+    }
+
+    async fn did_open_inner(&mut self, path: &Path, text: &str, language_id: String) {
         let doc_uri = uri(path);
         self.version += 1;
         if let Some(prev) = self.current_uri.take() {
@@ -276,7 +292,7 @@ impl LspSession {
             let params = json!({
                 "textDocument": {
                     "uri": doc_uri,
-                    "languageId": self.language_id,
+                    "languageId": language_id,
                     "version": self.version,
                     "text": text,
                 }
@@ -327,7 +343,14 @@ impl LspSession {
     /// 返さない（probe 実測）。rust-analyzer も開いているファイルの参照しか返さないため
     /// どちらの流儀にも適合する。`current_uri` は最後に開いた文書（復元・pull は
     /// 要求後にフォーカス文書を開き直して戻す）。
-    pub async fn did_open_keep(&mut self, path: &Path, text: &str) {
+    pub async fn did_open_keep(&mut self, path: &Path, text: &str, language_id: Option<&str>) {
+        let language_id = language_id
+            .unwrap_or(self.default_language_id.as_str())
+            .to_string();
+        self.did_open_keep_inner(path, text, language_id).await
+    }
+
+    async fn did_open_keep_inner(&mut self, path: &Path, text: &str, language_id: String) {
         let doc_uri = uri(path);
         if self.open_uris.contains(&doc_uri) {
             // 既に開いている文書は didChange で更新する（ADR-0068）。
@@ -337,7 +360,7 @@ impl LspSession {
             let params = json!({
                 "textDocument": {
                     "uri": doc_uri,
-                    "languageId": self.language_id,
+                    "languageId": language_id,
                     "version": self.version,
                     "text": text,
                 }
@@ -1278,7 +1301,8 @@ pub async fn pull_diagnostics_settled(
             // ロックを握ったまま対象を開き直す（この 2 行の間は他タスクが current を
             // 奪えない）。既に current なら何もしない。
             if s.current_uri() != Some(uri(path).as_str()) {
-                s.did_open(path, text).await;
+                // 同一 root・同一サーバの再 didOpen。言語は既知（None = 既定）で足りる。
+                s.did_open(path, text, None).await;
             }
             s.pull_diagnostics(path, text).await
         };
@@ -1812,7 +1836,12 @@ fn b_alnum(b: u8) -> bool {
 ///
 /// MEDIUM-4: ロック取得にもタイムアウトを付け、他タスクが hung サーバの
 /// notify でロックを握り続けていても Open コマンドをブロックしない。
-pub async fn open_document(session: &Mutex<LspSession>, path: &Path, text: &str) {
+pub async fn open_document(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    language_id: Option<&str>,
+) {
     // ADR-0056: セッションロック待ちと didOpen 送信を分ける（check の borrow が
     // 「背景 pull のロック待ち」か「didOpen の費用」かを見分けるため）。
     let mut trace = Trace::new("didOpen");
@@ -1820,17 +1849,22 @@ pub async fn open_document(session: &Mutex<LspSession>, path: &Path, text: &str)
         return; // サーバが忙しい: didOpen は次回の .rs Open で送られる
     };
     trace.mark("lock");
-    session.did_open(path, text).await;
+    session.did_open(path, text, language_id).await;
     trace.mark("send");
 }
 
 /// 文書を「閉じずに」開いたことを LSP に通知する（`open_document` の keep 版。
 /// [`LspSession::did_open_keep`] 参照）。
-pub async fn open_document_keep(session: &Mutex<LspSession>, path: &Path, text: &str) {
+pub async fn open_document_keep(
+    session: &Mutex<LspSession>,
+    path: &Path,
+    text: &str,
+    language_id: Option<&str>,
+) {
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
         return; // サーバが忙しい: 欠落は次の Open で補われる
     };
-    session.did_open_keep(path, text).await;
+    session.did_open_keep(path, text, language_id).await;
 }
 
 /// 編集後に全文同期する（現在の文書が LSP の監視対象のときだけ）。
@@ -1922,7 +1956,8 @@ pub async fn restore_focus_with_diagnostics(
     path: &Path,
     text: &str,
 ) -> Option<Vec<Diagnostic>> {
-    open_document(session, path, text).await;
+    // 既定言語（この経路は同一 root・同一サーバの再 didOpen なので None で足りる）。
+    open_document(session, path, text, None).await;
     let Ok(mut session) = timeout(LSP_LOCK_TIMEOUT, session.lock()).await else {
         return None;
     };
@@ -2286,7 +2321,7 @@ fn capabilities_of_parses_initialize_response() {
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
         let text = "fn frobnicate() {}\n";
-        session.lock().await.did_open(&path, text).await;
+        session.lock().await.did_open(&path, text, None).await;
         // 1行目 5文字目（fn の後ろ）→ 単語 frobnicate
         let h = hover_at_line_col(&session, &path, text, 1, 5).await.expect("hover が返る");
         assert!(h.contains("fn frobnicate() -> i32"), "型シグネチャ: {h}");
@@ -2309,7 +2344,7 @@ fn capabilities_of_parses_initialize_response() {
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
         let text = "fn run() {}\nstruct Thing;\nfn go() {}\n";
-        session.lock().await.did_open(&path, text).await;
+        session.lock().await.did_open(&path, text, None).await;
         let hit = workspace_symbols(&session, "run")
             .await
             .expect("検索が返る");
@@ -2333,7 +2368,7 @@ fn capabilities_of_parses_initialize_response() {
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
         let text = "fn ok() { TODO }\n";
-        session.lock().await.did_open(&path, text).await;
+        session.lock().await.did_open(&path, text, None).await;
         let (diags, settled) = pull_diagnostics_settled(&session, &path, text)
             .await
             .expect("診断が返る");
@@ -2356,7 +2391,7 @@ fn capabilities_of_parses_initialize_response() {
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
         let text = "fn ok() {}\n"; // TODO なし = 診断は空
-        session.lock().await.did_open(&path, text).await;
+        session.lock().await.did_open(&path, text, None).await;
         let t0 = std::time::Instant::now();
         let (diags, settled) = pull_diagnostics_settled(&session, &path, text)
             .await
@@ -2388,7 +2423,7 @@ fn capabilities_of_parses_initialize_response() {
                 .await
                 .expect("initialize"),
         ));
-        session.lock().await.did_open(&path, "あ😀TODO").await;
+        session.lock().await.did_open(&path, "あ😀TODO", None).await;
         let diags = session
             .lock()
             .await
@@ -2417,7 +2452,7 @@ fn capabilities_of_parses_initialize_response() {
         ));
         let guard = session.lock().await; // ロックを握りっぱなしにする
         let start = std::time::Instant::now();
-        open_document(&session, Path::new("/tmp/x.rs"), "fn main() {}").await;
+        open_document(&session, Path::new("/tmp/x.rs"), "fn main() {}", None).await;
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "ロック解放を無限に待たない（タイムアウトで諦める）: {:?}",
@@ -2555,7 +2590,7 @@ fn capabilities_of_parses_initialize_response() {
                 .await
                 .expect("initialize"),
         ));
-        session.lock().await.did_open(&path, text).await;
+        session.lock().await.did_open(&path, text, None).await;
         let hints = session
             .lock()
             .await
@@ -2585,7 +2620,7 @@ fn capabilities_of_parses_initialize_response() {
         let session = Arc::new(Mutex::new(
             LspSession::new(bin, Path::new("/tmp")).await.expect("initialize"),
         ));
-        session.lock().await.did_open(&path, text).await;
+        session.lock().await.did_open(&path, text, None).await;
         let hints = session
             .lock()
             .await

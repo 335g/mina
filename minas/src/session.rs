@@ -720,6 +720,17 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             if !recursive {
                 eprintln!("outline: revision {}", outcome.checksum);
             }
+            // ドッグフーディング #5（ts-frontend）: `--recursive` は Rust の
+            // `mod name;` だけを辿る。TS/JS では import を辿らないので、指定しても
+            // 出力が素の outline と同一になり「このファイルに横断構造は無い」と
+            // 誤読される。言語を問わず、辿れない言語では黙らずに言う。
+            if recursive && !outcome.changed_by_recursion {
+                eprintln!(
+                    "outline: --recursive follows Rust `mod` declarations only — \n\
+                     TS/JS imports are not followed (this output equals the plain outline; \n\
+                     use `minas symbol` / `minas references` for cross-file navigation)"
+                );
+            }
         }
         SessionCmd::At { path, pos } => {
             // 成功: 囲む記号（名前・種別・正確な範囲）を JSON で出力する —
@@ -1153,6 +1164,9 @@ struct OutlineOutcome {
     /// ルートファイルの内容 revision（fnv1a64。ADR-0063）。--recursive では
     /// ツリーが複数ファイルにまたがるので、これはルートファイルの分だけ。
     checksum: u64,
+    /// `--recursive` が実際に**別ファイルのシンボルを inline した**か
+    /// （Rust の `mod` のみ対応。TS/JS では false = 何もしなかったと告げる）。
+    changed_by_recursion: bool,
     symbols: Vec<OutlineSymbol>,
     error: Option<String>,
     /// ADR-0049: 再帰横断時にシンボル総数上限で打ち切られたか。
@@ -1378,6 +1392,12 @@ fn check_final_exit_code(any_error: bool, worst_failure: i32) -> i32 {
     if any_error { 2 } else { worst_failure }
 }
 
+/// ツリー内に「別ファイル由来のシンボル」（`path` 付き）がいるか = `--recursive` が
+/// 実際に何かを inline したか（ADR-0057 の `path` をそのまま使う）。
+fn symbols_have_child_paths(symbols: &[OutlineSymbol]) -> bool {
+    symbols.iter().any(|s| !s.path.is_empty() || symbols_have_child_paths(&s.children))
+}
+
 /// LSP が見ないコードのテキスト網（ドッグフーディング #16）。
 ///
 /// `rename` / `references` は言語サーバの解析結果なので、**アクティブな cargo
@@ -1541,6 +1561,7 @@ async fn execute_outline(path: &str, recursive: bool, depth: u32) -> io::Result<
             ..
         }) => Ok(OutlineOutcome {
             checksum,
+            changed_by_recursion: symbols_have_child_paths(&symbols),
             symbols,
             error,
             truncated,

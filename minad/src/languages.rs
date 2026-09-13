@@ -153,6 +153,13 @@ pub(crate) struct LanguageTable {
 
 /// `LanguageTable::server_for` の結果。borrow した参照の束。
 pub(crate) struct ServerSpec<'a> {
+    /// `languages.toml` の `[language-server.<id>]` の **id**（`rust-analyzer` /
+    /// `typescript-language-server` …）。**セッションの鍵はこの id と root**
+    /// （ADR-0069: 1 サーバ = 1 セッション。tsserver のように 1 プロセスが
+    /// 複数 languageId を扱うサーバを、言語ごとに分裂させないため）。
+    pub(crate) id: &'a str,
+    /// そのパスの `textDocument.languageId`（`rust` / `typescript` / `typescriptreact` …）。
+    /// セッションの鍵ではなく、**文書ごとに didOpen で送る**値。
     pub(crate) language_id: &'a str,
     pub(crate) command: &'a str,
     pub(crate) args: &'a [String],
@@ -226,6 +233,26 @@ impl LanguageTable {
     }
 
     /// パス（拡張子）から言語を引く。file-types の先勝ち。
+    /// サーバ id が扱う全 file-types（拡張子のみ。先頭の `.` は無し）。
+    ///
+    /// 事前 didOpen（`open_workspace_files`）の対象集合に使う（ADR-0069）:
+    /// tsserver の 1 セッションは `.ts` だけでなく `.tsx/.js/.jsx` も扱うので、
+    /// アンカーの拡張子だけで集めると消費者側のファイルが開かれない。
+    pub(crate) fn extensions_for_server(&self, server_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for lang in &self.languages {
+            if lang.language_server.as_deref() != Some(server_id) {
+                continue;
+            }
+            for ft in &lang.file_types {
+                if !out.contains(ft) {
+                    out.push(ft.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn language_for_path(&self, path: &Path) -> Option<&Language> {
         let ext = path.extension()?.to_str()?;
         self.languages
@@ -239,6 +266,7 @@ impl LanguageTable {
         let server_id = lang.language_server.as_deref()?;
         let server = self.servers.get(server_id)?;
         Some(ServerSpec {
+            id: server_id,
             language_id: &lang.name,
             command: &server.command,
             args: &server.args,
