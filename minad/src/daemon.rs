@@ -1876,8 +1876,13 @@ struct Borrowed {
 
 /// 借用お膳立ての失敗理由。
 enum BorrowFail {
-    /// 対象が開文書にもディスクにもない（メッセージは元入力をそのまま使う）。
-    CannotOpen,
+    /// 対象が開文書にもディスクにもない。**理由をそのまま運ぶ**
+    /// （`cannot open <path>: not a file, is a directory` / `not valid UTF-8
+    /// (binary file?)` / `file too large: <path>`）。潰して `cannot open <path>`
+    /// にすると、ディレクトリと存在しないファイルが同じ答えになり、次の行動を
+    /// 誤る（ドッグフーディング #2 と同じクラス。self-host #1 で `outline <dir>`
+    /// が踏んだ）。
+    CannotOpen(String),
     /// LSP 非対応パス（.rs 以外）。表示用に正規化後のパスを渡す。
     NoServer(String),
     /// spawn + initialize 失敗。
@@ -1902,12 +1907,14 @@ async fn prepare_borrowed_session(
             .doc_id_for_path(&path_buf)
             .map(|id| d.editor.document(id).text().to_string())
     };
-    let (text, _status) = match text {
+    let (text, status) = match text {
         Some(t) => (Some(t), None),
         None => read_open_target(&path_str).await,
     };
     let Some(text) = text else {
-        return Err(BorrowFail::CannotOpen);
+        return Err(BorrowFail::CannotOpen(
+            status.unwrap_or_else(|| format!("cannot open {path}")),
+        ));
     };
     trace.mark("text");
     // LSP 非対応パス（テーブルにサーバ割当なし）: サーバを spawn しない（ADR-0030）
@@ -2456,7 +2463,7 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err(msg),
         Err(BorrowFail::NoServer(p)) => {
             return err(format!("outline not supported for {p} (no LSP server configured)"))
         }
@@ -2531,7 +2538,7 @@ async fn serve_outline_recursive(
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err(msg),
         Err(BorrowFail::NoServer(p)) => {
             return err(format!("outline not supported for {p} (no LSP server configured)"))
         }
@@ -2983,7 +2990,7 @@ async fn serve_enclosing_symbol(
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err(msg),
         Err(BorrowFail::NoServer(p)) => {
             return err(format!(
                 "symbol range not supported for {p} (no LSP server configured)"
@@ -3075,7 +3082,7 @@ async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32)
         }
         Err(e) => {
                     match e {
-                BorrowFail::CannotOpen => return err(format!("cannot open {path}")),
+                BorrowFail::CannotOpen(msg) => return err(msg),
                 BorrowFail::NoServer(p) => {
                     return err(format!("hover not supported for {p} (no LSP server configured)"))
                 }
@@ -3140,7 +3147,7 @@ async fn serve_workspace_symbols(
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err(msg),
         Err(BorrowFail::NoServer(p)) => {
             return err(format!(
                 "symbol search not supported for {p} (no LSP server configured)"
@@ -3236,7 +3243,7 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
     };
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err(msg),
         Err(BorrowFail::NoServer(p)) => {
             return err(format!("check not supported for {p} (no LSP server configured)"))
         }
@@ -3435,7 +3442,7 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err_refs(path, format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err_refs(path, msg),
         Err(BorrowFail::NoServer(p)) => {
             return err_refs(
                 path,
@@ -3586,7 +3593,7 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     }
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
-        Err(BorrowFail::CannotOpen) => return err_input(format!("cannot open {path}")),
+        Err(BorrowFail::CannotOpen(msg)) => return err_input(msg),
         Err(BorrowFail::NoServer(p)) => {
             return err_input(format!(
                 "rename not supported for {p} (no LSP server configured)"
