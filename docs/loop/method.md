@@ -13,10 +13,15 @@
 > | `log.md` | 全反復の生データ＋考察（`l0.py --log` が追記） |
 > | `l0.py` | 計測器 L0（LLM なし・決定論的） |
 > | `probe_progress.py` / `probe_pull_diagnostics.py` | LSP 直叩きプローブ（§6） |
+> | `probe_startup.py` | `minas` 起動固定費の debug/release プローブ（§6、#13） |
 >
-> 設計判断は **`docs/adr/0051`（索引完走ゲート）/ `0052`（check の空の早期確定）**にあり、
-> `docs/adr/0045` にも追記してある。コードのコメントもこの番号を参照している
-> （判断がコードと離れないように追跡側に置く）。
+> 設計判断は `docs/adr/` にある: **`0045`（`settled` の意味）/ `0051`（索引完走ゲート）/
+> `0052`（check の空の早期確定）/ `0053`（編集後の settle を置かない + 追記）/ `0054`
+> （意味的リトライ待ち 0ms）/ `0055`（編集後 pull の背景化）/ `0056`（計時ログ `MINAD_TRACE`）/
+> `0061`（watched-files 通知 + 追記）/ `0071`（peer uid 検査を accept ループの外へ）/
+> `0072`（LSP へ送る直前に現在のテキストを取り直す）/ `0073`（watched-files 通知を Save
+> 応答の経路から外す）**。コードのコメントもこの番号を参照している（判断がコードと
+> 離れないように追跡側に置く）。
 >
 > 注意: `tmp/loop/`（スクラッチ・結果 JSON）は checkout ごとの gitignore 対象。
 > linked worktree で回すと fixture と JSON はそちらに作られる（この文書自体は worktree にも複製される）。
@@ -120,11 +125,13 @@ python3 tools/ab/ab.py run t11 A 1 && python3 tools/ab/ab.py run t11 B 1
 #   注意: この環境では `opencode` が PATH に無い（DB と auth.json は残っている）。
 
 # 回帰
-cargo test          # 全 486 テスト
+cargo test          # 全 487 テスト
 cargo build
 ```
 
-バイナリは `L0_MINAS` / `L0_MINAD` で差し替え可（既定は `target/debug/` → PATH の順）。
+バイナリは `L0_MINAS` / `L0_MINAD` で差し替え可（**env が最優先**。未指定なら
+`target/debug/` → PATH の順に解決する — `l0.py` の `resolve()`）。#13 はこれで
+`target/release/` を指す。
 **注意**: コードを触ったら `cargo build` を先に（計測対象は `target/debug/`）。
 結果 JSON は `tmp/loop/` に落ちる（`--json <path>` で指定可）。
 
@@ -198,9 +205,26 @@ env `MOCK_INIT_DELAY_MS` で `initialize` の応答を遅らせられる（`ensu
 再現）。Open の背景タスクが送るテキストの回帰テスト
 （`open_background_settle_sends_the_edited_text_not_the_snapshot`）はこれを使う。
 
-**クライアントの固定費を測る（iteration #9 の手法）**: `minas` 側に待ちがあると
-疑ったら、Python で同じプロトコルを直に喋って daemon の応答時間と比較する。
-`tmp/loop/probe-client/` の形（`fixture_rust` を生成 → `minad serve` を同じ
+**応答経路が待っていないことをテストする（#12 の手）**: mock に
+`MOCK_DIAG_DELAY_MS`（`textDocument/diagnostic` を n ms 遅らせる = セッションロックを
+保持させる）、`MOCK_DIAG_LOG`（pull の処理中を 1 行追記）、`MOCK_WATCH_LOG`
+（`workspace/didChangeWatchedFiles` を受けたら追記）を足してある。これで
+「背景 pull がロックを握っている最中に Save を撃ち、Save が待たずに返る／通知は遅れて
+届く」を決定的に検査できる（`save_does_not_wait_for_the_background_pull_before_notifying_watched_files`）。
+**待ち時間の絶対値ではなく「応答が返った後に届いたか」を見る**（test cfg の
+`LSP_LOCK_TIMEOUT` は 200ms なので、遅延は 200ms 未満にすること）。
+
+**クライアントの起動固定費を測る（iteration #13 の手法）**: `minas` の 1 呼び出しの
+固定費は `python3 docs/loop/probe_startup.py 9` で測る（`minas --help` = 起動 + clap +
+help 描画、`minas info` = 起動 + clap + 接続 + 1 往復。専用 TMPDIR の daemon を 1 個
+共有し、**debug と release を交互に**測って中央値と生値を出す）。同一バイナリを両方の
+枠に入れて先に**ノイズ床**を測ること（それより小さい差は判定に使わない）。
+`--help` > `info` になり得るので、**`--help` を「起動費」と読まない**（help 描画込み）。
+実体は `docs/loop/probe_startup.py`（`tmp/loop/` は掃除され得るので、無ければこの段落の形で作り直す）。
+
+**接続経路そのものを測る（iteration #9/#10 の手法）**: `minad` に Python で同じプロトコルを
+直に喋って daemon の応答時間と比較する。
+`tmp/loop/probe-client/probe10.py` の形（`minad serve` を同じ
 コマンド内で起動 → socket に `Hello` + コマンドを送って 1 行読む）で、
 「単一接続」「probe 接続（接続→即 close）を挟む」「同一接続で 3 往復」を測る。
 iteration #9 はこれで **daemon の応答は 0.27ms、`minas` の 1 呼び出しに ~68ms
@@ -225,19 +249,22 @@ iteration #10 で**除去した**（ADR-0071。`minas info` 76.6 → 9.1ms、pro
 - **fixture が小さい**: `cargo check` が 0.2〜0.5s で終わるので、`wall_ms` の結論は
   実プロジェクトに外挿しない（`calls` / `equiv_B` は契約の形で決まるので外挿可）。
   規模の確認は L2 の仕事。
-- **`minas apply` の残りの ~1 秒は RA の初回再解析**（diagnostics の pull が解析完了まで
-  ブロックする。iteration #4 のトレースで確定、#5 で下調べ済み）。他のコマンド
-  （`symbol` / `check`）が先に解析を起こしていれば `apply` は 100ms 台。
-  編集処理自体は ~150ms（旧記述の「診断 + hint の pull の固定待ち」は #5 で撤去済み — ADR-0053）。
-  #7 で「pull を外しても hint pull が同じ解析を買うので `apply` は変わらない。両方外すと
-  153ms だが `check` が 1122ms を払い、編集後追従のテスト 3 件が落ちる」まで確定した
-  （ADR-0053 追記）。この 1.1s をエージェントの待ち時間から外す道は「ブロックしない」
-  （pull の背景化）で、それが iteration #8 の課題。
-- **`apply` の wall は 700ms / 1100ms に割れる**: `Open` は背景 settle を
-  `tokio::spawn` する（Open 応答をブロックしない）ので、その解析と編集後 pull の解析が
-  同じ RA の中で競合する。どちらが先に解析を起こしたかで `apply` の wall が変わる
-  （同一バイナリで 807ms と 1241ms を観測 — #7）。**`apply` を含む比較は `-r 3` 必須、
-  同一セッションで交互に測る**。1 回の観測で「改善した」と結論しない。
+- **`minas apply` の ~1 秒は「編集後の RA 解析」で、それを誰が待つかが変わってきた**:
+  編集処理自体は 2ms・応答構築も 1ms（#9）。解析は背景 pull（#8 / ADR-0055）が買う。
+  #12 で **Save 応答の末尾の watched-files 通知（ADR-0061）がセッションロックを待って
+  いた**分が消え（Save 往復 965 → 1.8ms、apply step 1006–1123 → 53ms）、**残ったのは
+  「次に解析を必要とするコマンドが待つ」形**だけ（ギャップなしの `apply`+`check` の和は
+  不変 = 同じ 1 回の解析。ADR-0073）。他のコマンド（`symbol` / `check`）が先に解析を
+  起こしていれば `apply` はさらに速い。旧記述の「診断 + hint の固定待ち」は #5 で撤去
+  （ADR-0053）、「pull を外せば速くなる」は #7 で棄却（ADR-0053 追記）。
+- **`apply` の wall は「解析がどこまで進んでいたか」で割れる**（#12 後は 53ms 前後＋
+  背景解析。以前は 700ms / 1100ms に割れた）: `Open` は背景 settle を `tokio::spawn` する
+  （Open 応答をブロックしない）ので、その解析と編集後 pull の解析が同じ RA の中で競合する。
+  **`apply` を含む比較は `-r 3` 必須、同一セッションで交互に測る**（`L0_MINAD` /
+  `L0_MINAS` で修正前バイナリを指せる — #12 はこれで before→after→before を測った）。
+  1 回の観測で「改善した」と結論しない。**「apply が速くなった」と言うときは、
+  その待ちがどこへ移ったか（次のコマンドか、背景か）を必ず見る**（#12: ギャップなしの
+  `apply`+`check` の和は不変で、ギャップありだけが下がる）。
 - **1 アーム 1 回の観測**: `equiv_B` / `calls` は決定論的（同じ契約なら同じ値）、
   `wall_ms` は揺れる（`-r 3` で中央値）。
 - **`C_0`（システムプロンプト等の固定費）は測らない**: アーム間で同じなら比較に影響しない。
@@ -261,11 +288,14 @@ iteration #10 で**除去した**（ADR-0071。`minas info` 76.6 → 9.1ms、pro
   応答経路に残っている待ちは無い。
 - **`minas` の接続経路の固定費は #10 で除去済み**（ADR-0071。`minas info` 76.6 →
   9.1ms、`explore/lsp` 310 → 82ms）。残っているのは `minas` 起動の ~12ms × calls と、
-  `apply` の 3 往復。`wall_ms` を読むときは「実処理 + calls×12ms + 往復数×~10ms」と分ける。
+  `apply` の 3 往復（#12 後は apply の wall 53ms の主項）。`wall_ms` を読むときは
+  「実処理 + calls×12ms + 往復数×~10ms」と分ける。**ただしこの 12ms は `target/debug`
+  （L0 の計測対象）の値で、実エージェントが走らせる release では未測定** — §4 の #13。
 - **L0 の step・warmup は解決済みのビルド済みバイナリを実行する**（#10 で `l0.py` を
   修正。以前は `minas` が PATH 解決でインストール済みバイナリを実行していた）。
   **コードを触ったら `cargo build` を先に行う**（忘れると古いバイナリを測る）。`l0.py` は
-  `MINAS = target/debug → L0_MINAS` の順で解決し、デーモンは `target/debug/minad`。
+  `L0_MINAS` → `target/debug/minas` の順で解決し、デーモンは `L0_MINAD` →
+  `target/debug/minad`（**env が最優先**。#13 は `L0_MINAS=target/release/minas` を使う）。
 - **手動テストの daemon / rust-analyzer が残ると wall が汚染される**（実測で +60ms。
   `minas symbol` が 12ms のはずが 90ms になった）。測る前に
   `ps aux | grep -E "minad serve|rust-analyzer" | wc -l` が 0 であることを確認する。
@@ -278,9 +308,9 @@ iteration #10 で**除去した**（ADR-0071。`minas info` 76.6 → 9.1ms、pro
   `open_background_settle_sends_the_edited_text_not_the_snapshot`（mock の
   `MOCK_INIT_DELAY_MS` で initialize を遅らせて ensure を長くする）が見る。
 - **L0 の warmup は文書を didOpen しない**（プローブは `minas symbol`）。なので warm の
-  **最初の `apply` は RA の初回解析を払う** — その待ちは「Save 応答の末尾の
-  watched-files 通知（ADR-0061）が背景 pull のセッションロックを待つ」形で出る
-  （初回 ~1.0s / 2 回目 ~30ms。§4 の #12）。「warm なら apply は速い」と読まない。
+  **最初の `apply` は RA の初回解析を払う**。その待ちは #12 で「Save 応答」から
+  「次に解析を必要とするコマンド（`check` など）」へ移った（apply step 1006–1123 → 53ms、
+  `check` が ~900ms 待つ。ADR-0073）。**「apply が速い = 編集の検証も速い」と読まない**。
 - **L0 の `out_B` は fixture の絶対パス長で ±数バイト揺れる**（応答 JSON に path が入る）。
   `calls`/`equiv_B` は決定論的。`wall_ms` は `-r 3` の中央値で読む。
 

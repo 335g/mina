@@ -1913,3 +1913,182 @@ cold 全 flow（`--log` 済み）: **fails 0**（before は `verify-broken/check
 
 → `latest.md` §4（別候補から選ぶ: `minas` 起動 12ms × calls / `apply` の 3 往復 /
 `ServerMetrics` の穴（v20 bump）/ L2 での確認）。
+
+## 2026-09-14 21:44 — iteration #12: Save 応答の末尾の watched-files 通知（ADR-0061）を背景へ移せば、初回 apply の ~1.0s（背景 pull のセッションロック待ち）が消える（apply step が 1006-1123ms → 53ms）。calls/out_B/equiv_B 不変・fails 0・通知は遅れてでも届く（ADR-0073）。ギャップなしの apply+check の和は「同じ 1 回の解析を誰が待つか」なので不変（check がロックを待つ）— ギャップありは 1140 → 71ms
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1085        18       587      1672      79.5         0  True
+explore  dump                  2      4750       298      4510      9260      27.9         0  True
+hints    hints                 1       110         8         0       110     647.9         0  True
+rename   lsp                   2       309         3       309       618    1352.4         0  True
+rename   apply                 5       406         4      1018      1424     267.6         0  True
+verify   apply-check           2       275         2       108       383    1017.3         0  True
+verify   apply-cargo           2       108         1       108       216     182.6         0  True
+verify   hunks-cargo           2       169         1       169       338     191.5         0  True
+verify   apply2-cargo          3       218         2       327       545     215.9         0  True
+verify-blind check                 2       269         2       104       373     655.9         0  True
+verify-blind cargo                 2       104         1       104       208     191.1         0  True
+verify-broken check                 2       473         2       105       578     682.4         0  True
+verify-broken cargo                 2       105         1       105       210     126.8         0  True
+verify-gap apply-gap-check         3       291         2       232       523    3086.5         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3203.4         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4974, read_total=1, symbol_range_bytes=281, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5403, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=187, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-14 21:45 — iteration #12 (cold): 修正後。apply を含む arm の apply step は cold でも速い（apply-check の wall は索引完走ゲート支配）。cold の無言の誤り 0・fails 0（#11 の契約は維持）
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1085        18       587      1672    7196.5         0  True
+explore  dump                  2      4750       298      4510      9260      30.4         0  True
+hints    hints                 1       110         8         0       110    8137.8         0  True
+rename   lsp                   2       309         3       309       618    8879.2         0  True
+rename   apply                 5       406         4      1018      1424     412.0         0  True
+verify   apply-check           2       275         2       108       383    8671.6         0  True
+verify   apply-cargo           2       108         1       108       216     313.0         0  True
+verify   hunks-cargo           2       169         1       169       338     312.6         0  True
+verify   apply2-cargo          3       218         2       327       545     336.1         0  True
+verify-blind check                 2       269         2       104       373    6118.1         0  True
+verify-blind cargo                 2       104         1       104       208     331.6         0  True
+verify-broken check                 2       473         2       105       578    5754.1         0  True
+verify-broken cargo                 2       105         1       105       210     222.6         0  True
+verify-gap apply-gap-check         3       291         2       232       523    8607.3         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3203.2         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4974, read_total=1, symbol_range_bytes=281, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5403, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=186, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## iteration #12 — 修正: watched-files 通知を Save 応答の経路から外す（ADR-0073）
+
+> 生データは上の 2 ブロック（warm r=3 / cold r=1、修正後）。ここには A/B と考察を書く。
+
+### 課題（§4 の #12）
+
+`minas apply` の初回だけ ~1.0s（2 回目以降 ~30ms）。待ちは daemon の編集（`edit total 2ms`）
+でも解析そのものでもなく、**Save 応答の末尾にある watched-files 通知（ADR-0061）が
+背景 pull（ADR-0055）のセッションロックを待っていること**。ADR-0061 は 09-13 16:58 追加
+= #8 の後なので、#8 の「apply ~130ms」は「解析済みでロックが空いている」場合の値だった。
+
+### 測り方 1（プローブで再現・確定）
+
+`tmp/loop/probe_apply.py`（Python で同じプロトコルを直叩き、warmup 済み）:
+
+| 往復 | before（2 回観測） | after（3 回観測） |
+|---|---|---|
+| `Open` | 36–50ms | 37–45ms |
+| `DocumentEdit` | 3.4–4.3ms | 2.9–4.1ms |
+| `Save` | **907 / 966ms** | **1.5 / 1.8 / 1.9ms** |
+
+`MINAD_TRACE=1`（before）: `edit total 2` → 応答 `write` → 背景 `sync.bg`
+（`didChange 2` / `sync.lock 986` / `sync.pull diag 979` / `sync.bg total 990`）→
+**Save の応答 `write` が最後**。Save ハンドラの `notify_watched_files(...).await` が
+`session.lock()` を待っている（待ち時間 = 背景 pull の長さ = Save の wall）。
+after の trace には `sync.bg` が現れない（プローブが終了する方が背景 pull より速い）。
+
+### 測り方 2（A/B・同一セッションで交互）
+
+`L0_MINAD` / `L0_MINAS` で修正前バイナリを指して交互に測った（before→after→before）。
+L0 の apply step（`-r 3` 中央値）:
+
+| arm | step | before | after |
+|---|---|---|---|
+| `verify/apply-check` | `apply` | 1006 / 1010ms | **54ms** |
+| | `check` | 17ms | 919ms（背景 pull のロック待ち） |
+| | 和 | ~1029ms | ~1017ms（**不変**） |
+| `verify/apply-cargo` | `apply` | 1040ms | ~53ms |
+| `verify/hunks-cargo` | `apply` | 1009ms | ~53ms |
+| `verify/apply2-cargo` | `apply`#1 / #2 | 1010 / 30ms | 53 / 30ms |
+| `verify-gap/apply-gap-check` | `apply` | 1123ms | **53ms** |
+| | 和（apply + check） | **1140ms** | **71ms（−94%）** |
+| `verify-gap/apply-gap-cargo` | `apply` | 931–1056ms | 54ms |
+
+arm 全体（warm r=3・上のログ）: `apply-cargo` 1202 → 183ms、`hunks-cargo`
+1214 → 192ms、`apply2-cargo` 1192 → 216ms、`rename/apply`（apply ループ）1379 → 268ms。
+`calls` / `out_B` / `equiv_B` は全 flow で不変、fails 0。`explore`（編集しない flow）は
+79.5 / 27.9ms で不変。
+
+### 測り方 3（cold・契約）
+
+- cold 全 flow: **fails 0・無言の誤り 0**。wall は §3 の cold 表と ±10% 以内
+  （`apply-check` 8589 → 8672、`explore/lsp` 7743 → 7197、`rename/lsp` 8907 → 8879ms）。
+  cold の支配項は索引完走ゲートなので、この修正は cold では見えない。
+- cold `verify-broken/check`（#11 の契約）は `-r 5` で fails 0（rc=2 + Syntax Error のまま）。
+
+### 測り方 4（回帰テストと ADR-0061 の受け入れ）
+
+- `cargo test --workspace`: **487 passed**（486 + 追加 1）。
+- 追加: `save_does_not_wait_for_the_background_pull_before_notifying_watched_files`
+  （`minad/src/daemon.rs`）。mock サーバに `MOCK_WATCH_LOG`（通知を受けたら記録）/
+  `MOCK_DIAG_LOG`（pull の処理中を記録）/ `MOCK_DIAG_DELAY_MS` を足し、
+  **「背景 pull がロックを握っている最中に Save を撃つ」**ことを決定的にしたうえで
+  (1) Save が 100ms 未満で返る、(2) 通知は 50ms 以上遅れて届く（= 応答が通知を
+  待っていない）、の両方を見る。**修正を戻すと失敗する**ことを確認。
+- ADR-0061 の受け入れ試験を再実行（`tmp/loop/probe_watch_member.py`）: 稼働中の
+  daemon に `minas apply` で新メンバー `crates/c` を作り、6 秒後に
+  `minas symbol crates/a/src/lib.rs c_helper` が `crates/c/src/lib.rs` の `c_helper` を
+  返す（= 通知は遅れても届き、RA は読み直す）。
+
+### 考察
+
+- **原因の形は #8 と同じクラス**: ADR-0055 が「pull を背景へ」で消した待ちを、
+  ADR-0061 が**別の口（Save の末尾）から応答経路に戻していた**。ADR-0061 は #8 の
+  5 日後（09-13）に追加されたので、#8 の L0 はこの回帰を測っていなかった
+  （`apply2-cargo` の 1 回目 1061ms は §3 の表に載っていたが、「初回だけ」として
+  説明されていなかった）。**同じ経路の待ちは、後から足した処理でも復活しうる**。
+- **「誰が待つか」は指標の上で見えにくい**。`apply` を含む arm の wall は
+  `verify/apply-check` では変わらない（~1017ms）。変わったのは内訳で、
+  `apply` 54ms + `check` 919ms になった。エージェントにとっては「編集の応答が即返り、
+  次の一手（別ファイルの編集・思考）が解析と重なる」ので、**ギャップありの和
+  1140 → 71ms** が実効の改善になる。L0 は `sleep 3` のギャップ arm を持っていたので
+  これを直接測れた。
+- **ギャップなしの `apply` + `check` が不変なのは棄却理由にならない**（§4 の棄却条件 (c)
+  は「二重払いの再来」を指す）。#9 の計時で `check total 686 = borrow 682 + pull 2` と
+  確定済み = **解析は 1 回しか買われていない**。待ちの位置が変わっただけで、
+  `check` の待ちを消すには「背景 pull と check を同じ 1 回の要求に合流させる」設計変更が
+  要る（§4 の別候補に残す）。
+- **通知を落とさないことが本質**（ADR-0061 の穴は「黙って部分的な答え」）。`try_lock` で
+  即諦める案は棄却、背景タスク + 既存の `timeout(3s)` を維持した。ロックが取れない
+  ときは通知タスクが FIFO で次の LSP 要求より前に並ぶので、実用上の順序も保たれる。
+- **計測器の使い方が効いた**: ①プローブで往復ごとに割る → ②`MINAD_TRACE` で
+  「Save の応答が `sync.bg` の後」を確認 → ③`L0_MINAD` で A/B、の順で
+  「Save が背景 pull のロックを待っている」まで一度で確定できた（A/B の除去実験は不要）。
+
+### iteration #13 の課題設定
+
+→ `latest.md` §4（ギャップなし check の ~700ms（背景 pull と check の合流）/ `minas` 起動
+12ms × calls（先に release で測る）/ `apply` の 3 往復 / `ServerMetrics` の穴（v20 bump）/
+L2 での確認）。

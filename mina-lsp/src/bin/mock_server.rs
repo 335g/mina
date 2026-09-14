@@ -22,6 +22,20 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // MOCK_DIAG_DELAY_MS: pull 診断（= RA の解析に相当する処理）を遅らせる。
+    // 「背景 pull がセッションロックを保持している間、応答経路が待たされないか」
+    // を決定的に見るための回帰テスト用（ADR-0073）。
+    let diag_delay_ms: u64 = std::env::var("MOCK_DIAG_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // MOCK_WATCH_LOG: `workspace/didChangeWatchedFiles` を受けたらここに追記する
+    // （daemon が通知を送ったかをテストから観測する。ADR-0061 / ADR-0073）。
+    let watch_log = std::env::var("MOCK_WATCH_LOG").ok();
+    // MOCK_DIAG_LOG: `textDocument/diagnostic` の**処理中**（= セッションロックを
+    // 保持している間）であることを記録する。「背景 pull がロックを攜んでいる間に
+    // Save を撃った」ことを決定的にするためのテスト用の印（ADR-0073）。
+    let diag_log = std::env::var("MOCK_DIAG_LOG").ok();
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
@@ -89,6 +103,11 @@ fn main() {
                     write_frame(&mut stdout, &resp);
                 }
                 "textDocument/diagnostic" => {
+                    // pull の処理中（= daemon 側のセッションロック保持中）を記録する
+                    append_log(&diag_log, "diag");
+                    if diag_delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(diag_delay_ms));
+                    }
                     // pull 診断: 現在のテキストの TODO 位置を items で返す（無ければ空）
                     let diag = current
                         .as_ref()
@@ -297,8 +316,25 @@ fn main() {
                     "params": { "uri": uri, "diagnostics": todo_diagnostic(&text, utf16).into_iter().collect::<Vec<_>>() },
                 });
                 write_frame(&mut stdout, &notif);
+            } else if method == "workspace/didChangeWatchedFiles" {
+                // 届いた通知をファイルに記録する（送信側のテスト用。1 行 1 通知）。
+                append_log(&watch_log, &msg["params"].to_string());
             }
         }
+    }
+}
+
+/// テスト用: 受けた通知・要求の印をファイルに 1 行ずつ追記する
+/// （env 〆 MOCK_WATCH_LOG / MOCK_DIAG_LOG。未指定なら何もしない）。
+fn append_log(path: &Option<String>, line: &str) {
+    let Some(path) = path else { return };
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 

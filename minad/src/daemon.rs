@@ -2444,6 +2444,23 @@ async fn notify_watched_files(daemon: &Mutex<Daemon>, changes: &[(PathBuf, lsp::
     }
 }
 
+/// `notify_watched_files` を応答経路から外して背景で送る（iteration #12 / ADR-0073）。
+///
+/// 通知は冪等（RA はファイルを読み直すだけ）なので、**遅れて届くのは構わないが
+/// 失うのは困る**。同期実行だと、編集後の背景 pull（ADR-0055）がセッションロックを
+/// ~1s 保持している間 Save 応答が待たされる — `minas apply` の初回だけ ~1.0s
+/// かかっていた原因がこれ（2 回目以降は解析済みでロックが空くので ~10ms）。
+/// 応答に必要な情報はハンドラ側で既に作ってあるため、ここは待たなくてよい。
+fn notify_watched_files_in_background(
+    daemon: &Arc<Mutex<Daemon>>,
+    changes: Vec<(PathBuf, lsp::FileChange)>,
+) {
+    let daemon = daemon.clone();
+    tokio::spawn(async move {
+        notify_watched_files(&daemon, &changes).await;
+    });
+}
+
 /// 通知先の判定（純関数 — テスト可能）: manifest は**全セッション**（新しい
 /// メンバーはどの root 配下でもないため）、通常ファイルは root 配下だけ。
 fn watcher_wants(is_manifest: bool, path: &Path, session_root: &Path) -> bool {
@@ -4993,8 +5010,11 @@ async fn process_command(
                 let msg = snapshot(&mut d, Some(format!("deleted: {path_str}")));
                 drop(d);
                 // ADR-0061: 消えたファイルを LSP に通知する（モジュール削除で
-                // crate graph を再ロードさせる。lock 外で）。
-                notify_watched_files(daemon, &[(path_buf.clone(), lsp::FileChange::Deleted)]).await;
+                // crate graph を再ロードさせる。lock 外で）。ADR-0073: 応答は待たない。
+                notify_watched_files_in_background(
+                    daemon,
+                    vec![(path_buf.clone(), lsp::FileChange::Deleted)],
+                );
                 msg
             }
             Ok(Command::Save) => {                // #49: 基準配下への保存を拒否する。
@@ -5141,8 +5161,10 @@ async fn process_command(
                         // manifest なら cargo metadata を再実行する）。
                         drop(d);
                         if let Some(p) = &path {
-                            notify_watched_files(daemon, &[(p.clone(), lsp::FileChange::Changed)])
-                                .await;
+                            notify_watched_files_in_background(
+                                daemon,
+                                vec![(p.clone(), lsp::FileChange::Changed)],
+                            );
                         }
                         msg
                     }
@@ -10104,6 +10126,111 @@ root-markers = [".docsroot"]
         );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn save_does_not_wait_for_the_background_pull_before_notifying_watched_files() {
+        // 回帰（iteration #12 = `minas apply` の初回だけ ~1.0s）: Save 応答の末尾で
+        // watched-files 通知（ADR-0061）を同期実行していたため、直前の編集が起こした
+        // 背景 pull（ADR-0055）がセッションロックを保持している間、Save 応答が
+        // 待たされていた。通知は冪等（RA は読み直すだけ）なので応答は待たない（ADR-0073）。
+        // mock の pull を遅らせ、**mock が pull の処理中（= セッションロック保持中）に
+        // 入ってから** Save を撃つ。（1）Save は待たずに返り、（2）通知は遅れてでも届く。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let watch_log = dir.join(format!("minae-12notify-log-{}.txt", std::process::id()));
+        let diag_log = dir.join(format!("minae-12diag-log-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&watch_log);
+        let _ = std::fs::remove_file(&diag_log);
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        // 120ms: 通知側のロック待ちタイムアウト（test cfg の LSP_LOCK_TIMEOUT = 200ms）
+        // より短くして、通知が届く余地を残す。テストの目盛りとしては十分大きい。
+        unsafe { std::env::set_var("MOCK_DIAG_DELAY_MS", "120") };
+        unsafe { std::env::set_var("MOCK_WATCH_LOG", &watch_log) };
+        unsafe { std::env::set_var("MOCK_DIAG_LOG", &diag_log) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+                unsafe { std::env::remove_var("MOCK_DIAG_DELAY_MS") };
+                unsafe { std::env::remove_var("MOCK_WATCH_LOG") };
+                unsafe { std::env::remove_var("MOCK_DIAG_LOG") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let sock = dir.join(format!("minae-12notify-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-12notify-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "fn f() { TODO }\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // mock の didOpen は診断を push する。これが見えたらセッションは登録済み
+        // （= 編集の背景 pull が `session_for` でセッションを見つけられる）。
+        let _ = poll_snapshot(
+            &mut c,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        // 編集（背景 pull がセッションロックを掴んで mock の中で待つ）
+        let _ = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 0,
+                text: "aaaa".into(),
+                checksum: fnv1a64(b"fn f() { TODO }\n"),
+                expected_text: None,
+            },
+        )
+        .await;
+        // 背景 pull が mock の中（= セッションロック保持中）に入るまで待つ。待たずに
+        // 撃つと、この検査は何も見ていないことになる。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::read_to_string(&diag_log).is_err() {
+            assert!(std::time::Instant::now() < deadline, "背景 pull が来ない");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let t_save = std::time::Instant::now();
+        let snap = request(&mut c, &Command::Save).await;
+        let save_ms = t_save.elapsed().as_millis();
+        // 通知は（遅れてでも）届く — 契約は「送ること」（ADR-0061）
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut delivered = None;
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(&watch_log).is_ok_and(|s| s.contains(&name)) {
+                delivered = Some(std::time::Instant::now());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let delivered = delivered.expect("didChangeWatchedFiles が LSP に届く（ADR-0061）");
+        let waited_ms = delivered.duration_since(t_save).as_millis();
+        assert!(
+            waited_ms >= 50,
+            "Save 応答が通知を待っている（背景 pull がロックを離すまで届かないはず）: \
+             save={save_ms}ms 通知まで={waited_ms}ms status={:?}",
+            snap.status
+        );
+        assert!(
+            save_ms < 100,
+            "Save が背景 pull のロックを待っている（ADR-0073）: {save_ms}ms"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&watch_log);
+        let _ = std::fs::remove_file(&diag_log);
     }
 
     #[tokio::test]

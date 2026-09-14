@@ -39,7 +39,7 @@ OUT_DIR = REPO / "tmp" / "loop"
 
 
 def resolve(name: str, env_key: str) -> str:
-    """iter 中の self-build を測れるよう、先に target/debug、無ければ PATH。"""
+    """env（L0_MINAS / L0_MINAD）が最優先。無ければ target/debug、それも無ければ PATH。"""
     override = os.environ.get(env_key)
     if override:
         return override
