@@ -2342,7 +2342,7 @@ async fn apply(
     // `HUNK SKIPPED` と別の語で報告する）。exit は 0 のまま（冪等な編集）。
     let unchanged = snapshot.text == text;
     if unchanged {
-        eprintln!("NO-OP: the replacement left the buffer unchanged");
+        eprintln!("APPLY NO-OP: the replacement left the buffer unchanged");
     }
     match (&old_text, unchanged) {
         (_, true) => println!("no-change: {abs} (the replacement left the buffer unchanged)"),

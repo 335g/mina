@@ -6840,9 +6840,20 @@ pub(crate) fn snapshot_from_view(
         daemon.syntax_highlights(doc_id, &text, checksum, view.first_line, viewport_height);
     // ADR-0066: この文書のサーバが pull 診断を持たないなら、`diagnostics` が空でも
     // 「診断なし」ではない（何度読んでも残るマーカー）。
-    let diagnostics_unavailable = path
-        .as_ref()
-        .is_some_and(|p| daemon.push_only_paths.contains(p));
+    //
+    // ドッグフーディング #8（A1）: **言語 entry すら無いパス**（Python 等）も同じ
+    // 「問い合わせ先が無い」なので true にする。以前は push-only のときだけ true で、
+    // サーバが 1 つも無いパスでは `diagnostics: []` + `false` = 「見て、無かった」に
+    // 見えていた（コマンド側は同じ状況を exit 1 で拒否するようになっていたので、
+    // state 面だけが古い答えを返していた）。
+    let diagnostics_unavailable = match path.as_ref() {
+        None => false,
+        Some(p) => {
+            let push_only = daemon.push_only_paths.contains(p);
+            let server = daemon.languages_refresh().server_for(p).is_some();
+            push_only || !server
+        }
+    };
     StateSnapshot {
         diagnostics_unavailable,
         activity: daemon.activity_log.iter().cloned().collect(),
