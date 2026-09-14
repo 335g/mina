@@ -1999,7 +1999,7 @@ async fn resolve_symbol_lsp_pos(
     path: &Path,
     text: &str,
     old: &str,
-) -> Result<(u32, u32), String> {
+) -> Result<(usize, (u32, u32)), String> {
     open_workspace_files(daemon, session, path).await;
     // サーバ（tsserver 等）は要求対象のファイルが開いている必要がある —
     // open_workspace_files が last 開く文書で対象が閉じられると rename に null を
@@ -2017,7 +2017,7 @@ async fn resolve_symbol_lsp_pos(
         };
         s.char_to_lsp_pos(text, char_idx)
     };
-    Ok((line, character))
+    Ok((char_idx, (line, character)))
 }
 
 async fn serve_inlay_hints(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
@@ -3589,18 +3589,37 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
         }
     };
     // 識別子位置の解決（コメント・文字列内には解決しない — T3 の誤位置事故を予防）
-    let (line, character) =
+    let (char_idx, (line, character)) =
         match resolve_symbol_lsp_pos(daemon, &borrowed.session, &borrowed.path, &borrowed.text, old)
             .await
         {
             Ok(v) => v,
             Err(e) => return err(e).await,
         };
-    let locations = match lsp::references_at(&borrowed.session, &borrowed.path, line, character).await
-    {
-        Ok(v) => v,
-        Err(e) => return err(e).await,
-    };
+    // ドッグフーディング #2（TS 版）: アンカーが import alias の別名側なら、**同じ宣言行の
+    // 元の識別子も引いて和集合を返す**。サーバの答えはトークンで変わり（実測 tsserver:
+    // specifier = 8 locations / 3 files、alias = 2 locations / 1 file）、alias 側だけを
+    // 信じると別名で書かれた参照（別ファイルの消費者）を無言で落とす。Rust でも別名の使用は
+    // どの位置の答えにも現れないことがある（そちらはテキスト網の INCOMPLETE が拾う）。
+    let mut queries = vec![(line, character)];
+    if let Some(spec_idx) = lsp::alias_specifier_char_idx(&borrowed.text, char_idx) {
+        let pos = {
+            let Ok(s) = timeout(lsp::LSP_LOCK_TIMEOUT, borrowed.session.lock()).await else {
+                return err("LSP error: could not acquire the session lock — retry".into()).await;
+            };
+            s.char_to_lsp_pos(&borrowed.text, spec_idx)
+        };
+        if pos != (line, character) {
+            queries.push(pos);
+        }
+    }
+    let mut locations: Vec<(String, u32)> = Vec::new();
+    for (q_line, q_char) in queries {
+        match lsp::references_at(&borrowed.session, &borrowed.path, q_line, q_char).await {
+            Ok(v) => locations.extend(v),
+            Err(e) => return err(e).await,
+        }
+    }
     // ドッグフーディング #18: 空の参照リストは「本当に参照が無い」か「このファイルの
     // 意味層が死んでいる」のどちらでもあり得る。後者を 0 件として返すと、
     // エージェントは API 削除の根拠にする。位置は解決できているので、同じ位置への
@@ -3627,6 +3646,10 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
     // フォーカス文書を借りていたら復元（開き直し + 診断更新 — 自己修復）
     restore_focus_after_semantic(daemon, &borrowed.session, &borrowed.focused, &borrowed.path).await;
     let mut out = Vec::with_capacity(locations.len());
+    // 同じ path:line は 1 件にまとめる（alias と specifier の 2 クエリは同じ行の別トークンを
+    // 返すので、そのままだと同じ行が 2 行並び、読み手には重複か別物か判別できない —
+    // driver 観測。出力は path:line だけなので粒度も合わせる）。
+    let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     for (uri, line) in locations {
         let Ok(p) = path_from_uri(&uri) else {
             return err(format!(
@@ -3634,10 +3657,11 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
             ))
             .await;
         };
-        out.push(mina_protocol::ReferenceLocation {
-            path: p.to_string_lossy().into_owned(),
-            line,
-        });
+        let path = p.to_string_lossy().into_owned();
+        if !seen.insert((path.clone(), line)) {
+            continue;
+        }
+        out.push(mina_protocol::ReferenceLocation { path, line });
     }
     let n = out.len();
     ServerMessage::ReferencesResult {
@@ -3745,7 +3769,7 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
         };
     }
     // 識別子位置の解決（コメント・文字列内には解決しない）
-    let (line, character) =
+    let (_, (line, character)) =
         match resolve_symbol_lsp_pos(daemon, &borrowed.session, &borrowed.path, &borrowed.text, old)
             .await
         {

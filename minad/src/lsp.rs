@@ -1764,6 +1764,49 @@ fn char_byte_idx(text: &str, char_idx: usize) -> usize {
         .map_or(text.len(), |(b, _)| b)
 }
 
+/// `char_idx` の識別子が **import alias の別名側**（`… as <名前>`）なら、同じ宣言行の
+/// 元の識別子（specifier）の char インデックスを返す。alias でなければ `None`。
+///
+/// なぜ要るか（ドッグフーディング #2 の TS 版）: 言語サーバの `references` は
+/// **クエリしたトークンで答えが変わる**。実測（tsserver、同一行の同一宣言）:
+/// specifier 位置 → 8 locations / 3 files（全消費者）/ alias 位置 → 2 locations /
+/// 1 file（ローカル束縛のみ）。minas が alias 位置の答えだけを返していたため、
+/// **1 ファイル丸ごと（`src/admin/summary.ts`）を無言で落として exit 0** になった
+/// （`INCOMPLETE` も出ない — テキスト網は「問い合わせた名前」しか探せず、別名で
+/// 書かれた参照には盲目）。rust-analyzer でも別名の使用を返さない（Rust の #2）。
+///
+/// 「識別子の直前の語が `as`」という形は Rust / TS / Python で共通
+/// （`use x::y as z` / `import { y as z }` / `from x import y as z`）。
+/// `import * as ns` は元の識別子が無いので `None`（namespace 全体の別名は
+/// 単一シンボルの参照ではない）。
+pub fn alias_specifier_char_idx(text: &str, char_idx: usize) -> Option<usize> {
+    let byte = char_byte_idx(text, char_idx);
+    let before = text[..byte].trim_end();
+    if !before.ends_with("as") {
+        return None;
+    }
+    let as_start = before.len() - 2;
+    // `alias` のような語尾の `as` を除外する
+    if before[..as_start].chars().next_back().is_some_and(is_ident_char) {
+        return None;
+    }
+    let head = before[..as_start].trim_end();
+    let spec_end = head.len();
+    let spec_start = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_ident_char(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    if spec_start == spec_end {
+        return None; // `* as ns` / `as` の直前に識別子が無い
+    }
+    Some(head[..spec_start].chars().count())
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// `old` の最初の「識別子としての」出現位置（char インデックス）を返す。
 ///
 /// tree-sitter でリーフの識別子ノード（kind に "identifier" を含む）に限定して
@@ -2195,6 +2238,31 @@ fn capabilities_of_parses_initialize_response() {
             RenameEdit { start: 2, end: 2, text: "[]".into() },
         ];
         assert_eq!(apply_char_edits(text, &edits), "<>ab[]");
+    }
+
+    #[test]
+    fn alias_specifier_char_idx_finds_the_original_name() {
+        // ドッグフーディング #2（TS 版）: alias アンカーでは同じ宣言行の元の識別子も
+        // 引く必要がある（サーバの答えがトークンで変わる）。
+        // Rust: use crate::report::render_summary as render;
+        let rust = "use crate::report::render_summary as render;\n";
+        let alias_byte = rust.find("render;").expect("alias");
+        let spec = alias_specifier_char_idx(rust, rust[..alias_byte].chars().count()).expect("alias 検出");
+        assert_eq!(
+            rust.chars().skip(spec).take("render_summary".len()).collect::<String>(),
+            "render_summary"
+        );
+
+        // TS: import { splitSeg as partsOf, parseQuery } from "./router.js";
+        let ts = "import { splitSeg as partsOf, parseQuery } from \"./router.js\";\n";
+        let alias_byte = ts.find("partsOf").expect("alias");
+        let spec = alias_specifier_char_idx(ts, ts[..alias_byte].chars().count()).expect("alias 検出");
+        assert_eq!(ts.chars().skip(spec).take("splitSeg".len()).collect::<String>(), "splitSeg");
+
+        // 負例: alias でない / namespace 別名 / `as` の前が識別子の一部
+        assert!(alias_specifier_char_idx("let render = 1;", 4).is_none());
+        assert!(alias_specifier_char_idx("import * as ns from \"x\";", 11).is_none());
+        assert!(alias_specifier_char_idx("xxas c", 5).is_none());
     }
 
     #[test]
