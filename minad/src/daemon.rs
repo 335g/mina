@@ -4360,6 +4360,23 @@ async fn settle_open_diagnostics_loop(
     }
 }
 
+/// Open の背景タスクが LSP に送る文書テキストを、**送る直前**に取り直す。
+///
+/// 背景タスクは `ensure`（cold では索引完走まで数秒）を挟むため、spawn 時に掴んだ
+/// テキストは古くなりうる。古い全文を didChange で送るとサーバ側の文書が巻き戻り、
+/// 以後の pull は「編集前の（正しい）空」を返す。実測（iteration #11）: cold の
+/// `check` が 5.5 秒待って `clean-unverified`（診断空・exit 0）を返し、直後の
+/// `check` が構文エラー 2 件を返した — 原因は Open の背景タスクが編集前の全文
+/// （`fn main() {`）を送り直していたこと。文書が閉じられていたら spawn 時の
+/// テキストを使う（次の Open が正を運ぶ）。
+async fn current_text_or(daemon: &Mutex<Daemon>, path: &Path, fallback: &str) -> String {
+    let d = daemon.lock().await;
+    d.editor
+        .doc_id_for_path(path)
+        .map(|id| d.editor.document(id).text().to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// M1/ADR-0009: 編集後の LSP 全文同期 + pull を1経路に集約する（コマンド編集・
 /// DocumentEdit・外部リロード watch_disk の3箇所が同じ規律を個別に再現していた）。
 ///
@@ -4735,10 +4752,16 @@ async fn process_command(
                                     }
                                     let lang =
                                         language_id_for(&daemon_task, &path_task).await;
+                                    let text_now = current_text_or(
+                                        &daemon_task,
+                                        &path_task,
+                                        &text_task,
+                                    )
+                                    .await;
                                     lsp::open_document(
                                         &session,
                                         &path_task,
-                                        &text_task,
+                                        &text_now,
                                         lang.as_deref(),
                                     )
                                     .await;
@@ -4848,10 +4871,16 @@ async fn process_command(
                                     }
                                     let lang =
                                         language_id_for(&daemon_task, &path_task).await;
+                                    let text_now = current_text_or(
+                                        &daemon_task,
+                                        &path_task,
+                                        &text_task,
+                                    )
+                                    .await;
                                     lsp::open_document(
                                         &session,
                                         &path_task,
-                                        &text_task,
+                                        &text_now,
                                         lang.as_deref(),
                                     )
                                     .await;
@@ -10005,6 +10034,74 @@ root-markers = [".docsroot"]
         )
         .await;
         assert_eq!(snap.diagnostics[0].start, 13, "didChange 同期後の位置に追従");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn open_background_settle_sends_the_edited_text_not_the_snapshot() {
+        // 回帰（iteration #11 = L0 `--cold` の check が構文エラーを取りこぼした穴）:
+        // Open の背景タスクは `ensure` を挟んでから didOpen を送る。cold では
+        // ensure が数秒かかるため、spawn 時に掴んだテキストをそのまま送ると
+        // **その間の編集がサーバ側の文書を巻き戻し**、以後の pull が編集前の
+        // 診断（構文エラーなら「空」）を返す。送る直前に現在のテキストを取り直す。
+        // ここでは mock の initialize を遅らせて ensure を長くし、その間に編集を
+        // 入れて「サーバが最終的に持つテキスト」を診断位置で確かめる。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        unsafe { std::env::set_var("MOCK_INIT_DELAY_MS", "1500") };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+                unsafe { std::env::remove_var("MOCK_INIT_DELAY_MS") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-11slow-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-11slow-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&file, "TODO f()\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Interactive).await;
+        let path = file.to_string_lossy().into_owned();
+        // Open の LSP 側（spawn + initialize）は背景。initialize が 1.5 秒遅れる。
+        let _ = request(&mut c, &Command::Open { path: path.clone() }).await;
+        // ensure の完了前に編集する: TODO は byte 0 → 4 へ動く。
+        let snap = request_edit(
+            &mut c,
+            &DocumentEdit {
+                start: 0,
+                end: 0,
+                text: "aaaa".into(),
+                checksum: fnv1a64(b"TODO f()\n"),
+                expected_text: None,
+            },
+        )
+        .await;
+        assert_eq!(snap.text, "aaaaTODO f()\n");
+        // 背景タスクが遅れて didOpen する。修正前はここで編集前の全文が届き、
+        // サーバのテキストが巻き戻っていた（診断位置が 0 のままになる）。
+        let snap = poll_snapshot(
+            &mut c,
+            |s| !s.diagnostics.is_empty(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(
+            snap.diagnostics[0].start, 4,
+            "背景 settle は編集後のテキストを送る（編集前へ巻き戻さない）: {:?}",
+            snap.diagnostics
+        );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&file);
     }

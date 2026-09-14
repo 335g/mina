@@ -1720,3 +1720,196 @@ step で一度も測られていなかった**。`l0.py` の `run()` で `minas`
 2. 効果確認の結果、次の固定費の候補: `minas` 起動 12ms × calls（`explore/lsp` 82ms の
    うち ~36ms）、`apply` の 3 往復、`ServerMetrics` の穴（v20 bump と束ねる）、
    L2（実 LLM）での確認。
+
+## 2026-09-14 20:57 — iteration #11 仮説: cold の check が構文エラーを確定できないのは、Open の背景タスクが ensure（cold では数秒）を挟んで spawn 時のテキスト（編集前）を didOpen/didChange で送り直し、サーバ側の文書が巻き戻るため。送る直前に現在のテキストを取り直せば、cold でも pull が構文エラーを返す（rc=2・fails 0）はず。warm/探索 flow は不変のはず
+
+warm 測定（warmup あり・wall は中央値）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1085        18       587      1672      80.0         0  True
+explore  dump                  2      4750       298      4510      9260      28.0         0  True
+hints    hints                 1       110         8         0       110     684.5         0  True
+rename   lsp                   2       309         3       309       618    1397.5         0  True
+rename   apply                 5       406         4      1018      1424    1378.9         0  True
+verify   apply-check           2       275         2       108       383    1140.9         0  True
+verify   apply-cargo           2       108         1       108       216    1250.1         0  True
+verify   hunks-cargo           2       169         1       169       338    1264.0         0  True
+verify   apply2-cargo          3       218         2       327       545    1279.5         0  True
+verify-blind check                 2       269         2       104       373     726.8         0  True
+verify-blind cargo                 2       104         1       104       208     842.5         0  True
+verify-broken check                 2       473         2       105       578     746.9         0  True
+verify-broken cargo                 2       105         1       105       210     815.4         0  True
+verify-gap apply-gap-check         3       291         2       232       523    4042.4         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    4267.2         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4974, read_total=1, symbol_range_bytes=281, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5403, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=187, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+## 2026-09-14 20:58 — iteration #11 効果確認（cold 全 flow）: 修正後は cold の check が構文エラーを確定できる（verify-broken/check が fails 0・rc=2）。索引完走ゲートに依存する探索 flow（explore/lsp・hints・rename/lsp）の wall は悪化しないはず（±10% 以内）
+
+cold 測定（warmup なし・1 回観測）
+
+```
+flow     arm               calls     out_B out_lines  resend_B   equiv_B   wall_ms     fails    ok
+--------------------------------------------------------------------------------------------------
+explore  lsp                   3      1085        18       587      1672    7742.7         0  True
+explore  dump                  2      4750       298      4510      9260      30.5         0  True
+hints    hints                 1       110         8         0       110    8207.3         0  True
+rename   lsp                   2       309         3       309       618    8907.0         0  True
+rename   apply                 5       406         4      1018      1424     423.5         0  True
+verify   apply-check           2       275         2       108       383    8588.6         0  True
+verify   apply-cargo           2       108         1       108       216     320.2         0  True
+verify   hunks-cargo           2       169         1       169       338     325.1         0  True
+verify   apply2-cargo          3       218         2       327       545     340.4         0  True
+verify-blind check                 2       269         2       104       373    6185.7         0  True
+verify-blind cargo                 2       104         1       104       208     342.8         0  True
+verify-broken check                 2       473         2       105       578    6111.3         0  True
+verify-broken cargo                 2       105         1       105       210     259.2         0  True
+verify-gap apply-gap-check         3       291         2       232       523    8627.4         0  True
+verify-gap apply-gap-cargo         3       116         1       232       348    3200.1         0  True
+```
+
+- `explore/lsp` daemon 計測: read_bytes=4974, read_total=1, symbol_range_bytes=281, symbol_range_total=1, symbol_search_bytes=200, symbol_search_total=1
+- `explore/dump` daemon 計測: read_bytes=5403, read_total=2
+- `rename/apply` daemon 計測: edits_expected_text_used=4, edits_total=4, save_total=4
+- `verify/apply-check` daemon 計測: check_bytes=178, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/apply-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify/hunks-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=1
+- `verify/apply2-cargo` daemon 計測: edits_expected_text_used=2, edits_total=2, save_total=2
+- `verify-blind/check` daemon 計測: check_bytes=176, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-blind/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/check` daemon 計測: check_bytes=385, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-broken/cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-check` daemon 計測: check_bytes=186, check_total=1, edits_expected_text_used=1, edits_total=1, save_total=1
+- `verify-gap/apply-gap-cargo` daemon 計測: edits_expected_text_used=1, edits_total=1, save_total=1
+
+
+---
+
+## iteration #11 考察（2026-09-14）— cold の `check` が構文エラーを取りこぼす原因は「背景タスクが編集前の全文を送り直す」こと（ADR-0072）
+
+**仮説の検証結果**: **採用（修正の場所は §4 の仮説とは別）**。§4 の (a)「索引完走ゲートの
+判定をファイル単位の解析完了観測へ変える」と (b)「cold で空の早期確定を無効化する」は
+**棄却** — どちらも「空を確定と見なすまでの待ち方」の話で、実測は
+**サーバが編集前のテキストを持っていた**ことを示した。修正は (c) の変種
+「LSP へ送る直前に現在のテキストを取り直す」（ADR-0072）。
+
+### 測り方 1（プローブで事実確認 — cold の pull は索引完走後に非空になる）
+
+`tmp/loop/probe_cold_pull.py`（RA を起動直後に didOpen + 構文エラーを入れ、pull を
+50ms 間隔で回す）:
+
+| 時刻 | 観測 |
+|---|---|
+| ~6ms〜4.4s | pull は `{"items":[]}`（`resultId:"rust-analyzer"`）または `None`（索引中は応答が数秒ブロックする） |
+| 4.7s | `Roots Scanned` end → `cachePriming`(Indexing) begin/end |
+| **4.8s** | pull が初めて **Syntax Error 2 件**を返す |
+| 同時刻 | `workspace/diagnostic/refresh`（冪等な再 pull 要求）、`publishDiagnostics` |
+
+→ **cold の空は「索引中の正しい空」**で、索引完走直後に非空へ変わる。つまり
+`check` の空確定が早すぎるのではなく、**確定の時点でサーバが古い文書を見ていた**
+（＝待ちの問題ではない）。`docs/loop/probe_cold_pull.py` は `tmp/loop/` のスクラッチ
+（gitignore）。
+
+### 測り方 2（ゲートと pull の内訳 — `MINAD_TRACE=1`。足りずに一時 DBG を追加）
+
+cold の `minas apply` → `check`（`MINAD_TRACE=1`、`tmp/loop/coldcheck.py`）:
+
+```
+borrow ensure 53        ← 完走ゲートは既に ready（Open の背景タスクが先に待っていた）
+check.pull round0 0     ← 空
+check.pull round1 6041  ← wait_ready 5345（静止 300ms で ready）+ pull（空）
+check.pull round2 4     ← 空 → 空 2 連続で早期確定
+check settled=false / diags=0 / total 6098
+（直後の 2 回目の check: 17ms で rc=2 + Syntax Error 2 件）
+```
+
+trace だけでは「どの pull が何を返したか」が見えないので、**一時的な DBG 計測**を
+`lsp.rs` / `mina-lsp` に足して（実装後に撤去済み。`git diff` は clean）送受信を並べた:
+
+```
+5173 ->RA didChange main.rs v=3 len=240   ← 編集前の全文（他はすべて len=239）
+5173 pull go → 5852 空（678ms）
+5854 pull go → 5856 空（2ms）              → 空 2 連続で早期確定
+5872 (2 回目の check) didChange v=5 len=239 → pull 1.2ms で 2 件
+```
+
+**決定打**: 空を返した pull の直前に **`len=240`（= 編集前の `fn main() {`）の
+didChange が届いていた**。送り主は `Command::Open` の背景タスク（`daemon.rs`）で、
+spawn 時に `text` を clone し、`ensure`（cold では索引完走待ちで数秒）の**後**に
+`lsp::open_document(&session, &path, &text_task, …)` を呼んでいた。didOpen 済みの
+文書では `did_open_inner` が `did_change`（全文同期）に落ちるので、その数秒の間に
+入った編集がサーバ側で巻き戻る。
+
+### 測り方 3（修正と効果確認）
+
+修正: `current_text_or(daemon, path, fallback)` を足し、Open の背景タスク 2 箇所は
+`ensure` の後に現在のテキストを取り直してから `open_document` へ渡す。
+
+| | before | after |
+|---|---|---|
+| `--cold -f verify-broken -a check`（本セッションの再現） | **6/6 が `clean-unverified`**（rc=0・~5.4s） | `-r 10` で **10/10 が rc=2 + Syntax Error**（fails 0） |
+| 追加観測 | （#10 で 4/4） | `tmp/loop/coldcheck.py` 1 + `--cold` 全 flow 1 + `-r 5` 5 = 計 17/17 |
+| cold `verify-broken/check` の wall | ~5.4s | ~5.8–6.2s（索引完走が支配。`out_B` 471→473 は fixture パス長の差） |
+| cold 探索 flow（ゲート依存） | explore/lsp 7397・hints 7879・rename/lsp 9203ms | 7743（+4.7%）・8207（+4.2%）・8907ms（−3.2%）= ±10% 以内 |
+| warm 全 flow | §3 の表 | `calls`/`out_B`/`equiv_B` 同一・fails 0 |
+
+cold 全 flow（`--log` 済み）: **fails 0**（before は `verify-broken/check` が fails 1）。
+
+### 測り方 4（契約と回帰テスト）
+
+- `cargo test`: **486 passed**（485 + 追加 1）。`verify-blind/check` の `settled:false`
+  維持、`verify-broken/cargo` の rc=101 維持、cold の無言の誤り 0。
+- **回帰テストを追加**: `open_background_settle_sends_the_edited_text_not_the_snapshot`
+  （`minad/src/daemon.rs`）。mock サーバに `MOCK_INIT_DELAY_MS`（env）を足し、
+  `initialize` を 1.5 秒遅らせて `ensure` を長くする。その間に編集を入れ、
+  「サーバが最終的に持つテキスト」を診断位置で確かめる。
+  **修正を戻して実行すると失敗する**ことを確認（診断位置 **0** = 編集前 vs 期待 **4**）。
+
+### 考察
+
+- **「空 + 未確認」の判定（ADR-0045/0052）は正しかった**。誤りの実体は
+  「サーバの文書が巻き戻っていた」ことで、`check` は巻き戻った文書に対して正しく
+  空を返していた。ADR-0052 の実測（pull は 1 回で最終集合）も
+  「**別の全文が入ってくる**」ケースは覆わない — 空を確定にしてよいのは
+  「送ったテキストが最新である」ことが前提。
+- **原因の形は ADR-0068 と同じクラス**（古い全文を送るとサーバの文書が巻き戻る）。
+  ADR-0068 は「didOpen の再送」を直したが、今回は「背景タスクが掴んだスナップショットを
+  await（ensure）をまたいで送る」経路が残っていた。**待つ処理をまたいで全文を持つと
+  必ず古くなる** — 同じ規律を `settle_open_diagnostics_loop`（毎ラウンド読み直す）が
+  既に守っていたのに、その 1 つ手前の didOpen 送信が守っていなかった。
+- **cold でだけ出る理由**: ensure が数秒（索引完走待ち）で窓が広い。warm では窓が
+  sub-ms なので症状が出ない（数反復測っても見えない）。「cold でしか出ない失敗は契約の
+  欠陥」という method.md §5 の規則どおりだった。
+- **測る順序が効いた**: §4 の順序（1. プローブで「索引完走後に非空」を確認 →
+  2. trace で内訳 → 3. A/B）で、「待ちが足りない」という見かけの説明を先に潰せた。
+  プローブで「索引完走直後に non-empty」を見ていなければ、settle 予算や早期確定の
+  条件を弄る（効果の無い）修正に流れていた。
+
+### 残る同類の窓（次以降の候補）
+
+- 編集経路（`sync_after_edit` → `lsp::sync`）も spawn 時のテキストを送る。窓は
+  `ensure` を挟まない sub-ms で、tokio Mutex の FIFO が順序を保つ（実測で症状なし）。
+  同じ手（送る直前に取り直す）が使えるが、観測されるまで触らない。
+- `pull_after_edit` は同じ `text` を診断の座標変換にも使うので、厳密には
+  「送ったテキスト」と「変換に使うテキスト」を 1 つに揃えるのが次の形。
+
+### iteration #12 の課題設定
+
+→ `latest.md` §4（別候補から選ぶ: `minas` 起動 12ms × calls / `apply` の 3 往復 /
+`ServerMetrics` の穴（v20 bump）/ L2 での確認）。

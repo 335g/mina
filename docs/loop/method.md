@@ -117,9 +117,10 @@ python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
 
 # 実LLM A/B（L0 で差が出た仮説だけ）
 python3 tools/ab/ab.py run t11 A 1 && python3 tools/ab/ab.py run t11 B 1
+#   注意: この環境では `opencode` が PATH に無い（DB と auth.json は残っている）。
 
 # 回帰
-cargo test          # 全 485 テスト
+cargo test          # 全 486 テスト
 cargo build
 ```
 
@@ -183,6 +184,19 @@ L0 は「minas の契約」を測るが、「その背後で LSP が何を返し
 python3 docs/loop/probe_pull_diagnostics.py tmp/loop/probe 3 0.2
 python3 docs/loop/probe_progress.py tmp/loop/probe 8 progress
 ```
+
+**cold（セッション開始直後）の pull を見る（iteration #11 の使い捨て）**:
+`probe_pull_diagnostics.py` は索引完走を待ってから編集する（warm）。cold を見るには
+「didOpen 直後に編集して pull を 50ms 間隔で回し、各 round の items 数と `$/progress` の
+outstanding を時刻で並べる」小プローブを書く（#11 の `tmp/loop/probe_cold_pull.py`、
+`probe_cold_emulate.py`、`probe_seq.py`、`probe_apply.py`。いずれも `tmp/loop/` の
+スクラッチで git 管理外）。「daemon のアルゴリズムを Python で真似て再現する」のが
+早い切り分け（#11 はこれで「daemon の判定は正しいが入力が違う」と分かった）。
+
+**文書テキストの順序をテストする**: mock LSP サーバ（`mina-lsp/src/bin/mock_server.rs`）は
+env `MOCK_INIT_DELAY_MS` で `initialize` の応答を遅らせられる（`ensure` が長い cold を
+再現）。Open の背景タスクが送るテキストの回帰テスト
+（`open_background_settle_sends_the_edited_text_not_the_snapshot`）はこれを使う。
 
 **クライアントの固定費を測る（iteration #9 の手法）**: `minas` 側に待ちがあると
 疑ったら、Python で同じプロトコルを直に喋って daemon の応答時間と比較する。
@@ -255,6 +269,20 @@ iteration #10 で**除去した**（ADR-0071。`minas info` 76.6 → 9.1ms、pro
 - **手動テストの daemon / rust-analyzer が残ると wall が汚染される**（実測で +60ms。
   `minas symbol` が 12ms のはずが 90ms になった）。測る前に
   `ps aux | grep -E "minad serve|rust-analyzer" | wc -l` が 0 であることを確認する。
+- **待つ処理をまたいで文書テキストのスナップショットを保持しない**（iteration #11 / ADR-0072）。
+  Open の背景タスクは `ensure`（cold では索引完走まで数秒）を挟むため、spawn 時に掴んだ
+  テキストを `didOpen`/`didChange` で送ると**サーバ側の文書が巻き戻り**、以後の pull が
+  編集前の診断（構文エラーなら「空」）を返す。cold の `check` が `clean-unverified` に
+  なっていた原因。**送る直前に現在のテキストを取り直す**（`current_text_or`）。
+  回帰は `--cold -f verify-broken -r 5` と `cargo test` の
+  `open_background_settle_sends_the_edited_text_not_the_snapshot`（mock の
+  `MOCK_INIT_DELAY_MS` で initialize を遅らせて ensure を長くする）が見る。
+- **L0 の warmup は文書を didOpen しない**（プローブは `minas symbol`）。なので warm の
+  **最初の `apply` は RA の初回解析を払う** — その待ちは「Save 応答の末尾の
+  watched-files 通知（ADR-0061）が背景 pull のセッションロックを待つ」形で出る
+  （初回 ~1.0s / 2 回目 ~30ms。§4 の #12）。「warm なら apply は速い」と読まない。
+- **L0 の `out_B` は fixture の絶対パス長で ±数バイト揺れる**（応答 JSON に path が入る）。
+  `calls`/`equiv_B` は決定論的。`wall_ms` は `-r 3` の中央値で読む。
 
 ## 8. 結果の書き先（どこに何を書くか）
 

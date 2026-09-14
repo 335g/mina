@@ -15,6 +15,13 @@ fn main() {
     // --bare: 機能を何も advertise しない「未検証サーバ」を模擬する
     // （Stage 3: 能力ゲートの負の経路をテストするため。--cjk 同様 spawn 引数）。
     let bare = std::env::args().any(|a| a == "--bare");
+    // MOCK_INIT_DELAY_MS: initialize の応答を遅らせ、`ensure` が長くかかる cold の
+    // 状況を再現する（spawn 引数は languages.toml 由来でテストから足せないため env）。
+    // 用途: Open の背景タスクが ensure を挟んで編集前のテキストを送る競合の回帰テスト。
+    let init_delay_ms: u64 = std::env::var("MOCK_INIT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
@@ -43,6 +50,9 @@ fn main() {
         if let Some(id) = msg.get("id").and_then(Value::as_u64) {
             match msg.get("method").and_then(Value::as_str).unwrap_or("") {
                 "initialize" => {
+                    if init_delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(init_delay_ms));
+                    }
                     let enc = if utf16 { "utf-16" } else { "utf-8" };
                     // 全機能を advertise（rename / references / definition は実装済み）。
                     // --bare なら positionEncoding と textDocumentSync のみ。
