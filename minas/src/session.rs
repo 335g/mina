@@ -229,12 +229,14 @@ pub enum SessionCmd {
         #[arg(long)]
         brief: bool,
     },
-    /// Fetch inlay hints for any path without full text (ADR-0020)
+    /// Fetch inlay hints for any path without full text (ADR-0020).
+    /// Requires a language server: a path whose language has none is refused (exit 1).
     Hints {
         /// Path
         path: PathBuf,
     },
-    /// Peek the definition at `<line>:<col>` (1-origin) without fetching full text (ADR-0025)
+    /// Peek the definition at `<line>:<col>` (1-origin) without fetching full text (ADR-0025).
+    /// Requires a language server: a path whose language has none is refused (exit 1).
     Peek {
         /// Path
         path: PathBuf,
@@ -268,6 +270,7 @@ pub enum SessionCmd {
     /// ranges double as the addresses for later reads and edits. With
     /// `--recursive`, file-scoped modules are followed to their definition files
     /// and nested into the tree (ADR-0049).
+    /// Requires a language server: a path whose language has none is refused (exit 1).
     Outline {
         /// Path
         path: PathBuf,
@@ -287,6 +290,7 @@ pub enum SessionCmd {
     /// Report the symbol enclosing `<line>:<col>` (1-origin) with its exact
     /// range and name-token range (ADR-0031). Reads no full text — use the
     /// returned ranges with `--lines` / `apply`.
+    /// Requires a language server: a path whose language has none is refused (exit 1).
     At {
         /// Path
         path: PathBuf,
@@ -295,6 +299,7 @@ pub enum SessionCmd {
     },
     /// Fetch the hover info (type/signature/doc) at `<line>:<col>` without full
     /// text (ADR-0032). Empty text = no hover at that position.
+    /// Requires a language server: a path whose language has none is refused (exit 1).
     Hover {
         /// Path
         path: PathBuf,
@@ -2303,6 +2308,9 @@ async fn apply(
         checksum: snapshot.checksum,
         expected_text: expected,
     };
+    if let Some(note) = boundary_note(&text, &old_text.clone().unwrap_or_default(), "") {
+        eprintln!("{note}");
+    }
     let snapshot = conn::request(&mut write_half, &mut reader, &edit).await?;
     if let Some(status) = &snapshot.status {
         // 拒否（checksum/expected_text 不一致）: 再試行可能な失敗として exit 2
@@ -2360,6 +2368,47 @@ fn rollback_created(path: &str, created: bool) {
     if std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// `old` の一致位置が**より大きな識別子の内側**なら、その識別子全体を返す。
+///
+/// ドッグフーディング #10: `minas search -w` で作ったチェックリストは `apply` の
+/// 部分一致と一致しない。実測（Python、`Note` → `Record` を 16 hunks）: `-w` は
+/// `NoteTest` の内側を除外して 16 件と数えたが、`apply` は部分一致なので
+/// `NoteTest` の `Note` を 1 件先に消費し、**意図した 16 件のうち 1 件が残った**
+/// （`edits:16, edits_noop:0` は「16 hunks 適用した」であって「意図した集合を
+/// 覆った」ではない）。境界を越えた一致は注記して、検算漏れを作らない。
+fn enclosing_identifier(text: &str, start_byte: usize, end_byte: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let before = start_byte > 0 && is_ident_byte(bytes[start_byte - 1]);
+    let after = end_byte < bytes.len() && is_ident_byte(bytes[end_byte]);
+    if !before && !after {
+        return None;
+    }
+    let mut lo = start_byte;
+    while lo > 0 && is_ident_byte(bytes[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = end_byte;
+    while hi < bytes.len() && is_ident_byte(bytes[hi]) {
+        hi += 1;
+    }
+    Some(text[lo..hi].to_string())
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// 境界を越えた一致の注記（[`enclosing_identifier`] があれば 1 行返す）。
+fn boundary_note(text: &str, old: &str, where_: &str) -> Option<String> {
+    let byte = text.find(old)?;
+    let ident = enclosing_identifier(text, byte, byte + old.len())?;
+    Some(format!(
+        "note: `{old}` matched INSIDE the identifier `{ident}`{where_} — `apply` matches plain \
+         substrings, so a `minas search -w` list does not describe what it consumes. \
+         Use a longer <old>, or verify with `minas search -w <file> <old>` afterwards"
+    ))
 }
 
 /// `text` 中の `old` の最初の出現位置を char インデックスで返す（[`DocumentEdit`]
@@ -2718,6 +2767,9 @@ async fn apply_hunks(path: &PathBuf, hunks: &[Hunk]) -> io::Result<()> {
             rollback_created(&abs, created); // Save 前なのでディスクは作成前の状態に戻す
             std::process::exit(2);
         };
+        if let Some(note) = boundary_note(&text, &hunk.old, &format!(" (hunk #{})", i + 1)) {
+            eprintln!("{note}");
+        }
         let edit = DocumentEdit {
             start,
             end,

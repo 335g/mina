@@ -162,12 +162,23 @@ pub async fn request_hints(
             generation,
             hints,
         }) => Ok((path, generation, hints)),
-        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
-            Err(std::io::Error::new(
+        // daemon が「サーバ未設定」を一般の status 経路で拒否した場合（ドッグフーディング #8:
+        // hints/peek も他コマンドと同じゲートを通る）。status をそのまま呼び出し側の理由に
+        // する — "unexpected snapshot response" では実態（LSP が無い）が伝わらない。
+        Ok(ServerMessage::Response { snapshot }) => match snapshot.status {
+            Some(status) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                status,
+            )),
+            None => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected snapshot response",
-            ))
-        }
+            )),
+        },
+        Ok(ServerMessage::Push { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected snapshot response",
+        )),
         // #23 と同様: Peek 応答はここでは期待しない
         Ok(ServerMessage::Peek { .. }) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -225,12 +236,23 @@ pub async fn request_peek(
         Ok(ServerMessage::Peek { path, line, text }) => {
             Ok(mina_protocol::Peek { path, line, text })
         }
-        Ok(ServerMessage::Response { .. }) | Ok(ServerMessage::Push { .. }) => {
-            Err(std::io::Error::new(
+        // daemon が「サーバ未設定」を一般の status 経路で拒否した場合（ドッグフーディング #8:
+        // hints/peek も他コマンドと同じゲートを通る）。status をそのまま呼び出し側の理由に
+        // する — "unexpected snapshot response" では実態（LSP が無い）が伝わらない。
+        Ok(ServerMessage::Response { snapshot }) => match snapshot.status {
+            Some(status) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                status,
+            )),
+            None => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unexpected snapshot response",
-            ))
-        }
+            )),
+        },
+        Ok(ServerMessage::Push { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected snapshot response",
+        )),
         // この経路は Peek 専用: hints 応答は期待しない
         Ok(ServerMessage::Hints { .. }) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

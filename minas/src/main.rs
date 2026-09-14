@@ -65,7 +65,18 @@ fn restore_sigpipe_default() {
 }
 
 async fn run() -> std::io::Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // clap は usage エラーを既定で exit 2 で終えるが、minas の契約は
+            // 「bad input = exit 1（再試行するな）」（`minas skill errors`）。
+            // 実測（ドッグフーディング #13）: `minas outline a b` が exit 2、
+            // `minas hover <path> not-a-pos` が exit 1 で、同じ「引数のミス」が
+            // 層によって retryable に見えていた。--help / --version は stdout へ。
+            let _ = e.print();
+            std::process::exit(if e.use_stderr() { 1 } else { 0 });
+        }
+    };
     match cli.command {
         Command::Session(cmd) => session::run(cmd, cli.name).await,
         Command::Skill { topic, md } => skill::run(topic, md),

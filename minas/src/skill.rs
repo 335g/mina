@@ -76,6 +76,21 @@ fn markdown(topic: Option<&str>) -> Result<String, String> {
     ))
 }
 
+/// 言語サーバが要るトピック（索引で `*` を付ける）。
+///
+/// ドッグフーディング #13: 索引に "LSP" が 1 度も出ず、no-LSP の言語（Python）の
+/// 読み手は「どのコマンドが exit 1 で拒否されるか」を索引から引けなかった
+/// （`read` だけは「LSP-free」と書いてあるのに、隣の `outline` は何も言わない）。
+const LSP_TOPICS: &[&str] = &[
+    "outline",
+    "at",
+    "hover",
+    "symbol",
+    "references",
+    "rename",
+    "check",
+];
+
 /// `minas skill [topic] [--md]` の本体。daemon は必要としない（静的コンテンツ）。
 pub fn run(topic: Option<String>, md: bool) -> std::io::Result<()> {
     if md {
@@ -94,8 +109,20 @@ pub fn run(topic: Option<String>, md: bool) -> std::io::Result<()> {
         None => {
             // 索引: 1トピック1行。薄く保つことが設計要件（常時ロードしても軽い）。
             for s in SKILLS.iter() {
-                println!("{:<10} {}", s.name, s.description);
+                let mark = if LSP_TOPICS.contains(&s.name.as_str()) {
+                    "* "
+                } else {
+                    "  "
+                };
+                println!("{:<10}{mark}{}", s.name, s.description);
             }
+            println!();
+            println!(
+                "* = needs a language server. A language without one gets an explicit `not \
+                 supported` refusal (exit 1) instead of an empty answer; `minas info` lists the \
+                 servers that exist. LSP-free: read, search, edit (apply / delete), wait, get, \
+                 persist, errors, exec."
+            );
             Ok(())
         }
         Some(t) => match lookup(&t) {

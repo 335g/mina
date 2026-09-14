@@ -1544,6 +1544,20 @@ async fn handle_connection(
                 if let Ok(Command::GetInlayHints { path }) =
                     serde_json::from_str::<Command>(line.trim())
                 {
+                    // ドッグフーディング #8: この 2 コマンド（hints / peek）だけが
+                    // サーバ解決を通らず、LSP 非対応パスで **exit 0 + 空** を返していた
+                    // （`[]` / `{"text":""}`）— 「ヒントは無い」「定義は無い」と区別できない。
+                    // 他 7 コマンドと同じく、サーバが無ければ status 付きで拒否する。
+                    if let Some(status) = no_lsp_refusal(&daemon, &path, "hints").await {
+                        let mut d = daemon.lock().await;
+                        let message = ServerMessage::Response {
+                            snapshot: snapshot(&mut d, Some(status)),
+                        };
+                        if !write_message(&mut write_half, conn_id, message).await {
+                            break;
+                        }
+                        continue;
+                    }
                     let message = serve_inlay_hints(&daemon, &path).await;
                     if !write_message(&mut write_half, conn_id, message).await {
                         break; // 切断 or 書き込みタイムアウト
@@ -1565,6 +1579,16 @@ async fn handle_connection(
                 if let Ok(Command::PeekDefinitionAt { path, line, col }) =
                     serde_json::from_str::<Command>(line.trim())
                 {
+                    if let Some(status) = no_lsp_refusal(&daemon, &path, "peek").await {
+                        let mut d = daemon.lock().await;
+                        let message = ServerMessage::Response {
+                            snapshot: snapshot(&mut d, Some(status)),
+                        };
+                        if !write_message(&mut write_half, conn_id, message).await {
+                            break;
+                        }
+                        continue;
+                    }
                     let message = serve_peek_definition_at(&daemon, &path, line, col).await;
                     if !write_message(&mut write_half, conn_id, message).await {
                         break; // 切断 or 書き込みタイムアウト
@@ -1917,10 +1941,67 @@ enum BorrowFail {
     /// 誤る（ドッグフーディング #2 と同じクラス。self-host #1 で `outline <dir>`
     /// が踏んだ）。
     CannotOpen(String),
-    /// LSP 非対応パス（.rs 以外）。表示用に正規化後のパスを渡す。
-    NoServer(String),
+    /// LSP 非対応パス。表示用の正規化後パスと、**言語が解決できたか**まで区別した理由
+    /// （ドッグフーディング #8: `.py` と `.zzz` が同じ文言だと、サーバを足せば使えるのか
+    /// 何を足してもダメなのかが呼び出し側に区別できない）。
+    NoServer { path: String, reason: String },
     /// spawn + initialize 失敗。
     SpawnFailed(String),
+}
+
+/// LSP サーバが割り当たっていないパスの理由（ドッグフーディング #8）。
+///
+/// 言語が解決できる（= サーバを足せば使える）か、拡張子すら未知（= 何を足しても
+/// 使えない）かを区別する。実測: `outline notes_cli/store.py` と `outline probe.zzz` の
+/// 文言が完全に同一で、呼び出し側は次の行動を決められなかった。`minas info` を
+/// 唯一の手掛かりにしないで済むよう、文言側からもその surface を指す。
+/// `path` に LSP サーバが割り当たっていなければ、拒否文言（`<verb> not supported for …`）を
+/// 返す。サーバがあれば `None`（呼び出し側は本来の処理へ）。
+///
+/// ドッグフーディング #8: `hints` と `peek` だけがこのゲートを持たず、Python のような
+/// 未対応言語で **exit 0 + 空**（`[]` / `{"text":""}`）を返していた。空は「無い」の意味に
+/// 読めるので、サーバが無いことを確定できる場面では必ず拒否する。
+async fn no_lsp_refusal(daemon: &Mutex<Daemon>, path: &str, verb: &str) -> Option<String> {
+    let path_buf = normalize_open_path(PathBuf::from(path)).await;
+    let supported = {
+        let mut d = daemon.lock().await;
+        d.languages_refresh().server_for(&path_buf).is_some()
+    };
+    if supported {
+        return None;
+    }
+    let reason = no_server_reason(daemon, &path_buf).await;
+    Some(format!(
+        "{verb} not supported for {} {reason}",
+        path_buf.display()
+    ))
+}
+
+async fn no_server_reason(daemon: &Mutex<Daemon>, path: &Path) -> String {
+    let mut d = daemon.lock().await;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    match d.languages_refresh().language_for_path(path) {
+        // 言語の entry はあるが、そのサーバが [language-server] に無い / 未設定。
+        Some(lang) => format!(
+            "(the language {:?} covers this file type but has no LSP server configured — \
+             `minas info` lists the servers that exist)",
+            lang.name
+        ),
+        // 言語の entry 自体が無い。`.py` も `.zzz` もここに来る — minas は「世の中に
+        // ある言語」の登録簿を持たない（既定表 + languages.toml だけ）ので、
+        // 「Python ならサーバを足せば使える」と「.zzz は何を足しても…」を区別する
+        // 材料を持たない。区別できるのは「このファイル型を扱う entry が無い」こと
+        // なので、そう書いて、直し方（languages.toml）を指す。
+        None => format!(
+            "(no language in the table covers this file type (.{ext}) — nothing in \
+             languages.toml matches it; `minas info` lists what is configured, and both a \
+             language entry and its LSP server can be added there)"
+        ),
+    }
 }
 
 async fn prepare_borrowed_session(
@@ -1959,7 +2040,11 @@ async fn prepare_borrowed_session(
         .server_for(&path_buf)
         .is_some();
     if !lsp_supported {
-        return Err(BorrowFail::NoServer(path_str));
+        let reason = no_server_reason(daemon, &path_buf).await;
+        return Err(BorrowFail::NoServer {
+            path: path_str,
+            reason,
+        });
     }
     trace.mark("languages");
     // 解析フォーカス文書（復元用 — v12: 借りたセッションの共有解析フォーカスを
@@ -2542,8 +2627,8 @@ async fn serve_outline(daemon: &Mutex<Daemon>, path: &str) -> ServerMessage {
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err(msg),
-        Err(BorrowFail::NoServer(p)) => {
-            return err(format!("outline not supported for {p} (no LSP server configured)"))
+        Err(BorrowFail::NoServer { path: p, reason }) => {
+            return err(format!("outline not supported for {p} {reason}"))
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
@@ -2619,8 +2704,8 @@ async fn serve_outline_recursive(
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err(msg),
-        Err(BorrowFail::NoServer(p)) => {
-            return err(format!("outline not supported for {p} (no LSP server configured)"))
+        Err(BorrowFail::NoServer { path: p, reason }) => {
+            return err(format!("outline not supported for {p} {reason}"))
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
@@ -3079,9 +3164,9 @@ async fn serve_enclosing_symbol(
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err(msg),
-        Err(BorrowFail::NoServer(p)) => {
+        Err(BorrowFail::NoServer { path: p, reason }) => {
             return err(format!(
-                "symbol range not supported for {p} (no LSP server configured)"
+                "symbol range not supported for {p} {reason}"
             ))
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
@@ -3175,8 +3260,8 @@ async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32)
         Err(e) => {
                     match e {
                 BorrowFail::CannotOpen(msg) => return err(msg),
-                BorrowFail::NoServer(p) => {
-                    return err(format!("hover not supported for {p} (no LSP server configured)"))
+                BorrowFail::NoServer { path: p, reason } => {
+                    return err(format!("hover not supported for {p} {reason}"))
                 }
                 BorrowFail::SpawnFailed(e) => return err(format!("LSP error: {e}")),
             }
@@ -3241,9 +3326,9 @@ async fn serve_workspace_symbols(
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err(msg),
-        Err(BorrowFail::NoServer(p)) => {
+        Err(BorrowFail::NoServer { path: p, reason }) => {
             return err(format!(
-                "symbol search not supported for {p} (no LSP server configured)"
+                "symbol search not supported for {p} {reason}"
             ))
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
@@ -3344,8 +3429,8 @@ async fn serve_check_diagnostics(daemon: &Mutex<Daemon>, path: &str) -> ServerMe
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err(msg),
-        Err(BorrowFail::NoServer(p)) => {
-            return err(format!("check not supported for {p} (no LSP server configured)"))
+        Err(BorrowFail::NoServer { path: p, reason }) => {
+            return err(format!("check not supported for {p} {reason}"))
         }
         Err(BorrowFail::SpawnFailed(e)) => return err(format!("LSP error: {e}")),
     };
@@ -3544,10 +3629,10 @@ async fn serve_references(daemon: &Mutex<Daemon>, path: &str, old: &str) -> Serv
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err_refs(path, msg),
-        Err(BorrowFail::NoServer(p)) => {
+        Err(BorrowFail::NoServer { path: p, reason }) => {
             return err_refs(
                 path,
-                format!("references not supported for {p} (no LSP server configured)"),
+                format!("references not supported for {p} {reason}"),
             )
         }
         Err(BorrowFail::SpawnFailed(e)) => return err_refs(path, format!("LSP error: {e}")),
@@ -3719,9 +3804,9 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
     let borrowed = match prepare_borrowed_session(daemon, path).await {
         Ok(b) => b,
         Err(BorrowFail::CannotOpen(msg)) => return err_input(msg),
-        Err(BorrowFail::NoServer(p)) => {
+        Err(BorrowFail::NoServer { path: p, reason }) => {
             return err_input(format!(
-                "rename not supported for {p} (no LSP server configured)"
+                "rename not supported for {p} {reason}"
             ))
         }
         Err(BorrowFail::SpawnFailed(e)) => return err_input(format!("LSP error: {e}")),
