@@ -629,8 +629,15 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // 残りを見つけたら**stdout の行自体**に INCOMPLETE と書く。
             let leftovers = leftover_mentions(&path, &old, &outcome.changed, &std::collections::HashMap::new(), "rename");
             let impact = leftovers.marker(
-                &format!("file(s) still mention `{old}` and were NOT changed"),
-                &format!("whole-word mention(s) of `{old}` remain inside the changed files"),
+                &format!(
+                    "file(s) still mention `{old}` and were NOT changed (text-level: comments, \
+                     strings, or a DIFFERENT identifier of the same name — verify with \
+                     `minas search -w`)"
+                ),
+                &format!(
+                    "whole-word mention(s) of `{old}` remain inside the changed files (same \
+                     caveat: verify with `minas search -w`)"
+                ),
             );
             println!(
                 "renamed: {old} -> {new} ({} files, {} edits){impact}",
@@ -672,8 +679,15 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // ファイルに名前が残っている」と見つけたら、件数の行に INCOMPLETE と書く。
             let leftovers = leftover_mentions(&path, &old, &touched, &listed, "references");
             let impact = leftovers.marker(
-                &format!("file(s) still mention `{old}` and are not listed"),
-                &format!("whole-word mention(s) of `{old}` inside the listed files are missing from this list"),
+                &format!(
+                    "file(s) still mention `{old}` and are not listed (text-level: comments, \
+                     strings, or a DIFFERENT identifier of the same name — verify with \
+                     `minas search -w`)"
+                ),
+                &format!(
+                    "whole-word mention(s) of `{old}` inside the listed files are missing from \
+                     this list (same caveat: verify with `minas search -w`)"
+                ),
             );
             println!(
                 "{} references in {} files:{impact}",
