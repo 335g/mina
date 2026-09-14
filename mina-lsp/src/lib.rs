@@ -75,7 +75,7 @@ pub struct Client {
     write: ChildStdin,
     child: Child,
     next_id: u64,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     notifications: mpsc::Receiver<Incoming>,
     progress: Arc<Progress>,
 }
@@ -225,7 +225,7 @@ impl Client {
             .spawn()?;
         let write = child.stdin.take().expect("stdin は piped");
         let stdout = child.stdout.take().expect("stdout は piped");
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         // M4: unbounded だと読まれない通知が蓄積し続けるため bounded にする
         let (tx, rx) = mpsc::channel(NOTIFICATION_CAPACITY);
@@ -248,7 +248,24 @@ impl Client {
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                     if msg.get("method").is_none() {
                         if let Some(sender) = reader_pending.lock().await.remove(&id) {
-                            let _ = sender.send(msg.get("result").cloned().unwrap_or(Value::Null));
+                            // JSON-RPC error を **null に潰さない**（ドッグフーディング #2）。
+                            // 潰すと「サーバが拒否した」が「サーバが空を返した」に化け、
+                            // 呼び出し側は原因を失う — 実測: rust-analyzer の
+                            // "Renaming aliases is currently unsupported" が捨てられ、
+                            // alias を anchor にした rename が 20 回リトライ（8 秒）の末に
+                            // 「symbol not found（rename produced no edits）」という
+                            // **実態と違う断定**になった。
+                            //
+                            // ただし解析待ちの窓で出る一時的なエラーは従来どおり null
+                            // として retry に委ねる（Err にすると、ロード中の
+                            // ContentModified で正しい答えを捨てる）。
+                            let payload = match msg.get("error") {
+                                Some(err) if !is_transient_server_error(err) => {
+                                    Err(server_error_text(err))
+                                }
+                                _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                            };
+                            let _ = sender.send(payload);
                         }
                         continue;
                     }
@@ -317,7 +334,11 @@ impl Client {
             return Err(e);
         }
         match timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(Ok(value))) => Ok(value),
+            // サーバが返した JSON-RPC error（[`SERVER_REFUSED_PREFIX`] 付き）。
+            // transport 失敗とは別物として渡す — 呼び出し側が「再試行してよいか」を
+            // 区別できるようにするため。
+            Ok(Ok(Err(text))) => Err(std::io::Error::new(std::io::ErrorKind::Other, text)),
             Ok(Err(_)) => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "サーバが終了した",
@@ -364,6 +385,31 @@ impl Client {
     pub async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
+}
+
+/// サーバが返した JSON-RPC error の文言の前置き（[`Client::request`] の Err が
+/// これで始まる）。呼び出し側は「transport 障害（再試行可）」と「サーバの拒否
+/// （再試行しても同じ）」を区別できる（ドッグフーディング #2）。
+pub const SERVER_REFUSED_PREFIX: &str = "server refused: ";
+
+/// 解析待ちの窓で出る一時的な LSP エラー = 「まだ答えていない」と同じ扱い。
+/// LSP 3.17 の予約コード（RequestCancelled / ContentModified / ServerCancelled /
+/// ServerNotInitialized）。
+fn is_transient_server_error(err: &Value) -> bool {
+    matches!(
+        err.get("code").and_then(Value::as_i64),
+        Some(-32800 | -32801 | -32802 | -32002)
+    )
+}
+
+/// エージェントに渡す 1 行。message が無いサーバでも code は残す。
+fn server_error_text(err: &Value) -> String {
+    let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("no message");
+    format!("{SERVER_REFUSED_PREFIX}{message} (code {code})")
 }
 
 /// Content-Length フレームを書き出す（LSP 標準トランスポート）。

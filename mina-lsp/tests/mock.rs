@@ -25,6 +25,54 @@ async fn wait_notification(client: &mut Client) -> Incoming {
 }
 
 #[tokio::test]
+async fn server_error_is_not_converted_to_an_empty_result() {
+    // ドッグフーディング #2: サーバの JSON-RPC error を null に潰すと「サーバが
+    // 拒否した」が「サーバが空を返した」に化け、呼び出し側は原因を失う（実測:
+    // rust-analyzer の "Renaming aliases is currently unsupported" が捨てられ、
+    // alias を anchor にした rename が 20 回リトライの末に
+    // "symbol not found (rename produced no edits)" という実態と違う断定になった）。
+    let (mut client, reader) = spawn_client(&[]).await;
+
+    client.request("initialize", json!({})).await.expect("initialize");
+    client.notify("initialized", json!({})).await.unwrap();
+    client
+        .notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///mock.rs",
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "let fee = 1;\n\n",
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    // 空行（単語が無い位置）→ モックは -32602 を返す（LSP の意味論では
+    // 「その位置にシンボルが無い」= 決定的な拒否。transport 障害ではない）。
+    let err = client
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": "file:///mock.rs" },
+                "position": { "line": 1, "character": 0 },
+                "newName": "x",
+            }),
+        )
+        .await
+        .expect_err("サーバのエラーは Err として返る（null に潰さない）");
+    assert!(
+        err.to_string().contains("No references found at position"),
+        "サーバの文言を保持する: {err}"
+    );
+
+    client.kill().await;
+    reader.abort();
+}
+
+#[tokio::test]
 async fn initialize_and_publish_diagnostics_round_trip() {
     let (mut client, reader) = spawn_client(&[]).await;
 

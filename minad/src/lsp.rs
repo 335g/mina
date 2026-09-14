@@ -1621,7 +1621,23 @@ async fn request_with_loading_retry(
                 // 混ぜない — ドッグフーディング #12/#19 と同じ規律。self-host #3 の
                 // 観測: cold の references が「LSP エラー: LSP 応答タイムアウト」を返し、
                 // exit code を捕れないと再試行可能か判断できなかった）。
-                .map_err(|e| format!("LSP error: {e} — retry (the server may be busy or restarting)"))?
+                .map_err(|e| {
+                    let s = e.to_string();
+                    // サーバが返した JSON-RPC error は transport 障害ではない。
+                    // 「busy or restarting / retry」を付けると、決定的な拒否
+                    // （実測: rust-analyzer の alias rename 未対応）をエージェントが
+                    // 再試行し続ける（ドッグフーディング #2）。
+                    if s.starts_with(mina_lsp::SERVER_REFUSED_PREFIX) {
+                        format!(
+                            "LSP error: {s} — the language server answered with an error \
+                             (not a transport failure; the same request will fail the same way)"
+                        )
+                    } else {
+                        format!(
+                            "LSP error: {s} — retry (the server may be busy or restarting)"
+                        )
+                    }
+                })?
         };
         // ADR-0056: 何回目の要求が高いか（1 回目 = RA の計算、2 回目 = 安定確認）。
         trace.mark(&format!("attempt{}", attempts));

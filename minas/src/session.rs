@@ -623,13 +623,10 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // 「N files, M edits」を影響範囲の全体として読ませないため、テキスト網が
             // 残りを見つけたら**stdout の行自体**に INCOMPLETE と書く。
             let leftovers = leftover_mentions(&path, &old, &outcome.changed, &std::collections::HashMap::new(), "rename");
-            let impact = if leftovers == 0 {
-                String::new()
-            } else {
-                format!(
-                    " — INCOMPLETE: {leftovers} file(s) still mention `{old}` and were NOT changed (see stderr)"
-                )
-            };
+            let impact = leftovers.marker(
+                &format!("file(s) still mention `{old}` and were NOT changed"),
+                &format!("whole-word mention(s) of `{old}` remain inside the changed files"),
+            );
             println!(
                 "renamed: {old} -> {new} ({} files, {} edits){impact}",
                 outcome.files, outcome.edits
@@ -669,13 +666,10 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // ADR-0067: この一覧は 1 セッション分の視界。テキスト網が「一覧に無い
             // ファイルに名前が残っている」と見つけたら、件数の行に INCOMPLETE と書く。
             let leftovers = leftover_mentions(&path, &old, &touched, &listed, "references");
-            let impact = if leftovers == 0 {
-                String::new()
-            } else {
-                format!(
-                    " — INCOMPLETE: {leftovers} file(s) still mention `{old}` and are not listed (see stderr)"
-                )
-            };
+            let impact = leftovers.marker(
+                &format!("file(s) still mention `{old}` and are not listed"),
+                &format!("whole-word mention(s) of `{old}` inside the listed files are missing from this list"),
+            );
             println!(
                 "{} references in {} files:{impact}",
                 outcome.total,
@@ -1377,6 +1371,11 @@ fn lsp_input_error(e: &str) -> bool {
         || e.starts_with("read-only-base")
         || e.starts_with("file too large")
         || e.contains("not supported")
+        // サーバが返した JSON-RPC error は決定的な拒否 — 同じ要求を繰り返しても
+        // 同じ結果になる（実測: alias を anchor にした rename に対する
+        // "Renaming aliases is currently unsupported"）。transport 障害と混ぜると
+        // エージェントが永遠に再試行する（ドッグフーディング #2）。
+        || e.contains("server refused:")
 }
 
 /// check の失敗の exit コード分類（ADR-0032。outline と同型）: 入力エラー
@@ -1422,6 +1421,39 @@ fn symbols_have_child_paths(symbols: &[OutlineSymbol]) -> bool {
 ///
 /// 上限: [`LEFTOVER_SCAN_MAX_FILES`] ファイル / 1 ファイル [`LEFTOVER_SCAN_MAX_BYTES`]。
 /// ディレクトリ走査なので、別クレート（crates/*）からの参照までは見えない。
+/// テキスト網の残差（[`leftover_mentions`] の戻り値）。
+///
+/// 以前は「一覧に無いファイル数」しか返しておらず、**LSP が触ったファイルの中に
+/// 取りこぼし（実測: alias 経由の使用）があっても exit 0 + 件数行は完全に見えた**
+/// （ドッグフーディング #2: `references` が `render` の使用を 1 件落としたまま
+/// "3 references in 2 files" と表示し、気づけるのは stderr の note だけだった）。
+struct Leftovers {
+    /// LSP が触らなかった（一覧に無いファイル）で名前が残っている数。
+    unlisted_files: usize,
+    /// LSP が触ったファイルのうち、一覧に載っていない同一語の出現数
+    /// （コメント・文字列、またはサーバが取りこぼした識別子）。
+    in_touched_mentions: usize,
+}
+
+impl Leftovers {
+    /// stdout の件数行に付ける in-band マーカー（ADR-0067: 部分的な一覧を完全な
+    /// 影響範囲として読ませない）。残差が無ければ空文字。
+    fn marker(&self, unlisted: &str, in_touched: &str) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.unlisted_files > 0 {
+            parts.push(format!("{} {unlisted}", self.unlisted_files));
+        }
+        if self.in_touched_mentions > 0 {
+            parts.push(format!("{} {in_touched}", self.in_touched_mentions));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" — INCOMPLETE: {} (see stderr)", parts.join("; "))
+        }
+    }
+}
+
 fn leftover_mentions(
     path: &std::path::Path,
     old: &str,
@@ -1430,12 +1462,16 @@ fn leftover_mentions(
     // 旧名が「一覧に載っていない言及」だけになるため差し引き不要）。
     listed: &std::collections::HashMap<String, usize>,
     what: &str,
-) -> usize {
+) -> Leftovers {
+    let none = Leftovers {
+        unlisted_files: 0,
+        in_touched_mentions: 0,
+    };
     if old.is_empty() {
-        return 0;
+        return none;
     }
     let Some(dir) = path.parent() else {
-        return 0;
+        return none;
     };
     // 相対パスのままだと祖先の walk-up が空パスを踏んで走査範囲を失う（実測:
     // `crates/b/src/lib.rs` で scan_root が空になり警告が出なかった）。
@@ -1512,11 +1548,14 @@ fn leftover_mentions(
         eprintln!(
             "note: {in_touched_mentions} more textual mention(s) of `{old}` inside the \
              file(s) the LSP {what} did touch — the LSP left them (string literals, comments, \
-             or text its own edit introduced). An IDENTIFIER among them is a real leftover: \
-             `minas search <file> {old}` to see them"
+             or text its own edit introduced, or references it did not see). An IDENTIFIER \
+             among them is a real leftover: `minas search <file> {old}` to see them"
         );
     }
-    n_leftovers
+    Leftovers {
+        unlisted_files: n_leftovers,
+        in_touched_mentions,
+    }
 }
 
 /// `text` に `word` が識別子として（前後が識別子文字でない）現れる回数。
@@ -2289,13 +2328,18 @@ async fn apply(
         std::process::exit(2);
     }
     // no-op（old == new / 同一内容の全文置換）は daemon が status に載せない（ADR-0012）。
-    // 「成功」と読めてしまうので stderr に明示する（exit は 0 のまま — 冪等な編集）。
-    if snapshot.text == text {
+    // 「成功」と読めてしまうので stderr に明示するのに加え、**stdout の語自体を分ける**
+    // （ドッグフーディング #6: `^applied:` を「内容が変わった」の判定に使う検証
+    // スクリプトが、恒等編集を成功として数えていた。`--hunks-stdin` も恒等 hunk は
+    // `HUNK SKIPPED` と別の語で報告する）。exit は 0 のまま（冪等な編集）。
+    let unchanged = snapshot.text == text;
+    if unchanged {
         eprintln!("NO-OP: the replacement left the buffer unchanged");
     }
-    match &old_text {
-        Some(_) => println!("applied: {abs} (chars {start}..{end})"),
-        None => println!("applied: {abs} (whole file, {} chars)", new_text.chars().count()),
+    match (&old_text, unchanged) {
+        (_, true) => println!("no-change: {abs} (the replacement left the buffer unchanged)"),
+        (Some(_), false) => println!("applied: {abs} (chars {start}..{end})"),
+        (None, false) => println!("applied: {abs} (whole file, {} chars)", new_text.chars().count()),
     }
     Ok(())
 }
