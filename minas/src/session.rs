@@ -2302,8 +2302,18 @@ async fn apply(
 
 /// 失敗経路の後始末: apply が新規作成した空ファイルを消し、作成前（未存在）に戻す。
 /// 作成していなければ何もしない。成功経路では呼ばない。
+///
+/// 並行する apply が同じパスを掴むと、自分が作った空ファイルが既に**他人の内容**を
+/// 持っていることがある（ドッグフーディング #1 の並行ラウンドで実測: 4 並列 writer の
+/// 1 つが成功して `applied` を返した後に、別の writer の失敗経路がそのファイルを消した）。
+/// 中身があるファイルは消さない — 消すとコミット済みの書き込みを巻き添えで失う。
 fn rollback_created(path: &str, created: bool) {
-    if created {
+    if !created {
+        return;
+    }
+    // 0 バイトのときだけ「自分が作った空ファイル」と断定できる。stat 失敗
+    // （既に消えている）も何もしない。
+    if std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -2359,12 +2369,41 @@ fn project_root_of_dir(dir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// `symbol` のヒットがアンカーを基準にした**プロジェクトの外**かを判定する境界。
+///
+/// 境界は「アンカーの言語 manifest を持つ**最も外側の祖先**」＝ workspace root
+/// （ドッグフーディング #3）。テキスト網（`scan_manifests` の walk-up）と同じ規則に
+/// 揃える — 最も近いマーカー（= 自分のクレートの `Cargo.toml`）を使うと、**同一
+/// ワークスペースの兄弟メンバー**へのヒットを "outside the project root"
+/// "(dependency sources?)" と呼んでしまい、正しいヒットの信頼を損なう（実測:
+/// `minas symbol cli/src/main.rs Task` が core/src/… の 2 件を "dependency
+/// sources?" と注記。同じクロスクレート結果に `references` は注記を出さないので、
+/// コマンド間でも基準が食い違っていた）。
+///
+/// manifest が無い/見つからないときは汎用マーカー（`.git` 等）へフォールバックする。
+fn project_boundary(path: &str) -> Option<String> {
+    let abs = std::path::PathBuf::from(conn::absolutize(path));
+    let manifests = scan_manifests(&abs);
+    if !manifests.is_empty() {
+        let mut outermost: Option<std::path::PathBuf> = None;
+        for ancestor in abs.ancestors().skip(1) {
+            if manifests.iter().any(|m| ancestor.join(m).is_file()) {
+                outermost = Some(ancestor.to_path_buf());
+            }
+        }
+        if let Some(root) = outermost {
+            return Some(conn::absolutize(&root.to_string_lossy()));
+        }
+    }
+    project_root(path)
+}
+
 /// `symbol` のヒットがアンカーファイルのプロジェクト外なら stderr で注記する
 /// （self-host #2: `minas symbol <daemon.rs> save` が `~/.cargo/registry/…/smallvec`
 /// を返し、docs は「workspace root 内」と読めた。パスが唯一の手掛かりなので、
-/// 黙って返さない）。
+/// 黙って返さない）。境界は [`project_boundary`]（workspace root）。
 fn note_out_of_project_hits(anchor: &std::path::Path, symbols: &[mina_protocol::WorkspaceSymbol]) {
-    let Some(root) = project_root(&anchor.to_string_lossy()) else {
+    let Some(root) = project_boundary(&anchor.to_string_lossy()) else {
         return;
     };
     let outside: Vec<&str> = symbols
@@ -2376,8 +2415,8 @@ fn note_out_of_project_hits(anchor: &std::path::Path, symbols: &[mina_protocol::
         return;
     }
     eprintln!(
-        "note: {} of {} hit(s) are outside the project root {root} (dependency sources?) — \
-         check the path before trusting them:",
+        "note: {} of {} hit(s) are outside the project root {root} (dependency sources / \
+         generated code?) — check the path before trusting them:",
         outside.len(),
         symbols.len()
     );

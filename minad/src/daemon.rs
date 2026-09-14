@@ -869,8 +869,8 @@ impl Daemon {
     }
 
     /// コマンド適用前に、発信接続の View をフォーカスへ合わせる（ADR-0037）。
-    /// Interactive は自接続の View（未登録 = テスト等のフォールバックは idle view）、
-    /// Headless は共有 idle view。合わせて viewport 高さを接続の値へ切り替える。
+    /// 各接続は自分の View を持つ（未登録 = テスト等のフォールバックは idle view）。
+    /// 合わせて viewport 高さを接続の値へ切り替える。
     fn focus_for(&mut self, conn_id: u64) {
         let record = self.conn_views.get(&conn_id);
         let view_id = record.map_or(self.idle_view, |r| r.view_id);
@@ -1340,6 +1340,7 @@ async fn watch_disk(
                 // lsp_sync はフォーカス文書の場合にだけ設定される）。
                 snap = Some(sync_after_edit(
                     &daemon,
+                    None,
                     push_tx.clone(),
                     Some((session, path.clone(), text.clone())),
                     snap.and_then(|s| s.status),
@@ -1454,12 +1455,20 @@ async fn handle_connection(
     };
 
     // ADR-0027: 最後の Interactive 切断判定用に登録しておく。
-    // ADR-0037: Interactive 接続には専用の View を割り当てる（Headless は
-    // 共有 idle view を使う — 接続の View は持たない）。
-    if kind == ClientKind::Interactive {
+    // ADR-0037: 接続ごとに View を割り当てる（**Headless も含む** — ADR-0074）。
+    // Headless を共有 idle view のままにすると、編集は常に「今フォーカスしている
+    // 文書」に当たるため、並行する agent 接続の Open → DocumentEdit → Save が
+    // 同じ doc ポインタを奪い合い、片方の編集が**別のファイル**へ書かれる
+    // （意図したパスは 0 バイトのまま `applied` が返る = 無言のデータ損失。
+    // ドッグフーディング #1）。ロード（文書集合・undo・LSP）は共有のまま、
+    // フォーカスだけを接続別にする。idle view は Open に追従し続けるので
+    // 「パス無し GetState = 最後に開かれた文書」は不変（open_idle_follow）。
+    {
         let mut d = daemon.lock().await;
         d.register_conn_view(conn_id);
-        d.interactive_clients.insert(conn_id);
+        if kind == ClientKind::Interactive {
+            d.interactive_clients.insert(conn_id);
+        }
     }
     // ADR-0038: 自己申告ラベルを保持する（activity の actor に使う）
     daemon.lock().await.conn_names.insert(conn_id, client_name);
@@ -2369,7 +2378,12 @@ async fn semantic_layer_unavailable(
     // 1 記号だけを probe にすると、この正常ケースを誤警告する。
     let mut all_empty = true;
     for (line, character) in probes {
-        let hover = lsp::hover_at_line_col(session, path, text, *line, *character).await;
+        // `probes` は LSP 座標（0-origin。`char_to_lsp_pos` の出力）、
+        // `hover_at_line_col` は 1-origin。変換を忘れると**1 行上**を probe し、
+        // 空行を踏んだ瞬間に「意味層が死んでいる」と誤警告する（ドッグフーディング #4:
+        // 宣言の直前が空行のファイルで、live な hover があるのに exit 2 +
+        // 「daemon を再起動しろ」。driver 実測 6 ファイル中 2 ファイルで誤発火）。
+        let hover = lsp::hover_at_line_col(session, path, text, line + 1, character + 1).await;
         if matches!(hover, Some(t) if !t.trim().is_empty()) {
             all_empty = false;
             break;
@@ -4416,6 +4430,9 @@ async fn current_text_or(daemon: &Mutex<Daemon>, path: &Path, fallback: &str) ->
 /// （応答に「同期中」が残らない）。
 async fn sync_after_edit(
     daemon: &Arc<Mutex<Daemon>>,
+    // 応答スナップショットを合成する接続（ADR-0074）。watch_disk 等の
+    // 発信元の無い経路は `None`（購読者側が自分の View で再合成する）。
+    conn_id: Option<u64>,
     push_tx: watch::Sender<(Option<u64>, StateSnapshot)>,
     target: Option<(Arc<Mutex<LspSession>>, PathBuf, String)>,
     status: Option<String>,
@@ -4466,6 +4483,11 @@ async fn sync_after_edit(
     }
     // 応答は現状のスナップショット（= pull 前の診断・ヒント）を即返す
     let mut d = daemon.lock().await;
+    if let Some(conn) = conn_id {
+        // ADR-0074: 背景タスクの spawn を跨いだ間に他接続がフォーカスを動かし得る。
+        // 応答は発信接続の View 基準でなければ、"NO-OP の判定"などが別の文書を見る。
+        d.focus_for(conn);
+    }
     drain_into(&mut d);
     let snap = snapshot(&mut d, status);
     drop(d);
@@ -4653,6 +4675,11 @@ async fn process_command(
                 // 保持する（再利用 = 「何も変えない」）。
                 let reuse_text: Option<String> = {
                     let mut d = daemon.lock().await;
+                    // ADR-0074: process_command 冒頭の focus_for からここまでに await（file I/O・
+                    // spawn）が挟まる。その間に他接続が自分の View をフォーカスすると、下の
+                    // 「フォーカス中の文書」を触る変更が**別の接続の文書**に当たる。
+                    // 変更・スナップショット合成の直前には同じロック保持内で再フォーカスする。
+                    d.focus_for(conn_id);
                     let reused = d.editor.focus_open_path(&path_buf);
                     // フォーカス直後のテキストを掴んでおく（後に ensure で await する
                     // 間に他接続がフォーカスを動かしても、正しい文書に通知するため）
@@ -4690,6 +4717,7 @@ async fn process_command(
                     };
                     let text = {
                         let mut d = daemon.lock().await;
+                        d.focus_for(conn_id); // ADR-0074: await を跨いだ再フォーカス
                         // ベースライン更新（削除済みなら保持し、復活検知に使う）
                         if let Some((mtime, size)) = &stat {
                             // ctime はここでは取れない（stat は (mtime, size) の組）ので、
@@ -4800,6 +4828,7 @@ async fn process_command(
                         });
                     }
                     let mut d = daemon.lock().await;
+                    d.focus_for(conn_id); // ADR-0074
                     drain_into(&mut d);
                     // ADR-0012: 再利用も Open として記録（フォーカス変更）
                     d.record_event(source, EventKind::Open, None, None);
@@ -4836,6 +4865,7 @@ async fn process_command(
                     };
                     // ロック内: 文書状態の変更のみ（await なし）
                     let mut d = daemon.lock().await;
+                    d.focus_for(conn_id); // ADR-0074: await を跨いだ再フォーカス
                     let text = match &contents {
                         Some(contents) => {
                             d.editor.open_with_path(path_buf.clone(), contents);
@@ -4919,6 +4949,7 @@ async fn process_command(
                         });
                     }
                     let mut d = daemon.lock().await;
+                    d.focus_for(conn_id); // ADR-0074
                     drain_into(&mut d);
                     d.open_idle_follow(&path_buf);
                     // ADR-0038: 読み込み成否も含めて記録する（ok = 実際に文書を読めたか）
@@ -5019,7 +5050,8 @@ async fn process_command(
             }
             Ok(Command::Save) => {                // #49: 基準配下への保存を拒否する。
                 let blocked = {
-                    let d = daemon.lock().await;
+                    let mut d = daemon.lock().await;
+                    d.focus_for(conn_id); // ADR-0074: 保存対象は「今フォーカス中の文書」ではなく発信接続の View
                     d.editor.focused_path().and_then(|p| d.base_reject(p))
                 };
                 if let Some(msg) = blocked {
@@ -5032,7 +5064,8 @@ async fn process_command(
                     d.metrics.save_total += 1;
                 }
                 let (text, path, doc_id) = {
-                    let d = daemon.lock().await;
+                    let mut d = daemon.lock().await;
+                    d.focus_for(conn_id); // ADR-0074
                     let text = d.editor.current_document().text().to_string();
                     let doc_id = d.editor.focused_doc_id();
                     (text, d.editor.focused_path().map(Path::to_path_buf), doc_id)
@@ -5082,6 +5115,7 @@ async fn process_command(
                     None => Err(io::Error::new(io::ErrorKind::NotFound, "no file name")),
                 };
                 let mut d = daemon.lock().await;
+                d.focus_for(conn_id); // ADR-0074: 応答スナップショットも発信接続の View 基準
                 // ADR-0028: 保存の活動を除去（write の前で追加済み。成功/失敗どちらも除去）。
                 if let Some(p) = &path {
                     d.remove_activity(p, ActivityKind::Save);
@@ -5450,7 +5484,7 @@ async fn process_command(
                     None
                 };
                 drop(d);
-                sync_after_edit(daemon, push_tx.clone(), sync_target, status, None).await
+                sync_after_edit(daemon, Some(conn_id), push_tx.clone(), sync_target, status, None).await
             }
             Err(_) => {
                 // ADR-0011: Command として解釈できなければ DocumentEdit を試す
@@ -5462,6 +5496,7 @@ async fn process_command(
                         // edit = 適用（apply_edit + 記録）/ sync = 応答構築。
                         let mut trace = Trace::new("edit");
                         let mut d = daemon.lock().await;
+                        d.focus_for(conn_id); // ADR-0074: await を跨いだ再フォーカス
                         // 拒否（checksum 不一致）なら状態を変えず status を返す
                         let rejected = apply_edit(&mut d, &edit, conn_id, source);
                         if rejected.is_none() {
@@ -5494,7 +5529,7 @@ async fn process_command(
                         if let Some(rejected) = rejected {
                             rejected
                         } else {
-                            sync_after_edit(daemon, push_tx.clone(), sync_target, None, None).await
+                            sync_after_edit(daemon, Some(conn_id), push_tx.clone(), sync_target, None, None).await
                         }
                     }
                     Err(_) => {
@@ -8951,6 +8986,75 @@ root-markers = [".docsroot"]
     }
 
     #[tokio::test]
+    async fn concurrent_headless_edits_do_not_steal_the_other_connections_document() {
+        // ドッグフーディング #1: 並行する agent（Headless）接続の Open →
+        // DocumentEdit → Save が「今フォーカスしている文書」に当たると、相手の
+        // Open でフォーカスが動いた瞬間に別のファイルを書き、意図したパスは
+        // 0 バイトのまま `applied` が返る（無言のデータ損失）。両方を空ファイルに
+        // すると checksum が同一になり、checksum ガードでは区別できない。
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-race-sock-{}.sock", std::process::id()));
+        let f1 = dir.join(format!("minae-race-a-{}.txt", std::process::id()));
+        let f2 = dir.join(format!("minae-race-b-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&f1, "").unwrap();
+        std::fs::write(&f2, "").unwrap();
+        start_server(&sock).await;
+
+        let mut a = connect_client(&sock, ClientKind::Headless).await;
+        let mut b = connect_client(&sock, ClientKind::Headless).await;
+        let snap_a = request(
+            &mut a,
+            &Command::Open {
+                path: f1.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        // b の Open が a のフォーカスを奪う（修正前はここで共有 doc が f2 へ動く）
+        let _ = request(
+            &mut b,
+            &Command::Open {
+                path: f2.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+
+        // a は自分が読んだ（空の）文書の checksum で編集を送る
+        let edit = DocumentEdit {
+            start: 0,
+            end: 0,
+            text: "from-a".into(),
+            checksum: snap_a.checksum,
+            expected_text: None,
+        };
+        let snap = request_edit(&mut a, &edit).await;
+        assert!(
+            snap.status.is_none(),
+            "a の編集は拒否されない（status: {:?}）",
+            snap.status
+        );
+        let snap = request(&mut a, &Command::Save).await;
+        assert!(
+            snap.status.as_deref().is_some_and(|s| s.starts_with("saved")),
+            "a の Save が通る（status: {:?}）",
+            snap.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f1).unwrap(),
+            "from-a",
+            "a の編集は a が Open したファイルへ書かれる"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f2).unwrap(),
+            "",
+            "b が開いたファイルは触られない"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+    }
+
+    #[tokio::test]
     async fn per_client_views_are_independent_on_shared_document() {
         // ADR-0037: 同じ文書を 2 つの Interactive クライアントが開いても、
         // カーソルは接続ごとに独立（文書・undo・LSP は共有のまま）。
@@ -9365,6 +9469,71 @@ root-markers = [".docsroot"]
 
     /// pkill を使う LSP テストの直列化（並行実行だと互いの mock を殺し合う）。
     static LSP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `Command::WorkspaceSymbol` の応答（ヒット一覧と失敗理由）を読む。
+    async fn request_workspace_symbols(
+        c: &mut TestClient,
+        path: &str,
+        query: &str,
+    ) -> (Vec<mina_protocol::WorkspaceSymbol>, Option<String>) {
+        let mut line = serde_json::to_string(&Command::WorkspaceSymbol {
+            path: path.to_string(),
+            query: query.to_string(),
+        })
+        .unwrap();
+        line.push('\n');
+        c.send(line.as_bytes()).await;
+        loop {
+            match c.recv_message().await {
+                ServerMessage::WorkspaceSymbols {
+                    symbols, error, ..
+                } => return (symbols, error),
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_symbol_search_does_not_accuse_a_live_semantic_layer() {
+        // ドッグフーディング #4: probe は LSP 座標（0-origin）だが `hover_at_line_col`
+        // は 1-origin。変換しないと 1 行上の位置を probe するので、宣言の直前が空行の
+        // ファイルでは hover が空になり、意味層が生きているのに「死んでいる →
+        // daemon を再起動しろ」と exit 2 で誤警告していた。
+        let _guard = LSP_TEST_LOCK.lock().await;
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/debug/mock-server");
+        if !mock.exists() {
+            eprintln!("mock-server が未ビルドのためスキップ（cargo test --workspace で実行）");
+            return;
+        }
+        unsafe { std::env::set_var("MINA_LSP_COMMAND", &mock) };
+        struct ResetEnv;
+        impl Drop for ResetEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("MINA_LSP_COMMAND") };
+            }
+        }
+        let _reset = ResetEnv;
+
+        let dir = std::env::temp_dir();
+        let sock = dir.join(format!("minae-symprobe-sock-{}.sock", std::process::id()));
+        let file = dir.join(format!("minae-symprobe-file-{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        // 宣言の直前を空行にする（probe が 1 行ずれると空行を踏む）
+        std::fs::write(&file, "\nfn alpha() {}\n\nfn beta() {}\n").unwrap();
+        start_server(&sock).await;
+
+        let mut c = connect_client(&sock, ClientKind::Headless).await;
+        let path = file.to_string_lossy().into_owned();
+        let (symbols, error) = request_workspace_symbols(&mut c, &path, "ZzzNotASymbol").await;
+        assert!(symbols.is_empty(), "存在しない名前は 0 件");
+        assert_eq!(
+            error, None,
+            "意味層は生きている（hover が返る位置を probe する）"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&file);
+    }
 
     #[tokio::test]
     async fn reopen_rs_path_respawns_lsp_and_reannounces_current_text() {
@@ -11545,8 +11714,13 @@ root-markers = [".docsroot"]
         let mut tui = connect_client(&sock, ClientKind::Interactive).await;
         let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let path = file.to_string_lossy().into_owned();
-        let _ = request(&mut tui, &Command::Open { path }).await;
+        let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
         // Open の自分の push は届かない（発信元スキップ — 応答で状態を持つ）
+        // ADR-0074: agent も操作対象のパスを自分で Open する（headless も接続別 View を
+        // 持ち、共有 idle view の文書を勝手に掴まない）。同一パスの再 Open は文書を
+        // 再利用する（#7）ので、以降の編集は TUI と同じ文書に当たる。
+        let _ = request(&mut agent, &Command::Open { path }).await;
+        let _ = recv_push(&mut tui).await; // agent の Open も push で届く
 
         // agent の位置指定編集 → TUI へ push が届く
         let resp = request_edit(
@@ -11732,8 +11906,9 @@ root-markers = [".docsroot"]
         let mut agent = connect_client(&sock, ClientKind::Headless).await;
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
-
-        // agent の編集 → tui へ push
+        // ADR-0074: agent も自分が操作するパスを Open する（headless も接続別 View を持つ）
+        let _ = request(&mut agent, &Command::Open { path: path.clone() }).await;
+        let _ = recv_push(&mut tui).await; // agent の Open は push で届く
         let resp = request_edit(
             &mut agent,
             &DocumentEdit {
@@ -11860,6 +12035,11 @@ root-markers = [".docsroot"]
         let path = file.to_string_lossy().into_owned();
         let _ = request(&mut tui, &Command::Open { path: path.clone() }).await;
         // Open の自分の push は届かない（発信元スキップ）
+        // ADR-0074: agent も自分が操作するパスを Open する（headless も接続別 View を持ち、
+        // 未 Open のまま編集すると自分の View の文書 = 別物に当たる）
+        let _ = request(&mut agent, &Command::Open { path: path.clone() }).await;
+        // 拒否テストの基準世代は agent の Open 後（TUI の Open と agent の Open で 2 進む）
+        let generation_after_open = request(&mut agent, &Command::GetState).await.generation;
 
         // 拒否されるコマンド: 状態・世代・モードは不変（Open は #28 で許可済み）
         for cmd in [
@@ -11880,7 +12060,7 @@ root-markers = [".docsroot"]
                 snap.status
             );
             assert_eq!(snap.text, "base\n", "{cmd:?} で状態が変わらない");
-            assert_eq!(snap.generation, 1, "{cmd:?} で世代が進まない");
+            assert_eq!(snap.generation, generation_after_open, "{cmd:?} で世代が進まない");
             assert_eq!(snap.mode, Mode::Normal, "{cmd:?} でモードが変わらない");
         }
 
