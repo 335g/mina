@@ -3284,9 +3284,39 @@ async fn serve_hover_at(daemon: &Mutex<Daemon>, path: &str, line: u32, col: u32)
         .borrows_focus_session(&borrowed.focused, &borrowed.path);
     let hovered =
         lsp::hover_at_line_col(&borrowed.session, &borrowed.path, &borrowed.text, line, col).await;
+    // ドッグフーディング #7 と同じクラス（driver の N1）: 空の hover は「ここに何も無い」と
+    // 「意味層が答えていない」の 2 通りがある。後者を空 + exit 0 で返すと、呼び出し側は
+    // 「型情報が無い」と結論する — `symbol` は同じ状況を `semantic_layer_unavailable` で
+    // 拒否している（同じ規則を hover にも適用する）。判定は復元の**前**に行う
+    // （restore はセッションの対象文書を戻すので、その後の probe は別文書を見る）。
+    let dead = if hovered.as_deref().map_or(true, |t| t.trim().is_empty()) {
+        match lsp::document_symbols_at(&borrowed.session, &borrowed.path, &borrowed.text).await {
+            Ok(symbols) => {
+                match probe_positions(&borrowed.session, &borrowed.text, &symbols, None).await {
+                    Some(probes) => {
+                        semantic_layer_unavailable(
+                            &borrowed.session,
+                            &borrowed.path,
+                            &borrowed.text,
+                            &probes,
+                        )
+                        .await
+                    }
+                    // そのファイルに宣言が無い: 生存確認ができないので空を返す（誤警告しない）
+                    None => None,
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     if borrows {
         // 復元（Q10-(c)）: フォーカス文書へ戻し、更新停止を自己修復する
         restore_focus_session(daemon, &borrowed.session, &borrowed.focused).await;
+    }
+    if let Some(msg) = dead {
+        return err(msg);
     }
     // メッセージを先に組み立ててから計測する。引数式内で daemon.lock() を作ると
     // 一時ガードがステートメント末（record_agent_metric の .await の後）まで生き、

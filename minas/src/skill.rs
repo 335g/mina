@@ -89,6 +89,8 @@ const LSP_TOPICS: &[&str] = &[
     "references",
     "rename",
     "check",
+    "hints",
+    "peek",
 ];
 
 /// `minas skill [topic] [--md]` の本体。daemon は必要としない（静的コンテンツ）。
@@ -114,7 +116,7 @@ pub fn run(topic: Option<String>, md: bool) -> std::io::Result<()> {
                 } else {
                     "  "
                 };
-                println!("{:<10}{mark}{}", s.name, s.description);
+                println!("{:<11}{mark}{}", s.name, s.description);
             }
             println!();
             println!(
