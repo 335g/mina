@@ -14,6 +14,7 @@
     隔離し、同一モデル・同一タスクで対比する。詳細は tools/ab/README.md。
 """
 import argparse
+import glob
 import json
 import os
 import pathlib
@@ -21,19 +22,41 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 SHIMS = pathlib.Path(__file__).resolve().parent / "shims"
 WORK = pathlib.Path("/tmp/ab-run")
 DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
-OPENCODE = os.environ.get(
-    "OPENCODE_BIN",
-    "/Users/335g/.local/share/mise/installs/opencode/1.14.30/opencode",
-)
-MINA = os.environ.get("MAB_MINABIN", str(REPO / "target" / "debug" / "minae"))
+
+
+def _find_opencode():
+    """env > PATH > mise installs。以前は 1.14.30 のパス直書きで、mise のピンが
+    上がると runner が消える単一障害点になっていた。"""
+    if os.environ.get("OPENCODE_BIN"):
+        return os.environ["OPENCODE_BIN"]
+    found = shutil.which("opencode")
+    if found:
+        return found
+    pats = sorted(glob.glob(os.path.expanduser(
+        "~/.local/share/mise/installs/opencode/*/opencode")))
+    return pats[-1] if pats else "opencode"
+
+
+OPENCODE = _find_opencode()
+MINA = os.environ.get("MAB_MINABIN", str(REPO / "target" / "debug" / "minas"))
 MODEL = os.environ.get("MAB_MODEL", "opencode/gpt-5.4-nano")
-AGENT = "minae-bash"
+AGENT_FORCED = "minae-bash"    # ツールを shim に強制（naive / minas arm）
+AGENT_NATIVE = "minae-native"  # ネイティブ read/edit/write（素朴な対照 arm）
+AGENT = AGENT_FORCED            # 後方互換（他のテストは従来どおり）
+
+# t11 の規模掃引: 「2ファイル合計行数」の 5 点。1200 は公開済み t11 と同じ規模
+# （README の −41% の値はここに載る = 曲線との連続性を保つため中間点として残す）。
+SCALES = (150, 600, 1200, 2400, 9600)
+# drift の注入対象（decode の戻り行）。規模に依存しないのでどの点でも同じ。
+T11_DRIFT_OLD = "Ok(Config { timeout, retries })"
+T11_DRIFT_NEW = "Ok(Config { timeout, retries /* external */ })"
 
 TOOLS_OFF = {
     "bash": True,
@@ -48,6 +71,58 @@ TOOLS_OFF = {
     "skill": False,
     "apply_patch": False,
 }
+
+# native arm（素朴な対照）: ネイティブの read/edit/write を許す。強制も bypass 監査も
+# しない — これが実際のエージェントの素朴な道具面。
+TOOLS_NATIVE = {**TOOLS_OFF, "read": True, "edit": True, "write": True}
+
+# opencode 1.18 では `tools` は deprecated で、permission が本体（config.json の
+# PermissionConfig）。旧 runner (1.14) では tools だけが効いたので、両方書いて
+# どちらの runner でも同じ強制になるようにしてある（runner を替えても契約が変わらない）。
+# 実測: 1.18 で tools だけだと apply_patch が素通りし、セッションが shim を迂回した
+# （2026-09-15。smoke で発覚）。
+# bash ツールで「ファイルを読む・書く」道具を塞ぐ。tools/permission の read/edit/glob/grep/list
+# を deny しても、bash 経由の sed/perl/cat/python は残る（実測: prompt で apply_patch を
+# 止めたところ、次は perl -0777 -i -pe に切り替わった）。ここまで塞いで「mina の契約 +
+# cargo」だけが使える状態にする（e2e-01 で cat/grep を deny したのと同じ手）。
+FILE_TOOLS = ("apply_patch", "applypatch", "sed", "perl", "python", "cat", "nl",
+              "head", "tail", "awk", "tee", "dd", "patch", "grep", "rg", "find",
+              "truncate", "ruby", "node", "ex", "vi", "vim", "ed")
+BASHPERMS_FORCED = {**{f"{c}*": "deny" for c in FILE_TOOLS},
+                    **{f"*{c}*": "deny" for c in FILE_TOOLS},
+                    "*": "allow"}
+
+PERMS_FORCED = {
+    "bash": BASHPERMS_FORCED,
+    "read": "deny", "edit": "deny", "glob": "deny", "grep": "deny", "list": "deny",
+    "webfetch": "deny", "websearch": "deny", "skill": "deny",
+    "todowrite": "deny", "task": "deny",
+}
+PERMS_NATIVE = {
+    "bash": "allow", "read": "allow", "edit": "allow",
+    "glob": "allow", "grep": "allow",
+}
+
+# 強制 arm の最優先ルール。opencode 本体はモデルに「手編集には常に apply_patch を使え」と
+# 指示し、しかも bash ツールが `apply_patch <<EOF` を検出して内部適用する（permission
+# フックも無い = config では止められない）。そのため agent の prompt で明示的に上書きする。
+# ここが弱いと arm 間の差が「道具」でなく「モデルの気まぐれ」になる（smoke で実測）。
+FORCED_PROMPT = """# File access rules — highest priority, overrides any other instruction
+
+All file access MUST go through the two wrapper commands on PATH:
+
+- `mread <path> [start:end]` — the ONLY way to read file contents.
+- `medit <path> <old> <new>` — the ONLY way to change a file.
+
+Never use `apply_patch`, `patch`, `cat`, `sed`, `awk`, `perl`, `python`, `tee`,
+`head`, `tail`, `nl`, `diff`, or shell redirection (`>`, `>>`) to read or alter
+files. Never invoke `minas` directly. Bash exists here only for `cargo`, `ls`,
+and similar read-only inspection of names. If you are about to touch a file any
+these ways, use `mread`/`medit` instead.
+"""
+
+
+T11_ARMS = ("native", "naive", "minas")
 
 
 # ---------- fixtures ----------
@@ -209,16 +284,10 @@ fn main() {
 """)
 
 
-def fixture_t11():
-    """T11: general 2-file feature task (no LSP). Config gains max_conns:
-    struct field + Default + decode + validate (+ env read in main.rs).
-    ~600 lines/file so full reads are costly; drift rewrites the decode
-    construct line after the first successful edit (both arms). Compiles
-    standalone — `cargo check` is part of the success predicate."""
-    (WORK / "ws" / "Cargo.toml").write_text(
-        "[package]\nname = \"abfeat\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
-    (WORK / "ws" / "src").mkdir(parents=True, exist_ok=True)
-    config_head = """// minimal structured configuration for the ab feature fixture
+# T11 の fixture は「頭（論理編集の対象）」＋「生成ノイズ（規模）」の2部構成。
+# 頭を定数に切り出してあるのは、outcome 分類が「ノイズ宣言の集合が元と一致するか」
+# を検査するため（= 意図しない領域の変更検出）。規模を変えても頭は不変。
+T11_CONFIG_HEAD = """// minimal structured configuration for the ab feature fixture
 // (keep this file plain and valid Rust — `cargo check` is the ground truth)
 
 pub struct Config {
@@ -253,13 +322,8 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 """
-    lines = [config_head]
-    lines.append("// ---- generated noise: keep this file large (contract realism) ----\n")
-    for i in range(41, 601):
-        v = (i * 7 + 3) % 503
-        lines.append(f"fn cfg_noise_{i}() -> u64 {{ {v} }}\n")
-    (WORK / "ws" / "src" / "config.rs").write_text("".join(lines))
-    main_head = """mod config;
+
+T11_MAIN_HEAD = """mod config;
 use config::{decode, validate, Config};
 
 fn main() {
@@ -274,12 +338,43 @@ fn main() {
     println!("timeout={} retries={}", cfg.timeout, cfg.retries);
 }
 """
-    mlines = [main_head]
-    mlines.append("// ---- generated noise: keep this file large (contract realism) ----\n")
-    for i in range(31, 601):
-        v = (i * 13 + 7) % 251
-        mlines.append(f"fn main_noise_{i}() -> u64 {{ {v} }}\n")
-    (WORK / "ws" / "src" / "main.rs").write_text("".join(mlines))
+
+
+def _cfg_noise(i):
+    return f"fn cfg_noise_{i}() -> u64 {{ {(i * 7 + 3) % 503} }}\n"
+
+
+def _main_noise(i):
+    return f"fn main_noise_{i}() -> u64 {{ {(i * 13 + 7) % 251} }}\n"
+
+
+def t11_noise_counts(scale):
+    """(cfg_noise 個数, main_noise 個数)。scale は 2 ファイル合計の行数。
+
+    1 ファイル = 頭 + ノイズコメント 1 行 + ノイズ n 行。scale//2 に合わせるため
+    コメント行も差し引く。"""
+    per = max(40, scale // 2)
+    return (max(0, per - T11_CONFIG_HEAD.count("\n") - 1),
+            max(0, per - T11_MAIN_HEAD.count("\n") - 1))
+
+
+def fixture_t11(scale=1200):
+    """T11: general 2-file feature task (no LSP). Config gains max_conns:
+    struct field + Default + decode + validate (+ env read in main.rs).
+
+    規模はノイズ行数だけで変える（論理編集・ground truth は固定）。全ファイル read の
+    費用は規模に比例し、窓 read は比例しない — 交点がこの曲線に出る。
+    drift は shim 非依存の外部注入（_DriftInjection）で当てる（native arm でも動く）。
+    `cargo check` は成功判定の一部。"""
+    n_cfg, n_main = t11_noise_counts(scale)
+    (WORK / "ws" / "Cargo.toml").write_text(
+        "[package]\nname = \"abfeat\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
+    (WORK / "ws" / "src").mkdir(parents=True, exist_ok=True)
+    noise = "// ---- generated noise: keep this file large (contract realism) ----\n"
+    (WORK / "ws" / "src" / "config.rs").write_text(
+        T11_CONFIG_HEAD + noise + "".join(_cfg_noise(i) for i in range(41, 41 + n_cfg)))
+    (WORK / "ws" / "src" / "main.rs").write_text(
+        T11_MAIN_HEAD + noise + "".join(_main_noise(i) for i in range(31, 31 + n_main)))
 
 
 def fixture_t10():
@@ -500,7 +595,26 @@ You MUST use these commands for all file access (no other file commands):
 Work file by file, occurrence by occurrence. When done, verify that no
 occurrence of "USD" or "price" remains in ANY of the .rs files and reply with
 exactly: DONE""",
-    "t11-A": """Implement a small feature in the Rust crate (src/config.rs and
+    # t11 の 3 arm（規模掃引）。native = opencode ネイティブ（read/edit/write 自由、
+    # 強制なし）、naive = 全文 read + 無検証置換（cat + sed 契約）、minas = 範囲 read +
+    # 検証付き apply。プロンプト本文（5項目・cargo check・DONE）は 3 arm で同一に保ち、
+    # 差が「道具と読み方」だけに帰属するようにする。
+    "t11-native": """Implement a small feature in the Rust crate (src/config.rs and
+src/main.rs): add a connection limit to the Config struct. Do ALL of the
+following:
+
+1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
+2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
+3. In fn decode, read the json key "max_conns" (with the same default 1024)
+   and include max_conns in the returned Config.
+4. In fn validate, reject configs with max_conns > 65535 with
+   Err("max_conns too large").
+5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
+   max_conns into the Config built in main.
+
+After the edits, run `cargo check` in this directory and make sure it passes.
+Reply with exactly: DONE""",
+    "t11-naive": """Implement a small feature in the Rust crate (src/config.rs and
 src/main.rs): add a connection limit to the Config struct. Do ALL of the
 following:
 
@@ -520,7 +634,7 @@ Available file commands (use ONLY these for file access):
   mread <path>               print the entire file
   medit <path> <old> <new>   replace the first occurrence of <old> with <new>
 If an edit reports "text not found", re-read the file and retry.""",
-    "t11-B": """Implement a small feature in the Rust crate (src/config.rs and
+    "t11-minas": """Implement a small feature in the Rust crate (src/config.rs and
 src/main.rs): add a connection limit to the Config struct. Do ALL of the
 following:
 
@@ -612,20 +726,30 @@ and reply with exactly: DONE""",
 
 # ---------- workdir build ----------
 
-def build_workdir(test, arm):
+def build_workdir(test, arm, scale=1200, drift=False):
     wd = WORK / "ws"
     if wd.exists():
         shutil.rmtree(wd)
     (wd / "bin").mkdir(parents=True)
     (wd / "audit.log").write_text("")
-    # bash-only agent config
-    cfg = {"agent": {AGENT: {
-        "description": "bash-only agent for minae A/B",
-        "tools": TOOLS_OFF,
-        "permission": {"bash": "allow"},
-        "maxSteps": 30,
-    }}}
+    # 3 arm の agent 設定。native はネイティブ read/edit/write を許す（強制なし）。
+    cfg = {"agent": {
+        AGENT_FORCED: {
+            "description": "bash-only agent（shim 強制）",
+            "prompt": str(wd / "forced-prompt.md"),
+            "tools": TOOLS_OFF,          # 旧 runner (1.14) 用
+            "permission": PERMS_FORCED,  # 1.18 用
+            "maxSteps": 30,
+        },
+        AGENT_NATIVE: {
+            "description": "native tools（素朴な対照・強制なし）",
+            "tools": TOOLS_NATIVE,
+            "permission": PERMS_NATIVE,
+            "maxSteps": 30,
+        },
+    }}
     (wd / "opencode.json").write_text(json.dumps(cfg, indent=2))
+    (wd / "forced-prompt.md").write_text(FORCED_PROMPT)
     # mode resolution
     read_mode = "range"
     if test == "t2":
@@ -652,32 +776,31 @@ def build_workdir(test, arm):
         p.chmod(0o755)
         return p
 
-    wr("mread", "read_shim.py", read_mode)
-    wr("medit", "edit_shim.py", edit_mode)
-    wr("mcheck", "check_shim.py", "x")
+    # native arm は shim を置かない（PATH に何も足さない = 素朴な道具だけで解く）
+    if not (test == "t11" and arm == "native"):
+        wr("mread", "read_shim.py", read_mode)
+        wr("medit", "edit_shim.py", edit_mode)
+        wr("mcheck", "check_shim.py", "x")
     if test == "t11":
-        # T11 arms. A = naive generic tools (full-file reads, blind replace,
-        # no checksum — the "cat + sed" contract). B = the minae session
-        # contract (numbered range reads, verified apply).
-        if arm == "A":
+        # 規模掃引の 3 arm。native は上の guard で shim 無し。
+        #  drift は run_once の外部注入（shim 非依存）が当てる — 3 arm に同じ機構。
+        if arm == "naive":
             wr("mread", "read_naive_shim.py", "x")
             wr("medit", "edit_naive_shim.py", "x")
             (wd / "bin" / "mcheck").unlink()
-        else:
+        elif arm == "minas":
             wr("mread", "read_shim.py", "range")
             wr("medit", "edit_shim.py", "apply")
-        fixture_t11()
-        # drift: after the first successful edit, the decode construct line is
-        # externally rewritten (retries-adjacent region), so the model's
-        # remembered anchor for the NEXT edit is stale in BOTH arms — recovery
-        # cost is what differs (full re-read vs bounded re-read + verification)
-        p = wd / "bin" / "medit"
-        shim = "edit_naive_shim.py" if arm == "A" else "edit_shim.py"
-        mode = "x" if arm == "A" else "apply"
-        p.write_text(
-            f"#!/usr/bin/env bash\n{env} export MAB_DRIFT_OLD='Ok(Config {{ timeout, retries }})'; export MAB_DRIFT_NEW='Ok(Config {{ timeout, retries /* external */ }})'; "
-            f"exec python3 {SHIMS}/{shim} {mode} \"$@\"\n")
-        p.chmod(0o755)
+        if arm != "native":
+            # 実物の `minas` が PATH にあると、エージェントが shim を飛ばして直接読む
+            # （smoke で実際に起きた: `minas read src/config.rs`）。shim の中で使う
+            # `minas` は絶対パスなので、PATH 側をブロックしても影響しない。
+            p = wd / "bin" / "minas"
+            p.write_text(
+                "#!/usr/bin/env bash\n"
+                'echo "error: use mread/medit for file access" >&2\n'
+                "exit 1\n")
+            p.chmod(0o755)
     if test == "t8":
         # both edit tools present: medit (positional) and mapply (content-resolved)
         wr("mapply", "edit_shim.py", "apply")
@@ -730,7 +853,7 @@ def build_workdir(test, arm):
     elif test == "t10":
         fixture_t10()
     elif test == "t11":
-        fixture_t11()
+        fixture_t11(scale)
     if test == "t7":
         fixture_t7()
     if test == "t8":
@@ -741,27 +864,116 @@ def build_workdir(test, arm):
 
 # ---------- run ----------
 
-def run_once(test, arm, idx):
-    wd = build_workdir(test, arm)
-    title = f"mab-{test}-{arm}-{idx}"
+class _DriftInjection:
+    """外部プロセスによる書き換えを 1 回だけ注入する（LLM には予告しない）。
+
+    shim 非依存 — naive/minas は shim の内側で注入できたが、native arm には shim が
+    無いので、ファイル監視のポーラーで 3 arm に同じ機構を当てる（外部エディタ/他プロセス
+    による変更の再現。より現実に近い）。
+
+    対象ファイルのいずれかが変化し、そのあと 1 ポーリング静かになってから
+    T11_DRIFT_OLD -> T11_DRIFT_NEW を適用する。モデルが記憶している anchor が
+    ここで古くなるので、次にそれを <old> として使うと見つからない（= drift）。
+    注入は audit.log に 1 行残す。
+    """
+
+    def __init__(self, paths, audit, old, new, interval=0.1):
+        self.paths, self.audit, self.old, self.new = paths, audit, old, new
+        self.interval = interval
+        self._stop = threading.Event()
+
+    @staticmethod
+    def _snap(p):
+        try:
+            st = p.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _run(self):
+        prev = {p: self._snap(p) for p in self.paths}
+        changed = False
+        while not self._stop.is_set():
+            time.sleep(self.interval)
+            now = {p: self._snap(p) for p in self.paths}
+            if any(now[p] != prev[p] for p in self.paths):
+                changed = True
+            elif changed:
+                break          # 変化のあと 1 ポーリング静かになった → 注入する
+            prev = now
+        if self._stop.is_set():
+            return
+        for p in self.paths:
+            try:
+                s = p.read_text()
+            except OSError:
+                continue
+            if self.old in s:
+                try:
+                    p.write_text(s.replace(self.old, self.new, 1))
+                    with open(self.audit, "a") as f:
+                        f.write(f"drift\t{p.name}\n")
+                except OSError:
+                    pass
+                return
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+
+def run_once(test, arm, idx, scale=1200, drift=False):
+    wd = build_workdir(test, arm, scale, drift)
+    title = f"mab-{test}-s{scale}-d{int(drift)}-{arm}-{idx}"
+    agent = AGENT_NATIVE if (test == "t11" and arm == "native") else AGENT_FORCED
     subprocess.run(["pkill", "-f", "opencode run"], capture_output=True)
     time.sleep(1)
+    inj = None
+    if drift:
+        inj = _DriftInjection(
+            [wd / "src" / "config.rs", wd / "src" / "main.rs"],
+            wd / "audit.log", T11_DRIFT_OLD, T11_DRIFT_NEW)
+        inj.start()
     start = time.time()
     env = os.environ.copy()
     env["PATH"] = f"{wd}/bin:" + env["PATH"]
-    proc = subprocess.Popen(
-        [OPENCODE, "run", "--agent", AGENT, "-m", MODEL,
-         "--dangerously-skip-permissions", "--pure", "--title", title,
-         PROMPTS[f"{test}-{arm}"]],
-        cwd=str(wd), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        proc.wait(timeout=600)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    # opencode 1.18 は env の PWD を見てプロジェクトディレクトリを決める（cwd では
+    # ない）。Python の env には親 shell の PWD が残っているので、ここで合わせないと
+    # セッションが呼び出し元のリポジトリに作られ、最初のメッセージで server error に
+    # なる（opencode 1.14 では起きなかった。1.18 で runner を戻した際に判明）。
+    env["PWD"] = str(wd)
+    # opencode の bash ツールは zsh。~/.zshrc の `mise activate zsh` が PATH を
+    # 組み直すので wd/bin が後ろに回り、実物の `minas`（~/.cargo/bin）が shim より
+    # 先に解決される（smoke で発覚: `minas apply --whole-stdin` が実行された）。
+    # 空の ZDOTDIR を渡して PATH を継承させ、shim を確実に先に解決させる。
+    zdir = wd / "zsh"
+    zdir.mkdir(exist_ok=True)
+    for f in (".zshrc", ".zprofile", ".zshenv", ".zlogin"):
+        (zdir / f).write_text("")
+    env["ZDOTDIR"] = str(zdir)
+    with open(wd / "agent.log", "w") as log:
+        proc = subprocess.Popen(
+            [OPENCODE, "run", "--agent", agent, "-m", MODEL,
+             "--auto", "--pure", "--title", title,
+             PROMPTS[f"{test}-{arm}"]],
+            cwd=str(wd), env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            proc.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     wall = int(time.time() - start)
+    if inj:
+        inj.stop()
     sid = session_by_title(title)
-    m = measure(sid)
-    ok, detail = success(test)
+    m = measure(sid, native=(test == "t11" and arm == "native"))
+    if test == "t11":
+        label, detail = outcome_t11(scale)
+    else:
+        ok_, detail = success(test)
+        label = "GREEN" if ok_ == "OK" else "LOUD-FAIL"
+    ok = "OK" if label == "GREEN" else "FAIL"
     audit = wd / "audit.log"
     audit_summary = summarize_audit(audit.read_text()) if audit.exists() else ""
     edits = audit.read_text().count("edit_ok") if audit.exists() else 0
@@ -770,7 +982,10 @@ def run_once(test, arm, idx):
     bypass = int(m.split("bypass=")[-1].split()[0]) if "bypass=" in m else -1
     skills = int(m.split("skills=")[-1]) if "skills=" in m else 0
     comp = "C" if ((edits + rejects + renames) > 0 and bypass == 0) else "NC"
-    print(f"{title} wall={wall}s ok={ok} comp={comp} {m} {audit_summary} renames={renames} skills={skills} {detail}")
+    if test == "t11" and arm == "native":
+        comp = "N/A"   # native は強制も bypass 監査も無い（素朴な対照）
+    print(f"{title} wall={wall}s ok={ok} outcome={label} comp={comp} {m} "
+          f"{audit_summary} renames={renames} skills={skills} {detail}")
     return title, ok, comp
 
 
@@ -783,7 +998,7 @@ def session_by_title(title):
     return row[0] if row else None
 
 
-def measure(sid):
+def measure(sid, native=False):
     if not sid:
         return "input=NA"
     con = sqlite3.connect(DB)
@@ -793,12 +1008,14 @@ def measure(sid):
     bypass = 0
     refused = 0
     skills = 0
+    steps = 0
     for (r,) in rows:
         try:
             d = json.loads(r)
         except Exception:
             continue
         if "tokens" in d and "cost" in d:
+            steps += 1
             t = d["tokens"]
             inp += t.get("input", 0)
             outp += t.get("output", 0)
@@ -806,13 +1023,21 @@ def measure(sid):
         # bypass: direct edits outside the shims (compliance check). Command text
         # lives in state.input.command (top-level input is null). Common direct-edit
         # patterns (sed -i, perl -pi, python replace/re.sub) are also flagged.
-        if d.get("type") == "tool" and str(d.get("tool", "")).lower() == "bash":
+        # bypass: 直接編集（shim 外）の検出。command テキストは state.input.command に
+        # ある（トップの input は null）。ネイティブの書き込み系ツールもカウントする
+        # （1.18 で apply_patch が permission を素通りした穴をここで可視化する）。
+        if not native and str(d.get("tool", "")).lower() in (
+                "apply_patch", "patch", "write", "edit"):
+            bypass += 1
+        if not native and d.get("type") == "tool" and str(d.get("tool", "")).lower() == "bash":
             st = d.get("state") or {}
             st_in = st.get("input") or {}
             cmd = str(st_in.get("command", "")) if isinstance(st_in, dict) else ""
             bypass_words = ("session apply", "session edit", "session rename",
-                            "sed -i", "perl -pi", "re.sub", "python3 - <<",
-                            "python3 -c", "python3 -f", ".replace(")
+                            "minas apply", "minas edit", "minas rename",
+                            "apply_patch", "applypatch", "perl -", "ruby -",
+                            "sed -i", "sed -n", "sed ", "cat ", "nl ", "tee ",
+                            "python3 ", "re.sub", ">>", "> src/", ".replace(")
             if any(w in cmd for w in bypass_words):
                 bypass += 1
             if "minae skill" in cmd:
@@ -823,7 +1048,8 @@ def measure(sid):
             if "only 'minae skill' is exposed" in out:
                 refused += 1
     eff = max(0, bypass - refused)
-    return f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} bypass={eff} refused={refused} skills={skills}"
+    return (f"input={inp} output={outp} billed={inp+outp} cost={cost:.4f} "
+            f"steps={steps} bypass={eff} refused={refused} skills={skills}")
 
 
 def summarize_audit(text):
@@ -845,6 +1071,53 @@ def cargo_check_ok():
         return p.returncode == 0
     except Exception:
         return False
+
+
+def outcome_t11(scale):
+    """t11 の run を 4 分類する（人手なし・決定論的）。
+
+      CORRUPT   — 生成ノイズ（= 意図しない領域）の宣言が欠けている / 壊れている
+      LOUD-FAIL — ビルドは通らない（検出可能な失敗）
+      GREEN     — 5 項目すべて + `cargo check` green + ノイズ無傷
+      INCOMPLETE— ビルドは通るが項目が欠けている（取りこぼし）
+
+    ノイズ宣言の集合は規模から再計算できる（生成が決定的）ので、fixture の期待値を
+    ここで組み立てて現物と比べる。drift の注入先は decode の戻り行でノイズ行ではないため、
+    注入分はこの検査に混入しない。
+    """
+    def read(p):
+        try:
+            return (WORK / "ws" / p).read_text()
+        except OSError:
+            return ""
+    cf, mn = read("src/config.rs"), read("src/main.rs")
+    n_cfg, n_main = t11_noise_counts(scale)
+    # ponytail: 部分集合 + 行数の下限で見る（ノイズ行の重複挿入は検出しない）。
+    # 何らかの解析が要るようになったら行の多重度まで見る。
+    want_cfg = {_cfg_noise(i).rstrip("\n") for i in range(41, 41 + n_cfg)}
+    want_main = {_main_noise(i).rstrip("\n") for i in range(31, 31 + n_main)}
+    have_cfg, have_main = set(cf.splitlines()), set(mn.splitlines())
+    scope_ok = (want_cfg <= have_cfg and want_main <= have_main
+                and len(have_cfg) >= len(want_cfg) and len(have_main) >= len(want_main))
+    facts = [
+        "max_conns: u32" in cf,
+        "max_conns: 1024" in cf,
+        "cfg.max_conns" in cf,
+        "65535" in cf,
+        ("max_conns" in mn and "MAX_CONNS" in mn),
+    ]
+    comp = cargo_check_ok()
+    drift_applied = T11_DRIFT_NEW in cf
+    detail = (f"facts={sum(facts)}/5 noise={'ok' if scope_ok else 'DAMAGED'} "
+              f"cargo={'ok' if comp else 'FAIL'} drift={'yes' if drift_applied else 'no'} "
+              f"lines={cf.count(chr(10))}+{mn.count(chr(10))}")
+    if not scope_ok:
+        return "CORRUPT", detail
+    if not comp:
+        return "LOUD-FAIL", detail
+    if all(facts):
+        return "GREEN", detail
+    return "INCOMPLETE", detail
 
 
 def success(test):
@@ -908,19 +1181,109 @@ def success(test):
     return "NA", ""
 
 
+def _apply_t11_ground_truth():
+    """5 項目の正解を手で当てる（selftest 専用。GREEN を作るため）。"""
+    wd = WORK / "ws"
+    p = wd / "src" / "config.rs"
+    cf = p.read_text()
+    cf = cf.replace("    pub retries: u32,\n", "    pub retries: u32,\n    pub max_conns: u32,\n")
+    cf = cf.replace("            retries: 3,\n", "            retries: 3,\n            max_conns: 1024,\n")
+    cf = cf.replace("    Ok(Config { timeout, retries })\n",
+                    "    let max_conns = if json.contains(\"max_conns\") { 1024 } else { 1024 };\n"
+                    "    Ok(Config { timeout, retries, max_conns })\n")
+    cf = cf.replace('    if cfg.retries > 10 {\n        return Err("too many retries".to_string());\n    }\n',
+                    '    if cfg.retries > 10 {\n        return Err("too many retries".to_string());\n    }\n'
+                    '    if cfg.max_conns > 65535 {\n        return Err("max_conns too large".to_string());\n    }\n')
+    p.write_text(cf)
+    mn = wd / "src" / "main.rs"
+    mn.write_text(mn.read_text().replace(
+        "    let cfg = Config { timeout: t, retries: r };\n",
+        '    let c = std::env::var("MAX_CONNS").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);\n'
+        '    let cfg = Config { timeout: t, retries: r, max_conns: c };\n'))
+
+
+def _selftest_outcome():
+    """規模掃引の計器の自己検証（LLM 不要・daemon 不要・数十秒）。
+
+    分類器が「分類できる」ことと「間違った入力で間違った答えを出す」ことを確かめる。
+    4 分類すべてを決定論的に作って確認する（ここが赤いまま掃引を回さない）。
+    """
+    wd = WORK / "ws"
+    failed = []
+
+    def check(name, got, want):
+        ok = got == want
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:26s} -> {got!r:14s} (want {want!r})")
+        if not ok:
+            failed.append(name)
+
+    for scale in SCALES:
+        build_workdir("t11", "minas", scale, False)
+        cfg = (wd / "src" / "config.rs").read_text()
+        mn = (wd / "src" / "main.rs").read_text()
+        check(f"行数 cfg scale={scale}", cfg.count("\n"), scale // 2)
+        check(f"行数 main scale={scale}", mn.count("\n"), scale // 2)
+        check(f"未編集 scale={scale}", outcome_t11(scale)[0], "INCOMPLETE")
+
+    p = wd / "src" / "config.rs"
+    build_workdir("t11", "minas", 150, False)
+    p.write_text(p.read_text().replace(_cfg_noise(45).rstrip("\n"),
+                                       "fn cfg_noise_45() -> i64", 1))
+    check("ノイズ改変 -> CORRUPT", outcome_t11(150)[0], "CORRUPT")
+
+    build_workdir("t11", "minas", 150, False)
+    _apply_t11_ground_truth()
+    check("ground truth -> GREEN", outcome_t11(150)[0], "GREEN")
+
+    build_workdir("t11", "minas", 150, False)
+    # ノイズは無傷のままビルドだけ落とす（ノイズを消すと CORRUPT が先に確定する）
+    mn_ = wd / "src" / "main.rs"
+    mn_.write_text(mn_.read_text() + '\nfn broken() { let x: u32 = "s"; }\n')
+    check("ビルド不能 -> LOUD-FAIL", outcome_t11(150)[0], "LOUD-FAIL")
+
+    build_workdir("t11", "minas", 150, True)
+    inj = _DriftInjection([p, wd / "src" / "main.rs"], wd / "audit.log",
+                          T11_DRIFT_OLD, T11_DRIFT_NEW)
+    inj.start()
+    time.sleep(0.5)
+    p.write_text(p.read_text().replace("    pub retries: u32,",
+                                       "    pub retries: u32,\n    pub tmp: u8,", 1))
+    time.sleep(1.2)
+    inj.stop()
+    check("drift 注入が当たる", "drift=yes" in outcome_t11(150)[1], True)
+
+    print(f"\n{len(failed)} failure(s)" if failed else "\nselftest OK")
+    return 1 if failed else 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["run", "stats", "fixture"])
-    ap.add_argument("test", choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"])
-    ap.add_argument("arm", choices=["A", "B"], nargs="?")
+    ap.add_argument("action", choices=["run", "stats", "fixture", "selftest"])
+    ap.add_argument("test", nargs="?",
+                    choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"])
+    ap.add_argument("arm", nargs="?", help="t11 は native|naive|minas、他は A|B")
     ap.add_argument("idx", type=int, nargs="?")
+    ap.add_argument("--scale", type=int, default=1200,
+                    choices=list(SCALES), help="t11 の 2 ファイル合計行数")
+    ap.add_argument("--drift", type=int, default=0, help="1 で外部書き換えを注入")
     a = ap.parse_args()
+    if a.action == "selftest":
+        sys.exit(_selftest_outcome())
+    if a.action in ("run", "fixture"):
+        valid = T11_ARMS if a.test == "t11" else ("A", "B")
+        if a.arm not in valid:
+            ap.error(f"arm must be one of {valid} for {a.test}")
     if a.action == "fixture":
-        build_workdir(a.test, "A")
-        print(f"fixture ready in {WORK}/ws")
+        build_workdir(a.test, a.arm, a.scale, bool(a.drift))
+        for f in ("src/config.rs", "src/main.rs"):
+            p = WORK / "ws" / f
+            if p.exists():
+                print(f"{f}: {p.read_text().count(chr(10))} lines")
+        print(f"fixture ready in {WORK}/ws (scale={a.scale} drift={bool(a.drift)})")
         sys.exit(0)
     if a.action == "stats":
-        sid = session_by_title(f"mab-{a.test}-{a.arm}-{a.idx}")
-        print(f"mab-{a.test}-{a.arm}-{a.idx}: {measure(sid)}")
+        title = f"mab-{a.test}-s{a.scale}-d{int(a.drift)}-{a.arm}-{a.idx}"
+        sid = session_by_title(title)
+        print(f"{title}: {measure(sid)}")
         sys.exit(0)
-    run_once(a.test, a.arm, a.idx)
+    run_once(a.test, a.arm, a.idx, a.scale, bool(a.drift))
