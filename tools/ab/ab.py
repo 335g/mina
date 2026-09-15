@@ -58,9 +58,14 @@ AGENT = AGENT_FORCED            # 後方互換（他のテストは従来どお�
 # t11 の規模掃引: 「2ファイル合計行数」の 5 点。1200 は公開済み t11 と同じ規模
 # （README の −41% の値はここに載る = 曲線との連続性を保つため中間点として残す）。
 SCALES = (150, 600, 1200, 2400, 9600)
-# drift の注入対象（decode の戻り行）。規模に依存しないのでどの点でも同じ。
-T11_DRIFT_OLD = "Ok(Config { timeout, retries })"
-T11_DRIFT_NEW = "Ok(Config { timeout, retries /* external */ })"
+# drift の注入。"外部プロセスが後から加えた変更" を main.rs の末尾に足す。
+# タスクの編集範囲（config.rs / main.rs の先頭部分）の外に置くのがミソ: これを
+# 失ったら「並行変更を黙って消した」と言える。中身が valid な Rust なので cargo check は
+# 通る（未使用 const は warning だけ）＝ 検出可能な失敗にはならず、静かな失敗だけが残る。
+# 旧設計は decode の戻り行を書き換えていたが、そこはエージェント自身が編集する
+# 場所なので "消えた = 選手が書き換えた" と区別できなかった（2026-09-16 の掃引で判明）。
+T11_DRIFT_MARKER = "const EXTERNAL_REVISION: u64 = 7;"
+T11_DRIFT_TARGET = "src/main.rs"
 
 TOOLS_OFF = {
     "bash": True,
@@ -931,14 +936,16 @@ class _DriftInjection:
     無いので、ファイル監視のポーラーで 3 arm に同じ機構を当てる（外部エディタ/他プロセス
     による変更の再現。より現実に近い）。
 
-    対象ファイルのいずれかが変化し、そのあと 1 ポーリング静かになってから
-    T11_DRIFT_OLD -> T11_DRIFT_NEW を適用する。モデルが記憶している anchor が
-    ここで古くなるので、次にそれを <old> として使うと見つからない（= drift）。
-    注入は audit.log に 1 行残す。
+    対象ファイルのいずれかが最初に変化したら、書き込みが終わるのを 0.2 秒待って
+    ただちに注入する（"静かになるまで待つ" 方式は run によって発火しなかった —
+    2026-09-16 の掃引で 30 run 中何件かが未発火のまま記録されていた）。
+    発火しなかった場合は理由を audit に残す（後から「発火した run だけ」を
+    分析できるようにする。計器の取りこぼしを黙って黙認しない）。
     """
 
-    def __init__(self, paths, audit, old, new, interval=0.1):
-        self.paths, self.audit, self.old, self.new = paths, audit, old, new
+    def __init__(self, watch, target, audit, marker, interval=0.05):
+        self.watch, self.target, self.audit = watch, target, audit
+        self.marker = marker
         self.interval = interval
         self._stop = threading.Event()
 
@@ -951,31 +958,29 @@ class _DriftInjection:
             return None
 
     def _run(self):
-        prev = {p: self._snap(p) for p in self.paths}
-        changed = False
+        prev = {p: self._snap(p) for p in self.watch}
         while not self._stop.is_set():
             time.sleep(self.interval)
-            now = {p: self._snap(p) for p in self.paths}
-            if any(now[p] != prev[p] for p in self.paths):
-                changed = True
-            elif changed:
-                break          # 変化のあと 1 ポーリング静かになった → 注入する
-            prev = now
+            if any(self._snap(p) != prev[p] for p in self.watch):
+                break
         if self._stop.is_set():
+            self._note("miss", "no-change")
             return
-        for p in self.paths:
-            try:
-                s = p.read_text()
-            except OSError:
-                continue
-            if self.old in s:
-                try:
-                    p.write_text(s.replace(self.old, self.new, 1))
-                    with open(self.audit, "a") as f:
-                        f.write(f"drift\t{p.name}\n")
-                except OSError:
-                    pass
-                return
+        time.sleep(0.2)          # 書き込み中のファイルを触らないための短い待ち
+        try:
+            s = self.target.read_text()
+            if self.marker not in s:
+                self.target.write_text(s + "\n" + self.marker + "\n")
+            self._note("drift", self.target.name)
+        except OSError:
+            self._note("miss", "write-failed")
+
+    def _note(self, kind, detail):
+        try:
+            with open(self.audit, "a") as f:
+                f.write(f"{kind}\t{detail}\n")
+        except OSError:
+            pass
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -994,7 +999,7 @@ def run_once(test, arm, idx, scale=1200, drift=False):
     if drift:
         inj = _DriftInjection(
             [wd / "src" / "config.rs", wd / "src" / "main.rs"],
-            wd / "audit.log", T11_DRIFT_OLD, T11_DRIFT_NEW)
+            wd / T11_DRIFT_TARGET, wd / "audit.log", T11_DRIFT_MARKER)
         inj.start()
     start = time.time()
     env = os.environ.copy()
@@ -1048,6 +1053,9 @@ def run_once(test, arm, idx, scale=1200, drift=False):
     edits = audit.read_text().count("edit_ok") if audit.exists() else 0
     rejects = audit.read_text().count("edit_reject") if audit.exists() else 0
     renames = audit.read_text().count("rename\t") if audit.exists() else 0
+    audit_text = audit.read_text() if audit.exists() else ""
+    drift_fired = audit_text.count("drift\t")
+    drift_miss = audit_text.split("miss\t")[-1].split("\n")[0] if "miss\t" in audit_text else ""
     bypass = int(m.split("bypass=")[-1].split()[0]) if "bypass=" in m else -1
     skills = int(m.split("skills=")[-1]) if "skills=" in m else 0
     comp = "C" if ((edits + rejects + renames) > 0 and bypass == 0) else "NC"
@@ -1065,7 +1073,13 @@ def run_once(test, arm, idx, scale=1200, drift=False):
              "noise": "DAMAGED" if "noise=DAMAGED" in detail else "ok",
              "cargo": "ok" if "cargo=ok" in detail else "FAIL",
              "edits": edits, "rejects": rejects, "renames": renames,
-             "reads": _num(audit_summary, "reads")})
+             "reads": _num(audit_summary, "reads"),
+             # drift が実際に発火したかは run ごとに違う（タイミング依存）。
+             # 後から「発火した run だけ」で分析できるよう必ず記録する。
+             "drift_fired": drift_fired, "drift_miss": drift_miss,
+             "marker": "yes" if "marker=yes" in detail else "no",
+             # 外部変更を黙って消した（= 安全側の失敗）。drift が発火した run でのみ意味がある。
+             "ext_lost": bool(drift_fired) and "marker=no" in detail})
     return title, ok, comp
 
 
@@ -1136,12 +1150,14 @@ def _meta():
             "model": MODEL, "runner": sh(OPENCODE, "--version")}
 
 
-def sweep(arms=T11_ARMS, scales=SCALES, drift_scales=None, n=5):
+def sweep(arms=T11_ARMS, scales=SCALES, drift_scales=None, n=5,
+          drift_only=False, idx_from=1):
     """決定済みの掃引をそのまま回す。
 
     規模点 × arm × n を idx に沿って **arm 交互**（paired 設計）に走らせる。
     drift は最小・最大の 2 点だけで on/off を取る。1 run が失敗しても続行する
     （失敗 run は NC として履歴に残り、後で差し替えられる）。
+    drift_only + idx_from で「drift セルだけを追加反復する」ことができる。
     """
     drift_scales = drift_scales or (SCALES[0], SCALES[-1])
     plan = []
@@ -1149,7 +1165,9 @@ def sweep(arms=T11_ARMS, scales=SCALES, drift_scales=None, n=5):
         for dr in (0, 1):
             if dr == 1 and scale not in drift_scales:
                 continue
-            for idx in range(1, n + 1):
+            if drift_only and dr == 0:
+                continue
+            for idx in range(idx_from, idx_from + n):
                 for arm in arms:
                     plan.append((arm, idx, scale, bool(dr)))
     print(f"sweep: {len(plan)} runs -> {HISTORY}", flush=True)
@@ -1282,9 +1300,9 @@ def outcome_t11(scale):
         ("max_conns" in mn and "MAX_CONNS" in mn),
     ]
     comp = cargo_check_ok()
-    drift_applied = T11_DRIFT_NEW in cf
+    marker_kept = T11_DRIFT_MARKER in mn
     detail = (f"facts={sum(facts)}/5 noise={'ok' if scope_ok else 'DAMAGED'} "
-              f"cargo={'ok' if comp else 'FAIL'} drift={'yes' if drift_applied else 'no'} "
+              f"cargo={'ok' if comp else 'FAIL'} marker={'yes' if marker_kept else 'no'} "
               f"lines={cf.count(chr(10))}+{mn.count(chr(10))}")
     if not scope_ok:
         return "CORRUPT", detail
@@ -1382,6 +1400,38 @@ def _apply_t11_ground_truth(underscore=False):
         '    let cfg = Config { timeout: t, retries: r, max_conns: c };\n'))
 
 
+def _selftest_safety():
+    """安全側の性質を決定論的に示す（LLM 不要）。
+
+    外部プロセスが追記した変更を、知らないまま全体を書き戻すと消える —
+    これが naive arm（読んで置換して全体を書く）の失敗モード。
+    同じ状況で `minas apply` は消さない（open のたびにディスクを見る）。
+    """
+    wd = WORK / "ws"
+    build_workdir("t11", "minas", 150, False)
+    p = wd / "src" / "main.rs"
+    out = []
+
+    stale = p.read_text()                      # エージェントが読んだつもりの内容
+    p.write_text(p.read_text() + "\n" + T11_DRIFT_MARKER + "\n")   # 外部の並行変更
+    p.write_text(stale.replace("fn main() {", "fn main() { // touched", 1))  # 古い内容で書き戻す
+    out.append(("無検証の全体書戻しは外部変更を消す",
+                T11_DRIFT_MARKER not in p.read_text(), True))
+
+    build_workdir("t11", "minas", 150, False)  # minas 側はきれいな状態から
+    p.write_text(p.read_text() + "\n" + T11_DRIFT_MARKER + "\n")
+    r = subprocess.run([str(MINA), "apply", "src/main.rs",
+                        "    let cfg = Config { timeout: t, retries: r };",
+                        "    let cfg = Config { timeout: t, retries: r }; // edited"],
+                       cwd=str(wd), capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        out.append(("minas apply は外部変更を保つ", "SKIP（daemon 不在）", "SKIP"))
+    else:
+        out.append(("minas apply は外部変更を保つ",
+                    T11_DRIFT_MARKER in p.read_text(), True))
+    return out
+
+
 def _selftest_outcome():
     """規模掃引の計器の自己検証（LLM 不要・daemon 不要・数十秒）。
 
@@ -1426,15 +1476,25 @@ def _selftest_outcome():
     check("ビルド不能 -> LOUD-FAIL", outcome_t11(150)[0], "LOUD-FAIL")
 
     build_workdir("t11", "minas", 150, True)
-    inj = _DriftInjection([p, wd / "src" / "main.rs"], wd / "audit.log",
-                          T11_DRIFT_OLD, T11_DRIFT_NEW)
+    inj = _DriftInjection([p, wd / "src" / "main.rs"], wd / T11_DRIFT_TARGET,
+                          wd / "audit.log", T11_DRIFT_MARKER)
     inj.start()
     time.sleep(0.5)
     p.write_text(p.read_text().replace("    pub retries: u32,",
                                        "    pub retries: u32,\n    pub tmp: u8,", 1))
     time.sleep(1.2)
     inj.stop()
-    check("drift 注入が当たる", "drift=yes" in outcome_t11(150)[1], True)
+    check("drift 注入が当たる", "marker=yes" in outcome_t11(150)[1], True)
+    # 並行変更を消したケースを検出できるか（whole-file write の再現）
+    mn2 = (wd / "src" / "main.rs")
+    mn2.write_text(mn2.read_text().replace(T11_DRIFT_MARKER, ""))
+    check("外部変更を失ったら検出", "marker=no" in outcome_t11(150)[1], True)
+
+    for name, got, want in _selftest_safety():
+        if want == "SKIP":
+            print(f"  SKIP  {name:26s} -> {got}")
+        else:
+            check(name, got, want)
 
     print(f"\n{len(failed)} failure(s)" if failed else "\nselftest OK")
     return 1 if failed else 0
@@ -1453,12 +1513,21 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=5, help="sweep: arm ごとの反復数")
     ap.add_argument("--scales", default=",".join(map(str, SCALES)),
                     help="sweep: 規模点をカンマ区切りで")
+    ap.add_argument("--arms", default=",".join(T11_ARMS),
+                    help="sweep: arm をカンマ区切りで")
+    ap.add_argument("--drift-only", action="store_true", help="sweep: drift=1 だけ")
+    ap.add_argument("--idx-from", type=int, default=1, help="sweep: idx の起点")
     a = ap.parse_args()
     if a.action == "selftest":
         sys.exit(_selftest_outcome())
     if a.action == "sweep":
         sc = tuple(int(x) for x in a.scales.split(",") if x.strip())
-        sweep(scales=sc, n=a.n)
+        arms = tuple(x for x in a.arms.split(",") if x.strip())
+        bad = [x for x in arms if x not in T11_ARMS]
+        if bad:
+            ap.error(f"unknown arm(s): {bad}; known: {T11_ARMS}")
+        sweep(scales=sc, arms=arms, n=a.n, drift_only=a.drift_only,
+              idx_from=a.idx_from)
         sys.exit(0)
     if a.action in ("run", "fixture"):
         valid = T11_ARMS if a.test == "t11" else ("A", "B")
