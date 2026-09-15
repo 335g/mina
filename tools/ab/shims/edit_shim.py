@@ -9,9 +9,9 @@ Model-facing interface (bash-only agent):
 Mode selectable via argv[0] wrapper (edit_shim.py apply|edit|apply-generic).
 
 Difference between modes:
-  apply        : runs `minae session apply <path> <old> <new>` — content-
+  apply        : runs `minas apply <path> <old> <new>` — content-
                  resolved, no positions, verified + saved in one call.
-  edit         : runs `minae session edit <json>` where the model supplies
+  edit         : runs `minas edit <json>` where the model supplies
                  {start,end,text,checksum,expected_text} in char indices —
                  the positional path (must compute offsets itself).
   generic      : same as apply, but rejection/not-found stderr is rewritten to
@@ -69,7 +69,7 @@ def main():
         if len(args) != 3:
             print("usage: e <path> <old> <new>"); sys.exit(1)
         path, old, new = args
-        out, err, rc = run([MINA, "session", "apply", path, old, new])
+        out, err, rc = run([MINA, "apply", path, old, new])
         if rc == 0:
             drift(path)
             audit("edit_ok", f"apply old={old[:40]}")
@@ -83,7 +83,7 @@ def main():
         if len(args) != 2:
             print("usage: e <path> <documentedit-json>"); sys.exit(1)
         path, doc = args
-        out, err, rc = run([MINA, "session", "edit", doc])
+        out, err, rc = run([MINA, "edit", doc])
         if rc == 0:
             drift(path)
             audit("edit_ok", "edit")

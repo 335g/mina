@@ -3,20 +3,20 @@
 
 Model-facing interface (bash-only agent):
     r <path> [start:end]
-        read lines of <path> via minae `session get --lines` (numbered lines).
+        read lines of <path> via minas `read --lines` (numbered lines JSON).
         Without a range, prints a short head (first 25 lines) to avoid dumping
         the whole file (the model must use ranges — that is the point).
         Out-of-range start prints the explained zero result (Q3/R1).
 
 Mode selectable via argv[0] wrapper (read_shim.py range|full ...).
-Mode "full": `minae session get` full snapshot is printed instead (for the
+Mode "full": `minas read` full text is printed instead (for the
 Arm-B comparison) — forces whole-file reads.
 
 Environment:
     MAB_MINABIN   path to the minae binary
     MAB_AUDIT     audit log path (append lines)
 """
-import json, os, subprocess, sys
+import os, subprocess, sys
 
 MINA = os.environ.get("MAB_MINABIN", "")
 AUDIT = os.environ.get("MAB_AUDIT", "")
@@ -33,10 +33,6 @@ def m(args, binary=False):
     return p.stdout, p.stderr, p.returncode
 
 
-def open_file(path):
-    return m([MINA, "session", "exec", json.dumps({"Open": {"path": path}})])
-
-
 def main():
     mode = sys.argv[1]
     args = sys.argv[2:]
@@ -44,19 +40,18 @@ def main():
         print("usage: r <path> [start:end]"); sys.exit(1)
     path = args[0]
     rng = args[1] if len(args) > 1 else None
-    open_file(path)
     if mode == "full" and rng is None:
-        out, err, rc = m([MINA, "session", "get"])
+        out, err, rc = m([MINA, "read", path])
         size = len(out)
         print(out, end="")
     elif rng is None:
         # head only: 25 lines (discourages dumping; ranges are the contract)
-        out, err, rc = m([MINA, "session", "get", "--lines", "1:25"])
+        out, err, rc = m([MINA, "read", path, "--lines", "1:25"])
         size = len(out)
         print(out, end="")
         audit("read_head", path, f"bytes={size}")
     else:
-        out, err, rc = m([MINA, "session", "get", "--lines", rng])
+        out, err, rc = m([MINA, "read", path, "--lines", rng])
         size = len(out)
         print(out, end="")
         audit("read", path, f"range={rng} bytes={size}")

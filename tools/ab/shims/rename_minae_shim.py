@@ -2,7 +2,7 @@
 """minae A/B shim — semantic rename via minae's OWN `session rename` (M2, ADR-0029).
 
     mrename <path> <old> <new>
-        Runs `minae session rename <path> <old> <new>`: content-addressed — minae
+        Runs `minas rename <path> <old> <new>`: content-addressed — minae
         resolves <old> to the first identifier occurrence (comments/strings
         excluded), the language server (rust-analyzer) rewrites every reference
         across files, and the result is applied and saved to disk. Output is
@@ -32,7 +32,7 @@ def main():
         print("usage: mrename <path> <old> <new>", file=sys.stderr)
         sys.exit(1)
     path, old, new = sys.argv[1:4]
-    r = subprocess.run([MINA, "session", "rename", path, old, new],
+    r = subprocess.run([MINA, "rename", path, old, new],
                        capture_output=True, text=True)
     if r.returncode == 0:
         audit("rename", f"{old}->{new} ok")

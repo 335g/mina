@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -28,6 +29,9 @@ import time
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 SHIMS = pathlib.Path(__file__).resolve().parent / "shims"
 WORK = pathlib.Path("/tmp/ab-run")
+# 測定の履歴。1 run = 1 行の JSONL で git 管理下に置く（数字は binary と runner に
+# 依存するので、commit / generation / runner 版を各業に入れておかないと比較できない）。
+HISTORY = pathlib.Path(__file__).resolve().parent.parent.parent / "docs" / "benchmarks" / "l2" / "history.jsonl"
 DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
 
 
@@ -72,57 +76,146 @@ TOOLS_OFF = {
     "apply_patch": False,
 }
 
-# native arm（素朴な対照）: ネイティブの read/edit/write を許す。強制も bypass 監査も
-# しない — これが実際のエージェントの素朴な道具面。
-TOOLS_NATIVE = {**TOOLS_OFF, "read": True, "edit": True, "write": True}
+# --- t11 の 3 arm は「bash を外す」で強制する（2026-09-15 の方針変更）---
+#
+# 理由（すべて実測）: opencode 1.18 では
+#   (1) `apply_patch` は PATH のコマンドではなく bash ツール内部の特例で、permission
+#       フックを持たない。しかも opencode 自身が「手編集には常に apply_patch を使え」と
+#       モデルに指示している。
+#   (2) bash の permission deny パターンが効かない（`{"cat":"deny"}` も
+#       `{"cat*":"deny"}` も、--auto の有無に関わらず `cat` が実行された）。
+#   (3) prompt で apply_patch を禁じると `perl -0777 -i -pe` に切り替わった。
+# つまり bash が 1 つでもあると mina の道具面は強制できず、測れるのは「モデルの気まぐれ」
+# になる（6 run 中 5 run が何らかの形で迂回）。そこで bash を tool ごと落とし、ファイル
+# アクセスは opencode の custom tool（.opencode/tools/*.ts）だけにする。custom tool は
+# 同名の組み込み tool を上書きでき、`tools: {bash: false}` は実測で効いた。
+STRICT_OFF = {**TOOLS_OFF, "bash": False, "task": False}
+# native arm: ネイティブの read/edit/write/glob/grep だけ。bash も task も無し
+# （= 素朴な道具面からシェルの万能さだけを除いた対照。厳密さを優先し、3 arm すべてで
+# bash を使わない）。
+TOOLS_NATIVE = {**STRICT_OFF, "read": True, "edit": True, "write": True,
+                "glob": True, "grep": True}
+# 強制 arm: ファイル系のネイティブ tool を全部落とし、custom tool だけ残す。
+TOOLS_STRICT = STRICT_OFF
 
-# opencode 1.18 では `tools` は deprecated で、permission が本体（config.json の
-# PermissionConfig）。旧 runner (1.14) では tools だけが効いたので、両方書いて
-# どちらの runner でも同じ強制になるようにしてある（runner を替えても契約が変わらない）。
-# 実測: 1.18 で tools だけだと apply_patch が素通りし、セッションが shim を迂回した
-# （2026-09-15。smoke で発覚）。
-# bash ツールで「ファイルを読む・書く」道具を塞ぐ。tools/permission の read/edit/glob/grep/list
-# を deny しても、bash 経由の sed/perl/cat/python は残る（実測: prompt で apply_patch を
-# 止めたところ、次は perl -0777 -i -pe に切り替わった）。ここまで塞いで「mina の契約 +
-# cargo」だけが使える状態にする（e2e-01 で cat/grep を deny したのと同じ手）。
-FILE_TOOLS = ("apply_patch", "applypatch", "sed", "perl", "python", "cat", "nl",
-              "head", "tail", "awk", "tee", "dd", "patch", "grep", "rg", "find",
-              "truncate", "ruby", "node", "ex", "vi", "vim", "ed")
-BASHPERMS_FORCED = {**{f"{c}*": "deny" for c in FILE_TOOLS},
-                    **{f"*{c}*": "deny" for c in FILE_TOOLS},
-                    "*": "allow"}
-
-PERMS_FORCED = {
-    "bash": BASHPERMS_FORCED,
-    "read": "deny", "edit": "deny", "glob": "deny", "grep": "deny", "list": "deny",
-    "webfetch": "deny", "websearch": "deny", "skill": "deny",
-    "todowrite": "deny", "task": "deny",
-}
+# 旧 runner (1.14) / 旧テスト (t1-t10) 用。t11 ではもう使わない。
 PERMS_NATIVE = {
-    "bash": "allow", "read": "allow", "edit": "allow",
-    "glob": "allow", "grep": "allow",
+    "bash": "deny", "task": "deny",
+    "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow",
 }
+PERMS_STRICT = {
+    "bash": "deny", "task": "deny",
+    "read": "deny", "edit": "deny", "glob": "deny", "grep": "deny",
+    "list": "deny", "webfetch": "deny", "websearch": "deny",
+    "skill": "deny", "todowrite": "deny",
+}
+PERMS_FORCED = {**PERMS_STRICT, "bash": "allow"}   # 旧テスト用（bash + shim）
 
-# 強制 arm の最優先ルール。opencode 本体はモデルに「手編集には常に apply_patch を使え」と
-# 指示し、しかも bash ツールが `apply_patch <<EOF` を検出して内部適用する（permission
-# フックも無い = config では止められない）。そのため agent の prompt で明示的に上書きする。
-# ここが弱いと arm 間の差が「道具」でなく「モデルの気まぐれ」になる（smoke で実測）。
-FORCED_PROMPT = """# File access rules — highest priority, overrides any other instruction
+# 強制 arm の補足 prompt。opencode 本体はモデルに「手編集には常に apply_patch を使え」と
+# 指示するが、強制 arm には bash も apply_patch も無い。そのままだと存在しない道具を
+# 探しに行くので、使える道具をここで明示する。
+STRICT_PROMPT = """# File access in this project
 
-All file access MUST go through the two wrapper commands on PATH:
-
-- `mread <path> [start:end]` — the ONLY way to read file contents.
-- `medit <path> <old> <new>` — the ONLY way to change a file.
-
-Never use `apply_patch`, `patch`, `cat`, `sed`, `awk`, `perl`, `python`, `tee`,
-`head`, `tail`, `nl`, `diff`, or shell redirection (`>`, `>>`) to read or alter
-files. Never invoke `minas` directly. Bash exists here only for `cargo`, `ls`,
-and similar read-only inspection of names. If you are about to touch a file any
-these ways, use `mread`/`medit` instead.
+There is no shell in this session. All file access goes through the two tools
+`mread` and `medit` — use them; do not attempt anything else.
 """
 
 
 T11_ARMS = ("native", "naive", "minas")
+
+# ---------- t11 の custom tool ----------
+#
+# .opencode/tools/<name>.ts のファイル名が tool 名になる。ここでは shim を subprocess で
+# 呼ぶだけの薄いラッパ（実装は既存の python shim 1 本のまま = audit.log もそのまま使える）。
+# shim が非ゼロで終わったら throw して tool error にする — 却下が「見える」ことが mina の
+# 契約の一部なので、黙って失敗させない。
+TOOL_TS_HEAD = """import { tool } from "@opencode-ai/plugin"
+
+const MINA = %(mina)r
+const AUDIT = %(audit)r
+const SHIM = %(shim)r
+const PY = %(py)r
+
+function run(argv: string[], cwd: string) {
+  const p = Bun.spawnSync({
+    cmd: [PY, SHIM, ...argv],
+    cwd,
+    env: { ...process.env, MAB_MINABIN: MINA, MAB_AUDIT: AUDIT },
+  })
+  const out = (p.stdout?.toString() ?? "") + (p.stderr?.toString() ?? "")
+  if (p.exitCode !== 0) {
+    throw new Error(out.trim() || `failed with exit ${p.exitCode}`)
+  }
+  return out
+}
+"""
+
+
+#: arm -> (read shim, read mode, edit shim, edit mode, tool descriptions)
+T11_TOOLS = {
+    "naive": {
+        "read": ("read_naive_shim.py", "x"),
+        "edit": ("edit_naive_shim.py", "x"),
+        "read_desc": "Read a file. Returns the whole file, as-is.",
+        "edit_desc": ("Replace the first occurrence of `old` with `new` in `path`. "
+                      "Both are literal text."),
+    },
+    "minas": {
+        "read": ("read_shim.py", "range"),
+        "edit": ("edit_shim.py", "apply"),
+        "read_desc": ("Read lines of a file. Returns numbered lines (n: text). "
+                      "Give `start`/`end` to read only the lines you need; "
+                      "omitting both returns just the head of the file."),
+        "edit_desc": ("Apply a content-based edit: replace `old` with `new` in "
+                      "`path`. `old` must be text you actually saw in the file; "
+                      "the edit is verified against the current file contents and "
+                      "is rejected if it no longer matches. If it is rejected, "
+                      "re-read the affected lines and retry."),
+    },
+}
+
+
+def write_t11_tools(wd, arm):
+    """強制 arm の custom tool を生成する。native arm はネイティブ tool を使うので何もしない。"""
+    if arm not in T11_TOOLS:
+        return
+    spec = T11_TOOLS[arm]
+    tdir = wd / ".opencode" / "tools"
+    tdir.mkdir(parents=True, exist_ok=True)
+    base = dict(mina=str(MINA), audit=str(wd / "audit.log"), py=sys.executable,
+                shim=str(SHIMS))
+    rshim, rmode = spec["read"]
+    eshim, emode = spec["edit"]
+    (tdir / "mread.ts").write_text(TOOL_TS_HEAD % {**base, "shim": str(SHIMS / rshim)} + f"""
+export default tool({{
+  description: {spec["read_desc"]!r},
+  args: {{
+    path: tool.schema.string().describe("file path relative to the project root"),
+    start: tool.schema.number().optional().describe("first line (1-based)"),
+    end: tool.schema.number().optional().describe("last line, inclusive"),
+  }},
+  async execute(args, ctx) {{
+    const argv = [{rmode!r}, args.path]
+    if (args.start !== undefined || args.end !== undefined) {{
+      argv.push(`${{args.start ?? 1}}:${{args.end ?? ""}}`)
+    }}
+    return run(argv, ctx.directory)
+  }},
+}})
+""")
+    (tdir / "medit.ts").write_text(TOOL_TS_HEAD % {**base, "shim": str(SHIMS / eshim)} + f"""
+export default tool({{
+  description: {spec["edit_desc"]!r},
+  args: {{
+    path: tool.schema.string().describe("file path relative to the project root"),
+    old: tool.schema.string().describe("exact text currently in the file"),
+    new: tool.schema.string().describe("replacement text"),
+  }},
+  async execute(args, ctx) {{
+    return run([{emode!r}, args.path, args.old, args.new], ctx.directory)
+  }},
+}})
+""")
 
 
 # ---------- fixtures ----------
@@ -412,6 +505,40 @@ console.log(first + " " + second + " " + third);
 """)
 
 
+# t11 のタスク本文。3 arm で完全に同一。
+# 旧版は「cargo check を走らせて通ることを確かめよ」と書いていたが、3 arm とも bash を
+# 持たない（strict）ので検証は実行できない。合否は harness 側が cargo check で判定する。
+T11_BODY = """Implement a small feature in the Rust crate (src/config.rs and
+src/main.rs): add a connection limit to the Config struct. Do ALL of the
+following:
+
+1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
+2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
+3. In fn decode, read the json key "max_conns" (with the same default 1024)
+   and include max_conns in the returned Config.
+4. In fn validate, reject configs with max_conns > 65535 with
+   Err("max_conns too large").
+5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
+   max_conns into the Config built in main.
+
+The result must compile. Reply with exactly: DONE
+"""
+
+# arm ごとの道具の案内 — ここだけが 3 arm で違う。
+T11_TOOL_HINT = {
+    "native": "",
+    "naive": """
+Use `mread` to read a file and `medit` to replace text in it. This session has
+no shell.""",
+    "minas": """
+Use `mread` to read lines of a file (pass `start`/`end` to read only the lines
+you need) and `medit` to apply a content-based edit. An edit is rejected when
+its `old` text no longer matches the file — re-read the affected lines and
+retry. This session has no shell.""",
+}
+
+T11_PROMPTS = {f"t11-{arm}": T11_BODY + T11_TOOL_HINT[arm] for arm in T11_ARMS}
+
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
     # the rejection message differs (apply vs apply-generic in edit_shim).
@@ -595,68 +722,9 @@ You MUST use these commands for all file access (no other file commands):
 Work file by file, occurrence by occurrence. When done, verify that no
 occurrence of "USD" or "price" remains in ANY of the .rs files and reply with
 exactly: DONE""",
-    # t11 の 3 arm（規模掃引）。native = opencode ネイティブ（read/edit/write 自由、
-    # 強制なし）、naive = 全文 read + 無検証置換（cat + sed 契約）、minas = 範囲 read +
-    # 検証付き apply。プロンプト本文（5項目・cargo check・DONE）は 3 arm で同一に保ち、
-    # 差が「道具と読み方」だけに帰属するようにする。
-    "t11-native": """Implement a small feature in the Rust crate (src/config.rs and
-src/main.rs): add a connection limit to the Config struct. Do ALL of the
-following:
-
-1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
-2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
-3. In fn decode, read the json key "max_conns" (with the same default 1024)
-   and include max_conns in the returned Config.
-4. In fn validate, reject configs with max_conns > 65535 with
-   Err("max_conns too large").
-5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
-   max_conns into the Config built in main.
-
-After the edits, run `cargo check` in this directory and make sure it passes.
-Reply with exactly: DONE""",
-    "t11-naive": """Implement a small feature in the Rust crate (src/config.rs and
-src/main.rs): add a connection limit to the Config struct. Do ALL of the
-following:
-
-1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
-2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
-3. In fn decode, read the json key "max_conns" (with the same default 1024)
-   and include max_conns in the returned Config.
-4. In fn validate, reject configs with max_conns > 65535 with
-   Err("max_conns too large").
-5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
-   max_conns into the Config built in main.
-
-After the edits, run `cargo check` in this directory and make sure it passes.
-Reply with exactly: DONE
-
-Available file commands (use ONLY these for file access):
-  mread <path>               print the entire file
-  medit <path> <old> <new>   replace the first occurrence of <old> with <new>
-If an edit reports "text not found", re-read the file and retry.""",
-    "t11-minas": """Implement a small feature in the Rust crate (src/config.rs and
-src/main.rs): add a connection limit to the Config struct. Do ALL of the
-following:
-
-1. In src/config.rs, add the field `pub max_conns: u32,` to struct Config.
-2. In the Default impl, add `max_conns: 1024,` to the constructed Config.
-3. In fn decode, read the json key "max_conns" (with the same default 1024)
-   and include max_conns in the returned Config.
-4. In fn validate, reject configs with max_conns > 65535 with
-   Err("max_conns too large").
-5. In src/main.rs, read the env var MAX_CONNS (default 1024) and pass
-   max_conns into the Config built in main.
-
-After the edits, run `cargo check` in this directory and make sure it passes.
-Reply with exactly: DONE
-
-Available file commands (use ONLY these for file access):
-  mread <path> [start:end]   read numbered lines of a file (JSON: lines with n/text)
-  medit <path> <old> <new>   verified content-based apply (opens, locates, saves)
-  mcheck <path>              print the file checksum
-Use mread with a range to read only the lines you need before each edit. If an
-edit is rejected, re-read the affected range and retry. You can pass the line
-text you saw verbatim as <old> — it is used to locate the edit.""",
+    # t11 の 3 arm（規模掃引）。プロンプト本文（5項目・DONE）は 3 arm で完全に同一に保ち、
+    # 差が「道具と読み方」だけに帰属するようにする（T11_PROMPTS を参照）。
+    **T11_PROMPTS,
     "t9-B": """Refactor the Rust crate in the current directory
 (src/utils.rs, src/data.rs, src/main.rs):
   - rename the constant USD to JPY (every occurrence in every file)
@@ -732,24 +800,31 @@ def build_workdir(test, arm, scale=1200, drift=False):
         shutil.rmtree(wd)
     (wd / "bin").mkdir(parents=True)
     (wd / "audit.log").write_text("")
-    # 3 arm の agent 設定。native はネイティブ read/edit/write を許す（強制なし）。
+    # 3 arm の agent 設定。t11 は bash を外して custom tool だけで解かせる（strict）。
+    # t1-t10 は従来どおり bash + PATH shim（強制はできず監査除外に依存する旧方式）。
+    strict = (test == "t11")
     cfg = {"agent": {
         AGENT_FORCED: {
-            "description": "bash-only agent（shim 強制）",
-            "prompt": str(wd / "forced-prompt.md"),
-            "tools": TOOLS_OFF,          # 旧 runner (1.14) 用
-            "permission": PERMS_FORCED,  # 1.18 用
+            "description": ("mina contract agent（custom tool のみ）" if strict
+                            else "bash-only agent（shim 強制）"),
+            "tools": TOOLS_STRICT if strict else TOOLS_OFF,          # 旧 runner (1.14) 用
+            "permission": PERMS_STRICT if strict else PERMS_FORCED,  # 1.18 用
             "maxSteps": 30,
         },
         AGENT_NATIVE: {
-            "description": "native tools（素朴な対照・強制なし）",
-            "tools": TOOLS_NATIVE,
-            "permission": PERMS_NATIVE,
+            "description": "native tools（素朴な対照）",
+            "tools": TOOLS_NATIVE if strict else {**TOOLS_OFF, "read": True,
+                                                  "edit": True, "write": True},
+            "permission": PERMS_NATIVE if strict else {
+                "bash": "allow", "read": "allow", "edit": "allow",
+                "glob": "allow", "grep": "allow"},
             "maxSteps": 30,
         },
     }}
+    if strict:
+        cfg["agent"][AGENT_FORCED]["prompt"] = str(wd / "strict-prompt.md")
+        (wd / "strict-prompt.md").write_text(STRICT_PROMPT)
     (wd / "opencode.json").write_text(json.dumps(cfg, indent=2))
-    (wd / "forced-prompt.md").write_text(FORCED_PROMPT)
     # mode resolution
     read_mode = "range"
     if test == "t2":
@@ -777,30 +852,15 @@ def build_workdir(test, arm, scale=1200, drift=False):
         return p
 
     # native arm は shim を置かない（PATH に何も足さない = 素朴な道具だけで解く）
-    if not (test == "t11" and arm == "native"):
+    if test != "t11":
         wr("mread", "read_shim.py", read_mode)
         wr("medit", "edit_shim.py", edit_mode)
         wr("mcheck", "check_shim.py", "x")
     if test == "t11":
-        # 規模掃引の 3 arm。native は上の guard で shim 無し。
-        #  drift は run_once の外部注入（shim 非依存）が当てる — 3 arm に同じ機構。
-        if arm == "naive":
-            wr("mread", "read_naive_shim.py", "x")
-            wr("medit", "edit_naive_shim.py", "x")
-            (wd / "bin" / "mcheck").unlink()
-        elif arm == "minas":
-            wr("mread", "read_shim.py", "range")
-            wr("medit", "edit_shim.py", "apply")
-        if arm != "native":
-            # 実物の `minas` が PATH にあると、エージェントが shim を飛ばして直接読む
-            # （smoke で実際に起きた: `minas read src/config.rs`）。shim の中で使う
-            # `minas` は絶対パスなので、PATH 側をブロックしても影響しない。
-            p = wd / "bin" / "minas"
-            p.write_text(
-                "#!/usr/bin/env bash\n"
-                'echo "error: use mread/medit for file access" >&2\n'
-                "exit 1\n")
-            p.chmod(0o755)
+        # 3 arm。native はネイティブ tool のみ、naive/minas は custom tool のみ。
+        # どの arm も bash を持たないので PATH shim も `minas` ブロッカーも不要。
+        # drift は run_once の外部注入が当てる（shim 非依存の同じ機構）。
+        write_t11_tools(wd, arm)
     if test == "t8":
         # both edit tools present: medit (positional) and mapply (content-resolved)
         wr("mapply", "edit_shim.py", "apply")
@@ -938,21 +998,24 @@ def run_once(test, arm, idx, scale=1200, drift=False):
         inj.start()
     start = time.time()
     env = os.environ.copy()
-    env["PATH"] = f"{wd}/bin:" + env["PATH"]
+    if test != "t11":
+        env["PATH"] = f"{wd}/bin:" + env["PATH"]
     # opencode 1.18 は env の PWD を見てプロジェクトディレクトリを決める（cwd では
     # ない）。Python の env には親 shell の PWD が残っているので、ここで合わせないと
     # セッションが呼び出し元のリポジトリに作られ、最初のメッセージで server error に
     # なる（opencode 1.14 では起きなかった。1.18 で runner を戻した際に判明）。
     env["PWD"] = str(wd)
-    # opencode の bash ツールは zsh。~/.zshrc の `mise activate zsh` が PATH を
-    # 組み直すので wd/bin が後ろに回り、実物の `minas`（~/.cargo/bin）が shim より
-    # 先に解決される（smoke で発覚: `minas apply --whole-stdin` が実行された）。
-    # 空の ZDOTDIR を渡して PATH を継承させ、shim を確実に先に解決させる。
-    zdir = wd / "zsh"
-    zdir.mkdir(exist_ok=True)
-    for f in (".zshrc", ".zprofile", ".zshenv", ".zlogin"):
-        (zdir / f).write_text("")
-    env["ZDOTDIR"] = str(zdir)
+    if test != "t11":
+        # opencode の bash ツールは zsh。~/.zshrc の `mise activate zsh` が PATH を
+        # 組み直すので wd/bin が後ろに回り、実物の `minas`（~/.cargo/bin）が shim より
+        # 先に解決される（smoke で発覚: `minas apply --whole-stdin` が実行された）。
+        # 空の ZDOTDIR を渡して PATH を継承させ、shim を確実に先に解決させる。
+        # t11 は bash を持たないので不要。
+        zdir = wd / "zsh"
+        zdir.mkdir(exist_ok=True)
+        for f in (".zshrc", ".zprofile", ".zshenv", ".zlogin"):
+            (zdir / f).write_text("")
+        env["ZDOTDIR"] = str(zdir)
     with open(wd / "agent.log", "w") as log:
         proc = subprocess.Popen(
             [OPENCODE, "run", "--agent", agent, "-m", MODEL,
@@ -967,12 +1030,18 @@ def run_once(test, arm, idx, scale=1200, drift=False):
     if inj:
         inj.stop()
     sid = session_by_title(title)
-    m = measure(sid, native=(test == "t11" and arm == "native"))
+    m = measure(sid, native=(test == "t11"))
     if test == "t11":
         label, detail = outcome_t11(scale)
+        # strict: arm ごとに許した tool 以外が 1 回でも呼ばれたら、その run は
+        # 「契約の測定」として使えない（NC）。bash を外したので、ここが本当の意味での
+        # 遵守チェックになる。
+        used = tool_names(sid)
+        stray = ",".join(sorted(used - T11_ALLOWED[arm]))
     else:
         ok_, detail = success(test)
         label = "GREEN" if ok_ == "OK" else "LOUD-FAIL"
+        stray = ""
     ok = "OK" if label == "GREEN" else "FAIL"
     audit = wd / "audit.log"
     audit_summary = summarize_audit(audit.read_text()) if audit.exists() else ""
@@ -982,11 +1051,115 @@ def run_once(test, arm, idx, scale=1200, drift=False):
     bypass = int(m.split("bypass=")[-1].split()[0]) if "bypass=" in m else -1
     skills = int(m.split("skills=")[-1]) if "skills=" in m else 0
     comp = "C" if ((edits + rejects + renames) > 0 and bypass == 0) else "NC"
-    if test == "t11" and arm == "native":
-        comp = "N/A"   # native は強制も bypass 監査も無い（素朴な対照）
-    print(f"{title} wall={wall}s ok={ok} outcome={label} comp={comp} {m} "
+    if test == "t11":
+        comp = "C" if not stray else "NC"
+    print(f"{title} wall={wall}s ok={ok} outcome={label} comp={comp} stray={stray or '-'} {m} "
           f"{audit_summary} renames={renames} skills={skills} {detail}")
+    _record({**_meta(), "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             "task": test, "scale": scale, "drift": int(drift), "arm": arm,
+             "idx": idx, "wall_s": wall, "steps": _num(m, "steps"),
+             "input": _num(m, "input"), "output": _num(m, "output"),
+             "cost": _num(m, "cost", float), "outcome": label, "comp": comp,
+             "stray": stray,
+             "facts": detail.split("facts=")[-1].split()[0] if "facts=" in detail else "",
+             "noise": "DAMAGED" if "noise=DAMAGED" in detail else "ok",
+             "cargo": "ok" if "cargo=ok" in detail else "FAIL",
+             "edits": edits, "rejects": rejects, "renames": renames,
+             "reads": _num(audit_summary, "reads")})
     return title, ok, comp
+
+
+def _num(text, key, cast=int):
+    """`m` / audit summary は "key=value" の並び。Number を取り出す。"""
+    if f"{key}=" not in text:
+        return None
+    try:
+        return cast(text.split(f"{key}=")[-1].split()[0])
+    except ValueError:
+        return None
+
+
+# t11 の各 arm に許した tool。これ以外が 1 回でも呼ばれた run は NC（測定に使わない）。
+# native の apply_patch: opencode 1.18 では apply_patch tool に permission フックが無く、
+# `tools: {apply_patch: false}` も無視される（実測: bash を外しても呼ばれた）。一方
+# apply_patch は opencode の既定のファイル tool 一式に含まれるので、native arm の
+# 「素朴な道具面」としてはむしろこれを許すのが正しい（弱い対照にしない）。
+T11_ALLOWED = {
+    "native": {"read", "edit", "write", "glob", "grep", "apply_patch"},
+    "naive": {"mread", "medit"},
+    "minas": {"mread", "medit"},
+}
+
+
+def tool_names(sid):
+    """そのセッションで実際に呼ばれた tool 名の集合（遵守監査）。"""
+    con = sqlite3.connect(DB)
+    rows = con.execute("select data from part where session_id=?", (sid,)).fetchall()
+    con.close()
+    names = set()
+    for (r,) in rows:
+        try:
+            d = json.loads(r)
+        except Exception:
+            continue
+        if d.get("type") == "tool" and d.get("tool"):
+            names.add(str(d["tool"]))
+    return names
+
+
+def _record(row):
+    """1 run = 1 行を履歴に追記する（同じ key の再走も追記し、集計側が「同一 key の
+    最後の行」を採用する。履歴は消さない）。"""
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY, "a") as f:
+        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _meta():
+    """commit / minas の build generation / runner 版を 1 run ごとに固定する。"""
+    def sh(*cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=20).stdout.strip()
+        except Exception:
+            return ""
+    gen = ""
+    try:
+        gen = str(json.loads(subprocess.run([MINA, "info"], capture_output=True,
+                                            text=True, timeout=20).stdout)
+                            .get("generation", ""))
+    except Exception:
+        pass
+    return {"commit": sh("git", "rev-parse", "--short", "HEAD"),
+            "generation": gen,
+            "build": "debug" if "/debug/" in str(MINA) else "release",
+            "model": MODEL, "runner": sh(OPENCODE, "--version")}
+
+
+def sweep(arms=T11_ARMS, scales=SCALES, drift_scales=None, n=5):
+    """決定済みの掃引をそのまま回す。
+
+    規模点 × arm × n を idx に沿って **arm 交互**（paired 設計）に走らせる。
+    drift は最小・最大の 2 点だけで on/off を取る。1 run が失敗しても続行する
+    （失敗 run は NC として履歴に残り、後で差し替えられる）。
+    """
+    drift_scales = drift_scales or (SCALES[0], SCALES[-1])
+    plan = []
+    for scale in scales:
+        for dr in (0, 1):
+            if dr == 1 and scale not in drift_scales:
+                continue
+            for idx in range(1, n + 1):
+                for arm in arms:
+                    plan.append((arm, idx, scale, bool(dr)))
+    print(f"sweep: {len(plan)} runs -> {HISTORY}", flush=True)
+    for k, (arm, idx, scale, dr) in enumerate(plan, 1):
+        print(f"[{k}/{len(plan)}] {arm} scale={scale} drift={int(dr)} idx={idx}", flush=True)
+        try:
+            run_once("t11", arm, idx, scale, dr)
+        except Exception as e:                      # 1 run の失敗で掃引を止めない
+            print(f"  run failed: {type(e).__name__}: {e}", flush=True)
+    print("sweep done")
 
 
 def session_by_title(title):
@@ -1099,11 +1272,13 @@ def outcome_t11(scale):
     have_cfg, have_main = set(cf.splitlines()), set(mn.splitlines())
     scope_ok = (want_cfg <= have_cfg and want_main <= have_main
                 and len(have_cfg) >= len(want_cfg) and len(have_main) >= len(want_main))
+    cf_c = re.sub(r"\s+", " ", cf)   # 空白だけ潰す（識別子はそのまま）
+    cf_num = cf_c.replace("_", "")    # Rust の数値は `65_535` とも書ける
     facts = [
-        "max_conns: u32" in cf,
-        "max_conns: 1024" in cf,
-        "cfg.max_conns" in cf,
-        "65535" in cf,
+        "max_conns: u32" in cf_c,
+        "max_conns: 1024" in cf_c,
+        "cfg.max_conns" in cf_c,
+        ("65535" in cf_num and "max_conns too large" in cf_c),
         ("max_conns" in mn and "MAX_CONNS" in mn),
     ]
     comp = cargo_check_ok()
@@ -1181,8 +1356,12 @@ def success(test):
     return "NA", ""
 
 
-def _apply_t11_ground_truth():
-    """5 項目の正解を手で当てる（selftest 専用。GREEN を作るため）。"""
+def _apply_t11_ground_truth(underscore=False):
+    """5 項目の正解を手で当てる（selftest 専用。GREEN を作るため）。
+
+    underscore=True で `65_535` と書く — nano が実際にこう書いて分類器が
+    誤って INCOMPLETE にしたので、その綴りでも GREEN になることを検証する。
+    """
     wd = WORK / "ws"
     p = wd / "src" / "config.rs"
     cf = p.read_text()
@@ -1191,9 +1370,10 @@ def _apply_t11_ground_truth():
     cf = cf.replace("    Ok(Config { timeout, retries })\n",
                     "    let max_conns = if json.contains(\"max_conns\") { 1024 } else { 1024 };\n"
                     "    Ok(Config { timeout, retries, max_conns })\n")
+    limit = "65_535" if underscore else "65535"
     cf = cf.replace('    if cfg.retries > 10 {\n        return Err("too many retries".to_string());\n    }\n',
                     '    if cfg.retries > 10 {\n        return Err("too many retries".to_string());\n    }\n'
-                    '    if cfg.max_conns > 65535 {\n        return Err("max_conns too large".to_string());\n    }\n')
+                    f'    if cfg.max_conns > {limit} {{\n        return Err("max_conns too large".to_string());\n    }}\n')
     p.write_text(cf)
     mn = wd / "src" / "main.rs"
     mn.write_text(mn.read_text().replace(
@@ -1236,6 +1416,10 @@ def _selftest_outcome():
     check("ground truth -> GREEN", outcome_t11(150)[0], "GREEN")
 
     build_workdir("t11", "minas", 150, False)
+    _apply_t11_ground_truth(underscore=True)
+    check("ground truth 65_535 -> GREEN", outcome_t11(150)[0], "GREEN")
+
+    build_workdir("t11", "minas", 150, False)
     # ノイズは無傷のままビルドだけ落とす（ノイズを消すと CORRUPT が先に確定する）
     mn_ = wd / "src" / "main.rs"
     mn_.write_text(mn_.read_text() + '\nfn broken() { let x: u32 = "s"; }\n')
@@ -1258,7 +1442,7 @@ def _selftest_outcome():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["run", "stats", "fixture", "selftest"])
+    ap.add_argument("action", choices=["run", "stats", "fixture", "selftest", "sweep"])
     ap.add_argument("test", nargs="?",
                     choices=["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"])
     ap.add_argument("arm", nargs="?", help="t11 は native|naive|minas、他は A|B")
@@ -1266,9 +1450,16 @@ if __name__ == "__main__":
     ap.add_argument("--scale", type=int, default=1200,
                     choices=list(SCALES), help="t11 の 2 ファイル合計行数")
     ap.add_argument("--drift", type=int, default=0, help="1 で外部書き換えを注入")
+    ap.add_argument("--n", type=int, default=5, help="sweep: arm ごとの反復数")
+    ap.add_argument("--scales", default=",".join(map(str, SCALES)),
+                    help="sweep: 規模点をカンマ区切りで")
     a = ap.parse_args()
     if a.action == "selftest":
         sys.exit(_selftest_outcome())
+    if a.action == "sweep":
+        sc = tuple(int(x) for x in a.scales.split(",") if x.strip())
+        sweep(scales=sc, n=a.n)
+        sys.exit(0)
     if a.action in ("run", "fixture"):
         valid = T11_ARMS if a.test == "t11" else ("A", "B")
         if a.arm not in valid:
