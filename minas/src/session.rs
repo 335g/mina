@@ -139,10 +139,12 @@ pub enum SessionCmd {
     /// document's unsaved edits are searched, else the file on disk. Use it to
     /// locate occurrences cheaply, then read only the lines you need.
     Search {
-        /// File to search (relative to the agent's cwd, like `Open`)
-        path: PathBuf,
+        /// File to search (relative to the agent's cwd, like `Open`). With
+        /// `--crate-root` this positional is the QUERY instead (the entry file
+        /// supplies the paths).
+        path: Option<PathBuf>,
         /// Literal text to find (empty is rejected)
-        query: String,
+        query: Option<String>,
         /// Case-insensitive search
         #[arg(long, short = 'i')]
         ignore_case: bool,
@@ -151,6 +153,19 @@ pub enum SessionCmd {
         /// (e.g. TOTAL_COUNT vs TOTAL_COUNT_HEADER).
         #[arg(long, short = 'w')]
         word: bool,
+        /// Search a whole crate in one call: pass the crate root (e.g.
+        /// `src/lib.rs`) and every .rs under its directory is searched with the
+        /// same expansion as `check --crate-root` (entry first, then sorted,
+        /// `--include-tests` adds the sibling tests/). Prints
+        /// `{searched, total, files:[{path, generation, checksum, total,
+        /// truncated, matches[]}]}` — files with zero matches are omitted, so
+        /// this is the one-call form of the sweep `minas rename`'s INCOMPLETE
+        /// note asks for.
+        #[arg(long, value_name = "ENTRY")]
+        crate_root: Option<PathBuf>,
+        /// With --crate-root: also search the sibling tests/ directory
+        #[arg(long, requires = "crate_root")]
+        include_tests: bool,
     },
     /// Fetch the daemon build generation and metrics (printed as JSON, issue #27).
     /// This is the DAEMON's build/metrics (the wire command is `GetServerInfo`),
@@ -466,9 +481,86 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             query,
             ignore_case,
             word,
+            crate_root,
+            include_tests,
         } => {
+            // `--crate-root <ENTRY> <QUERY>` では位置引数は 1 つだけ（entry が全パスを
+            // 供給する）。clap は最初の位置引数を `path` に束縛するのでここで読み替える。
+            let (path, query): (Option<PathBuf>, String) = if crate_root.is_some() {
+                match (path, query) {
+                    (Some(only), None) => (None, only.to_string_lossy().into_owned()),
+                    _ => {
+                        eprintln!(
+                            "search: --crate-root takes one positional argument (the query): \
+                             `minas search --crate-root src/lib.rs <query>`"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match (path, query) {
+                    (Some(p), Some(q)) => (Some(p), q),
+                    _ => {
+                        eprintln!(
+                            "search: <PATH> and <QUERY> are required (or `--crate-root <ENTRY> \
+                             <QUERY>`)"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            };
+            // --crate-root: check と同じ展開で crate 全体を 1 コールにする
+            // （dogfooding 2026-09-15: rename の INCOMPLETE が指示する sweep が
+            // ファイル数ぶんの N コールだった）。
+            if let Some(root) = &crate_root {
+                let expansion = expand_crate_root(root, include_tests)?;
+                if !expansion.dir_has_rs {
+                    eprintln!(
+                        "search: no .rs files found under {}",
+                        expansion.crate_dir.display()
+                    );
+                }
+                let mut files = Vec::new();
+                let mut total = 0usize;
+                let mut failed = 0usize;
+                for p in &expansion.paths {
+                    let outcome =
+                        execute_search(&p.to_string_lossy(), &query, !ignore_case, word).await?;
+                    if let Some(e) = &outcome.error {
+                        // 黙って落とさない（残りは続けて、失敗があれば exit 1）。
+                        eprintln!("search: {}: {e}", p.display());
+                        failed += 1;
+                        continue;
+                    }
+                    total += outcome.total;
+                    if outcome.total == 0 {
+                        continue;
+                    }
+                    files.push(serde_json::json!({
+                        "path": outcome.path,
+                        "generation": outcome.generation,
+                        "checksum": outcome.checksum,
+                        "total": outcome.total,
+                        "truncated": outcome.truncated,
+                        "matches": outcome.matches,
+                    }));
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "searched": expansion.paths.len(),
+                        "total": total,
+                        "files": files,
+                    }))?
+                );
+                if failed > 0 {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             // 全文を読まずに一致位置だけを得る（rust2 要望）。失敗は stderr + exit 1
             // （cannot open / empty query = 入力エラー、再試行不可）。
+            let path = path.expect("non-crate-root search has a path");
             let outcome = execute_search(
                 &path.to_string_lossy(),
                 &query,
@@ -621,6 +713,14 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             let outcome = execute_rename(&path.to_string_lossy(), &old, &new).await?;
             if let Some(e) = &outcome.error {
                 eprintln!("rename failed: {e}");
+                // ドッグフーディング 2026-09-15: この拒否は「シンボルが無い」だけでなく
+                // **ファイルが crate/module tree に入っていない**ときにも出る
+                // （サーバはそのファイルのセマンティクスを持たない）。
+                if e.contains("No references found at position")
+                    && let Some(note) = rename_refusal_note(&path).await
+                {
+                    eprintln!("{note}");
+                }
                 std::process::exit(rename_exit_code(e));
             }
             // ADR-0067 / self-host #12: LSP は**1 セッション分の視界**しか見ない
@@ -666,14 +766,18 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 files.insert(loc.path.as_str());
             }
             let mut touched: Vec<String> = Vec::new();
-            let mut listed: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
+            // 行ごとの件数を持つ（ファイル単位の件数だと、1 行に 2 つある言及を
+            // サーバが 1 位置しか返さないときに偽の残差が出る — #11）。
+            let mut listed: std::collections::HashMap<
+                String,
+                std::collections::HashMap<u32, usize>,
+            > = std::collections::HashMap::new();
             for loc in &outcome.locations {
-                let abs = conn::absolutize(&loc.path);
+                let abs = same_path_key(&loc.path);
                 if !listed.contains_key(&abs) {
                     touched.push(abs.clone());
                 }
-                *listed.entry(abs).or_insert(0) += 1;
+                *listed.entry(abs).or_default().entry(loc.line).or_insert(0) += 1;
             }
             // ADR-0067: この一覧は 1 セッション分の視界。テキスト網が「一覧に無い
             // ファイルに名前が残っている」と見つけたら、件数の行に INCOMPLETE と書く。
@@ -694,7 +798,13 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 outcome.total,
                 files.len()
             );
-            for loc in &outcome.locations {
+            // 出力は path → 行でソートする（ドッグフーディング 2026-09-15: アンカー起点の
+            // 順で返るため `id.rs:6` が `add.rs:5` の後に出て、読む側が
+            // 「どのファイルがどこまで揃っているか」を追えなかった）。
+            let mut ordered: Vec<&mina_protocol::ReferenceLocation> =
+                outcome.locations.iter().collect();
+            ordered.sort_by(|a, b| (a.path.as_str(), a.line).cmp(&(b.path.as_str(), b.line)));
+            for loc in ordered {
                 println!("{}:{}", loc.path, loc.line + 1);
             }
 
@@ -1373,6 +1483,32 @@ fn is_unlinked_file(d: &mina_protocol::CheckDiagnostic) -> bool {
         || d.message.contains("not included anywhere in the module tree")
 }
 
+/// rename が LSP の「位置に何も無い」で拒否されたときの原因切り分け。
+///
+/// ドッグフーディング 2026-09-15: 対象ファイルが crate/module tree に入っていない
+/// （`mod x;` が無い / クレートグラフ外）と、rust-analyzer はそのファイルの
+/// セマンティクスを持たないので rename を `No references found at position`
+/// (code -32602) で拒否する。文言は「同じリクエストは同じように失敗する」と
+/// 非再試行を宣言するので、**宣言を足せば直る**ことが読めない。`check` は同じ
+/// 状況を `unlinked-unverified` と名指しできるので、**失敗経路でだけ** 1 回
+/// 引いて事実を添える（成功経路のレイテンシは変えない）。
+async fn rename_refusal_note(path: &std::path::Path) -> Option<String> {
+    let outcome = execute_check(&path.to_string_lossy()).await.ok()?;
+    let unlinked = outcome.diagnostics.iter().any(is_unlinked_file)
+        || (outcome.diagnostics.is_empty() && !in_project(&outcome.path));
+    if !unlinked {
+        return None;
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned())?;
+    Some(format!(
+        "note: `minas check {}` reports `unlinked-unverified` for this file: it is not part of \
+         any crate/module tree, so the server has nothing to resolve at that position. Add the \
+         declaration (`mod {stem};`, or include the file in the crate) and retry — this failure \
+         does change once the file is linked",
+        path.display()
+    ))
+}
+
 /// LSP コマンド共通の「入力エラー（再試行しても通らない）」判定。
 ///
 /// 再試行しても結果が変わらない失敗だけを 1 に落とす: 対象外（LSP 非対応）・
@@ -1449,8 +1585,12 @@ fn symbols_have_child_paths(symbols: &[OutlineSymbol]) -> bool {
 struct Leftovers {
     /// LSP が触らなかった（一覧に無いファイル）で名前が残っている数。
     unlisted_files: usize,
-    /// LSP が触ったファイルのうち、一覧に載っていない同一語の出現数
+    /// LSP が触ったファイルのうち、**一覧に行すら載っていない**同一語の出現数
     /// （コメント・文字列、またはサーバが取りこぼした識別子）。
+    ///
+    /// 数え方は**行単位**: 同じ行に 2 つある言及（`EntryId(2) < EntryId(10)`）は
+    /// サーバが 1 位置しか返さないことがあり、ファイル単位の差し引きでは
+    /// 残差 1 が生まれて INCOMPLETE を偽って立てた（ドッグフーディング 2026-09-15）。
     in_touched_mentions: usize,
 }
 
@@ -1477,9 +1617,10 @@ fn leftover_mentions(
     path: &std::path::Path,
     old: &str,
     touched: &[String],
-    // LSP がそのファイルで挙げた件数（`references` のみ。`rename` は空 — 改名後は
-    // 旧名が「一覧に載っていない言及」だけになるため差し引き不要）。
-    listed: &std::collections::HashMap<String, usize>,
+    // LSP がそのファイルで挙げた位置（`path → 行(0-origin) → 件数`。`references`
+    // のみ。`rename` は空 — 改名後は旧名が「一覧に載っていない言及」だけに
+    // なるため差し引き不要）。
+    listed: &std::collections::HashMap<String, std::collections::HashMap<u32, usize>>,
     what: &str,
 ) -> Leftovers {
     let none = Leftovers {
@@ -1522,7 +1663,7 @@ fn leftover_mentions(
     collect_source_files(&scan_root, &ext_refs, &mut files);
     let touched: std::collections::HashSet<String> = touched
         .iter()
-        .map(|p| conn::absolutize(p))
+        .map(|p| same_path_key(p))
         .collect();
     let mut leftovers = Vec::new();
     // ヒットしたファイルの中にも、LSP が改名しない言及（文字列リテラル・コメント）が
@@ -1530,8 +1671,9 @@ fn leftover_mentions(
     // （ドッグフーディング self-host #4: daemon.rs の in-file recall 87%、5 件の
     // assert メッセージ文字列が不可視）。件数だけを 1 行で報告する。
     let mut in_touched_mentions = 0usize;
+    let mut duplicate_lines = 0usize;
     for f in files.into_iter().take(LEFTOVER_SCAN_MAX_FILES) {
-        let abs = conn::absolutize(&f.to_string_lossy());
+        let abs = same_path_key(&f.to_string_lossy());
         let Ok(md) = std::fs::metadata(&f) else {
             continue;
         };
@@ -1541,13 +1683,27 @@ fn leftover_mentions(
         let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
         };
-        let n = count_whole_word(&text, old);
-        if n == 0 {
+        let by_line = whole_word_lines(&text, old);
+        if by_line.is_empty() {
             continue;
         }
         if touched.contains(&abs) {
-            let already = *listed.get(&abs).unwrap_or(&0);
-            in_touched_mentions += n.saturating_sub(already);
+            // 行ごとに突き合わせる: 一覧がその行を指していれば、同じ行の追加の
+            // 言及は「住所の無い重複」（情報）であって残差ではない。行ごと一覧に
+            // 無ければ、その行の言及はすべて残差（コメント/文字列/別識別子、
+            // またはサーバの取りこぼし）。
+            let listed_lines = listed.get(&abs);
+            for (line, n) in by_line {
+                let already = listed_lines
+                    .and_then(|m| m.get(&line))
+                    .copied()
+                    .unwrap_or(0);
+                if already == 0 {
+                    in_touched_mentions += n;
+                } else if n > already {
+                    duplicate_lines += 1;
+                }
+            }
         } else {
             leftovers.push(abs);
         }
@@ -1571,6 +1727,16 @@ fn leftover_mentions(
              among them is a real leftover: `minas search <file> {old}` to see them"
         );
     }
+    if duplicate_lines > 0 {
+        // 情報であって INCOMPLETE ではない（ドライバー #6）。一覧は 1 行 1 エントリ
+        // なので、同じ行の 2 つ目には住所が無いだけ。
+        eprintln!(
+            "note: {duplicate_lines} line(s) in the listed file(s) carry more than one mention \
+             of `{old}`; the list shows one `path:line` per line, so the extra mention(s) have \
+             no position of their own (not a leftover — `minas search -w <file> {old}` for \
+             exact positions)"
+        );
+    }
     Leftovers {
         unlisted_files: n_leftovers,
         in_touched_mentions,
@@ -1578,21 +1744,44 @@ fn leftover_mentions(
 }
 
 /// `text` に `word` が識別子として（前後が識別子文字でない）現れる回数。
-fn count_whole_word(text: &str, word: &str) -> usize {
+/// パスの同一性判定用のキー。symlink を解いて**同じファイルの 2 つの綴り**を
+/// 揃える（macOS の `/tmp` → `/private/tmp`）。
+///
+/// ドッグフーディング 2026-09-15 の実測: LSP は実体パス（`/private/tmp/...`）を返す一方、
+/// 利用者が `/tmp/...` を渡してきた場合の走査結果は `/tmp/...` のままで、テキスト網の
+/// 突き合わせが外れ、**一覧 6 件が載っているファイル**が「LSP が見ていない」と
+/// 警告された（＝ 偽の INCOMPLETE。実際に起きるのは `/tmp` のスクラッチを使う
+/// ドッグフーディング環境そのもの）。canonicalize できないパス（未作成ファイル）は
+/// 字句の絶対パスにフォールバックする。
+fn same_path_key(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| conn::absolutize(p))
+}
+
+/// `text` 中の `word` の whole-word 一致を**行番号（0-origin）ごとの件数**で返す。
+///
+/// ドッグフーディング 2026-09-15: LSP は 1 行に複数ある言及を 1 位置しか返さないことが
+/// ある（実測: `assert!(EntryId(2) < EntryId(10));` → 一覧は 1 件）。ファイル
+/// 単位で件数を差し引くとこの差が「一覧に無い言及」に化け、正常なシンボルに
+/// 偽の INCOMPLETE が付いた。行ごとに突き合わせれば本当の残差だけが残る。
+fn whole_word_lines(text: &str, word: &str) -> std::collections::HashMap<u32, usize> {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let mut count = 0;
+    let mut per_line: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut line = 0u32;
     let mut from = 0;
     while let Some(idx) = text[from..].find(word) {
         let start = from + idx;
         let end = start + word.len();
+        line += text[from..start].matches('\n').count() as u32;
         let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_word(c));
         let after_ok = text[end..].chars().next().is_none_or(|c| !is_word(c));
         if before_ok && after_ok {
-            count += 1;
+            *per_line.entry(line).or_insert(0) += 1;
         }
         from = start + word.chars().next().map_or(1, |c| c.len_utf8());
     }
-    count
+    per_line
 }
 
 /// 旧名の残留スキャンの上限（ファイル数 / 1 ファイルのサイズ）。
@@ -2322,7 +2511,10 @@ async fn apply(
         checksum: snapshot.checksum,
         expected_text: expected,
     };
-    if let Some(note) = boundary_note(&text, &old_text.clone().unwrap_or_default(), "") {
+    if let Some(note) = old_text
+        .as_deref()
+        .and_then(|old| boundary_note(&text, old, ""))
+    {
         eprintln!("{note}");
     }
     let snapshot = conn::request(&mut write_half, &mut reader, &edit).await?;
@@ -2393,29 +2585,50 @@ fn rollback_created(path: &str, created: bool) {
 /// （`edits:16, edits_noop:0` は「16 hunks 適用した」であって「意図した集合を
 /// 覆った」ではない）。境界を越えた一致は注記して、検算漏れを作らない。
 fn enclosing_identifier(text: &str, start_byte: usize, end_byte: usize) -> Option<String> {
-    let bytes = text.as_bytes();
-    let before = start_byte > 0 && is_ident_byte(bytes[start_byte - 1]);
-    let after = end_byte < bytes.len() && is_ident_byte(bytes[end_byte]);
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // 針**自体**が識別子でなければ「識別子の内側」ではない。これが無いと、
+    // 複数行の削除（old = "fn one() {}\n\n"）で「隣が識別子文字だから」と発火し、
+    // **実在しない識別子名**（`fn one() {}\n\nfn`）を作り出す — ドッグフーディング 2026-09-15。
+    // ファイル単位のテキスト網（[`whole_word_lines`]）が whole-word で数えるのと
+    // 同じ基準に揃える。
+    let matched = text.get(start_byte..end_byte)?;
+    if matched.is_empty() || !matched.chars().all(is_ident) {
+        return None;
+    }
+    let before = text[..start_byte].chars().next_back().is_some_and(is_ident);
+    let after = text[end_byte..].chars().next().is_some_and(is_ident);
     if !before && !after {
         return None;
     }
+    // 一致を含む**最大の識別子トークン**を返す（例: `Note` → `NoteTest`）。
     let mut lo = start_byte;
-    while lo > 0 && is_ident_byte(bytes[lo - 1]) {
-        lo -= 1;
+    while let Some((i, c)) = text[..lo].char_indices().next_back() {
+        if !is_ident(c) {
+            break;
+        }
+        lo = i;
     }
     let mut hi = end_byte;
-    while hi < bytes.len() && is_ident_byte(bytes[hi]) {
-        hi += 1;
+    while let Some(c) = text[hi..].chars().next() {
+        if !is_ident(c) {
+            break;
+        }
+        hi += c.len_utf8();
     }
     Some(text[lo..hi].to_string())
 }
 
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 /// 境界を越えた一致の注記（[`enclosing_identifier`] があれば 1 行返す）。
 fn boundary_note(text: &str, old: &str, where_: &str) -> Option<String> {
+    // 空の針は**必ず**先頭で一致するので、境界判定が「直前の内容の先頭識別子」を
+    // 名指ししてしまう（ドッグフーディング 2026-09-15 実測: 既存ファイルへの
+    // `apply --whole-stdin` ごとに `note: `` matched INSIDE the identifier `use`` が
+    // 出ていた。--whole / --whole-stdin は user 指定の old を持たない）。
+    // `--hunks-stdin` の old は空を拒否するので、ここに来る空針は
+    // 全文置換だけ = 注記の対象が無い。
+    if old.is_empty() {
+        return None;
+    }
     let byte = text.find(old)?;
     let ident = enclosing_identifier(text, byte, byte + old.len())?;
     Some(format!(
@@ -2537,6 +2750,60 @@ fn note_out_of_project_hits(anchor: &std::path::Path, symbols: &[mina_protocol::
 /// 並び順は探索順（read_dir の順） — 呼び出し側で必要ならソートする。
 fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     collect_source_files(dir, &["rs"], out);
+}
+
+/// `--crate-root <entry.rs>` の展開結果。
+struct CrateRootExpansion {
+    /// check / search に 1 コール分として渡すパス列（entry が先頭、
+    /// 残りはソート済み。`--include-tests` ならテストも末尾に）。
+    paths: Vec<PathBuf>,
+    /// entry の親ディレクトリ（警告文用）。
+    crate_dir: PathBuf,
+    /// `crate_dir` 直下に .rs が 1 つでもあったか（単一ファイルクレートの
+    /// 判定に使う — dogfooding #14: 単一ファイルで「no .rs files found」と
+    /// 言いながら同じファイルを check して stderr と stdout が矛盾した）。
+    dir_has_rs: bool,
+}
+
+/// クレートを構成する `.rs` を列挙する（`check --crate-root` の展開。
+/// dogfooding 2026-09-15 で `search --crate-root` と共有した）: ドライバーが
+/// 「`minas rename` の INCOMPLETE は `minas search -w` で検証しろと言うのに、
+/// crate 全体を 1 回で捩く形が無い」と報告し、`check` に既にある展開を
+/// そのまま使えることが分かったため。
+fn expand_crate_root(root: &PathBuf, include_tests: bool) -> io::Result<CrateRootExpansion> {
+    let root_abs = conn::absolutize(&root.to_string_lossy());
+    if !root_abs.ends_with(".rs") {
+        return Err(invalid("--crate-root takes a .rs file (e.g. src/lib.rs)"));
+    }
+    let Some(crate_dir) = std::path::Path::new(&root_abs).parent() else {
+        return Err(invalid("cannot resolve the parent directory of --crate-root"));
+    };
+    let crate_dir = crate_dir.to_path_buf();
+    let mut rs = Vec::new();
+    collect_rs_files(&crate_dir, &mut rs);
+    let dir_has_rs = !rs.is_empty();
+    rs.retain(|p| conn::absolutize(&p.to_string_lossy()) != root_abs);
+    rs.sort();
+    let mut paths = vec![root.clone()];
+    paths.extend(rs);
+    if include_tests {
+        // tests/ は crate_dir の兄弟。`join("..")` で組み立てると展開結果に `..`
+        // が残り、失敗経路（daemon が入力をそのまま返す）と成功経路（文書を
+        // 開いて正規化される）で同じファイルが別の綴りになる（driver #7）。
+        let tests_dir = crate_dir
+            .parent()
+            .map(|p| p.join("tests"))
+            .unwrap_or_else(|| crate_dir.join("tests"));
+        let mut ts = Vec::new();
+        collect_rs_files(&tests_dir, &mut ts);
+        ts.sort();
+        paths.extend(ts);
+    }
+    Ok(CrateRootExpansion {
+        paths,
+        crate_dir,
+        dir_has_rs,
+    })
 }
 
 /// `dir` 配下から指定拡張子のファイルを再帰収集する（`collect_rs_files` の一般形）。
@@ -3107,6 +3374,50 @@ mod tests {
         // 置換で先行 hunk の old が消えた後の後続 hunk も検出される（適用順の再現）。
         let chained = simulate_hunks("a", &[h("a", "b"), h("b", "c")]);
         assert!(chained.is_none(), "置換結果に対する後続 hunk も検出");
+    }
+
+    #[test]
+    fn an_empty_needle_never_produces_a_boundary_note() {
+        // ドッグフーディング 2026-09-15 実測: 既存ファイルへの `apply --whole-stdin` が、
+        // **直前の内容**の先頭識別子を名指しする注記を stderr に出していた
+        // （`note: `` matched INSIDE the identifier `use``）。old が空だと
+        // `text.find("")` が先頭に一致するため、境界判定が常に成立していた。
+        assert_eq!(boundary_note("fn a() {}\n", "", ""), None);
+
+        // 対照（正常系は壊していない）: 本当に識別子の内側を食う針は今も注記する。
+        let note = boundary_note("fn note_id() {}\n", "note", "").expect("境界越えの注記");
+        assert!(
+            note.contains("INSIDE the identifier `note_id`"),
+            "識別子全体を名指しする: {note}"
+        );
+        // 対照2: 識別子境界で終わる針は注記しない。
+        assert_eq!(boundary_note("fn note_id() {}\n", "note_id", ""), None);
+
+        // 対照3（ドッグフーディング 2026-09-15）: 識別子に**隣接しているだけ**の針は
+        // 注記しない。複数行の削除（old が `\n\n` で終わり、次の宣言が続く）で
+        // 実在しない識別子名を名指ししていた。
+        assert_eq!(boundary_note("fn one() {}\n\nfn two() {}\n", "fn one() {}\n\n", ""), None);
+        assert_eq!(boundary_note("fn a1one() {}\n", "one() {}", ""), None);
+        // 対照4: 同じ形でも、針が識別子なら本当の内側一致として名指しする。
+        assert_eq!(
+            boundary_note("fn a1one() {}\n", "one", "").as_deref(),
+            Some("note: `one` matched INSIDE the identifier `a1one` — `apply` matches plain \
+                  substrings, so a `minas search -w` list does not describe what it consumes. \
+                  Use a longer <old>, or verify with `minas search -w <file> <old>` afterwards")
+        );
+    }
+
+    #[test]
+    fn whole_word_lines_counts_per_line() {
+        // ドッグフーディング 2026-09-15: 一覧が 1 行 1 位置しか返さないとき、同じ行の 2 つ目の
+        // 言及を「一覧に無い言及」と数えていた（`EntryId(2) < EntryId(10)`）。
+        let text = "let a = EntryId(2) < EntryId(10);\nlet b = Other;\n";
+        let per_line = whole_word_lines(text, "EntryId");
+        assert_eq!(per_line.get(&0), Some(&2), "同じ行の 2 件を数える");
+        assert_eq!(per_line.get(&1), None);
+        // whole-word でない（`EntryIdX`）は数えない。
+        assert_eq!(whole_word_lines("EntryIdX\n", "EntryId").len(), 0);
+        assert_eq!(whole_word_lines("EntryId\nEntryId\n", "EntryId").len(), 2);
     }
 
     #[test]
