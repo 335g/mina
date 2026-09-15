@@ -442,7 +442,58 @@ async fn wait_with_timeout(
 }
 
 /// `minas <subcommand>` を処理する。
+///
+/// 接続消失（daemon の入れ替え・クラッシュ）は**書き込み系では「起きたかどうか
+/// 分からない」**（2026-09-15 ドライバー実測: `apply` が `invalid response: EOF …` で
+/// exit 1 を返したのに、daemon のバッファには既に適用済みで、その後の別ファイルの
+/// `rename` がそのバッファを保存してディスクに永続化した）。素のパースエラーは
+/// 「何も起きなかった」と読めるので、書き込み系だけは専用の文言 + exit 2 にする。
 pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
+    let in_flight = may_have_landed(&cmd);
+    match run_command(cmd, name).await {
+        Ok(()) => Ok(()),
+        Err(e) if in_flight.is_some() && connection_lost(&e) => {
+            let op = in_flight.unwrap_or("minas");
+            eprintln!(
+                "{op}: the daemon closed the connection while this request was in flight — minas \
+                 CANNOT tell whether it was applied. The buffer may already carry the change even \
+                 though the file on disk does not (`minas get --brief` -> `dirty: true`), and any \
+                 later saving command (`apply` / `rename` / `exec '\"Save\"'`, even for another \
+                 file) writes that buffer to disk. Re-read the file, then retry (retryable)"
+            );
+            std::process::exit(2);
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 接続消失時に「もう適用されたかもしれない」コマンド名（読み取り専用は `None`）。
+/// `exec` は任意の [`Command`] を運ぶので常に書き込み扱い。
+fn may_have_landed(cmd: &SessionCmd) -> Option<&'static str> {
+    match cmd {
+        SessionCmd::Apply { .. } => Some("apply"),
+        SessionCmd::Edit { .. } => Some("edit"),
+        SessionCmd::Rename { .. } => Some("rename"),
+        SessionCmd::Delete { .. } => Some("delete"),
+        SessionCmd::Exec { .. } => Some("exec"),
+        SessionCmd::Get { .. }
+        | SessionCmd::Read { .. }
+        | SessionCmd::Search { .. }
+        | SessionCmd::Info
+        | SessionCmd::Wait { .. }
+        | SessionCmd::Hints { .. }
+        | SessionCmd::Peek { .. }
+        | SessionCmd::References { .. }
+        | SessionCmd::Outline { .. }
+        | SessionCmd::At { .. }
+        | SessionCmd::Hover { .. }
+        | SessionCmd::Symbol { .. }
+        | SessionCmd::Check { .. }
+        | SessionCmd::Review { .. } => None,
+    }
+}
+
+async fn run_command(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
     // ADR-0038: 自己申告ラベルを一度だけ解決する（--name > MINAE_CLIENT_NAME > "unknown"）。
     let _ = CLIENT_NAME.set(
         name.unwrap_or_else(|| {
@@ -694,7 +745,9 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             // 事故クラスを防ぐため、dirty のままなら永続化導線を stderr に1行だけ
             // 明示する（auto-save は不採用 — 非保存が正しいユースケースが存在する）。
             if snapshot.dirty {
-                eprintln!("note: buffer is dirty (not saved); persist with: session exec '\"Save\"'");
+                eprintln!(
+                    "note: buffer is dirty (not saved); persist with: minas exec '\"Save\"' --brief"
+                );
             }
             // 成功経路でも宛先を 1 行出す（間違ったファイルを編集した事故は、
             // 「dirty」の 1 行だけでは見えない — ドッグフーディング 2026-09-15）。
@@ -3666,6 +3719,75 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_classification_covers_mutations_and_connection_loss() {
+        // #17: 接続消失は**書き込み系では「起きたか分からない」**（CLI が failure を
+        // 報告しても daemon のバッファには適用済みで、後の保存系が永続化する）。
+        // 読み取り専用は None（素のエラーでよい）。
+        // 書き込み系（接続消失 = 「起きたか分からない」）
+        assert_eq!(
+            may_have_landed(&SessionCmd::Delete {
+                path: PathBuf::from("x.rs")
+            }),
+            Some("delete")
+        );
+        assert_eq!(
+            may_have_landed(&SessionCmd::Rename {
+                path: PathBuf::from("x.rs"),
+                old: "a".into(),
+                new: "b".into(),
+            }),
+            Some("rename")
+        );
+        assert_eq!(
+            may_have_landed(&SessionCmd::Exec {
+                json: "\"Save\"".into(),
+                brief: false,
+            }),
+            Some("exec")
+        );
+        // 読み取り専用（素のエラーでよい）
+        assert_eq!(
+            may_have_landed(&SessionCmd::Get {
+                lines: None,
+                brief: true
+            }),
+            None
+        );
+        assert_eq!(
+            may_have_landed(&SessionCmd::Read {
+                path: PathBuf::from("x.rs"),
+                lines: None,
+                span: None,
+            }),
+            None
+        );
+        assert_eq!(
+            may_have_landed(&SessionCmd::Check {
+                paths: vec![PathBuf::from("x.rs")],
+                summary: true,
+                crate_root: None,
+                include_tests: false,
+            }),
+            None
+        );
+        // 接続消失と判定する文字列（EOF / 切断 / reset）。
+        for msg in [
+            "invalid response: EOF while parsing a value at line 1 column 0",
+            "Broken pipe (os error 32)",
+            "Connection reset by peer (os error 54)",
+        ] {
+            assert!(
+                connection_lost(&io::Error::new(io::ErrorKind::Other, msg)),
+                "{msg}"
+            );
+        }
+        assert!(!connection_lost(&io::Error::new(
+            io::ErrorKind::Other,
+            "cannot open x.rs: No such file or directory (os error 2)"
+        )));
+    }
+
+        #[test]
     fn parse_char_span_accepts_offsets_and_rejects_inverted() {
         // `read --span` は 0-origin の char オフセット（`--lines` の行番号とは別座標系）。
         assert_eq!(parse_char_span("346:350").unwrap(), (346, Some(350)));
