@@ -3797,6 +3797,50 @@ fn err_refs(path: &str, msg: String) -> ServerMessage {
     }
 }
 
+/// 解決位置の行が use / import 行かを判定し、**再輸出（export）か**を返す。
+///
+/// [`serve_rename`] の anchor 検査にだけ使う: ここが真の位置を anchor にすると、
+/// 言語サーバは「その束縛の名前を変える」編集を返し、**定義と使用者を別々に**
+/// 扱ってしまう（実測 2026-09-15: `pub use id::EntryId;` を anchor にした rename が
+/// `pub use id::EntryId as EntryKey;` を書いて exit 0、呼び出し側 2 ファイルは
+/// E0432 で取り残された）。
+///
+/// 戻り値は `None`（import 行でない）/ `Some(false)`（private な use）/ 
+/// `Some(true)`（再輸出 — `pub use` / `pub(crate) use` / TS・JS の `export … from`）。
+/// 再輸出かどうかで**結果の壊れ方が違う**ので、拒否の文言を分ける。
+fn import_line_kind(text: &str, line: u32) -> Option<bool> {
+    let l = text.lines().nth(line as usize)?;
+    let mut t = l.trim_start();
+    let mut exported = false;
+    for vis in ["pub(crate)", "pub(super)", "pub(self)"] {
+        if let Some(rest) = t.strip_prefix(vis) {
+            t = rest.trim_start();
+            exported = true;
+            break;
+        }
+    }
+    if let Some(rest) = t.strip_prefix("pub ") {
+        t = rest.trim_start();
+        exported = true;
+    }
+    if t.starts_with("use ") {
+        return Some(exported);
+    }
+    // TS/JS: `import …` は private、`export … from` は再輸出。`export const X`
+    // （= 定義）は定義位置が anchor 自身になるので、呼び出し側の検査で弾かれる。
+    if t.starts_with("import ") {
+        return Some(false);
+    }
+    if t.starts_with("export ") {
+        return Some(t.contains(" from "));
+    }
+    // Python: `from x import y`
+    if t.starts_with("from ") {
+        return Some(false);
+    }
+    None
+}
+
 /// [`Command::Rename`] の処理（ADR-0029）。内容指定（`old` の最初の識別子出現）を
 /// 位置に解決し、LSP rename の WorkspaceEdit を適用・保存して、影響範囲
 /// （ファイル数・編集数・変更一覧）を軽量応答で返す。
@@ -3892,6 +3936,50 @@ async fn serve_rename(daemon: &Mutex<Daemon>, path: &str, old: &str, new: &str) 
             Err(e) => return err(e).await,
         };
     trace.mark("resolve");
+    // ドッグフーディング 2026-09-15（ドライバー実測）: anchor が use / import 行にあると、
+    // rust-analyzer は「その束縛の名前を変える」編集（`pub use id::EntryId as EntryKey;`）を
+    // 返す。定義は不変のまま、旧名を import している呼び出し側は取り残され、**crate が
+    // コンパイルできなくなる**のに exit 0 で、INCOMPLETE の説明は「コメント/文字列」と言う。
+    // 定義位置を 1 回引いて、anchor でないなら行き先を名指して拒否する（同じ要求を
+    // 繰り返しても同じ束縛を書き換えるだけなので、再試行不可 = exit 1 の文言）。
+    if let Some(exported) = import_line_kind(&borrowed.text, line)
+        && let Some(def) = lsp::definition_peek_at(
+            &borrowed.session,
+            &borrowed.path,
+            &borrowed.text,
+            line,
+            character,
+        )
+        .await
+    {
+        let same_file = std::fs::canonicalize(&def.path)
+            .ok()
+            .zip(std::fs::canonicalize(&borrowed.path).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+        // 定義が anchor 行そのもの（同じファイルの同じ行）なら普通の rename でよい。
+        if !(same_file && def.line == line + 1) {
+            let anchor = format!("{}:{}", borrowed.path_str, line + 1);
+            let consequence = if exported {
+                format!(
+                    "renaming here rewrites THIS re-export (`use … as {new}`) and leaves the users \
+                     of `{old}` behind, so the crate stops building"
+                )
+            } else {
+                format!(
+                    "renaming here rewrites only THIS import binding (`use … as {new}`) — a local \
+                     alias; the definition and every other file keep `{old}`"
+                )
+            };
+            return err(format!(
+                "import/re-export anchor: {anchor} is a use/import binding of `{old}`, not its \
+                 definition (defined at {}:{}) — {consequence}. Anchor the rename at the \
+                 definition instead: minas rename {} {old} {new}",
+                def.path, def.line, def.path
+            ))
+            .await;
+        }
+    }
     let raw = match lsp::rename_at(&borrowed.session, &borrowed.path, line, character, new).await {
         Ok(v) => v,
         Err(e) => return err(e).await,
@@ -6980,6 +7068,26 @@ mod tests {
     use super::*;
     use mina_protocol::Severity;
     use mina_protocol::{Direction, GotoTarget, HighlightGroup, Mode, Movement};
+
+    #[test]
+    fn import_line_kind_spots_use_and_import_lines() {
+        // 2026-09-15: rename の anchor 検査。定義行は絶対に拾わない（誤拒否防止）。
+        // 戻り値 = Some(再輸出か) / None（import 行でない）。
+        let text = "use crate::a::EntryId;\npub use id::EntryId;\npub(crate) use id::X;\n\
+                    import { EntryId } from './x';\nfrom x import EntryId\n\
+                    export { EntryId } from './x';\nexport const EntryId = 1;\n\
+                    pub struct EntryId(pub u64);\n    let x = EntryId(1);\n";
+        assert_eq!(import_line_kind(text, 0), Some(false), "private use");
+        assert_eq!(import_line_kind(text, 1), Some(true), "pub use = 再輸出");
+        assert_eq!(import_line_kind(text, 2), Some(true), "pub(crate) use = 再輸出");
+        assert_eq!(import_line_kind(text, 3), Some(false), "TS import");
+        assert_eq!(import_line_kind(text, 4), Some(false), "Python from");
+        assert_eq!(import_line_kind(text, 5), Some(true), "TS re-export");
+        assert_eq!(import_line_kind(text, 6), Some(false), "export const は定義（検査で弾く）");
+        assert_eq!(import_line_kind(text, 7), None, "定義行は対象外（誤拒否しない）");
+        assert_eq!(import_line_kind(text, 8), None, "式中の呼び出しも対象外");
+        assert_eq!(import_line_kind(text, 99), None, "行範囲外は None");
+    }
 
     #[test]
     fn line_and_col_of_char_are_1_origin() {

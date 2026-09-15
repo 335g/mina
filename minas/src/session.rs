@@ -7,7 +7,10 @@
 //!   `--old-file` / `--new-file` で argv 制限やシェル引用を回避できる。
 //!   複数編集は `--hunks-stdin`（JSON 配列を stdin から、1 接続で Save は最後に一度））
 //! - `minas exec <JSON>` — `Command` を1つ実行する（JSON は wire の [`Command`] そのまま）
-//! - `minas edit <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する
+//! - `minas edit --path <path> <JSON>` — [`DocumentEdit`]（位置指定編集）を1つ実行する。
+//!   `--path` は必須で、daemon の**現在の文書**と一致しなければ送る前に拒否する
+//!   （パス指定の無い edit は「今フォーカスされている文書」に落ちるため、2 ペインが
+//!   1 daemon を共有すると相手のファイルを編集してしまう — 2026-09-15）
 //! - `minas wait <generation>` — 世代が `<generation>` を超えるまでブロックして状態を返す
 //!   （90 秒で時間切れ: 現状を返し exit code 2 = 再試行可能）
 //! - `minas hints <path>` — 任意パスの inlay hint を全文テキストなしで取得する（ADR-0020）
@@ -19,7 +22,7 @@
 //! - `minas check <path>` — 診断の settle を待って診断だけを返す（ADR-0032）
 //!
 //! 例: `minas exec '{"Insert": {"text": "hello"}}'`
-//! 例: `minas edit '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>}'`
+//! 例: `minas edit --path src/lib.rs '{"start": 0, "end": 0, "text": "hi", "checksum": <snapshot.checksum>, "expected_text": ""}'`
 //! 例: `minas apply src/lib.rs "let x = 1" "let x = 2"`
 //! 例: `minas apply src/lib.rs --whole-stdin < new_content.rs`
 //! 例: `minas wait 42`
@@ -202,6 +205,17 @@ pub enum SessionCmd {
     Edit {
         /// DocumentEdit JSON
         json: String,
+        /// Path this positional edit is FOR (required). The daemon applies a raw
+        /// edit to its GLOBALLY current document — with two panes on one daemon
+        /// (or any other writer) the current document can change between your
+        /// `get` and your `edit`, and the edit then lands in someone else's
+        /// buffer (measured 2026-09-15: a driver's edit landed in the
+        /// implementer's fixture file and a later `exec '"Save"'` persisted it).
+        /// minas compares this against the daemon's current document first and
+        /// refuses (exit 1) when they differ. `minas apply` needs no path check
+        /// because its path is part of the command.
+        #[arg(long, value_name = "PATH")]
+        path: PathBuf,
         /// Strip `events` / `activity` from the snapshot response (token
         /// reduction — same as `get --brief`; rust2 #5-3)
         #[arg(long)]
@@ -637,7 +651,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 .map_err(|e| invalid(format!("cannot parse the command JSON: {e}")))?;
             exec_raw(&command, brief).await?;
         }
-        SessionCmd::Edit { json, brief } => {
+        SessionCmd::Edit { json, brief, path } => {
             let edit: DocumentEdit = serde_json::from_str(&json)
                 .map_err(|e| invalid(format!("cannot parse the DocumentEdit JSON: {e}")))?;
             // 位置指定 edit の静かな破壊ガード（rust2 #5-2）: expected_text は
@@ -651,6 +665,17 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                      document checksum cannot detect a shifted range. Use `minas apply` \
                      for content-addressed editing (rust2 #5-2)",
                 ));
+            }
+            // ドッグフーディング 2026-09-15（ドライバー実測）: raw edit の宛先は
+            // **daemon が今フォーカスしている文書**で、パス指定が無い。2 ペインが
+            // 1 つの daemon を共有すると、`get` と `edit` の間に相手の Open が入り、
+            // 編集が相手のファイルに落ちる（その後の `exec '"Save"'` がそれを永続化
+            // した）。--path を必須にし、**現在の文書と違れば送る前に拒否**する。
+            let current = execute(&Command::GetState).await?;
+            let current_path = current.path.clone().unwrap_or_default();
+            if let Some(reason) = edit_target_mismatch(&path, &current_path) {
+                eprintln!("edit: {reason}");
+                std::process::exit(1);
             }
             let snapshot = execute_edit(&edit).await?;
             if brief {
@@ -671,6 +696,12 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             if snapshot.dirty {
                 eprintln!("note: buffer is dirty (not saved); persist with: session exec '\"Save\"'");
             }
+            // 成功経路でも宛先を 1 行出す（間違ったファイルを編集した事故は、
+            // 「dirty」の 1 行だけでは見えない — ドッグフーディング 2026-09-15）。
+            eprintln!(
+                "note: edited {} (buffer only)",
+                snapshot.path.as_deref().unwrap_or("<unknown document>")
+            );
         }
         SessionCmd::Apply {
             path,
@@ -712,13 +743,31 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                     Ok(())
                 }
             };
-            match wait_with_timeout(
+            let waited = wait_with_timeout(
                 WAIT_TIMEOUT,
                 execute(&Command::WaitFor { generation }),
                 execute(&Command::GetState),
             )
-            .await?
-            {
+            .await;
+            // ドッグフーディング 2026-09-15（ドライバー実測）: wait は長時間接続を
+            // 保持する唯一のコマンドなので、daemon の再起動（反復中は普通に起きる）を
+            // またぎやすい。そのとき素の `invalid response: EOF while parsing a value`
+            // が出ると、タイムアウト経路の `(retryable)` と違って**クライアントの
+            // バグに見える**。接続消失と名指しして再試行可能（exit 2）にする。
+            let outcome = match waited {
+                Ok(o) => o,
+                Err(e) if connection_lost(&e) => {
+                    eprintln!(
+                        "wait: the daemon closed the connection before generation {generation} \
+                         was observed (restarted or stopped) — this is a lost connection, not a \
+                         bad generation: re-run `minas wait {generation}`, or read the current \
+                         state with `minas get --brief` (retryable)"
+                    );
+                    std::process::exit(2);
+                }
+                Err(e) => return Err(e),
+            };
+            match outcome {
                 WaitOutcome::Completed(snapshot) => {
                     print(&snapshot)?;
                 }
@@ -1660,12 +1709,58 @@ async fn rename_refusal_note(path: &std::path::Path) -> Option<String> {
 /// バイナリは何度投げても同じで、exit code だけで分岐するエージェントが無限
 /// 再試行してしまう（rust2 #23 の check だけが例外だったのを全コマンドに揃える。
 /// ドッグフーディング #2 と同根: 「見れなかった」と「壊れている」を混同しない）。
+/// `minas edit --path` の宛先検査。現在の文書と**違えば理由**を返す（`None` = 一致）。
+///
+/// ドッグフーディング 2026-09-15: raw edit の宛先は daemon の「今フォーカスしている
+/// 文書」で、パス指定が無かった。2 ペインが 1 daemon を共有すると `get` と `edit` の
+/// 間に相手の `Open` が入って編集が相手のファイルに落ち、checksum ガードも
+/// （同じ誤った文書から読んだ値なら）何も言えない。ここで**送る前に**止める。
+/// 接続が切れたことを示す io::Error か（wait の再試行分類用）。
+///
+/// daemon が落ちる/入れ替わると、待っていた側の read は 0 バイトで返り、
+/// パースエラー（`EOF while parsing a value`）になる。同じ「状態は得られなかった」
+/// でも、世代の到着待ちが時間切れ（exit 2 + `wait timed out … (retryable)`）とは
+/// 別のものを指すので、文言と exit を合わせる（2026-09-15 ドライバー実測）。
+fn connection_lost(e: &io::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("invalid response: EOF")
+        || msg.contains("invalid response: expected value")
+        || msg.contains("Connection reset")
+        || msg.contains("Broken pipe")
+        || msg.contains("connection closed")
+}
+
+fn edit_target_mismatch(want: &std::path::Path, current: &str) -> Option<String> {
+    if current.is_empty() {
+        return Some(format!(
+            "refusing: the daemon reports no current document, so --path {} cannot be verified \
+             (open it first, or use `minas apply {} <old> <new>`)",
+            want.display(),
+            want.display()
+        ));
+    }
+    if same_path_key(&want.to_string_lossy()) == same_path_key(current) {
+        return None;
+    }
+    Some(format!(
+        "refusing: the daemon's current document is {current}, not {} — a positional edit would \
+         land in that file. Another pane (or your own earlier `Open`) changed it. Use \
+         `minas apply {} <old> <new>` (path is part of the command), or re-open the file and \
+         retry immediately",
+        want.display(),
+        want.display()
+    ))
+}
+
 fn lsp_input_error(e: &str) -> bool {
     e.starts_with("invalid input")
         || e.starts_with("cannot open")
         || e.starts_with("cannot delete")
         || e.starts_with("read-only-base")
         || e.starts_with("file too large")
+        // use/import 行を anchor にした rename の拒否（2026-09-15）。同じ要求を
+        // 繰り返せば同じ束縛を書き換えるだけなので、再試行不可（1）に分類する。
+        || e.starts_with("import/re-export anchor")
         || e.contains("not supported")
         // サーバが返した JSON-RPC error は決定的な拒否 — 同じ要求を繰り返しても
         // 同じ結果になる（実測: alias を anchor にした rename に対する
