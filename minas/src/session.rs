@@ -122,6 +122,14 @@ pub enum SessionCmd {
         /// the whole text — same contract as `get --lines`.
         #[arg(long)]
         lines: Option<String>,
+        /// Read an exact CHAR-OFFSET span `anchor:head` (0-origin, end exclusive;
+        /// `head` may be empty = end of file). Same units that `at` / `outline` /
+        /// `hints` return in their range fields, so no conversion is needed —
+        /// `--lines` takes LINE numbers and would return an empty answer for an
+        /// offset (`read --span 346:350` is the name token, `read --lines 346:350`
+        /// is 300 lines past a 53-line file).
+        #[arg(long, conflicts_with = "lines")]
+        span: Option<String>,
     },
     /// Delete a file (ADR-0060) — the editing surface covers creation (`apply`)
     /// and modification but a module move needs the old file GONE; without this
@@ -179,6 +187,13 @@ pub enum SessionCmd {
     Exec {
         /// Command JSON
         json: String,
+        /// Strip `events` / `activity` from a snapshot response (token
+        /// reduction — same as `get --brief`). `exec '"Save"'` is the
+        /// documented way to persist a positional `edit`, and without this
+        /// flag that confirmation is the largest answer minas can print
+        /// (~61 KB vs ~1.2 KB, 2026-09-15).
+        #[arg(long)]
+        brief: bool,
     },
     /// Run one [`DocumentEdit`] (position-addressed edit). `expected_text` is
     /// REQUIRED: without it a shifted range is not detected (document checksum
@@ -250,7 +265,10 @@ pub enum SessionCmd {
         /// Path
         path: PathBuf,
     },
-    /// Peek the definition at `<line>:<col>` (1-origin) without fetching full text (ADR-0025).
+    /// Peek the definition at `<line>:<col>` (1-origin) without fetching full text.
+    /// The returned `text` is a SMALL WINDOW (a few lines), not the whole
+    /// definition, and it carries no truncation flag — to read a complete body
+    /// use `minas read --span <anchor>:<head>` with the range from `outline`.
     /// Requires a language server: a path whose language has none is refused (exit 1).
     Peek {
         /// Path
@@ -281,9 +299,10 @@ pub enum SessionCmd {
         old: String,
     },
     /// Fetch the hierarchical symbol outline of any path without full text
-    /// (ADR-0031). Prints the symbol tree (name, kind, ranges) as JSON — the
-    /// ranges double as the addresses for later reads and edits. With
-    /// `--recursive`, file-scoped modules are followed to their definition files
+    /// (ADR-0031). Prints the symbol tree (name, kind, CHAR-OFFSET ranges) as
+    /// JSON — those offsets are the addresses for `minas edit` and for
+    /// `minas read --span <anchor>:<head>`; they are NOT line numbers.
+    /// With `--recursive`, file-scoped modules are followed to their definition files
     /// and nested into the tree (ADR-0049).
     /// Requires a language server: a path whose language has none is refused (exit 1).
     Outline {
@@ -303,8 +322,12 @@ pub enum SessionCmd {
         depth: Option<u32>,
     },
     /// Report the symbol enclosing `<line>:<col>` (1-origin) with its exact
-    /// range and name-token range (ADR-0031). Reads no full text — use the
-    /// returned ranges with `--lines` / `apply`.
+    /// range and name-token range (ADR-0031). Reads no full text. The two
+    /// ranges are CHAR OFFSETS (0-origin) — feed them to
+    /// `minas read --span <anchor>:<head>` to read the symbol, or to
+    /// `minas edit` (start/end + expected_text) to change it. They are NOT
+    /// `--lines` addresses (`--lines` is 1-origin LINE numbers; an offset there
+    /// returns an empty answer).
     /// Requires a language server: a path whose language has none is refused (exit 1).
     At {
         /// Path
@@ -355,7 +378,11 @@ pub enum SessionCmd {
         /// edit→verify loop in one round trip (rust2 #7).
         #[arg(long, value_name = "PATH")]
         crate_root: Option<PathBuf>,
-        /// With --crate-root: also check the sibling `tests/` directory.
+        /// With --crate-root: also add the sibling `tests/` DIRECTORY to the
+        /// expansion (more paths). It does NOT enable the `cfg(test)` cfg, so
+        /// code inside `#[cfg(test)]` is still not analysed — a test-only
+        /// compile error stays `clean-unverified` here while `cargo test`
+        /// fails. `cargo test` is the gate for test code (2026-09-15).
         #[arg(long)]
         include_tests: bool,
     },
@@ -429,7 +456,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 }
             }
         }
-        SessionCmd::Read { path, lines } => {
+        SessionCmd::Read { path, lines, span } => {
             // ADR-0048: パス指定の軽量テキスト読み。get（現在のバッファ）と違い
             // 任意パスをバッファを汚さず読む。失敗は stderr + exit 1（cannot open = 
             // 入力エラー、再試行不可）。
@@ -438,16 +465,25 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 eprintln!("read: {e}");
                 std::process::exit(1);
             }
-            match lines {
-                // --lines: get と同じ番号付き行契約（read→apply の old にそのまま使える）。
-                Some(range) => print_text_lines(
+            match (span, lines) {
+                // --span: `at` / `outline` / `hints` の char オフセットをそのまま読む
+                // （2026-09-15: オフセットを --lines に渡すと空 + exit 0 になり、
+                // 「outline first → その記号だけ読む」ループが手変換なしに辿れなかった）。
+                (Some(span), _) => print_text_span(
+                    &outcome.path,
+                    outcome.generation,
+                    outcome.checksum,
+                    &outcome.text,
+                    &span,
+                )?,
+                (None, Some(range)) => print_text_lines(
                     &outcome.path,
                     outcome.generation,
                     outcome.checksum,
                     &outcome.text,
                     &range,
                 )?,
-                None => {
+                (None, None) => {
                     // ADR-0063 / self-host #10: 生テキスト経路も revision を stderr に出す。
                     // stdout は `minas apply <new> --whole-stdin` にそのまま流せる形のまま
                     // （skill は小さいファイルでは --lines より素の read を勧めているので、
@@ -596,10 +632,10 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
             let info = execute_server_info().await?;
             println!("{}", serde_json::to_string_pretty(&info)?);
         }
-        SessionCmd::Exec { json } => {
+        SessionCmd::Exec { json, brief } => {
             let command: Command = serde_json::from_str(&json)
                 .map_err(|e| invalid(format!("cannot parse the command JSON: {e}")))?;
-            exec_raw(&command).await?;
+            exec_raw(&command, brief).await?;
         }
         SessionCmd::Edit { json, brief } => {
             let edit: DocumentEdit = serde_json::from_str(&json)
@@ -1205,6 +1241,107 @@ fn print_text_lines(
     }
     println!("{}", serde_json::Value::Object(obj));
     Ok(())
+}
+
+/// [`print_text_lines`] の char オフセット版（`read --span`）。
+///
+/// `minas at` / `outline` / `hints` が返す `range` / `selection_range` / `span` は
+/// **char オフセット（0-origin）**で、`--lines` の 1-origin 行番号とは別の座標系。
+/// 2026-09-15 の実測: `at` の `selection_range`(346:350) をそのまま `--lines` に
+/// 渡すと `lines: []` + exit 0（ファイルは 53 行）— ドキュメントの
+/// 「outline first → その記号だけ読む」ループが手変換なしに辿れなかった。
+/// 範囲外は `--lines` と同じ契約（理由付きの空 + exit 0）で返す。
+fn print_text_span(
+    path: &str,
+    generation: u64,
+    checksum: u64,
+    text: &str,
+    span: &str,
+) -> io::Result<()> {
+    let (start, end) = parse_char_span(span)?;
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let end_c = end.unwrap_or(total).min(total);
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    if start < total {
+        let mut line_no = 1usize;
+        let mut cur = String::new();
+        let mut cur_line = 1usize;
+        for (i, c) in chars.iter().enumerate() {
+            if i < start {
+                if *c == '\n' {
+                    line_no += 1;
+                }
+                continue;
+            }
+            if i >= end_c {
+                break;
+            }
+            if cur.is_empty() {
+                cur_line = line_no;
+            }
+            if *c == '\n' {
+                lines.push((cur_line, std::mem::take(&mut cur)));
+                line_no += 1;
+            } else {
+                cur.push(*c);
+            }
+        }
+        if !cur.is_empty() {
+            lines.push((cur_line, cur));
+        }
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("path".into(), path.into());
+    obj.insert("generation".into(), generation.into());
+    obj.insert("char_count".into(), (total as u64).into());
+    obj.insert("checksum".into(), checksum.into());
+    obj.insert("span".into(), span.into());
+    if start >= total {
+        obj.insert(
+            "note".into(),
+            format!(
+                "no span at {start}..{}: the file has {total} chars",
+                end.unwrap_or(total)
+            )
+            .into(),
+        );
+        obj.insert("lines".into(), serde_json::Value::Array(vec![]));
+    } else {
+        obj.insert(
+            "lines".into(),
+            lines
+                .iter()
+                .map(|(n, t)| serde_json::json!({ "n": n, "text": t }))
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    println!("{}", serde_json::Value::Object(obj));
+    Ok(())
+}
+
+/// `anchor:head`（char オフセット、0-origin、head は排他）を解釈する。
+/// `head` 省略可（ファイル末尾まで）。
+fn parse_char_span(span: &str) -> io::Result<(usize, Option<usize>)> {
+    let (a, h) = span.split_once(':').ok_or_else(|| {
+        invalid("the span must be anchor:head (char offsets, 0-origin; e.g. 346:350)")
+    })?;
+    let start: usize = a
+        .trim()
+        .parse()
+        .map_err(|_| invalid(format!("invalid char offset: {a:?}")))?;
+    if h.trim().is_empty() {
+        return Ok((start, None));
+    }
+    let end: usize = h
+        .trim()
+        .parse()
+        .map_err(|_| invalid(format!("invalid char offset: {h:?}")))?;
+    if end < start {
+        return Err(invalid("the span end must be >= the anchor"));
+    }
+    Ok((start, Some(end)))
 }
 
 /// `start:end`（1-origin・両端含む）を解釈する。`end` 省略可（最終行まで）。
@@ -2346,7 +2483,7 @@ async fn execute(command: &Command) -> io::Result<StateSnapshot> {
 ///   "unexpected semantic response" になっていた
 /// - headless ゲート拒否は status にだけ載って exit 0 になっていたので、定数
 ///   接頭辞を検出して exit 1（stderr に理由）にする
-async fn exec_raw(command: &Command) -> io::Result<()> {
+async fn exec_raw(command: &Command, brief: bool) -> io::Result<()> {
     let (mut write_half, mut reader) = open_one_shot().await?;
     let command = absolutize_paths(command.clone());
     let mut line = serde_json::to_string(&command).map_err(|e| invalid(e.to_string()))?;
@@ -2359,7 +2496,11 @@ async fn exec_raw(command: &Command) -> io::Result<()> {
         .map_err(|e| invalid(format!("invalid response: {e}")))?;
     match message {
         ServerMessage::Response { snapshot } => {
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            if brief {
+                print_brief_snapshot(&snapshot)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            }
             if let Some(status) = snapshot.status.as_deref() {
                 if headless_gate_rejected(status) {
                     eprintln!("exec: {status}");
@@ -3427,6 +3568,17 @@ mod tests {
         // whole-word でない（`EntryIdX`）は数えない。
         assert_eq!(whole_word_lines("EntryIdX\n", "EntryId").len(), 0);
         assert_eq!(whole_word_lines("EntryId\nEntryId\n", "EntryId").len(), 2);
+    }
+
+    #[test]
+    fn parse_char_span_accepts_offsets_and_rejects_inverted() {
+        // `read --span` は 0-origin の char オフセット（`--lines` の行番号とは別座標系）。
+        assert_eq!(parse_char_span("346:350").unwrap(), (346, Some(350)));
+        assert_eq!(parse_char_span("12:").unwrap(), (12, None), "end 省略は末尾まで");
+        assert_eq!(parse_char_span("0:4").unwrap(), (0, Some(4)), "0 は有効（行番号と違う）");
+        assert!(parse_char_span("50:30").is_err(), "逆転した範囲は拒否");
+        assert!(parse_char_span("346").is_err(), "区切りが無いのはエラー");
+        assert!(parse_char_span("a:b").is_err());
     }
 
     #[test]

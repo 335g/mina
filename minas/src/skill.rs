@@ -123,7 +123,8 @@ pub fn run(topic: Option<String>, md: bool) -> std::io::Result<()> {
                 "* = needs a language server. A language without one gets an explicit `not \
                  supported` refusal (exit 1) instead of an empty answer; `minas info` lists the \
                  servers that exist. LSP-free: read, search, edit (apply / delete), wait, get, \
-                 persist, errors, exec."
+                 errors, exec (persisting is `minas exec \"Save\"` — `persist` is a topic, not a \
+                 command)."
             );
             Ok(())
         }
