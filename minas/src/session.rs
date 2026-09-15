@@ -523,6 +523,9 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 let mut files = Vec::new();
                 let mut total = 0usize;
                 let mut failed = 0usize;
+                // `searched` は**実際に見たファイル数**（失敗した entry は数えない —
+                // ドライバー nit: 存在しない entry で 28 と出ていた）。
+                let mut searched = 0usize;
                 for p in &expansion.paths {
                     let outcome =
                         execute_search(&p.to_string_lossy(), &query, !ignore_case, word).await?;
@@ -532,6 +535,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                         failed += 1;
                         continue;
                     }
+                    searched += 1;
                     total += outcome.total;
                     if outcome.total == 0 {
                         continue;
@@ -548,7 +552,7 @@ pub async fn run(cmd: SessionCmd, name: Option<String>) -> io::Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string(&serde_json::json!({
-                        "searched": expansion.paths.len(),
+                        "searched": searched,
                         "total": total,
                         "files": files,
                     }))?
@@ -1672,6 +1676,7 @@ fn leftover_mentions(
     // assert メッセージ文字列が不可視）。件数だけを 1 行で報告する。
     let mut in_touched_mentions = 0usize;
     let mut duplicate_lines = 0usize;
+    let mut duplicate_mentions = 0usize;
     for f in files.into_iter().take(LEFTOVER_SCAN_MAX_FILES) {
         let abs = same_path_key(&f.to_string_lossy());
         let Ok(md) = std::fs::metadata(&f) else {
@@ -1702,6 +1707,10 @@ fn leftover_mentions(
                     in_touched_mentions += n;
                 } else if n > already {
                     duplicate_lines += 1;
+                    // 注記に「住所の無い言及数」も出す: 見出しの件数＋ INCOMPLETE ＋
+                    // この数が本文の whole-word 出現数と合う（ドライバー nit B: 2 つの
+                    // note を頭の中で合わせないと帳尻が見えなかった）。
+                    duplicate_mentions += n - already;
                 }
             }
         } else {
@@ -1732,9 +1741,9 @@ fn leftover_mentions(
         // なので、同じ行の 2 つ目には住所が無いだけ。
         eprintln!(
             "note: {duplicate_lines} line(s) in the listed file(s) carry more than one mention \
-             of `{old}`; the list shows one `path:line` per line, so the extra mention(s) have \
-             no position of their own (not a leftover — `minas search -w <file> {old}` for \
-             exact positions)"
+             of `{old}`; the list shows one `path:line` per line, so {duplicate_mentions} extra \
+             mention(s) have no position of their own (not a leftover — `minas search -w <file> \
+             {old}` for exact positions)"
         );
     }
     Leftovers {
