@@ -9,8 +9,12 @@
 cargo build                                    # minas / minad（debug で可）
 python3 tools/ab/ab.py selftest                # 計器の自己検証（LLM 費用ゼロ・1〜2分）
 python3 tools/ab/ab.py sweep --n 5             # 105 runs / 約 1.7 時間 / 約 $1.5
+python3 tools/ab/ab.py --help                   # 位置指定 arm などの追加実験も同じ runner
 python3 tools/ab/report.py --svg curve.svg     # 集計 + 作図（標準ライブラリのみ）
 ```
+
+凍結した 3 arm の掃引（native / naive / minas）を壊さないため、追加 arm は
+`--arms positional` のように明示したときだけ走る。
 
 掃引は各 run の前に `pkill -f "opencode run"` を打つので、**同じ Mac で他の opencode を
 走らせない**。測定は `history.jsonl` に追記され、同じ key（task/scale/drift/arm/idx）の
@@ -101,7 +105,55 @@ native 比 -1% → -50%、naive 比 +16% → -68%）
 - drift 下のコスト: 3 arm とも入力トークンの増分は +1〜+8% で小さい（drift の入る位置が
   タスク範囲外のため）。minas の絶対値は変わらず最小。
 
-## この実験で言えないこと（正直に）
+## 結果3: 位置指定（offset）経路は高い（minas 自身の第2の編集経路）
+
+`minas` には内容指定の `apply` 以外に **位置指定の `edit`** がある（モデルが char offset を
+渡す）。それは実際の CLI なので、strawman ではなく **minas 自身のもう一つの経路** を測った
+（`--arms positional`）。
+
+| 条件 | positional / minas（入力） | 同（コスト） | 同（wall） | 非 GREEN |
+| :-- | ---: | ---: | ---: | :-- |
+| 150 行・drift 無 | **2.87x** | 3.12x | 2.05x | 2 / 5 |
+| 150 行・drift 有 | 2.21x | 2.78x | 1.97x | 1 / 5 |
+| 4,800 行・drift 無 | 1.95x | 2.66x | 1.96x | 1 / 5 |
+| 4,800 行・drift 有 | **4.11x** | 3.41x | 1.78x | 0 / 5 |
+
+（同一 idx の paired、n=5。中央値。`summary.md` に絶対値表）
+
+- **位置指定は minas の内容指定より 2〜4 倍高い。** 理由は計器が数えた通り: 1 編集に
+  `Open` + `edit` + `Save` の 3 往復が必要（`apply` は 1 往復で検証と保存まで終わる）、
+  さらに**モデルの計算した offset が外れて却下される**（1 run あたり中央値 1〜5 回。apply は 0）。
+- 遂行率も低い（20 run 中 4 回が非 GREEN。apply は 20 run 中 1 回）。
+- **それでも CORRUPT は 0。** これは偶然ではなく構造の帰結: `minas edit` は
+  `expected_text`（対象範囲の現テキスト）が無いと **実行を拒否する**。実際に拒否される:
+
+  ```
+  $ minas edit --path f.rs '{"start":0,"end":9,"text":"...","checksum":...}'
+  Error: positional edit requires expected_text (the old text at start..end) —
+  document checksum cannot detect a shifted range. Use `minas apply` for
+  content-addressed editing (rust2 #5-2)          # rc=1
+  ```
+
+  「offset がずれても全文 checksum では検出できない」という失敗モードは minas 自身が
+  既知で、CLI がその形の実行を許さない。つまり **offset 経路は「高くつく」が「黙って壊す」
+  には至らず、ずれは見える却下になる**。だから README で勧めるのは `apply` の方。
+- この arm は公平側に倒してある: `mread` は各行の `off`（正確な文字位置）を返す。
+  モデルに文字を数えさせず、「どの範囲を選ぶか」だけを測る。これを外すと
+  arm は「LLM は文字を数えられない」を測ってしまう。
+
+## 計器が決定論的に固定している安全側の性質（LLM なし・`selftest`）
+
+頻度の推定は n が足りないが、**機構は費用ゼロで毎回検証できる**。`ab.py selftest` が
+次を assert する（赤ければ掃引を回さない）:
+
+| 検査 | 意味 |
+| :-- | :-- |
+| 無検証の全体書戻しは外部変更を消す | naive 系の契約の失敗モードが実在すること |
+| minas apply は外部変更を保つ | 同じ状況で minas は消さないこと |
+| 位置指定（minas edit）経路が動く | offset 経路が「計器の故障」で 0 点にならないこと |
+| 各 arm の `.opencode/tools/*.ts` の TS 構文 | 生成ミスを opencode の不可解なエラーで発見しないため |
+| drift 注入が当たる / 外部変更を失ったら検出 | 安全指標 `ext_lost` 自体の検証 |
+
 
 - **頻度の主張はできない。** n=5（drift は n=25）で、比の bootstrap 95% CI は広い
   （全規模込みの -29% は [-60%, -10%]）。規模ごとの値は 5/5 同方向の一致性で読んでいる。
@@ -110,7 +162,11 @@ native 比 -1% → -50%、naive 比 +16% → -68%）
 - **`build=debug` の minas で測定。** L0 が見ている起動固定費の差はここには効かない
   （フィクスチャに LSP が無く、1 run のコストはモデルの往復が支配的）。
 - 「壊さない」の対象は**並行変更の消失**に限る。位置（char offset）をモデルに計算させる
-  経路の測定は未実施（過去の T3 はその経路で 0/5 だった）。
+  経路は**測定済み**（結果3）: 2〜4 倍高くつき、遂行率も低いが、**CORRUPT は 0**。
+  つまり offset 経路の欠点は「黙って壊す」ではなく「高くつく・しばしば却下される」。
+- **4 arm すべてで CORRUPT=0、noise 損壊 0。** この計器で「黙って壊す」頻度を推定することは
+  できない（n=20 で 0 件なら上限はおよそ 15%）。言えるのは「その失敗モードは決定論的に
+  実在し、minas の契約では n=45 の観測で 1 件も出なかった」まで。
 - 期間中の runner 修正: 測定開始時、全 shim が**既に存在しない `minas session` サブコマンド**を
   呼んでいた（現行 CLI は `minas read` / `apply` / `check` / `rename`）。修正前の drift 30 run は
   注入が発火していないため `"invalid": "drift-injector-v1"` として履歴に残し、集計から除外している。
@@ -119,6 +175,22 @@ native 比 -1% → -50%、naive 比 +16% → -68%）
 
 1. 上位モデル 1 種を最小・最大の 2 点で（20 runs・$20〜60）。**どの指標の差が残るか**を見る
    （トークン差は縮み、検証の差は残る、と予測）。
-2. 位置 arm（モデルが char offset を計算する経路）を足して CORRUPT を測る。今回は
-   `t11` が内容指定の編集なので CORRUPT は 0 件だった。
+2. 計器の既知の限界を埋める: `selftest` の決定論的検査は daemon の状態に依存するので、
+   CI で回すなら daemon を専用に立てる。
 3. README に数字を載せるときは、n / model / build / 日付 / 除外 run 数を併記する。
+
+## 計器を作る途中で見つけた穴（同じ穴を掘り返さないために）
+
+- **`minas read` は daemon が開いているファイルでは buffer を返す**（ディスクではない）。
+  外部書き換えは非同期に reload されるので、直後の read は古い内容を返しうる。
+  位置指定 arm は read と checksum を同じ情報源から取ることで、オフセットが
+  モデルの見たテキストと必ず一致するようにしてある。
+- **生成した custom tool の TS が壊れていると opencode は `undefined is not an object
+  (evaluating 'mo.output')` という無関係なエラーを返し、shim は一度も走らない。**
+  位置指定 arm の medit が 13 回連続で失敗した原因は文字列連結ミスだった。今は
+  `selftest` が `node --check` で各 `.ts` を検める。
+- **`build_workdir` の `rmtree` は `cargo check` の `target/` を消し切れないことがある**
+  （Directory not empty）。3 回まで再試行する。
+- **opencode 1.18 の `bash` は zsh を実行し、`~/.zshrc` の `mise activate` が PATH を
+  再構築する**ので、PATH 前置きの shim は無効化される（ZDOTDIR を空にして回避）。
+  これは「bash を外す」設計にした理由の一つ。
