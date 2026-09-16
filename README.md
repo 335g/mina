@@ -8,8 +8,8 @@
 
 **Two measured effects** (details and raw data in [docs/benchmarks/l2/](docs/benchmarks/l2/README.md), figures below):
 
-1. **Cost stops growing with file size.** On a task with 4,800 lines per file, input tokens are **−79%** and cost **−61%** versus naive full-file tooling (medians). Naive tooling grows with the file; minas stays roughly flat. The two curves cross at 300–600 lines per file.
-2. **External changes are not silently discarded.** In an experiment that injects a concurrent external write to the file being edited, **only 1 of 209 runs** lost that change — and that one was the whole-file-rewrite arm; minas's two edit paths scored **0/51**. The failure mode's existence itself is re-verified by a deterministic, LLM-free test on every run.
+1. **External changes are not silently discarded** (the headline). In an experiment that injects a concurrent external write to the file being edited, **only 1 of 209 runs** lost that change — and that one was the whole-file-rewrite arm; minas's two edit paths scored **0/51**. That the failure mode exists is itself re-verified by a deterministic, LLM-free test on every run.
+2. **Cost stops growing with file size** (the supporting claim). On a task with 4,800 lines per file, input tokens are **−79%** and cost **−61%** versus naive full-file tooling (medians). Naive tooling grows with the file; minas stays roughly flat. The two curves cross at 300–600 lines per file.
 
 ---
 
@@ -68,7 +68,7 @@ mina is a terminal editor with a daemon/client split, built for agent-driven edi
 
 A resident **Daemon** holds all editor state — open documents, undo histories, selections, LSP sessions, detection of external changes. **Clients** (the headless `minas` CLI, an agent, or the optional TUI) connect over a local socket, send commands, and render state snapshots. Clients can come and go; the daemon and its state remain. Because every frontend speaks the same protocol, the tools an agent uses in a script are the same tools the TUI uses interactively — and the TUI is optional.
 
-For an agent this has two important consequences: **edits are validated against the daemon's state**, and **external changes are detected and reloaded**. Both are the foundation of "does not silently break", measured in [Claim 2](#claim-2-it-does-not-silently-break).
+For an agent this has two important consequences: **edits are validated against the daemon's state**, and **external changes are detected and reloaded**. Both are the foundation of "does not silently break", measured in [Claim 1](#claim-1-it-does-not-silently-break).
 
 ## Capabilities
 
@@ -97,73 +97,18 @@ Every command returns JSON. If an edit is rejected, re-read the range and retry 
 
 ---
 
-## Claim 1: cost stops growing with file size
-
-![Cost does not grow with file size](docs/benchmarks/l2/curve.svg)
-
-One fixed task (add a field to a two-file Rust crate, five edits) was run at five scales,
-**varying only the line count** (padding with noise lines, so difficulty is unchanged). The three
-arms share the same prompt, the same model, and the same runner; only the available tools differ:
-
-| arm | Tools given |
-| :-- | :-- |
-| `native` | opencode's built-in read / edit / write / glob / grep (plus the internal `apply_patch`) |
-| `naive` | Full-file read + unverified whole-file replace (the classic naive shim) |
-| `minas` | Numbered range read + verified `apply` (minas's session contract) |
-| `positional` | Numbered range read + position-addressed `edit` (minas's own second path; results below) |
-
-None of the arms has a shell. Forcing shims through a shell does not hold: the model escapes to
-`apply_patch` or `sed -n` and the comparison collapses (see [Method and reproduction](#method-and-reproduction)).
-Compliance is judged by **the tools a run actually called**; a run that calls anything outside its
-allow-list is not used as a measurement (209 runs adopted, 31 rejected).
-
-### Input tokens and cost (medians, no injected drift)
-
-| Total lines | Per file | native | naive | **minas** | minas / native | minas / naive |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 150 | 75 | 13,226 | 10,627 | 13,973 | +3% | +1% |
-| 600 | 300 | 17,950 | 20,749 | 19,130 | +8% | −4% |
-| 1,200 | 600 | 26,619 | 42,827 | **18,859** | **−29%** | **−58%** |
-| 2,400 | 1,200 | 46,428 | 67,799 | **20,106** | **−60%** | **−70%** |
-| 9,600 | 4,800 | 56,036 | 83,422 | **17,770** | **−70%** | **−83%** |
-
-Cost (median, USD) has the same shape: at 4,800 lines per file, **minas $0.0101** versus native
-$0.0207 and naive $0.0257.
-
-What it says:
-
-- **minas's cost is nearly flat in scale** (14k → 17.8k, flat to slightly up): it reads only the ranges
-  it needs. native and naive read whole files, so they grow with the line count.
-- **The curves cross at 300–600 lines per file.** Below that, minas is the more expensive option
-  (+3% at 150 lines). It is not a "always cheaper" tool; it pays off when **files are large**.
-- At the largest scale: **−70% to −83% input, −51% to −61% cost**.
-
-### Statistical strength (honestly)
-
-| Comparison | Condition | n | Input delta | p (sign test) |
-| :-- | :-- | ---: | ---: | ---: |
-| minas / native | 4,800 lines/file | 10 | **−70%** | 0.002 |
-| minas / naive | 4,800 lines/file | 5 | −83% | 0.062 |
-| minas / naive | 4,800 lines/file + drift | 25 | **−84%** | **< 0.001** |
-| minas / native | all scales pooled | 35 | **−33%** [−56%, −14%] | 0.002 |
-| minas / naive | all scales pooled | 25 | −58% [−70%, −4%] | 0.015 |
-
-(Ratios are medians of paired same-idx ratios; they differ slightly from ratios of the medians in the table above.)
-
-At n=5 the sign test bottoms out at p=0.0625, so five runs per scale cannot be called significant on
-their own (the n and minimum-detectable-effect calculations are in
-[docs/benchmarks/l2/README.md](docs/benchmarks/l2/README.md)). That is why the 4,800-lines-per-file
-cell was extended to 25 runs — the only place where **all 25 pairs point the same way** at p < 0.001.
-Numbers depend on the model, runner and n, so read them as: **model opencode/gpt-5.4-nano, runner
-opencode 1.18.31, debug build, 2026-09-16.**
-
-## Claim 2: it does not silently break
+## Claim 1: it does not silently break
 
 ![Does not break](docs/benchmarks/l2/safety.svg)
 
 Agent edits break in two ways. **Breaking loudly** (the build fails, the edit is rejected) is a cheap
 failure. What is expensive is **breaking silently**: exit code 0, the agent says "done", the file is
-wrong. That is mina's central claim, so each run was classified four ways:
+wrong. That is mina's central claim.
+
+(Arms are defined in the next section. Here: `native` = opencode's built-in file tools,
+`naive` = full-file read + unverified whole-file replace, `minas` = verified `apply`, `positional` = position-addressed `edit`.)
+
+Each run was classified four ways:
 
 | Class | Meaning |
 | :-- | :-- |
@@ -244,6 +189,66 @@ rejected** — which is why the README recommends `apply`.
   What can be said: the failure mode exists deterministically and was never observed under minas's contract.
 - "Does not break" covers **loss of concurrent changes** and **modification of unintended regions**. It
   does not prevent semantically wrong edits (wrong content in the right place). That is the agent's job.
+
+## Claim 2: cost stops growing with file size
+
+![Cost does not grow with file size](docs/benchmarks/l2/curve.svg)
+
+One fixed task (add a field to a two-file Rust crate, five edits) was run at five scales,
+**varying only the line count** (padding with noise lines, so difficulty is unchanged). The three
+arms share the same prompt, the same model, and the same runner; only the available tools differ:
+
+| arm | Tools given |
+| :-- | :-- |
+| `native` | opencode's built-in read / edit / write / glob / grep (plus the internal `apply_patch`) |
+| `naive` | Full-file read + unverified whole-file replace (the classic naive shim) |
+| `minas` | Numbered range read + verified `apply` (minas's session contract) |
+| `positional` | Numbered range read + position-addressed `edit` (minas's own second path; results below) |
+
+None of the arms has a shell. Forcing shims through a shell does not hold: the model escapes to
+`apply_patch` or `sed -n` and the comparison collapses (see [Method and reproduction](#method-and-reproduction)).
+Compliance is judged by **the tools a run actually called**; a run that calls anything outside its
+allow-list is not used as a measurement (209 runs adopted, 31 rejected).
+
+### Input tokens and cost (medians, no injected drift)
+
+| Total lines | Per file | native | naive | **minas** | minas / native | minas / naive |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 150 | 75 | 13,226 | 10,627 | 13,973 | +3% | +1% |
+| 600 | 300 | 17,950 | 20,749 | 19,130 | +8% | −4% |
+| 1,200 | 600 | 26,619 | 42,827 | **18,859** | **−29%** | **−58%** |
+| 2,400 | 1,200 | 46,428 | 67,799 | **20,106** | **−60%** | **−70%** |
+| 9,600 | 4,800 | 56,036 | 83,422 | **17,770** | **−70%** | **−83%** |
+
+Cost (median, USD) has the same shape: at 4,800 lines per file, **minas $0.0101** versus native
+$0.0207 and naive $0.0257.
+
+What it says:
+
+- **minas's cost is nearly flat in scale** (14k → 17.8k, flat to slightly up): it reads only the ranges
+  it needs. native and naive read whole files, so they grow with the line count.
+- **The curves cross at 300–600 lines per file.** Below that, minas is the more expensive option
+  (+3% at 150 lines). It is not a "always cheaper" tool; it pays off when **files are large**.
+- At the largest scale: **−70% to −83% input, −51% to −61% cost**.
+
+### Statistical strength (honestly)
+
+| Comparison | Condition | n | Input delta | p (sign test) |
+| :-- | :-- | ---: | ---: | ---: |
+| minas / native | 4,800 lines/file | 10 | **−70%** | 0.002 |
+| minas / naive | 4,800 lines/file | 5 | −83% | 0.062 |
+| minas / naive | 4,800 lines/file + drift | 25 | **−84%** | **< 0.001** |
+| minas / native | all scales pooled | 35 | **−33%** [−56%, −14%] | 0.002 |
+| minas / naive | all scales pooled | 25 | −58% [−70%, −4%] | 0.015 |
+
+(Ratios are medians of paired same-idx ratios; they differ slightly from ratios of the medians in the table above.)
+
+At n=5 the sign test bottoms out at p=0.0625, so five runs per scale cannot be called significant on
+their own (the n and minimum-detectable-effect calculations are in
+[docs/benchmarks/l2/README.md](docs/benchmarks/l2/README.md)). That is why the 4,800-lines-per-file
+cell was extended to 25 runs — the only place where **all 25 pairs point the same way** at p < 0.001.
+Numbers depend on the model, runner and n, so read them as: **model opencode/gpt-5.4-nano, runner
+opencode 1.18.31, debug build, 2026-09-16.**
 
 ## Claim 3: what the tradeoff costs
 
