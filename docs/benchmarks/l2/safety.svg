@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="620" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+<rect width="940" height="620" fill="white"/>
+<text x="14" y="22" font-size="13" font-weight="bold">task outcome per arm（全 run）</text>
+<text x="14" y="62" fill="#333">native</text>
+<text x="456" y="62" text-anchor="end" fill="#666" font-size="10">n=56</text>
+<rect x="84.0" y="48" width="208.0" height="19" fill="#2e8b57"/>
+<text x="188.0" y="61.5" text-anchor="middle" fill="white">51</text>
+<rect x="292.0" y="48" width="20.4" height="19" fill="#d4a017"/>
+<text x="302.2" y="61.5" text-anchor="middle" fill="white">5</text>
+<text x="14" y="92" fill="#333">naive</text>
+<text x="456" y="92" text-anchor="end" fill="#666" font-size="10">n=55</text>
+<rect x="84.0" y="78" width="224.3" height="19" fill="#2e8b57"/>
+<text x="196.2" y="91.5" text-anchor="middle" fill="white">55</text>
+<text x="14" y="122" fill="#333">minas</text>
+<text x="456" y="122" text-anchor="end" fill="#666" font-size="10">n=76</text>
+<rect x="84.0" y="108" width="301.8" height="19" fill="#2e8b57"/>
+<text x="234.9" y="121.5" text-anchor="middle" fill="white">74</text>
+<rect x="385.8" y="108" width="8.2" height="19" fill="#d4a017"/>
+<text x="14" y="152" fill="#333">positional</text>
+<text x="456" y="152" text-anchor="end" fill="#666" font-size="10">n=22</text>
+<rect x="84.0" y="138" width="69.3" height="19" fill="#2e8b57"/>
+<text x="118.7" y="151.5" text-anchor="middle" fill="white">17</text>
+<rect x="153.3" y="138" width="12.2" height="19" fill="#d4a017"/>
+<rect x="165.6" y="138" width="8.2" height="19" fill="#8e8e8e"/>
+<rect x="14" y="171" width="10" height="10" fill="#2e8b57"/><text x="29" y="180" fill="#333" font-size="10">GREEN</text>
+<rect x="14" y="184" width="10" height="10" fill="#d4a017"/><text x="29" y="193" fill="#333" font-size="10">LOUD-FAIL</text>
+<rect x="14" y="197" width="10" height="10" fill="#8e8e8e"/><text x="29" y="206" fill="#333" font-size="10">INCOMPLETE</text>
+<rect x="14" y="210" width="10" height="10" fill="#c0392b"/><text x="29" y="219" fill="#333" font-size="10">CORRUPT</text>
+<text x="14" y="284" fill="#666" font-size="10">CORRUPT = 意図しない領域を書き換えたまま正常終了（0 本が主張）</text>
+<text x="484" y="22" font-size="13" font-weight="bold">positional ÷ apply（入力トークン、同一 idx の中央値）</text>
+<line x1="500" y1="210" x2="924" y2="210" stroke="#888"/>
+<rect x="515.4" y="129.2" width="71.8" height="80.8" fill="#7b3fa0" opacity="0.85"/><text x="551.2" y="124.2" text-anchor="middle" fill="#7b3fa0" font-weight="bold">2.61x</text>
+<text x="551.2" y="226" text-anchor="middle" fill="#333" font-size="10">75行 d0</text><text x="551.2" y="238" text-anchor="middle" fill="#888" font-size="9">n=7</text>
+<rect x="617.9" y="141.5" width="71.8" height="68.5" fill="#7b3fa0" opacity="0.85"/><text x="653.8" y="136.5" text-anchor="middle" fill="#7b3fa0" font-weight="bold">2.21x</text>
+<text x="653.8" y="226" text-anchor="middle" fill="#333" font-size="10">75行 d1</text><text x="653.8" y="238" text-anchor="middle" fill="#888" font-size="9">n=5</text>
+<rect x="720.4" y="149.8" width="71.8" height="60.2" fill="#7b3fa0" opacity="0.85"/><text x="756.2" y="144.8" text-anchor="middle" fill="#7b3fa0" font-weight="bold">1.95x</text>
+<text x="756.2" y="226" text-anchor="middle" fill="#333" font-size="10">4800行 d0</text><text x="756.2" y="238" text-anchor="middle" fill="#888" font-size="9">n=5</text>
+<rect x="822.9" y="82.9" width="71.8" height="127.1" fill="#7b3fa0" opacity="0.85"/><text x="858.8" y="77.9" text-anchor="middle" fill="#7b3fa0" font-weight="bold">4.11x</text>
+<text x="858.8" y="226" text-anchor="middle" fill="#333" font-size="10">4800行 d1</text><text x="858.8" y="238" text-anchor="middle" fill="#888" font-size="9">n=5</text>
+<line x1="500" y1="179.1" x2="924" y2="179.1" stroke="#1f6feb" stroke-dasharray="4,3"/><text x="924" y="174.1" text-anchor="end" fill="#1f6feb">apply = 1.0x</text>
+<text x="484" y="284" fill="#666" font-size="10">位置指定は 1 編集に Open + edit + Save の 3 往復かかる（apply は 1 往復）</text>
+<text x="14" y="352" font-size="13" font-weight="bold">並行変更を黙って消した run</text>
+<line x1="30" y1="540" x2="454" y2="540" stroke="#888"/>
+<text x="81.2" y="533.0" text-anchor="middle" fill="#888" font-weight="bold">0/21</text><text x="81.2" y="556" text-anchor="middle" fill="#333" font-size="10">native</text>
+<rect x="158.1" y="536.3" width="51.2" height="3.7" fill="#c0392b"/>
+<text x="183.8" y="529.3" text-anchor="middle" fill="#c0392b" font-weight="bold">1/30</text><text x="183.8" y="556" text-anchor="middle" fill="#333" font-size="10">naive</text>
+<text x="286.2" y="533.0" text-anchor="middle" fill="#888" font-weight="bold">0/41</text><text x="286.2" y="556" text-anchor="middle" fill="#333" font-size="10">minas</text>
+<text x="388.8" y="533.0" text-anchor="middle" fill="#888" font-weight="bold">0/10</text><text x="388.8" y="556" text-anchor="middle" fill="#333" font-size="10">positional</text>
+<text x="14" y="614" fill="#666" font-size="10">drift 注入が当たった run のみ。失った run はどれも「成功」と報告している</text>
+<text x="484" y="352" font-size="13" font-weight="bold">費用ゼロで毎回検証する不変条件（ab.py selftest）</text>
+<text x="494" y="378" fill="#2e8b57" font-weight="bold">PASS</text><text x="540" y="378" fill="#333">無検証の全文書戻しは外部変更を消す</text><text x="540" y="392" fill="#666" font-size="10">消える = 欠陥が実在する</text>
+<text x="494" y="412" fill="#2e8b57" font-weight="bold">PASS</text><text x="540" y="412" fill="#333">minas apply は同じ状況でも保つ</text><text x="540" y="426" fill="#666" font-size="10">消えない = 契約が守る</text>
+<text x="494" y="446" fill="#2e8b57" font-weight="bold">PASS</text><text x="540" y="446" fill="#333">位置指定の edit は expected_text 無しで拒否</text><text x="540" y="460" fill="#666" font-size="10">rc=1 で実行されない</text>
+<text x="494" y="480" fill="#2e8b57" font-weight="bold">PASS</text><text x="540" y="480" fill="#333">drift 注入が当たる / 外れたら検出</text><text x="540" y="494" fill="#666" font-size="10">安全指標 ext_lost 自体の検証</text>
+<text x="494" y="514" fill="#2e8b57" font-weight="bold">PASS</text><text x="540" y="514" fill="#333">各 arm の custom tool の TS 構文</text><text x="540" y="528" fill="#666" font-size="10">計器の生成ミスを検出</text>
+<text x="484" y="614" fill="#666" font-size="10">赤ければ掃引を回さない（LLM 費用ゼロ・1〜2 分）</text>
+</svg>

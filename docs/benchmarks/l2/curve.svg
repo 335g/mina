@@ -1,64 +1,109 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="840" height="340" font-family="sans-serif" font-size="11">
-<text x="46" y="18">input tokens (median) — drift off</text>
-<line x1="46" y1="270.0" x2="374" y2="270.0" stroke="#888"/><line x1="46" y1="30" x2="46" y2="270.0" stroke="#888"/>
-<text x="40" y="273.0" text-anchor="end">9,033</text>
-<text x="40" y="33.0" text-anchor="end">95,935</text>
-<line x1="46.0" y1="270.0" x2="46.0" y2="274.0" stroke="#888"/><text x="46.0" y="287.0" text-anchor="middle">75</text>
-<line x1="155.3" y1="270.0" x2="155.3" y2="274.0" stroke="#888"/><text x="155.3" y="287.0" text-anchor="middle">300</text>
-<line x1="210.0" y1="270.0" x2="210.0" y2="274.0" stroke="#888"/><text x="210.0" y="287.0" text-anchor="middle">600</text>
-<line x1="264.7" y1="270.0" x2="264.7" y2="274.0" stroke="#888"/><text x="264.7" y="287.0" text-anchor="middle">1200</text>
-<line x1="374.0" y1="270.0" x2="374.0" y2="274.0" stroke="#888"/><text x="374.0" y="287.0" text-anchor="middle">4800</text>
-<text x="210.0" y="302.0" text-anchor="middle">lines per file (log)</text>
-<polyline points="46.0,231.3 155.3,200.2 210.0,160.2 264.7,103.7 374.0,84.6" fill="none" stroke="#c0392b" stroke-width="2"/>
-<circle cx="46.0" cy="231.3" r="3" fill="#c0392b"/>
-<circle cx="155.3" cy="200.2" r="3" fill="#c0392b"/>
-<circle cx="210.0" cy="160.2" r="3" fill="#c0392b"/>
-<circle cx="264.7" cy="103.7" r="3" fill="#c0392b"/>
-<circle cx="374.0" cy="84.6" r="3" fill="#c0392b"/>
-<text x="380" y="89" fill="#c0392b">native</text>
-<polyline points="46.0,253.5 155.3,185.5 210.0,111.9 264.7,65.3 374.0,44.2" fill="none" stroke="#e67e22" stroke-width="2"/>
-<circle cx="46.0" cy="253.5" r="3" fill="#e67e22"/>
-<circle cx="155.3" cy="185.5" r="3" fill="#e67e22"/>
-<circle cx="210.0" cy="111.9" r="3" fill="#e67e22"/>
-<circle cx="264.7" cy="65.3" r="3" fill="#e67e22"/>
-<circle cx="374.0" cy="44.2" r="3" fill="#e67e22"/>
-<text x="380" y="48" fill="#e67e22">naive</text>
-<polyline points="46.0,225.7 155.3,193.8 210.0,195.2 264.7,188.7 374.0,201.3" fill="none" stroke="#2471a3" stroke-width="2"/>
-<circle cx="46.0" cy="225.7" r="3" fill="#2471a3"/>
-<circle cx="155.3" cy="193.8" r="3" fill="#2471a3"/>
-<circle cx="210.0" cy="195.2" r="3" fill="#2471a3"/>
-<circle cx="264.7" cy="188.7" r="3" fill="#2471a3"/>
-<circle cx="374.0" cy="201.3" r="3" fill="#2471a3"/>
-<text x="380" y="205" fill="#2471a3">minas</text>
-<text x="466" y="18">wall (s, median) — drift off</text>
-<line x1="466" y1="270.0" x2="794" y2="270.0" stroke="#888"/><line x1="466" y1="30" x2="466" y2="270.0" stroke="#888"/>
-<text x="460" y="273.0" text-anchor="end">32</text>
-<text x="460" y="33.0" text-anchor="end">79</text>
-<line x1="466.0" y1="270.0" x2="466.0" y2="274.0" stroke="#888"/><text x="466.0" y="287.0" text-anchor="middle">75</text>
-<line x1="575.3" y1="270.0" x2="575.3" y2="274.0" stroke="#888"/><text x="575.3" y="287.0" text-anchor="middle">300</text>
-<line x1="630.0" y1="270.0" x2="630.0" y2="274.0" stroke="#888"/><text x="630.0" y="287.0" text-anchor="middle">600</text>
-<line x1="684.7" y1="270.0" x2="684.7" y2="274.0" stroke="#888"/><text x="684.7" y="287.0" text-anchor="middle">1200</text>
-<line x1="794.0" y1="270.0" x2="794.0" y2="274.0" stroke="#888"/><text x="794.0" y="287.0" text-anchor="middle">4800</text>
-<text x="630.0" y="302.0" text-anchor="middle">lines per file (log)</text>
-<polyline points="466.0,187.5 575.3,181.5 630.0,226.6 684.7,212.9 794.0,184.4" fill="none" stroke="#c0392b" stroke-width="2"/>
-<circle cx="466.0" cy="187.5" r="3" fill="#c0392b"/>
-<circle cx="575.3" cy="181.5" r="3" fill="#c0392b"/>
-<circle cx="630.0" cy="226.6" r="3" fill="#c0392b"/>
-<circle cx="684.7" cy="212.9" r="3" fill="#c0392b"/>
-<circle cx="794.0" cy="184.4" r="3" fill="#c0392b"/>
-<text x="800" y="188" fill="#c0392b">native</text>
-<polyline points="466.0,113.7 575.3,175.6 630.0,193.6 684.7,148.0 794.0,175.6" fill="none" stroke="#e67e22" stroke-width="2"/>
-<circle cx="466.0" cy="113.7" r="3" fill="#e67e22"/>
-<circle cx="575.3" cy="175.6" r="3" fill="#e67e22"/>
-<circle cx="630.0" cy="193.6" r="3" fill="#e67e22"/>
-<circle cx="684.7" cy="148.0" r="3" fill="#e67e22"/>
-<circle cx="794.0" cy="175.6" r="3" fill="#e67e22"/>
-<text x="800" y="180" fill="#e67e22">naive</text>
-<polyline points="466.0,75.2 575.3,148.0 630.0,118.3 684.7,67.3 794.0,69.3" fill="none" stroke="#2471a3" stroke-width="2"/>
-<circle cx="466.0" cy="75.2" r="3" fill="#2471a3"/>
-<circle cx="575.3" cy="148.0" r="3" fill="#2471a3"/>
-<circle cx="630.0" cy="118.3" r="3" fill="#2471a3"/>
-<circle cx="684.7" cy="67.3" r="3" fill="#2471a3"/>
-<circle cx="794.0" cy="69.3" r="3" fill="#2471a3"/>
-<text x="800" y="73" fill="#2471a3">minas</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1050" height="366" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+<rect width="1050" height="366" fill="white"/>
+<text x="20" y="20" font-size="13" font-weight="bold">input tokens（中央値） — drift off</text>
+<line x1="54" y1="258.0" x2="296" y2="258.0" stroke="#e6e6e6"/>
+<text x="48" y="262.0" text-anchor="end" fill="#555">8.5k</text>
+<line x1="54" y1="146.0" x2="296" y2="146.0" stroke="#e6e6e6"/>
+<line x1="54" y1="34.0" x2="296" y2="34.0" stroke="#e6e6e6"/>
+<text x="48" y="38.0" text-anchor="end" fill="#555">104k</text>
+<line x1="54" y1="258.0" x2="54" y2="34" stroke="#888"/>
+<line x1="54.0" y1="258.0" x2="54.0" y2="262.0" stroke="#888"/><text x="54.0" y="276.0" text-anchor="middle" fill="#333">75</text>
+<line x1="134.7" y1="258.0" x2="134.7" y2="262.0" stroke="#888"/><text x="134.7" y="276.0" text-anchor="middle" fill="#333">300</text>
+<line x1="175.0" y1="258.0" x2="175.0" y2="262.0" stroke="#888"/><text x="175.0" y="276.0" text-anchor="middle" fill="#333">600</text>
+<line x1="215.3" y1="258.0" x2="215.3" y2="262.0" stroke="#888"/><text x="215.3" y="276.0" text-anchor="middle" fill="#333">1200</text>
+<line x1="296.0" y1="258.0" x2="296.0" y2="262.0" stroke="#888"/><text x="296.0" y="276.0" text-anchor="middle" fill="#333">4800</text>
+<text x="175.0" y="294.0" text-anchor="middle" fill="#333">lines per file（両対数）</text>
+<polyline points="54.0,218.5 134.7,191.2 175.0,156.0 215.3,106.3 296.0,89.5" fill="none" stroke="#c0392b" stroke-width="2"/>
+<circle cx="54.0" cy="218.5" r="3" fill="#c0392b"/>
+<circle cx="134.7" cy="191.2" r="3" fill="#c0392b"/>
+<circle cx="175.0" cy="156.0" r="3" fill="#c0392b"/>
+<circle cx="215.3" cy="106.3" r="3" fill="#c0392b"/>
+<circle cx="296.0" cy="89.5" r="3" fill="#c0392b"/>
+<polyline points="54.0,238.1 134.7,178.3 175.0,113.5 215.3,72.5 296.0,53.9" fill="none" stroke="#e67e22" stroke-width="2"/>
+<circle cx="54.0" cy="238.1" r="3" fill="#e67e22"/>
+<circle cx="134.7" cy="178.3" r="3" fill="#e67e22"/>
+<circle cx="175.0" cy="113.5" r="3" fill="#e67e22"/>
+<circle cx="215.3" cy="72.5" r="3" fill="#e67e22"/>
+<circle cx="296.0" cy="53.9" r="3" fill="#e67e22"/>
+<polyline points="54.0,213.6 134.7,185.5 175.0,186.8 215.3,181.1 296.0,192.1" fill="none" stroke="#1f6feb" stroke-width="2"/>
+<circle cx="54.0" cy="213.6" r="3" fill="#1f6feb"/>
+<circle cx="134.7" cy="185.5" r="3" fill="#1f6feb"/>
+<circle cx="175.0" cy="186.8" r="3" fill="#1f6feb"/>
+<circle cx="215.3" cy="181.1" r="3" fill="#1f6feb"/>
+<circle cx="296.0" cy="192.1" r="3" fill="#1f6feb"/>
+<polyline points="54.0,128.5 296.0,110.3" fill="none" stroke="#7b3fa0" stroke-width="2" stroke-dasharray="5,3"/>
+<circle cx="54.0" cy="128.5" r="3" fill="#7b3fa0"/>
+<circle cx="296.0" cy="110.3" r="3" fill="#7b3fa0"/>
+<text x="370" y="20" font-size="13" font-weight="bold">cost $（中央値） — drift off</text>
+<line x1="404" y1="258.0" x2="646" y2="258.0" stroke="#e6e6e6"/>
+<text x="398" y="262.0" text-anchor="end" fill="#555">0.0056</text>
+<line x1="404" y1="146.0" x2="646" y2="146.0" stroke="#e6e6e6"/>
+<line x1="404" y1="34.0" x2="646" y2="34.0" stroke="#e6e6e6"/>
+<text x="398" y="38.0" text-anchor="end" fill="#555">0.0443</text>
+<line x1="404" y1="258.0" x2="404" y2="34" stroke="#888"/>
+<line x1="404.0" y1="258.0" x2="404.0" y2="262.0" stroke="#888"/><text x="404.0" y="276.0" text-anchor="middle" fill="#333">75</text>
+<line x1="484.7" y1="258.0" x2="484.7" y2="262.0" stroke="#888"/><text x="484.7" y="276.0" text-anchor="middle" fill="#333">300</text>
+<line x1="525.0" y1="258.0" x2="525.0" y2="262.0" stroke="#888"/><text x="525.0" y="276.0" text-anchor="middle" fill="#333">600</text>
+<line x1="565.3" y1="258.0" x2="565.3" y2="262.0" stroke="#888"/><text x="565.3" y="276.0" text-anchor="middle" fill="#333">1200</text>
+<line x1="646.0" y1="258.0" x2="646.0" y2="262.0" stroke="#888"/><text x="646.0" y="276.0" text-anchor="middle" fill="#333">4800</text>
+<text x="525.0" y="294.0" text-anchor="middle" fill="#333">lines per file（両対数）</text>
+<polyline points="404.0,231.5 484.7,204.2 525.0,184.8 565.3,144.2 646.0,116.1" fill="none" stroke="#c0392b" stroke-width="2"/>
+<circle cx="404.0" cy="231.5" r="3" fill="#c0392b"/>
+<circle cx="484.7" cy="204.2" r="3" fill="#c0392b"/>
+<circle cx="525.0" cy="184.8" r="3" fill="#c0392b"/>
+<circle cx="565.3" cy="144.2" r="3" fill="#c0392b"/>
+<circle cx="646.0" cy="116.1" r="3" fill="#c0392b"/>
+<polyline points="404.0,233.8 484.7,185.8 525.0,147.7 565.3,104.4 646.0,92.9" fill="none" stroke="#e67e22" stroke-width="2"/>
+<circle cx="404.0" cy="233.8" r="3" fill="#e67e22"/>
+<circle cx="484.7" cy="185.8" r="3" fill="#e67e22"/>
+<circle cx="525.0" cy="147.7" r="3" fill="#e67e22"/>
+<circle cx="565.3" cy="104.4" r="3" fill="#e67e22"/>
+<circle cx="646.0" cy="92.9" r="3" fill="#e67e22"/>
+<polyline points="404.0,222.1 484.7,201.9 525.0,190.9 565.3,186.8 646.0,193.6" fill="none" stroke="#1f6feb" stroke-width="2"/>
+<circle cx="404.0" cy="222.1" r="3" fill="#1f6feb"/>
+<circle cx="484.7" cy="201.9" r="3" fill="#1f6feb"/>
+<circle cx="525.0" cy="190.9" r="3" fill="#1f6feb"/>
+<circle cx="565.3" cy="186.8" r="3" fill="#1f6feb"/>
+<circle cx="646.0" cy="193.6" r="3" fill="#1f6feb"/>
+<polyline points="404.0,75.4 646.0,58.2" fill="none" stroke="#7b3fa0" stroke-width="2" stroke-dasharray="5,3"/>
+<circle cx="404.0" cy="75.4" r="3" fill="#7b3fa0"/>
+<circle cx="646.0" cy="58.2" r="3" fill="#7b3fa0"/>
+<text x="720" y="20" font-size="13" font-weight="bold">wall 秒（中央値） — drift off</text>
+<line x1="754" y1="258.0" x2="996" y2="258.0" stroke="#e6e6e6"/>
+<text x="748" y="262.0" text-anchor="end" fill="#555">30</text>
+<line x1="754" y1="146.0" x2="996" y2="146.0" stroke="#e6e6e6"/>
+<line x1="754" y1="34.0" x2="996" y2="34.0" stroke="#e6e6e6"/>
+<text x="748" y="38.0" text-anchor="end" fill="#555">187</text>
+<line x1="754" y1="258.0" x2="754" y2="34" stroke="#888"/>
+<line x1="754.0" y1="258.0" x2="754.0" y2="262.0" stroke="#888"/><text x="754.0" y="276.0" text-anchor="middle" fill="#333">75</text>
+<line x1="834.7" y1="258.0" x2="834.7" y2="262.0" stroke="#888"/><text x="834.7" y="276.0" text-anchor="middle" fill="#333">300</text>
+<line x1="875.0" y1="258.0" x2="875.0" y2="262.0" stroke="#888"/><text x="875.0" y="276.0" text-anchor="middle" fill="#333">600</text>
+<line x1="915.3" y1="258.0" x2="915.3" y2="262.0" stroke="#888"/><text x="915.3" y="276.0" text-anchor="middle" fill="#333">1200</text>
+<line x1="996.0" y1="258.0" x2="996.0" y2="262.0" stroke="#888"/><text x="996.0" y="276.0" text-anchor="middle" fill="#333">4800</text>
+<text x="875.0" y="294.0" text-anchor="middle" fill="#333">lines per file（両対数）</text>
+<polyline points="754.0,212.5 834.7,209.7 875.0,230.5 915.3,224.2 996.0,211.1" fill="none" stroke="#c0392b" stroke-width="2"/>
+<circle cx="754.0" cy="212.5" r="3" fill="#c0392b"/>
+<circle cx="834.7" cy="209.7" r="3" fill="#c0392b"/>
+<circle cx="875.0" cy="230.5" r="3" fill="#c0392b"/>
+<circle cx="915.3" cy="224.2" r="3" fill="#c0392b"/>
+<circle cx="996.0" cy="211.1" r="3" fill="#c0392b"/>
+<polyline points="754.0,178.5 834.7,207.0 875.0,215.3 915.3,194.3 996.0,207.0" fill="none" stroke="#e67e22" stroke-width="2"/>
+<circle cx="754.0" cy="178.5" r="3" fill="#e67e22"/>
+<circle cx="834.7" cy="207.0" r="3" fill="#e67e22"/>
+<circle cx="875.0" cy="215.3" r="3" fill="#e67e22"/>
+<circle cx="915.3" cy="194.3" r="3" fill="#e67e22"/>
+<circle cx="996.0" cy="207.0" r="3" fill="#e67e22"/>
+<polyline points="754.0,160.7 834.7,194.3 875.0,180.6 915.3,157.1 996.0,158.0" fill="none" stroke="#1f6feb" stroke-width="2"/>
+<circle cx="754.0" cy="160.7" r="3" fill="#1f6feb"/>
+<circle cx="834.7" cy="194.3" r="3" fill="#1f6feb"/>
+<circle cx="875.0" cy="180.6" r="3" fill="#1f6feb"/>
+<circle cx="915.3" cy="157.1" r="3" fill="#1f6feb"/>
+<circle cx="996.0" cy="158.0" r="3" fill="#1f6feb"/>
+<polyline points="754.0,61.5 996.0,62.3" fill="none" stroke="#7b3fa0" stroke-width="2" stroke-dasharray="5,3"/>
+<circle cx="754.0" cy="61.5" r="3" fill="#7b3fa0"/>
+<circle cx="996.0" cy="62.3" r="3" fill="#7b3fa0"/>
+<line x1="333" y1="326" x2="355" y2="326" stroke="#c0392b" stroke-width="2"/><text x="360" y="330" fill="#c0392b">native</text>
+<line x1="429" y1="326" x2="451" y2="326" stroke="#e67e22" stroke-width="2"/><text x="456" y="330" fill="#e67e22">naive</text>
+<line x1="525" y1="326" x2="547" y2="326" stroke="#1f6feb" stroke-width="2"/><text x="552" y="330" fill="#1f6feb">minas</text>
+<line x1="621" y1="326" x2="643" y2="326" stroke="#7b3fa0" stroke-width="2" stroke-dasharray="5,3"/><text x="648" y="330" fill="#7b3fa0">positional</text>
 </svg>
