@@ -127,6 +127,9 @@ There is no shell in this session. All file access goes through the two tools
 
 
 T11_ARMS = ("native", "naive", "minas")
+# 追加実験用の arm（--arms で明示したときだけ走る）。
+# positional = minas 自身の位置指定経路（minas edit）。凍結 3 arm の掃引には入らない。
+T11_ALL_ARMS = T11_ARMS + ("positional",)
 
 # ---------- t11 の custom tool ----------
 #
@@ -177,7 +180,41 @@ T11_TOOLS = {
                       "is rejected if it no longer matches. If it is rejected, "
                       "re-read the affected lines and retry."),
     },
+    # 位置指定（position-addressed）——minas 自身が持つもう一つの編集経路。
+    # モデルが char offset を計算して渡す。minas はこの経路のために
+    # `minas edit --path ... <json>` を用意しており、その help 自体が
+    # 「expected_text 無しでは shifted range を検出できず silently corrupt する」
+    # と書いている（rust2 #5-2）。
+    "positional": {
+        "read": ("read_shim.py", "range_off"),
+        "edit": ("edit_shim.py", "pos"),
+        "read_desc": ("Read lines of a file. Each line carries `off` = the character "
+                      "offset where that line starts, so a range can be quoted as "
+                      "[off, off + len(text)). Give `start`/`end` to read only the "
+                      "lines you need."),
+        "edit_desc": ("Replace the character range [start, end) of `path` with `text`. "
+                      "`start`/`end` are 0-based character offsets into the file "
+                      "(NOT line numbers). `expected_text` must be exactly the text "
+                      "currently at [start, end); the edit is rejected if it is not."),
+        "edit_args": """{
+    path: tool.schema.string().describe("file path relative to the project root"),
+    start: tool.schema.number().describe("0-based character offset, inclusive"),
+    end: tool.schema.number().describe("character offset, exclusive"),
+    expected_text: tool.schema.string().describe("exact text currently at [start, end)"),
+    text: tool.schema.string().describe("replacement text"),
+  }""",
+        "edit_body": ('    return run(["pos", args.path, JSON.stringify('
+                      '{ start: args.start, end: args.end, '
+                      'expected_text: args.expected_text, text: args.text })], ctx.directory)'),
+    },
 }
+
+# 既定（content-addressed な 2 引数 tool）の args。
+DEFAULT_EDIT_ARGS = """{
+    path: tool.schema.string().describe("file path relative to the project root"),
+    old: tool.schema.string().describe("exact text currently in the file"),
+    new: tool.schema.string().describe("replacement text"),
+  }"""
 
 
 def write_t11_tools(wd, arm):
@@ -208,16 +245,15 @@ export default tool({{
   }},
 }})
 """)
+    args_text = spec.get("edit_args", DEFAULT_EDIT_ARGS)
+    body = spec.get("edit_body") or (
+        f"    return run([{emode!r}, args.path, args.old, args.new], ctx.directory)")
     (tdir / "medit.ts").write_text(TOOL_TS_HEAD % {**base, "shim": str(SHIMS / eshim)} + f"""
 export default tool({{
   description: {spec["edit_desc"]!r},
-  args: {{
-    path: tool.schema.string().describe("file path relative to the project root"),
-    old: tool.schema.string().describe("exact text currently in the file"),
-    new: tool.schema.string().describe("replacement text"),
-  }},
+  args: {args_text},
   async execute(args, ctx) {{
-    return run([{emode!r}, args.path, args.old, args.new], ctx.directory)
+{body}
   }},
 }})
 """)
@@ -540,9 +576,15 @@ Use `mread` to read lines of a file (pass `start`/`end` to read only the lines
 you need) and `medit` to apply a content-based edit. An edit is rejected when
 its `old` text no longer matches the file — re-read the affected lines and
 retry. This session has no shell.""",
+    "positional": """
+Use `mread` to read lines of a file: each line carries `off`, the 0-based
+character offset where it starts. Use `medit` to replace the character range
+[start, end) — `start`/`end` are CHARACTER OFFSETS, not line numbers, and
+`expected_text` must be exactly the text at that range. This session has no
+shell.""",
 }
 
-T11_PROMPTS = {f"t11-{arm}": T11_BODY + T11_TOOL_HINT[arm] for arm in T11_ARMS}
+T11_PROMPTS = {f"t11-{arm}": T11_BODY + T11_TOOL_HINT.get(arm, "") for arm in T11_ALL_ARMS}
 
 PROMPTS = {
     # Test2: rejection verbosity (C1). Both arms get the same task + drift; only
@@ -802,7 +844,13 @@ and reply with exactly: DONE""",
 def build_workdir(test, arm, scale=1200, drift=False):
     wd = WORK / "ws"
     if wd.exists():
-        shutil.rmtree(wd)
+        # cargo check の target/ を消す途中で cargo がファイルを作り直すことがあり、
+        # 1 回の rmtree では Directory not empty で落ちる（selftest で実測）。
+        for _ in range(3):
+            shutil.rmtree(wd, ignore_errors=True)
+            if not wd.exists():
+                break
+            time.sleep(0.5)
     (wd / "bin").mkdir(parents=True)
     (wd / "audit.log").write_text("")
     # 3 arm の agent 設定。t11 は bash を外して custom tool だけで解かせる（strict）。
@@ -1102,6 +1150,7 @@ T11_ALLOWED = {
     "native": {"read", "edit", "write", "glob", "grep", "apply_patch"},
     "naive": {"mread", "medit"},
     "minas": {"mread", "medit"},
+    "positional": {"mread", "medit"},
 }
 
 
@@ -1249,7 +1298,7 @@ def summarize_audit(text):
     reads = sum(1 for l in text.splitlines() if l.split("\t", 1)[0] in ("read", "read_head", "read_full"))
     # tool split: apply-mode logs "edit_ok\tapply...", positional logs "edit_ok\tedit"
     apply_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tapply"))
-    pos_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tedit"))
+    pos_n = sum(1 for l in text.splitlines() if l.startswith("edit_ok\tpos") or l.startswith("edit_ok\tedit"))
     drift = text.count("drift\t")
     return f"edits={edits} rejects={rejects} reads={reads} apply={apply_n} pos={pos_n} drift={drift}"
 
@@ -1400,6 +1449,25 @@ def _apply_t11_ground_truth(underscore=False):
         '    let cfg = Config { timeout: t, retries: r, max_conns: c };\n'))
 
 
+def _ts_syntax_ok(text):
+    """生成した TS の構文検査（node --check）。
+
+    文字列連結を間違えると TS が壊れ、opencode はそれを読み込めずに
+    'undefined is not an object (evaluating \'mo.output\')' という無関係なエラーを返す
+    （実測: 位置指定 arm の medit が 13 回連続で失敗し、shim は一度も走らなかった）。
+    計器が自分の生成ミスを見つけられるように、構文をここで検める。
+    """
+    if not shutil.which("node"):
+        return "SKIP"
+    js = "\n".join(l for l in text.splitlines() if not l.startswith("import "))
+    js = re.sub(r"\(argv: string\[\], cwd: string\)", "(argv, cwd)", js)
+    f = WORK / "_tscheck.mjs"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(js)
+    r = subprocess.run(["node", "--check", str(f)], capture_output=True, text=True)
+    return True if r.returncode == 0 else r.stderr.strip()[:200]
+
+
 def _selftest_safety():
     """安全側の性質を決定論的に示す（LLM 不要）。
 
@@ -1429,6 +1497,30 @@ def _selftest_safety():
     else:
         out.append(("minas apply は外部変更を保つ",
                     T11_DRIFT_MARKER in p.read_text(), True))
+
+    # 位置指定（minas edit）経路が本当に動くこと — 壊れた計器で arm を 0 点にしないため。
+    # テキストもオフセットも `minas read`（= daemon が見ている内容）から取る。
+    build_workdir("t11", "minas", 150, False)
+    env = {**os.environ, "MAB_MINABIN": str(MINA), "MAB_AUDIT": str(wd / "audit.log")}
+    rr = subprocess.run([str(MINA), "read", "src/config.rs", "--lines", "1:"],
+                        cwd=str(wd), capture_output=True, text=True, timeout=60, env=env)
+    try:
+        text = "".join(l["text"] + "\n" for l in json.loads(rr.stdout)["lines"])
+    except (ValueError, KeyError):
+        text = ""
+    old = "    pub retries: u32,"
+    if old not in text:
+        out.append(("位置指定（minas edit）経路が動く", "SKIP（フィクスチャ不一致）", "SKIP"))
+    else:
+        i = text.index(old)
+        doc = json.dumps({"start": i, "end": i + len(old), "expected_text": old,
+                          "text": "    pub retries: u32, // pos"})
+        pr = subprocess.run([sys.executable, str(SHIMS / "edit_shim.py"), "pos",
+                             "src/config.rs", doc], cwd=str(wd), capture_output=True,
+                            text=True, timeout=180, env=env)
+        got = (wd / "src" / "config.rs").read_text()
+        out.append(("位置指定（minas edit）経路が動く",
+                    pr.returncode == 0 and "// pos" in got, True))
     return out
 
 
@@ -1490,6 +1582,15 @@ def _selftest_outcome():
     mn2.write_text(mn2.read_text().replace(T11_DRIFT_MARKER, ""))
     check("外部変更を失ったら検出", "marker=no" in outcome_t11(150)[1], True)
 
+    for arm in T11_TOOLS:
+        build_workdir("t11", arm, 150, False)
+        for fn in ("mread.ts", "medit.ts"):
+            got = _ts_syntax_ok((WORK / "ws" / ".opencode" / "tools" / fn).read_text())
+            if got == "SKIP":
+                print(f"  SKIP  {arm} {fn} の TS 構文")
+            else:
+                check(f"{arm} {fn} の TS 構文", got, True)
+
     for name, got, want in _selftest_safety():
         if want == "SKIP":
             print(f"  SKIP  {name:26s} -> {got}")
@@ -1523,14 +1624,14 @@ if __name__ == "__main__":
     if a.action == "sweep":
         sc = tuple(int(x) for x in a.scales.split(",") if x.strip())
         arms = tuple(x for x in a.arms.split(",") if x.strip())
-        bad = [x for x in arms if x not in T11_ARMS]
+        bad = [x for x in arms if x not in T11_ALLOWED]
         if bad:
-            ap.error(f"unknown arm(s): {bad}; known: {T11_ARMS}")
+            ap.error(f"unknown arm(s): {bad}; known: {tuple(T11_ALLOWED)}")
         sweep(scales=sc, arms=arms, n=a.n, drift_only=a.drift_only,
               idx_from=a.idx_from)
         sys.exit(0)
     if a.action in ("run", "fixture"):
-        valid = T11_ARMS if a.test == "t11" else ("A", "B")
+        valid = tuple(T11_ALLOWED) if a.test == "t11" else ("A", "B")
         if a.arm not in valid:
             ap.error(f"arm must be one of {valid} for {a.test}")
     if a.action == "fixture":
